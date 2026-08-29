@@ -1,0 +1,169 @@
+"""Crash/restart durable cursor store — §1B.
+
+Persists per-asset (or shared WAL) cursor state every 5-10s and on shutdown.
+
+Concurrency (§1B):
+- per_asset: one SQLite file per asset → no lock contention, crash isolation
+- shared_wal: single SQLite file in WAL mode → concurrent writers don't serialize
+
+Fields per asset: current_window_index, current_condition_id, next_condition_id,
+last_sequence_number_per_token, last_snapshot_written_ts
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, Optional
+
+
+@dataclass
+class CursorState:
+    asset: str
+    current_window_index: int = 0
+    current_condition_id: Optional[str] = None
+    next_condition_id: Optional[str] = None
+    last_sequence_number_per_token: Dict[str, int] = field(default_factory=dict)
+    last_snapshot_written_ts: Optional[int] = None  # unix ms
+    updated_at: Optional[str] = None
+
+    def to_row(self) -> tuple:
+        return (
+            self.asset,
+            self.current_window_index,
+            self.current_condition_id,
+            self.next_condition_id,
+            json.dumps(self.last_sequence_number_per_token),
+            self.last_snapshot_written_ts,
+            self.updated_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+
+    @classmethod
+    def from_row(cls, row: tuple) -> "CursorState":
+        asset, widx, cur_cid, nxt_cid, seq_json, last_ts, updated = row
+        try:
+            seqs = json.loads(seq_json) if seq_json else {}
+        except Exception:
+            seqs = {}
+        # json keys are strings, values ints
+        seqs = {str(k): int(v) for k, v in seqs.items()}
+        return cls(
+            asset=asset,
+            current_window_index=int(widx) if widx is not None else 0,
+            current_condition_id=cur_cid,
+            next_condition_id=nxt_cid,
+            last_sequence_number_per_token=seqs,
+            last_snapshot_written_ts=last_ts,
+            updated_at=updated,
+        )
+
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS cursor_state (
+    asset TEXT PRIMARY KEY,
+    current_window_index INTEGER NOT NULL,
+    current_condition_id TEXT,
+    next_condition_id TEXT,
+    last_sequence_number_per_token TEXT NOT NULL DEFAULT '{}',
+    last_snapshot_written_ts INTEGER,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+class CursorStore:
+    """Durable cursor store for one asset (per_asset mode) or shared WAL.
+
+    Usage:
+        store = CursorStore.for_asset(config, "BTC")
+        store.save(state)
+        state = store.load("BTC")
+    """
+
+    def __init__(self, db_path: Path, wal_mode: bool = False):
+        self.db_path = Path(db_path)
+        self.wal_mode = wal_mode
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
+        if self.wal_mode:
+            # WAL mode must be set outside transaction; journal_mode pragma
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        else:
+            conn.execute("PRAGMA journal_mode=DELETE;")
+            conn.execute("PRAGMA synchronous=FULL;")
+        return conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        try:
+            conn.executescript(_DDL)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def save(self, state: CursorState) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO cursor_state
+                  (asset, current_window_index, current_condition_id, next_condition_id,
+                   last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset) DO UPDATE SET
+                  current_window_index=excluded.current_window_index,
+                  current_condition_id=excluded.current_condition_id,
+                  next_condition_id=excluded.next_condition_id,
+                  last_sequence_number_per_token=excluded.last_sequence_number_per_token,
+                  last_snapshot_written_ts=excluded.last_snapshot_written_ts,
+                  updated_at=excluded.updated_at
+                """,
+                state.to_row(),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load(self, asset: str) -> Optional[CursorState]:
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT asset, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state WHERE asset=?", (asset.upper(),))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return CursorState.from_row(row)
+        finally:
+            conn.close()
+
+    def load_all(self) -> Dict[str, CursorState]:
+        conn = self._connect()
+        try:
+            cur = conn.execute("SELECT asset, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state")
+            return {r[0]: CursorState.from_row(r) for r in cur.fetchall()}
+        finally:
+            conn.close()
+
+    # -- factory helpers (§1B concurrency spec) -----------------------------
+    @classmethod
+    def for_asset(cls, config, asset: str) -> "CursorStore":
+        """Create store for a single asset respecting config.cursor_store.mode."""
+        mode = getattr(config.cursor_store, "mode", "per_asset")
+        base = Path(config.cursor_store.path)
+        if mode == "per_asset":
+            return cls(base / f"{asset.upper()}.db", wal_mode=False)
+        elif mode == "shared_wal":
+            return cls(base / "shared.db", wal_mode=True)
+        else:
+            raise ValueError(f"Unknown cursor_store.mode {mode}")
+
+    @classmethod
+    def shared(cls, config) -> "CursorStore":
+        """Create the single shared WAL store (only when mode==shared_wal)."""
+        base = Path(config.cursor_store.path)
+        return cls(base / "shared.db", wal_mode=True)

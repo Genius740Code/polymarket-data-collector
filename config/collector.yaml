@@ -1,0 +1,103 @@
+# §0 — configurable assets, not hardcoded
+assets: [BTC, ETH, SOL]
+series_ids:
+  BTC: "BTC-5MIN"
+  ETH: "ETH-5MIN"
+  SOL: "SOL-5MIN"
+
+schema_version: "3.2.0"
+
+# §1 — rollover
+rollover_lead_seconds: 30
+max_coverage_gap_seconds: 5
+discovery_poll_interval_seconds: 2
+discovery_backoff_max_seconds: 8
+
+# §3 — snapshots (500ms aligned to UTC epoch grid, single scheduler)
+snapshot_interval_ms: 500
+l2_levels: 20              # 10–20 per spec; null-padded if fewer available
+depth_thresholds_cents: [1, 5, 10]
+
+# §8 / §9 — event detection thresholds (versioned via event_thresholds_config)
+event_thresholds:
+  spread_change_threshold: 0.002
+  size_change_threshold_pct: 0.10
+  depth_change_threshold_pct: 0.15
+  crossing_threshold: 0.0  # book_crossed is boolean, not thresholded
+
+# §1A — WS resync
+ws:
+  url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  rest_book_url: "https://clob.polymarket.com/book"   # must be verified via §18 gate
+  rest_market_url: "https://clob.polymarket.com/markets"
+  reconnect_backoff_initial_ms: 500
+  reconnect_backoff_max_ms: 30000
+  reconnect_jitter: true
+  resync_rest_backoff_initial_ms: 1000
+  resync_rest_backoff_max_ms: 20000
+  max_resync_duration_seconds: 60
+  sequence_gap_detection: true
+  full_book_diff_interval_seconds: 300
+  full_book_diff_tolerance: 0.01  # any level mismatch beyond timing noise
+
+# §1B — crash / restart cursor store
+cursor_store:
+  mode: "per_asset"  # "per_asset" (one SQLite per asset) OR "shared_wal" (single WAL-mode file)
+  path: "/home/fese/polymarket-collector/data/cursor_state"
+  # per_asset -> /home/fese/polymarket-collector/data/cursor_state/{BTC,ETH,SOL}.db
+  # shared_wal -> /home/fese/polymarket-collector/data/cursor_state/shared.db (opened WAL mode)
+  flush_interval_seconds: 5
+
+# §6 / §6A — chainlink + settlement
+chainlink:
+  ws_url: "wss://ws-live-data.polymarket.com"  # RTDS Chainlink TWAP — topic crypto_prices_chainlink (polymarket wss)
+  max_resolution_wait_seconds: 120
+  settlement_source_preference: "on_chain_confirmed"  # fallback: inferred_nearest
+  enable_binance_fallback: false  # per user request — no binance data, RTDS only
+
+# §10A — write batching / backpressure
+storage:
+  data_dir: "/home/fese/polymarket-collector/data"
+  flush_interval_seconds: 60
+  flush_row_count_threshold: 5000
+  buffer_max_rows: 50000
+  wal_enabled: true
+  wal_dir: "/home/fese/polymarket-collector/data/_wal"
+  disk_space_check_interval_seconds: 30
+  disk_space_min_bytes: 1073741824  # 1 GiB — alert before full
+  compaction_schedule: "daily"  # cron or interval for compaction job
+  compaction_temp_suffix: ".tmp"
+
+# §13 — raw WS archive (rolling)
+raw_archive:
+  enabled: true
+  retention_hours: 36   # 24–48h per spec
+  path: "/home/fese/polymarket-collector/data/raw_ws_archive"
+  format: "jsonl"
+
+# §14 — clock
+clock:
+  ntp_check_interval_seconds: 60
+  clock_issue_threshold_ms: 50
+  ntp_server: "pool.ntp.org"
+
+# §17A — watchdog
+watchdog:
+  heartbeat_interval_seconds: 5
+  heartbeat_stale_seconds: 15
+  alert_on:
+    - ws_disconnected
+    - resync_failed
+    - coverage_gap
+    - rollover_miss
+    - backpressure
+    - write_failed
+    - clock_issue
+    - resolution_stuck
+    - book_anomaly
+  daily_summary_hour_utc: 0
+
+# §11A capacity planning — override after pilot run
+capacity:
+  estimated_row_bytes_uncompressed: 2500  # snapshot row; measured in pilot
+  parquet_compression_ratio: 0.25
