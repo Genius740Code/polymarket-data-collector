@@ -32,17 +32,88 @@ class MarketsLog:
         import datetime
         row = dict(market)
         row["updated_at"] = updated_at or datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        # §3.1 alias: recorded_at mirrors updated_at for Kaggle JSON
+        if not row.get("recorded_at"):
+            row["recorded_at"] = row["updated_at"]
+        # §3.2 ms aliases: derive ISO <-> ms if one side missing
+        # market_start_ts_ms / market_end_ts_ms <-> market_start_ts / market_end_ts
+        if row.get("market_start_ts_ms") is not None and not row.get("market_start_ts"):
+            try:
+                ms = int(row["market_start_ts_ms"])
+                row["market_start_ts"] = datetime.datetime.fromtimestamp(ms/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                pass
+        if row.get("market_end_ts_ms") is not None and not row.get("market_end_ts"):
+            try:
+                ms = int(row["market_end_ts_ms"])
+                row["market_end_ts"] = datetime.datetime.fromtimestamp(ms/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                pass
+        if row.get("market_start_ts") and row.get("market_start_ts_ms") is None:
+            try:
+                iso = str(row["market_start_ts"])
+                dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                row["market_start_ts_ms"] = int(dt.timestamp()*1000)
+            except Exception:
+                pass
+        if row.get("market_end_ts") and row.get("market_end_ts_ms") is None:
+            try:
+                iso = str(row["market_end_ts"])
+                dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                row["market_end_ts_ms"] = int(dt.timestamp()*1000)
+            except Exception:
+                pass
         # ensure required fields have defaults
         row.setdefault("schema_version", "3.0.0")
         row.setdefault("status", MarketStatus.pending.value)
         row.setdefault("resolution_outcome", ResolutionOutcome.unknown.value)
         row.setdefault("settlement_source", None)
+        # §3.1 nullable enrichment defaults (keep null for backward compat if missing)
+        row.setdefault("slug", None)
+        row.setdefault("window_label", None)
+        row.setdefault("window_size_seconds", None)
+        row.setdefault("market_start_ts_ms", None)
+        row.setdefault("market_end_ts_ms", None)
         self._staging.append(row)
         # if writer provided, also enqueue for batched parquet flush
         if self.writer:
             import datetime as dtmod
             date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
             self.writer.append("markets_log", row, asset=None, date_str=date_str)
+
+    def append_event(
+        self,
+        event_type: str,
+        ts_utc: str,
+        ts_received_ns: int,
+        connection_id: Optional[str] = None,
+        condition_id: Optional[str] = None,
+        market_id: Optional[str] = None,
+        token_id: Optional[str] = None,
+        asset: Optional[str] = None,
+        details: Optional[dict] = None,
+    ) -> None:
+        """Append a collector_events row for data-quality tracking."""
+        import datetime
+        row = {
+            "event_id": str(uuid.uuid4()),
+            "event_type": event_type,
+            "ts_utc": ts_utc,
+            "ts_received_ns": ts_received_ns,
+            "connection_id": connection_id,
+            "condition_id": condition_id,
+            "market_id": market_id,
+            "token_id": token_id,
+            "asset": asset,
+            "details": details or {},
+            "schema_version": "3.2.0",
+        }
+        self._staging.append(row)
+        # if writer provided, also enqueue for batched parquet flush
+        if self.writer:
+            import datetime as dtmod
+            date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
+            self.writer.append("collector_events", row, asset=asset, date_str=date_str)
 
     def _normalize_rows(self, rows: List[Dict]) -> List[Dict]:
         """Ensure all rows have union of keys (pyarrow from_pylist drops cols not in first row)."""

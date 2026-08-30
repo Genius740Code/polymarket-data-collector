@@ -281,6 +281,24 @@ class ParquetWriter:
                         nr["ts_snapshot_ns"] = _time.time_ns()
                     if nr.get("updated_at") is None and dataset == "markets_log":
                         nr["updated_at"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                    if nr.get("recorded_at") is None and dataset == "markets_log":
+                        nr["recorded_at"] = nr.get("updated_at") or _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                    # §3.2 ms alias promotion for markets_log
+                    if dataset == "markets_log":
+                        if nr.get("market_start_ts_ms") is None and nr.get("market_start_ts"):
+                            try:
+                                iso = str(nr["market_start_ts"])
+                                dt = _dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                                nr["market_start_ts_ms"] = int(dt.timestamp()*1000)
+                            except Exception:
+                                pass
+                        if nr.get("market_end_ts_ms") is None and nr.get("market_end_ts"):
+                            try:
+                                iso = str(nr["market_end_ts"])
+                                dt = _dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                                nr["market_end_ts_ms"] = int(dt.timestamp()*1000)
+                            except Exception:
+                                pass
                     if nr.get("disconnect_ts_utc") is None and dataset == "resync_episodes":
                         nr["disconnect_ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
                     # condition_id etc. non-nullable but test may omit — fill placeholder

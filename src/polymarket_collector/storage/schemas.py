@@ -12,15 +12,22 @@ import pyarrow as pa
 SCHEMA_VERSION_FIELD = pa.field("schema_version", pa.string(), nullable=False)
 
 # §2 + §6A markets — time first, condition_id second
+# §3.5 enrichment: slug/window_label/window_size_seconds/recorded_at added for Kaggle plan.md §3
 MARKETS_SCHEMA = pa.schema([
     pa.field("updated_at", pa.string(), nullable=False),
+    pa.field("recorded_at", pa.string(), nullable=True),  # alias of updated_at for Kaggle JSON (§3.2)
     pa.field("market_start_ts", pa.string(), nullable=True),  # ISO8601
     pa.field("market_end_ts", pa.string(), nullable=True),
+    pa.field("market_start_ts_ms", pa.int64(), nullable=True),  # epoch ms alias (§3.2)
+    pa.field("market_end_ts_ms", pa.int64(), nullable=True),
     pa.field("resolution_ts", pa.string(), nullable=True),
     pa.field("condition_id", pa.string(), nullable=False),
     pa.field("market_id", pa.string(), nullable=False),
+    pa.field("slug", pa.string(), nullable=True),  # §3.1 e.g. btc-updown-5m-1774390200
     pa.field("series_id", pa.string(), nullable=False),
     pa.field("window_index", pa.int64(), nullable=False),
+    pa.field("window_label", pa.string(), nullable=True),  # §3.1 5m/15m/1h/4h/1d
+    pa.field("window_size_seconds", pa.int64(), nullable=True),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("up_token_id", pa.string(), nullable=False),
     pa.field("down_token_id", pa.string(), nullable=False),

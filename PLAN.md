@@ -1,10 +1,10 @@
-# PLAN.md — BTC / ETH / SOL Data Storage (v3 — field fixes + pre-build gating)
+# PLAN.md — BTC / ETH / SOL / HYPE / BNB / XRP / DOGE Data Storage (v4 — expanded to 7 assets + field fixes + pre-build gating)
 
 ## Scope
 
-This file defines the data our program will store for **BTC, ETH, and SOL 5-minute up/down markets** on Polymarket.
+This file defines the data our program will store for **BTC, ETH, SOL, HYPE, BNB, XRP, and DOGE 5-minute up/down markets** on Polymarket.
 
-The asset list is **configurable, not hardcoded** — adding a fourth asset later should require a config change, not a schema change.
+The asset list is **configurable, not hardcoded** — adding additional assets later should require a config change, not a schema change.
 
 The goal is to preserve enough information for strategy research, realistic backtesting, latency research, and future bot development — without gaps, without ambiguity about what a stored value means, and without unnecessarily storing every raw message — and to keep running **24/7 without silently losing data** when the network, the exchange, or our own process misbehaves.
 
@@ -19,17 +19,19 @@ The goal is to preserve enough information for strategy research, realistic back
 - §19 (NEW): testing / chaos-injection plan required before an unattended live run.
 - §18: reframed as a **gate**, not a checklist to verify alongside coding — §1A should not be implemented until these are answered against real payloads.
 
-Nothing from v1/v2 was removed; items are added, tightened, or made precise.
+**v4 changes (this revision):** expanded asset universe from 3 to 7 — added HYPE, BNB, XRP, and DOGE to BTC/ETH/SOL. Updated §0, §1 (§1 rate-limit now 7 assets), §1B, §3 (clock sync), §6 (Chainlink), §11 (partition examples), §11A (capacity ×7), and §16 (data-flow diagram). No schema changes required — asset list remains config-driven (§0).
+
+Nothing from v1/v2/v3 was removed; items are added, tightened, or made precise.
 
 ---
 
 ## 0. Assets
 
 ```
-assets: [BTC, ETH, SOL]
+assets: [BTC, ETH, SOL, HYPE, BNB, XRP, DOGE]
 ```
 
-Each asset is collected identically. Everywhere below, "per asset" means this pipeline runs independently and in parallel for BTC, ETH, and SOL.
+Each asset is collected identically. Everywhere below, "per asset" means this pipeline runs independently and in parallel for BTC, ETH, SOL, HYPE, BNB, XRP, and DOGE.
 
 **Before enabling an asset:** confirm a live 5-minute up/down market actually exists for it and has meaningful liquidity (volume, order book depth, spread). Don't assume — check directly against Polymarket's market list/API.
 
@@ -50,7 +52,7 @@ Every 5-minute window is a brand-new market (new `condition_id`, new `up_token_i
 4. **After `market_end_ts` passes** and the current market resolves, drop it from the active set and promote "next" to "current." Repeat the lookahead for the following market.
 5. If the next market cannot be discovered in time, log a `rollover_miss` collector event.
 6. **Distinguish "discovered late" from "no market existed."** If, after the previous window's `market_end_ts`, no next market is subscribed within a configurable `max_coverage_gap_seconds` (e.g. 5s), emit a `coverage_gap` event (see §8) — separate from `rollover_miss` — so research code can tell "we were slow" apart from "the venue genuinely had no market for this asset during this interval."
-7. **Rate-limited discovery polling.** The lookahead query is polled on a backoff schedule (e.g. every 2s starting at `rollover_lead_seconds`, capped), not tight-looped, to avoid hitting API rate limits across 3 assets simultaneously. Log `rate_limited` (§8) if the API returns a 429/backoff response, and widen the poll interval automatically.
+7. **Rate-limited discovery polling.** The lookahead query is polled on a backoff schedule (e.g. every 2s starting at `rollover_lead_seconds`, capped), not tight-looped, to avoid hitting API rate limits across 7 assets simultaneously. Log `rate_limited` (§8) if the API returns a 429/backoff response, and widen the poll interval automatically.
 
 ### `series_id` / `window_index`
 
@@ -161,7 +163,7 @@ A WS resync fixes *in-flight* disconnects, but doesn't help if the collector **p
 
 ### Concurrency (NEW)
 
-If BTC/ETH/SOL run as **separate processes**, use **one SQLite file per asset** for the persisted cursor store — avoids any lock contention between processes and keeps a crash in one asset's process from touching another's state file.
+If BTC/ETH/SOL/HYPE/BNB/XRP/DOGE run as **separate processes**, use **one SQLite file per asset** for the persisted cursor store — avoids any lock contention between processes and keeps a crash in one asset's process from touching another's state file.
 
 If they instead run as **threads/tasks within one process**, a single shared SQLite file is fine, but it must be opened in **WAL mode** so the periodic 5–10s writes from each asset's task don't serialize behind each other or block reads used for monitoring/debugging.
 
@@ -215,7 +217,7 @@ See **§6A** for the settlement/resolution ground-truth fields added here.
 
 One order-book snapshot every **500 milliseconds** per active market, per asset.
 
-**Clock synchronization:** all assets snapshot from the **same clock tick** (single scheduler firing every 500ms across BTC/ETH/SOL), not independent drifting loops. This scheduler tick should itself be aligned to the shared wall-clock grid described in §1A's redundancy section (UTC epoch boundaries), so a single collector's timestamps are already compatible if a second collector is added later.
+**Clock synchronization:** all assets snapshot from the **same clock tick** (single scheduler firing every 500ms across BTC/ETH/SOL/HYPE/BNB/XRP/DOGE — all 7 assets), not independent drifting loops. This scheduler tick should itself be aligned to the shared wall-clock grid described in §1A's redundancy section (UTC epoch boundaries), so a single collector's timestamps are already compatible if a second collector is added later.
 
 ### Identifiers
 ```
@@ -363,7 +365,7 @@ Same dedup rule as §4: unique on `(token_id, sequence_number)` where available,
 
 ## 6. chainlink_events
 
-Every relevant Chainlink price/data-stream event for BTC, ETH, and SOL — native frequency, not sampled to 500ms.
+Every relevant Chainlink price/data-stream event for BTC, ETH, SOL, HYPE, BNB, XRP, and DOGE — native frequency, not sampled to 500ms.
 
 ```
 event_id
@@ -565,17 +567,17 @@ Apache Parquet, partitioned by date (UTC) and asset:
 
 ```
 data/
-  book_snapshots_500ms/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/part-000.parquet
-  book_snapshots_clean/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/part-000.parquet   # NEW — compacted view, §9B
-  book_events/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/part-000.parquet
-  trades/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/part-000.parquet
-  chainlink_events/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/part-000.parquet
+  book_snapshots_500ms/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/part-000.parquet
+  book_snapshots_clean/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/part-000.parquet   # NEW — compacted view, §9B
+  book_events/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/part-000.parquet
+  trades/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/part-000.parquet
+  chainlink_events/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/part-000.parquet
   markets_log/date=YYYY-MM-DD/part-000.parquet          # append-only, §9A
   markets_latest/markets_latest.parquet                  # compacted view, §9A
   resync_episodes/date=YYYY-MM-DD/part-000.parquet       # §1A
   event_thresholds_config/config.parquet
   collector_events/date=YYYY-MM-DD/part-000.parquet
-  raw_ws_archive/date=YYYY-MM-DD/asset={BTC,ETH,SOL}/    # short retention, see §13
+  raw_ws_archive/date=YYYY-MM-DD/asset={BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}/    # short retention, see §13
 ```
 
 Date partitions use **UTC calendar days**, explicitly, to avoid local-timezone ambiguity around midnight. Rotate files via the §10A compaction job — do not let one file grow forever.
@@ -586,7 +588,7 @@ Date partitions use **UTC calendar days**, explicitly, to avoid local-timezone a
 
 Before assuming "24/7, won't fill the disk" holds, size it explicitly rather than by assumption:
 
-- `book_snapshots_500ms` alone is ~172,800 rows/day per asset (2/sec × 86,400s), × 3 assets, × ~160 L2 price/size columns plus identifiers/state fields. Estimate uncompressed and Parquet-compressed row size from the actual field list above, multiply out to a daily/weekly/monthly figure, and confirm it against available disk before relying on the pipeline running unattended for weeks.
+- `book_snapshots_500ms` alone is ~172,800 rows/day per asset (2/sec × 86,400s), × 7 assets, × ~160 L2 price/size columns plus identifiers/state fields. Estimate uncompressed and Parquet-compressed row size from the actual field list above, multiply out to a daily/weekly/monthly figure, and confirm it against available disk before relying on the pipeline running unattended for weeks.
 - Include `book_events`, `trades`, and `chainlink_events` in the same estimate — their volume is data-dependent (event-driven) rather than fixed-cadence, so size them from a short pilot run rather than guessing.
 - Feed this into the §10A compaction schedule and the §13 raw-archive retention window: if compaction cadence or archive retention was picked arbitrarily, revisit both against the actual measured volume.
 - Re-check this estimate once real data starts flowing — pilot-run numbers often differ from the back-of-envelope figures above, especially for event-driven tables.
@@ -640,7 +642,7 @@ Research and backtesting code should default to `book_snapshots_clean` (§9B) ra
 ## 16. Final Data Flow
 
 ```
-                    BTC / ETH / SOL 5-MIN MARKETS
+          BTC / ETH / SOL / HYPE / BNB / XRP / DOGE 5-MIN MARKETS
                               │
                  ┌────────────┴────────────┐
                  │  ~30s before close:      │

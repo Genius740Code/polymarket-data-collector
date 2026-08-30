@@ -12,6 +12,20 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 
+def _window_label_for(window_size_seconds: int) -> str:
+    """Map window_size_seconds -> label per plan.md §1.1."""
+    if window_size_seconds >= 86400:
+        return "1d"
+    elif window_size_seconds >= 14400:
+        return "4h"
+    elif window_size_seconds >= 3600:
+        return "1h"
+    elif window_size_seconds >= 900:
+        return "15m"
+    else:
+        return "5m"
+
+
 @dataclass
 class MarketInfo:
     condition_id: str
@@ -26,10 +40,50 @@ class MarketInfo:
     status: str = "active"
     question: Optional[str] = None
     tick_size: Optional[float] = None
+    # §3.1 enrichment — slug/volume/liquidity/window_label per plan.md
+    slug: Optional[str] = None
+    window_label: Optional[str] = None
+    window_size_seconds: Optional[int] = None
+    reported_volume: Optional[float] = None
+    reported_liquidity: Optional[float] = None
 
     @property
     def market_end_ts(self) -> int:
         return self.market_end_ts_ms
+
+    def to_markets_row(self, updated_at: Optional[str] = None) -> dict:
+        """Convert to markets_log row dict per enriched MARKETS_SCHEMA (§3)."""
+        import datetime as _dt
+        now_iso = updated_at or _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        def _ms_to_iso(ms: int) -> str:
+            try:
+                return _dt.datetime.fromtimestamp(ms/1000, tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                return now_iso
+        return {
+            "updated_at": now_iso,
+            "recorded_at": now_iso,
+            "market_start_ts": _ms_to_iso(self.market_start_ts_ms),
+            "market_end_ts": _ms_to_iso(self.market_end_ts_ms),
+            "market_start_ts_ms": int(self.market_start_ts_ms),
+            "market_end_ts_ms": int(self.market_end_ts_ms),
+            "condition_id": self.condition_id,
+            "market_id": self.market_id,
+            "slug": self.slug,
+            "series_id": self.series_id,
+            "window_index": int(self.window_index),
+            "window_label": self.window_label or _window_label_for(self.window_size_seconds or 300),
+            "window_size_seconds": int(self.window_size_seconds or 300),
+            "asset": self.asset,
+            "up_token_id": self.up_token_id,
+            "down_token_id": self.down_token_id,
+            "status": self.status,
+            "resolution_outcome": "unknown",
+            "question": self.question,
+            "tick_size": self.tick_size,
+            "reported_volume": self.reported_volume,
+            "reported_liquidity": self.reported_liquidity,
+        }
 
 
 @dataclass
@@ -86,18 +140,7 @@ class MarketDiscovery:
         self.window_multiplier = window_size_seconds // 300
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
-        # Determine the window label from window_size_seconds
-        ws = self.window_size_seconds
-        if ws >= 86400:
-            window_label = "1d"
-        elif ws >= 14400:
-            window_label = "4h"
-        elif ws >= 3600:
-            window_label = "1h"
-        elif ws >= 900:
-            window_label = "15m"
-        else:
-            window_label = "5m"
+        window_label = _window_label_for(self.window_size_seconds)
         # asset prefix is lower-case, e.g. btc-updown-5m-1787994000
         return f"{asset.lower()}-updown-{window_label}-{ts_seconds}"
 
@@ -119,9 +162,9 @@ class MarketDiscovery:
 
         # Try Gamma first — slug is deterministic but may be indexed ~30-60s late.
         # If the market for ts is already ended (endDate <= now), the current window
-        # is actually ts+300 (next window). Try ts and ts+300.
+        # is actually ts+window (next window). Try ts and ts+window.
         import datetime as _dt
-        candidates = [ts, ts + 300]
+        candidates = [ts, ts + self.window_size_seconds]
         # For "next after" we prefer ts (exact), but for initial discovery where ts is floor(now)
         # and that window is already ended, we fallback to ts+300.
         for cand_ts in candidates:
@@ -222,15 +265,16 @@ class MarketDiscovery:
             # incomplete market (maybe not yet fully created)
             return None
 
-        # timestamps: endDate is ISO, start = end - 5min if missing
+        # timestamps: endDate is ISO, start = end - window if missing (§3 hard-code fix)
         end_iso = data.get("endDate") or data.get("end_date")
         start_iso = data.get("startDate") or data.get("start_date")
+        ws = self.window_size_seconds
         try:
             if end_iso:
                 dt_end = datetime.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
                 end_ms = int(dt_end.timestamp() * 1000)
             else:
-                end_ms = (ts_seconds + 300) * 1000
+                end_ms = (ts_seconds + ws) * 1000
             if start_iso:
                 dt_start = datetime.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
                 start_ms = int(dt_start.timestamp() * 1000)
@@ -238,16 +282,37 @@ class MarketDiscovery:
                 start_ms = ts_seconds * 1000
         except Exception:
             start_ms = ts_seconds * 1000
-            end_ms = (ts_seconds + 300) * 1000
+            end_ms = (ts_seconds + ws) * 1000
 
-        # window_index deterministic from ts
-        window_index = ts_seconds // 300  # stable across runs
+        # window_index deterministic from ts (§3 fix: use window, not 300)
+        window_index = ts_seconds // ws  # stable across runs
 
         tick_raw = data.get("orderPriceMinTickSize") or data.get("order_price_min_tick_size") or 0.01
         try:
             tick_size = float(tick_raw)
         except Exception:
             tick_size = 0.01
+
+        # §3.1 slug / §3.3 volume/liquidity population
+        slug_val = data.get("slug") or data.get("marketSlug") or data.get("market_slug") or self._slug_for(asset, ts_seconds)
+        # volume / liquidity may be string or number, try volumeNum first
+        reported_volume = data.get("volumeNum")
+        if reported_volume is None:
+            reported_volume = data.get("volume")
+        reported_liquidity = data.get("liquidityNum")
+        if reported_liquidity is None:
+            reported_liquidity = data.get("liquidity")
+        # coerce to float where possible
+        try:
+            reported_volume = float(reported_volume) if reported_volume is not None else None
+        except Exception:
+            reported_volume = None
+        try:
+            reported_liquidity = float(reported_liquidity) if reported_liquidity is not None else None
+        except Exception:
+            reported_liquidity = None
+
+        window_label = _window_label_for(ws)
 
         return MarketInfo(
             condition_id=str(condition_id),
@@ -258,10 +323,15 @@ class MarketDiscovery:
             market_start_ts_ms=start_ms,
             market_end_ts_ms=end_ms,
             window_index=int(window_index),
-            series_id=f"{asset.upper()}-{self.window_size_seconds}s",
+            series_id=f"{asset.upper()}-{window_label}",
             status="active" if data.get("active") else "active",
             question=data.get("question"),
             tick_size=tick_size,
+            slug=str(slug_val) if slug_val else None,
+            window_label=window_label,
+            window_size_seconds=ws,
+            reported_volume=reported_volume,
+            reported_liquidity=reported_liquidity,
         )
 
     def _parse_market_response(self, asset: str, data: dict, after_ts_ms: int) -> Optional[MarketInfo]:
@@ -299,13 +369,14 @@ class MarketDiscovery:
         up_token = up_token or data.get("up_token_id") or f"{condition_id}-UP"
         down_token = down_token or data.get("down_token_id") or f"{condition_id}-DOWN"
 
-        # timestamps (ms)
+        # timestamps (ms) — §3 fix: use window not hardcoded 300s
+        ws = self.window_size_seconds
         start_ms = data.get("market_start_ts_ms") or data.get("start_time") or after_ts_ms
-        end_ms = data.get("market_end_ts_ms") or data.get("end_time") or (after_ts_ms + 5 * 60 * 1000)
+        end_ms = data.get("market_end_ts_ms") or data.get("end_time") or (after_ts_ms + ws * 1000)
         # normalize to int ms
         try:
             start_ms = int(start_ms) if start_ms else after_ts_ms
-            end_ms = int(end_ms) if end_ms else start_ms + 300_000
+            end_ms = int(end_ms) if end_ms else start_ms + ws * 1000
             # if values look like seconds ( < 1e12 ), convert
             if start_ms < 1e12:
                 start_ms *= 1000
@@ -313,7 +384,25 @@ class MarketDiscovery:
                 end_ms *= 1000
         except (TypeError, ValueError):
             start_ms = after_ts_ms
-            end_ms = after_ts_ms + 300_000
+            end_ms = after_ts_ms + ws * 1000
+
+        # window_index: prefer provided else compute from ts
+        if "window_index" in data and data.get("window_index") is not None:
+            try:
+                window_index = int(data.get("window_index"))
+            except Exception:
+                window_index = (start_ms // 1000) // ws
+        else:
+            window_index = (start_ms // 1000) // ws
+
+        window_label = _window_label_for(ws)
+        slug_val = data.get("slug") or data.get("marketSlug") or None
+        if not slug_val:
+            try:
+                ts_secs = int(start_ms // 1000) // ws * ws
+                slug_val = self._slug_for(asset, ts_secs)
+            except Exception:
+                slug_val = None
 
         return MarketInfo(
             condition_id=str(condition_id),
@@ -323,11 +412,16 @@ class MarketDiscovery:
             down_token_id=str(down_token),
             market_start_ts_ms=start_ms,
             market_end_ts_ms=end_ms,
-            window_index=int(data.get("window_index", 0)),
-            series_id=data.get("series_id", f"{asset.upper()}-5MIN"),
+            window_index=int(window_index),
+            series_id=data.get("series_id", f"{asset.upper()}-{window_label}"),
             status=data.get("status", "active"),
             question=data.get("question"),
             tick_size=data.get("tick_size"),
+            slug=str(slug_val) if slug_val else None,
+            window_label=window_label,
+            window_size_seconds=ws,
+            reported_volume=data.get("reported_volume") or data.get("volumeNum") or data.get("volume"),
+            reported_liquidity=data.get("reported_liquidity") or data.get("liquidityNum") or data.get("liquidity"),
         )
 
 
@@ -336,12 +430,17 @@ class RolloverManager:
 
     def __init__(self, config, discovery: Optional[MarketDiscovery] = None, on_event=None):
         self.config = config
+        # §3.5 fix: use config.window_size_seconds not test_mode.window_size_seconds
+        # fallback to test_mode only if window_size_seconds missing (backward compat)
+        ws = getattr(config, "window_size_seconds", None)
+        if ws is None:
+            ws = getattr(getattr(config, "test_mode", None), "window_size_seconds", 300)
         self.discovery = discovery or MarketDiscovery(
             rest_market_url=config.ws.rest_market_url,
             poll_interval_s=config.discovery_poll_interval_seconds,
             backoff_max_s=config.discovery_backoff_max_seconds,
             on_event=on_event,
-            window_size_seconds=config.test_mode.window_size_seconds,
+            window_size_seconds=ws,
         )
         self.on_event = on_event
         self.states: Dict[str, RolloverState] = {a.upper(): RolloverState(asset=a.upper()) for a in config.assets}

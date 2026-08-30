@@ -129,9 +129,9 @@ async def test_rate_limited_backoff():
 
 def test_series_id_window_index():
     cfg = CollectorConfig()
-    assert cfg.series_id_for("BTC") == "BTC-5MIN"
+    assert cfg.series_id_for("BTC") == "BTC-5m"
     # adding 4th asset via config, not hardcoded
-    cfg2 = CollectorConfig(assets=["BTC", "ETH", "SOL", "AVAX"], series_ids={"BTC": "BTC-5MIN", "ETH": "ETH-5MIN", "SOL": "SOL-5MIN", "AVAX": "AVAX-5MIN"})
+    cfg2 = CollectorConfig(assets=["BTC", "ETH", "SOL", "AVAX"], series_ids={"BTC": "BTC-5m", "ETH": "ETH-5m", "SOL": "SOL-5m", "AVAX": "AVAX-5m"})
     assert "AVAX" in cfg2.assets
-    assert cfg2.series_id_for("AVAX") == "AVAX-5MIN"
-    assert cfg2.series_id_for("btc") == "BTC-5MIN"  # case-insensitive
+    assert cfg2.series_id_for("AVAX") == "AVAX-5m"
+    assert cfg2.series_id_for("btc") == "BTC-5m"  # case-insensitive

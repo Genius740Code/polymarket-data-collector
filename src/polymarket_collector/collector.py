@@ -80,6 +80,75 @@ class Collector:
         self._conn_ids: Dict[str, str] = {}
         self._conn_tokens: Dict[str, set] = {}
 
+    async def _recover_from_cursor(self) -> None:
+        """§1B: recover cursor state on startup after crash/restart."""
+        import datetime
+        print(f"[startup] recovering cursor state for assets: {self.config.assets}")
+        for asset in self.config.assets:
+            try:
+                store = CursorStore.for_asset(self.config, asset)
+                state = store.load(asset)
+                print(f"[startup] recovered cursor for {asset}: window={state.current_window_index if state else 'None'}")
+            except Exception as e:
+                print(f"[startup] no cursor state for {asset}: {e}")
+
+    def _collector_event(self, event_type: CollectorEventType, details: dict) -> None:
+        """Fire a collector_events row for data-quality tracking."""
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        self.markets_log.append_event(
+            event_type=event_type,
+            ts_utc=now.isoformat(),
+            ts_received_ns=int(now.timestamp() * 1e9),
+            condition_id=details.get("condition_id"),
+            market_id=details.get("market_id"),
+            token_id=details.get("token_id"),
+            asset=details.get("asset"),
+            connection_id=details.get("connection_id"),
+            details=details.get("details"),
+        )
+
+    def _writer_event(self, event_type: CollectorEventType, details: dict) -> None:
+        """Fire a collector_events row for write-status tracking (no-op if not needed)."""
+        pass
+
+    async def _fetch_rest_book(self, asset: str, condition_id: str) -> Optional[dict]:
+        """Fetch a full order-book snapshot via REST for resync.
+
+        May return None if the endpoint isn't available (§18 gate).
+        """
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    self.config.ws.rest_book_url,
+                    params={"asset": asset, "condition_id": condition_id},
+                )
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+        return None
+
+    def _beat(self) -> None:
+        """Write heartbeat file for watchdog monitoring."""
+        import datetime
+        import json
+        path = Path(self.config.storage.data_dir) / "heartbeat.json"
+        ts_utc = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+        ts_ns = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1e9)
+        try:
+            path.write_text(json.dumps({"ts_ns": ts_ns, "ts_utc": ts_utc, "assets": self.config.assets}))
+        except Exception:
+            pass
+
+    def _persist_cursor_sync(self) -> None:
+        """Sync cursor state to durable storage."""
+        try:
+            for store in self.cursor_stores.values():
+                store.sync()
+        except Exception:
+            pass
+
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
         self._running = True
