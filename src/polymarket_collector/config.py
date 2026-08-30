@@ -89,10 +89,10 @@ class WatchdogConfig(BaseModel):
 
 class TestModeConfig(BaseModel):
     enabled: bool = False
-    num_markets: int = 3  # number of 5-min windows to collect live (§1) — 3×5min = 15 min wall-clock
+    num_markets: int = 4  # number of 5-min windows to collect live (§1) — 4×5min = 20 min wall-clock (only 5m window, 1d too long)
     accelerate: bool = False  # ignored for real mode (always wall-clock); kept for CLI compat
     synthetic_seed: int | None = None
-    window_size_seconds: int = 300  # override default 5-min window size
+    window_size_seconds: int = 300  # override default 5-min window size (test only uses 5m)
 
 
 class CapacityConfig(BaseModel):
@@ -101,10 +101,13 @@ class CapacityConfig(BaseModel):
 
 
 class KaggleConfig(BaseModel):
-    upload_interval_seconds: int = 3600  # hourly by default
+    upload_interval_seconds: int = 3600  # hourly by default (prod)
+    test_upload_interval_seconds: int = 600  # 10-min during test_mode (4 markets ×5m)
     username: str | None = None  # optional: override KAGGLE_USERNAME env
     key: str | None = None  # optional: override KAGGLE_KEY env
     dataset_prefix: str = "gghgg1/polymarket-5m-crypto"
+    # per-plan.md §1.1 single 5m dataset (all assets share same slug, not per-asset suffix)
+    # test_mode uploads every 10 min to same dataset, gated on closed markets only
 
 
 # ------------------------------------------------------------------ top-level
@@ -113,11 +116,11 @@ class CollectorConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="POLYMARKET_", extra="ignore")
 
-    assets: List[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    assets: List[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"])
     series_ids: Dict[str, str] = Field(default_factory=lambda: {
-        "BTC": "BTC", "ETH": "ETH", "SOL": "SOL",
+        "BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "HYPE": "HYPE", "BNB": "BNB", "XRP": "XRP", "DOGE": "DOGE",
     })
-    window_size_seconds: int = 300  # default 5-min; override for 15min/1h/4h/1d
+    window_size_seconds: int = 300  # default 5-min; 5m-only for test (1d too long, assume 5m validates others)
     schema_version: str = "3.2.0"
 
     rollover_lead_seconds: int = 30

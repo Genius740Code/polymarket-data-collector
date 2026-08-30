@@ -404,6 +404,9 @@ class OrderBookState:
         for outcome_key, book in (("up", self.up), ("down", self.down)):
             for side_key, side in (("bids", book.bids), ("asks", book.asks)):
                 key = f"{outcome_key}_{side_key}"  # e.g. up_bids
+                # Only update sides present in snapshot – don't wipe other side when single-outcome dict passed
+                if key not in snapshot and side_key not in snapshot:
+                    continue
                 levels = snapshot.get(key) or snapshot.get(side_key) or []
                 is_bid = side_key == "bids"
                 new_levels: List[Level] = []

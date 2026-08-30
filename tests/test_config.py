@@ -4,7 +4,12 @@ from polymarket_collector.config import CollectorConfig
 
 def test_default_assets():
     cfg = CollectorConfig()
-    assert cfg.assets == ["BTC", "ETH", "SOL"]
+    assert cfg.assets == ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+    assert len(cfg.assets) == 7
+    assert cfg.test_mode.num_markets == 4  # 4×5m =20 min, 5m-only
+    assert cfg.kaggle.test_upload_interval_seconds == 600
+    assert cfg.kaggle.upload_interval_seconds == 3600
+    assert cfg.window_size_seconds == 300
 
 
 def test_add_fourth_asset_via_config():

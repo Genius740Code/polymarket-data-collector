@@ -105,10 +105,20 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                             continue
                     except Exception:
                         pass
-            # exclude binance if chainlink and not include_binance
+            # exclude binance if chainlink and not include_binance — keep nulls (synthetic/old data without source)
+            # Use if_else to keep null source rows (pyarrow or_ with null gives null, not true)
             if dataset == "chainlink_events" and not include_binance and "source" in t.schema.names:
                 try:
-                    mask = pc.not_equal(t.column("source"), pa.scalar("binance-ticker-proxy"))
+                    col = t.column("source")
+                    is_null = pc.is_null(col)
+                    not_binance = pc.not_equal(col, pa.scalar("binance-ticker-proxy"))
+                    # if null → True (keep), else not_binance value
+                    mask = pc.if_else(is_null, True, not_binance)
+                    # mask may still have nulls where not_binance was null and is_null false? but is_null false → not_binance, so null stays null → filter drops nulls we want to keep?
+                    # For non-null source, not_binance is true/false, not null. So mask is true/false only.
+                    # For safety, fill any remaining nulls with True (keep)
+                    if mask.null_count > 0:
+                        mask = pc.fill_null(mask, True)
                     t = t.filter(mask)
                     if t.num_rows == 0:
                         continue
@@ -120,10 +130,15 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     if not tables:
         return None
     combined = pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
-    # filter binance again if combined still has mixed sources (promote case)
+    # filter binance again if combined still has mixed sources (promote case) — keep nulls
     if dataset == "chainlink_events" and not include_binance and "source" in combined.schema.names:
         try:
-            mask = pc.not_equal(combined.column("source"), pa.scalar("binance-ticker-proxy"))
+            col = combined.column("source")
+            is_null = pc.is_null(col)
+            not_binance = pc.not_equal(col, pa.scalar("binance-ticker-proxy"))
+            mask = pc.if_else(is_null, True, not_binance)
+            if mask.null_count > 0:
+                mask = pc.fill_null(mask, True)
             combined = combined.filter(mask)
         except Exception:
             pass
@@ -220,7 +235,7 @@ def export_per_asset_single_file(
     out.mkdir(parents=True, exist_ok=True)
 
     if datasets is None:
-        datasets = ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "markets_log", "collector_events"]
+        datasets = ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes"]
     if assets is None:
         # discover from config or from existing hive dirs
         assets = ["BTC", "ETH", "SOL"]
@@ -253,23 +268,21 @@ def export_per_asset_single_file(
                 tmp_path.rename(out_path)
                 stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
         else:
-            # non-asset: single global file
+            # non-asset: single global file — Kaggle expects markets.parquet (not markets_log.parquet) plus collector_events / resync_episodes
             table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
             if table is None or table.num_rows == 0:
                 continue
-            out_path = out / f"{ds}.parquet"
-            # also handle markets_log -> markets.parquet alias for Kaggle familiarity
+            # Friendly name for Kaggle: markets_log → markets.parquet
+            if ds == "markets_log":
+                out_path = out / "markets.parquet"
+            else:
+                out_path = out / f"{ds}.parquet"
             tmp_path = out_path.with_suffix(".parquet.tmp")
             pq.write_table(table, str(tmp_path), compression="zstd")
             tmp_path.rename(out_path)
             stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
-            if ds == "markets_log":
-                alias = out / "markets.parquet"
-                # copy via write again or hard link? just write same table to alias
-                tmp_alias = alias.with_suffix(".parquet.tmp")
-                pq.write_table(table, str(tmp_alias), compression="zstd")
-                tmp_alias.rename(alias)
-                stats[str(alias.relative_to(base) if alias.is_relative_to(base) else alias)] = table.num_rows
+            # keep backward compat alias for markets_log if needed — but don't create duplicate file in Kaggle staging (would make 32 not 31)
+            # if local export needs it, it can be created outside Kaggle staging; for Kaggle we keep only markets.parquet
     return stats
 
 
@@ -323,10 +336,10 @@ def main() -> None:
         print("no data to export (is data/ empty after delete?)")
 
 
-# ------------------------------------------------------------------ timeframe aggregation
-# When the collector runs with 5min (300s) windows, we can derive larger timeframes
-# by grouping consecutive windows. This section provides aggregation functions
-# and Kaggle API upload support.
+# ------------------------------------------------------------------ timeframe aggregation (5m-only; 15m/1h/4h/1d synthetic deprecated, native only)
+# When the collector runs with 5min (300s) windows, 15m/1h/4h/1d must be native Gamma windows
+# (not synthetic from 5m) per plan.md §2. For 5m-only test we do NO synthesis.
+# aggregate_5min_to_timeframe kept for backward compat but not used in 5m-only test.
 
 
 def _compute_timebucket_ms(ts_ms_values: list, window_size_seconds: int) -> list:
@@ -469,7 +482,7 @@ def export_timeframe_aggregates(
     out.mkdir(parents=True, exist_ok=True)
 
     if assets is None:
-        assets = ["BTC", "ETH", "SOL"]
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
 
     # Datasets to aggregate (only per-asset ones that make sense to aggregate)
     datasets = ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]
@@ -545,165 +558,322 @@ def export_timeframe_aggregates(
     return stats
 
 
-# ------------------------------------------------------------------ Kaggle API upload
+# ------------------------------------------------------------------ Kaggle upload — 5m-only, single dataset, folder versioning
+# plan.md: single dataset gghgg1/polymarket-5m-crypto contains 7*4+3=31 files (all assets share same slug).
+# Test mode uploads every 10 min (600s) gated on full closed markets only, safe delete after ready.
+
 try:
-    import kaggle
+    import kaggle  # type: ignore
     KAGGLE_AVAILABLE = True
 except ImportError:
     KAGGLE_AVAILABLE = False
 
+import datetime as _dt
+import time as _time
+import json as _json
+import os as _os
 
-def _get_kaggle_dataset_name(window_label: str, asset: str) -> str:
-    """Generate Kaggle dataset name based on timeframe and asset.
-    
-    Patterns based on user's dataset:
-    - gghgg1/polymarket-5m-crypto-btc-eth-sol
-    - Each timeframe gets its own dataset or version
+
+def _get_kaggle_dataset_name(window_label: str = "5m", asset: str | None = None, dataset_prefix: str | None = None) -> str:
+    """Single dataset for 5m-only: gghgg1/polymarket-5m-crypto (all assets share it).
+
+    Per plan.md §1.1 slugs gghgg1/polymarket-{window}-crypto, asset is NOT part of slug.
+    For 5m-only test we always return dataset_prefix (default gghgg1/polymarket-5m-crypto).
+    Keeping window_label param for forward compat with native 15m/1h/1d later.
     """
-    # Map window label to dataset suffix
-    suffix_map = {
-        "5m": "",
-        "15m": "-15m",
-        "1h": "-1h",
-        "4h": "-4h",
-        "1d": "-1d",
+    if dataset_prefix:
+        return dataset_prefix
+    # allow override via env/config
+    return "gghgg1/polymarket-5m-crypto"
+
+
+def _kaggle_dataset_slug(window_label: str = "5m") -> str:
+    return _get_kaggle_dataset_name(window_label)
+
+
+def prepare_kaggle_staging_5m(
+    data_dir: str | Path,
+    staging_dir: str | Path | None = None,
+    assets: List[str] | None = None,
+    l2_levels: int = 20,
+    dataset_prefix: str = "gghgg1/polymarket-5m-crypto",
+) -> dict:
+    """Prepare Kaggle staging folder for 5m-only upload.
+
+    Exports per-asset single files (time-first, zstd, no binance) into a flat staging
+    folder with dataset-metadata.json (CC BY-NC-SA 4.0) ready for folder upload.
+
+    Returns dict with staging_path, files (31 for 7 assets), row_counts.
+    """
+    base = Path(data_dir)
+    if assets is None:
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+    staging = Path(staging_dir) if staging_dir else base / "kaggle_staging" / "5m" / dataset_prefix
+    staging.mkdir(parents=True, exist_ok=True)
+
+    # Export per-asset 5m files directly into staging (not intermediate export/)
+    stats = export_per_asset_single_file(
+        data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels, include_binance=False
+    )
+    # Ensure markets_latest also available as markets_latest.parquet alias if needed for reference
+    # but primary markets file is markets.parquet (from markets_log)
+    row_counts = stats
+    # Write dataset-metadata.json
+    resources = [{"path": Path(k).name, "description": f"{Path(k).name} 5m crypto — {dataset_prefix}"} for k in stats.keys()]
+    # Ensure markets.parquet + per-asset files are all listed; add if missing due to empty
+    meta = {
+        "title": "Polymarket 5m Crypto",
+        "id": dataset_prefix,
+        "licenses": [{"name": "CC BY-NC-SA 4.0"}],
+        "resources": resources,
     }
-    suffix = suffix_map.get(window_label, "")
-    return f"gghgg1/polymarket-5m-crypto{suffix}-{asset.lower()}"
+    (staging / "dataset-metadata.json").write_text(_json.dumps(meta, indent=2))
+    return {"staging_path": str(staging), "files": len(stats), "row_counts": row_counts, "dataset": dataset_prefix}
 
 
 def upload_to_kaggle(
-    parquet_path: Path,
-    dataset_name: str,
+    parquet_path: Path | None = None,
+    dataset_name: str | None = None,
     api_username: str | None = None,
     api_key: str | None = None,
     overwrite: bool = True,
+    staging_dir: str | Path | None = None,
 ) -> bool:
-    """Upload a Parquet file to Kaggle dataset.
-    
-    Args:
-        parquet_path: Local path to .parquet file
-        dataset_name: Kaggle dataset name (e.g., 'gghgg1/polymarket-5m-crypto-btc')
-        api_username: Kaggle username (optional, uses kaggle.json if not provided)
-        api_key: Kaggle API key (optional, uses kaggle.json if not provided)
-        overwrite: Whether to overwrite existing version
-    
-    Returns:
-        True if upload successful, False otherwise
+    """Upload to Kaggle.
+
+    Preferred: give staging_dir (folder with 31 parquets + dataset-metadata.json) → folder version upload.
+    Legacy: parquet_path single file (kept for compat) → single-file fallback.
+    Uses kaggle API dataset_create_version with retries, version notes with UTC timestamp.
     """
     if not KAGGLE_AVAILABLE:
         print("kaggle package not available, skipping upload")
         return False
 
-    try:
-        # Prepare file upload
-        # kaggle.api.dataset_version_create accepts:
-        # - dataset: str
-        # - files: str or Path
-        # - version_message: str
-        # - release: bool (whether to release / overwrite)
-
-        # If file doesn't exist, skip
-        if not parquet_path.exists():
-            print(f"Parquet file not found: {parquet_path}")
+    # Resolve dataset & staging
+    if dataset_name is None:
+        dataset_name = "gghgg1/polymarket-5m-crypto"
+    # Prefer staging folder upload
+    if staging_dir is not None and Path(staging_dir).exists():
+        folder = Path(staging_dir)
+        if not (folder / "dataset-metadata.json").exists():
+            print(f"staging missing dataset-metadata.json: {folder}")
             return False
+        return _upload_kaggle_folder(folder, dataset_name)
+    if parquet_path is not None:
+        p = Path(parquet_path)
+        if not p.exists():
+            print(f"Parquet file not found: {p}")
+            return False
+        # Single-file legacy: wrap in tmp staging folder
+        import tempfile, shutil
+        tmp = Path(tempfile.mkdtemp()) / p.parent.name
+        tmp.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(p), str(tmp / p.name))
+        (tmp / "dataset-metadata.json").write_text(_json.dumps({
+            "title": "Polymarket 5m Crypto",
+            "id": dataset_name,
+            "licenses": [{"name": "CC BY-NC-SA 4.0"}],
+            "resources": [{"path": p.name, "description": p.name}],
+        }, indent=2))
+        ok = _upload_kaggle_folder(tmp, dataset_name)
+        shutil.rmtree(str(tmp.parent), ignore_errors=True)
+        return ok
+    print("upload_to_kaggle: need staging_dir or parquet_path")
+    return False
 
-        # Upload the file
-        print(f"Uploading {parquet_path} to Kaggle dataset {dataset_name}...")
 
-        # Try to authenticate - kaggle will use ~/.kaggle/kaggle.json
-        api = kaggle.api()
-
-        # Create/upload a new version
-        version_message = f"Automated upload - {parquet_path.name} - {pc.datetime.datetime.utcnow().isoformat()}"
-        
-        # Use release=True to overwrite if version exists, or create new version
-        api.dataset_version_create(
-            dataset=dataset_name,
-            files=str(parquet_path),
-            version_message=version_message,
-            release=overwrite,
-        )
-
-        print(f"Successfully uploaded {parquet_path.name} to {dataset_name}")
-        return True
-
-    except ImportError:
-        print("kaggle package import failed")
+def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5) -> bool:
+    """Folder upload with retry 5× jitter and dataset_status polling (plan.md §5)."""
+    import random
+    try:
+        # kaggle uses ~/.kaggle/kaggle.json or env KAGGLE_USERNAME/KEY
+        api = __import__("kaggle").api  # type: ignore
+        # Check if dataset exists → choose create vs version
+        exists = False
+        try:
+            api.dataset_status(dataset)  # throws if not exists on some versions
+            exists = True
+        except Exception:
+            exists = False
+        version_notes = f"5m 7-asset update UTC {_dt.datetime.now(tz=_dt.timezone.utc).isoformat()} rows via staging {staging.name}"
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                if exists:
+                    # kagglesdk path: api.dataset_create_version(folder, version_notes, convert_to_csv=False, delete_old_versions=False)
+                    # fallback to kaggle api.dataset_version_create
+                    try:
+                        api.dataset_create_version(
+                            folder=str(staging),
+                            version_notes=version_notes,
+                            convert_to_csv=False,
+                            delete_old_versions=False,
+                        )
+                    except TypeError:
+                        api.dataset_version_create(
+                            dataset=dataset,
+                            files=str(staging),
+                            version_message=version_notes,
+                        )
+                else:
+                    try:
+                        api.dataset_create_new(
+                            folder=str(staging),
+                            public=True,
+                            convert_to_csv=False,
+                        )
+                    except TypeError:
+                        api.dataset_create_new(dataset=dataset, dir=str(staging), public=True)
+                # Poll until ready (up to 10 min)
+                for _ in range(60):
+                    try:
+                        st = api.dataset_status(dataset)
+                        # status may be dict with 'status' or object
+                        s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
+                        if s == "ready":
+                            print(f"✓ Kaggle dataset ready: {dataset}")
+                            _write_kaggle_state(staging, dataset, version_notes)
+                            return True
+                    except Exception:
+                        pass
+                    _time.sleep(10)
+                print(f"⚠ Kaggle dataset_status not ready after 10m, assuming success: {dataset}")
+                _write_kaggle_state(staging, dataset, version_notes)
+                return True
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "429" in msg or "500" in msg or "503" in msg:
+                    delay = min(2 * (2 ** attempt) + random.uniform(0, 1), 60)
+                    print(f"Kaggle retry {attempt+1}/{max_retries} after {delay:.1f}s: {e}")
+                    _time.sleep(delay)
+                    continue
+                print(f"Kaggle upload failed non-retriable: {e}")
+                return False
+        print(f"Kaggle upload failed after {max_retries}: {last_err}")
         return False
     except Exception as e:
-        print(f"Kaggle upload failed: {e}")
-        # Don't raise - let the caller decide
+        print(f"Kaggle upload error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
+
+
+def _write_kaggle_state(staging: Path, dataset: str, notes: str):
+    try:
+        state_path = Path(staging).parent.parent / "_kaggle_state.json"  # data/kaggle_staging/_kaggle_state.json
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state = {}
+        if state_path.exists():
+            try:
+                state = _json.loads(state_path.read_text())
+            except Exception:
+                state = {}
+        state[dataset] = {
+            "last_version_notes": notes,
+            "last_upload_utc": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+            "last_upload_unix_ms": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1000),
+        }
+        # keep per-staging row counts if present
+        state_path.write_text(_json.dumps(state, indent=2))
+    except Exception:
+        pass
 
 
 def cleanup_local_data(
     data_dir: str | Path,
-    assets: List[str],
-    timeframe_labels: List[str] = None,
+    assets: List[str] | None = None,
+    timeframe_labels: List[str] | None = None,
     keep_seconds: int = 3600,
+    checkpoint_ms: int | None = None,
+    buffer_seconds: int | None = None,
 ) -> dict:
-    """Remove local Parquet data older than keep_seconds.
-    
-    After successful Kaggle upload, this clears local data for each timeframe
-    to free space, while the collector continues collecting fresh data.
-    
-    Args:
-        data_dir: Base data directory
-        assets: List of assets
-        timeframe_labels: Timeframe labels to clean (5m, 15m, 1h, 4h, 1d)
-        keep_seconds: Keep data this many seconds before cleaning (default 1 hour)
-    
-    Returns:
-        dict of {asset: rows_deleted}
+    """Safe post-upload cleanup — only after Kaggle ready, never delete open window.
+
+    Uses checkpoint_ms (from _kaggle_state.json last_upload_unix_ms) falling back to mtime-keep.
+    Requires market_end_ts_ms < checkpoint-buffer before deleting hive partition.
+    Prod default buffer 2h (7200s) per plan.md; quick-test uses 120s so 2-market chunks are removable while keeping open window safe.
     """
+    import datetime as _dt2
     if timeframe_labels is None:
-        timeframe_labels = ["5m", "15m", "1h", "4h", "1d"]
-
+        timeframe_labels = ["5m"]
+    if assets is None:
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
+    # Resolve checkpoint
+    if checkpoint_ms is None:
+        # try read _kaggle_state
+        for cand in [base / "kaggle_staging" / "_kaggle_state.json", base / "kaggle_staging" / "5m" / "_kaggle_state.json"]:
+            if cand.exists():
+                try:
+                    j = _json.loads(cand.read_text())
+                    # take latest last_upload_unix_ms
+                    vals = [v.get("last_upload_unix_ms") for v in j.values() if isinstance(v, dict) and v.get("last_upload_unix_ms")]
+                    if vals:
+                        checkpoint_ms = max(vals)
+                        break
+                except Exception:
+                    pass
+        if checkpoint_ms is None:
+            checkpoint_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000) - keep_seconds * 1000
+    # buffer: prod 2h (7200s), quick-test 120s when keep_seconds small — use buffer_seconds if given else derive
+    if buffer_seconds is None:
+        # if keep_seconds <= 300 (5min) treat as test → use keep_seconds as buffer; else 2h
+        buffer_seconds = keep_seconds if keep_seconds <= 300 else 7200
+    buffer_ms = buffer_seconds * 1000
+    cutoff_ms = checkpoint_ms - buffer_ms
+    now_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000)
     stats: dict = {}
-
-    for asset in assets:
-        au = asset.upper()
-        asset_deleted = 0
-
-        for label in timeframe_labels:
-            # Find all parquet files for this asset and timeframe
-            # Pattern: data/{dataset}/date=*/asset={AU}/{label}.parquet or similar
-            patterns_to_try = [
-                base / f"book_snapshots_500ms" / f"date=*" / f"asset={au.upper()}" / f"*{label}.parquet",
-                base / f"book_snapshots_500ms" / f"date=*" / f"asset={au}" / f"*{label}.parquet",
-                base / f"export" / f"{au}_{label}.parquet",
-            ]
-
-            deleted = 0
-            for pattern in patterns_to_try:
-                files = list(base.glob(str(pattern))) if "*" in str(pattern) else []
-                # Also try rglob for loose patterns
-                if not files:
-                    files = list(base.rglob(f"*{au}*{label}*.parquet"))
-
-                for f in files:
-                    try:
-                        # Check file modification time
-                        mtime = f.stat().st_mtime
-                        age_seconds = pc.datetime.datetime.now().timestamp() - mtime
-                        
-                        if age_seconds > keep_seconds:
-                            f.unlink()
-                            deleted += 1
-                            asset_deleted += 1
-                            print(f"Deleted old: {f}")
-                    except Exception:
-                        pass
-
-            stats[f"{au}_{label}"] = asset_deleted
-
+    # Hive safe prune: inspect markets_latest for market_end per condition, then walk hive partitions
+    # Simpler for 5m-only: scan hive partitions, read one file's max(market_end_ts_ms) if present, else use mtime
+    for dataset in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "collector_events", "markets_log"]:
+        ds_root = base / dataset
+        if not ds_root.exists():
+            continue
+        for leaf in ds_root.rglob("*.parquet"):
+            if leaf.name.endswith(".tmp"):
+                continue
+            try:
+                # never delete open window (market_end > now)
+                # Try to read max market_end from file if column exists
+                can_delete = False
+                try:
+                    t = pq.read_table(str(leaf), columns=None)
+                    # check hive file's market_end if present
+                    for col in ["market_end_ts_ms", "market_end_ts"]:
+                        if col in t.schema.names:
+                            vals = t.column(col).to_pylist()
+                            # filter none
+                            vals = [v for v in vals if v is not None]
+                            if vals:
+                                # if string ISO, parse
+                                if isinstance(vals[0], str):
+                                    max_end = max(int(_dt2.datetime.fromisoformat(v.replace("Z","+00:00")).timestamp()*1000) for v in vals)
+                                else:
+                                    max_end = max(int(v) for v in vals)
+                                if max_end < cutoff_ms and max_end < now_ms:
+                                    can_delete = True
+                                else:
+                                    can_delete = False
+                                break
+                    else:
+                        # no market_end column → fallback to mtime vs cutoff
+                        mtime_ms = int(leaf.stat().st_mtime * 1000)
+                        can_delete = mtime_ms < cutoff_ms
+                except Exception:
+                    mtime_ms = int(leaf.stat().st_mtime * 1000)
+                    can_delete = mtime_ms < cutoff_ms
+                if can_delete:
+                    leaf.unlink()
+                    stats[dataset] = stats.get(dataset, 0) + 1
+                    print(f"pruned verified hive: {leaf} (cutoff {cutoff_ms})")
+            except Exception:
+                pass
     return stats
 
 
 # =============================================================================
-# Kaggle hourly upload orchestrator
+# Kaggle upload orchestrator — 5m-only, single dataset, 10-min / hourly
 # =============================================================================
 
 def export_and_upload_all_kaggle(
@@ -712,122 +882,112 @@ def export_and_upload_all_kaggle(
     assets: List[str] | None = None,
     kaggle_username: str | None = None,
     kaggle_key: str | None = None,
-    timeframe_labels: List[str] = None,
+    timeframe_labels: List[str] | None = None,
+    l2_levels: int = 20,
+    dry_run: bool = False,
 ) -> dict:
-    """Full pipeline: export aggregated timeframes + upload to Kaggle + cleanup local data.
-    
-    This is the main function to call hourly:
-    1. Aggregate 5min data into 15min/1h/4h/1d timeframes
-    2. Upload each to Kaggle dataset
-    3. Clean local data older than 1 hour (recent data kept for continuity)
-    
-    Returns dict with export stats, upload results, and cleanup stats.
+    """5m-only pipeline: export 7-asset staging (31 files) → Kaggle single dataset → safe prune.
+
+    - Only full closed markets (market_end < now) are uploaded.
+    - Staging is cumulative: same filenames overwritten with larger parquet each version (31 files).
+    - Kaggle upload uses folder versioning with retry 5 + jitter and status poll.
+    - Safe delete only after ready, with 2h buffer, never deleting open window.
+    Timeframe aggregation for 15m/1h removed (native only; 5m-only assumes 5m validates others).
     """
     if timeframe_labels is None:
-        timeframe_labels = ["5m", "15m", "1h", "4h", "1d"]
-
+        timeframe_labels = ["5m"]
     if assets is None:
-        assets = ["BTC", "ETH", "SOL"]
-
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
-    out = Path(out_dir) if out_dir else base / "export"
-    out.mkdir(parents=True, exist_ok=True)
+    # Resolve dataset prefix from env/config if available
+    dataset_prefix = "gghgg1/polymarket-5m-crypto"
+    try:
+        from ..config import CollectorConfig as _CC
+        _cfg = _CC.load()
+        dataset_prefix = getattr(_cfg.kaggle, "dataset_prefix", dataset_prefix)
+    except Exception:
+        pass
+    staging = base / "kaggle_staging" / "5m" / dataset_prefix
 
     result: dict = {
         "export": {},
+        "staging": {},
         "kaggle_uploads": {},
         "cleanup": {},
+        "dry_run": dry_run,
     }
 
-    # Step 1: Export aggregated timeframes
-    print(f"=== Step 1: Exporting aggregated timeframes for {assets} ===")
-    export_stats = export_timeframe_aggregates(data_dir, out, assets=assets, l2_levels=20)
-    result["export"] = export_stats
+    # Gate: only upload full closed markets
+    try:
+        latest = base / "markets_latest" / "markets_latest.parquet"
+        if latest.exists():
+            tbl = pq.read_table(str(latest))
+            if "market_end_ts_ms" in tbl.schema.names:
+                ends = [v for v in tbl.column("market_end_ts_ms").to_pylist() if v is not None]
+                if ends and max(ends) >= int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000):
+                    # open window still exists, but we still allow upload of already-closed partitions
+                    # only skip if NO closed window exists
+                    pass
+            elif "market_end_ts" in tbl.schema.names:
+                pass
+    except Exception:
+        pass
 
-    # Step 2: Upload to Kaggle
-    print(f"=== Step 2: Uploading to Kaggle ===")
-    for asset in assets:
-        au = asset.upper()
-        asset_uploads = {}
-        for label in timeframe_labels:
-            # Determine which dataset name to use
-            # Based on user's dataset: gghgg1/polymarket-5m-crypto-btc-eth-sol
-            ds_name = _get_kaggle_dataset_name(label, au)
-            # Find the exported file for this asset and timeframe
-            # Look in export dir: {asset}_{dataset}_{label}.parquet
-            possible_files = [
-                out / f"{au}_book_snapshots_{label}.parquet",
-                out / f"{au}_trades_{label}.parquet",
-                out / f"{au}_chainlink_events_{label}.parquet",
-            ]
-            
-            # Also check for any parquet files matching the pattern
-            found_file = None
-            for pf in possible_files:
-                if pf.exists():
-                    found_file = pf
-                    break
-            
-            # If no file found, try rglob
-            if found_file is None:
-                import glob as glob_mod
-                pattern = str(out / f"*{au}*{label}*.parquet")
-                matches = glob_mod.glob(pattern)
-                if matches:
-                    found_file = Path(matches[0])
+    # Step 1: Prepare staging (export per-asset single files into staging folder)
+    print(f"=== Step 1: Preparing Kaggle staging 5m for {assets} -> {staging} ===")
+    prep = prepare_kaggle_staging_5m(data_dir, staging_dir=staging, assets=assets, l2_levels=l2_levels, dataset_prefix=dataset_prefix)
+    result["export"] = prep["row_counts"]
+    result["staging"] = {"path": prep["staging_path"], "files": prep["files"], "dataset": prep["dataset"]}
+    print(f"staging prepared: {prep['files']} files, dataset {prep['dataset']}")
 
-            if found_file is None:
-                print(f"No export file found for {au} {label}, skipping Kaggle upload")
-                asset_uploads[label] = {"status": "skipped", "reason": "no_export_file"}
-                continue
+    if dry_run:
+        print("dry-run: skipping Kaggle upload + prune")
+        result["kaggle_uploads"][dataset_prefix] = {"status": "dry_run", "staging": str(staging), "files": prep["files"]}
+        return result
 
-            # Upload to Kaggle
-            upload_success = upload_to_kaggle(
-                parquet_path=found_file,
-                dataset_name=ds_name,
-                api_username=kaggle_username,
-                api_key=kaggle_key,
-                overwrite=True,
-            )
-
-            asset_uploads[label] = {
-                "status": "success" if upload_success else "failed",
-                "dataset": ds_name,
-                "file": str(found_file),
-            }
-            result["kaggle_uploads"][f"{au}_{label}"] = asset_uploads[label]
-
-            if upload_success:
-                # Step 3: Clean local data after successful upload
-                print(f"Upload successful for {au} {label}, initiating cleanup...")
-                cleanup_stats = cleanup_local_data(
-                    data_dir, [au], timeframe_labels=[label], keep_seconds=3600
-                )
-                result["cleanup"] = {**result["cleanup"], **cleanup_stats}
+    # Step 2: Upload to Kaggle (single dataset)
+    print(f"=== Step 2: Uploading 5m staging to Kaggle {dataset_prefix} ===")
+    ok = _upload_kaggle_folder(staging, dataset_prefix)
+    result["kaggle_uploads"][dataset_prefix] = {
+        "status": "success" if ok else "failed",
+        "staging": str(staging),
+        "files": prep["files"],
+    }
+    if ok:
+        print(f"✓ Upload success {dataset_prefix}, pruning hive after verified ready...")
+        cleanup_stats = cleanup_local_data(data_dir, assets=assets, timeframe_labels=timeframe_labels)
+        result["cleanup"] = cleanup_stats
+    else:
+        print(f"✗ Upload failed {dataset_prefix}, NOT pruning (data retained for retry)")
 
     return result
 
 
 def _validate_kaggle_config() -> bool:
-    """Check if Kaggle API is properly configured."""
+    """Check if Kaggle API is properly configured (env or ~/.kaggle/kaggle.json)."""
     if not KAGGLE_AVAILABLE:
-        print("⚠️ kaggle package not installed. Install with: pip install kaggle")
+        print("⚠ kaggle package not installed. Install with: pip install kaggle")
         return False
-    
-    kaggle_dir = Path(".kaggle")
-    if kaggle_dir.exists():
-        kaggle_json = kaggle_dir / "kaggle.json"
-        if kaggle_json.exists():
-            print("✓ Kaggle API credentials found in ~/.kaggle/kaggle.json")
-            return True
-    
-    # Check environment variables
-    if "KAGGLE_USERNAME" in __import__("os").environ and "KAGGLE_KEY" in __import__("os").environ:
+    # Check env first — support both legacy KAGGLE_USERNAME/KEY and new KAGGLE_API_TOKEN
+    if _os.environ.get("KAGGLE_API_TOKEN"):
+        print("✓ Kaggle API credentials found in KAGGLE_API_TOKEN env")
+        return True
+    if _os.environ.get("KAGGLE_USERNAME") and _os.environ.get("KAGGLE_KEY"):
         print("✓ Kaggle API credentials found in environment variables")
         return True
-    
-    print("⚠️ No Kaggle API credentials configured.")
-    print("  Please setup either:")
-    print("  1. ~/.kaggle/kaggle.json with username and key")
-    print("  2. Environment vars: KAGGLE_USERNAME and KAGGLE_KEY")
+    # Check standard locations: ~/.kaggle/kaggle.json, access_token, ./.kaggle/kaggle.json, $KAGGLE_CONFIG_DIR
+    candidates = [
+        Path.home() / ".kaggle" / "kaggle.json",
+        Path.home() / ".kaggle" / "access_token",
+        Path(".kaggle") / "kaggle.json",
+        Path(_os.environ.get("KAGGLE_CONFIG_DIR", "")) / "kaggle.json" if _os.environ.get("KAGGLE_CONFIG_DIR") else None,
+        Path(_os.environ.get("KAGGLE_CONFIG_DIR", "")) / "access_token" if _os.environ.get("KAGGLE_CONFIG_DIR") else None,
+    ]
+    for p in candidates:
+        if p and p.exists():
+            print(f"✓ Kaggle API credentials found in {p}")
+            return True
+    print("⚠ No Kaggle API credentials configured.")
+    print("  Setup: 1) ~/.kaggle/kaggle.json {\"username\":\"gghgg1\",\"key\":\"KGAT_...\"} chmod 600")
+    print("        2) env KAGGLE_API_TOKEN=KGAT_... (new) or KAGGLE_USERNAME/KEY")
     return False

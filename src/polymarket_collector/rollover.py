@@ -104,8 +104,9 @@ class RolloverState:
         return (self.current.market_end_ts_ms - now_ms) <= lead_ms and self.next is None
 
     def should_promote(self, now_ms: int) -> bool:
-        if not self.current or not self.next:
+        if not self.current:
             return False
+        # Allow promotion even if next is None so we don't stall on missing market (gap)
         return now_ms >= self.current.market_end_ts_ms
 
 
@@ -161,12 +162,9 @@ class MarketDiscovery:
         params = {"slug": slug}
 
         # Try Gamma first — slug is deterministic but may be indexed ~30-60s late.
-        # If the market for ts is already ended (endDate <= now), the current window
-        # is actually ts+window (next window). Try ts and ts+window.
         import datetime as _dt
-        candidates = [ts, ts + self.window_size_seconds]
-        # For "next after" we prefer ts (exact), but for initial discovery where ts is floor(now)
-        # and that window is already ended, we fallback to ts+300.
+        # Try up to 3 windows ahead to handle missing market (gap) without skipping
+        candidates = [ts, ts + self.window_size_seconds, ts + 2 * self.window_size_seconds]
         for cand_ts in candidates:
             cand_slug = self._slug_for(asset, cand_ts)
             cand_params = {"slug": cand_slug}
@@ -182,18 +180,16 @@ class MarketDiscovery:
                     data = resp.json()
                     if isinstance(data, list) and not data:
                         continue
-                    # check if market is active and not closed
                     m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
                     if isinstance(m0, dict):
-                        # verify not already ended
                         end_iso = m0.get("endDate")
                         try:
                             if end_iso:
                                 dt_end = _dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
                                 end_ms = int(dt_end.timestamp()*1000)
                                 now_ms_check = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000)
-                                # For initial discovery, if market already ended, try next candidate
-                                if end_ms <= now_ms_check and cand_ts == ts:
+                                # Only skip if this is the first candidate and market already ended long ago (>window)
+                                if end_ms + self.window_size_seconds*1000 <= now_ms_check and cand_ts == ts:
                                     continue
                         except Exception:
                             pass
@@ -457,17 +453,20 @@ class RolloverManager:
         state = self.states[asset]
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
-        # Promotion: current ended, next becomes current
+        # Promotion: current ended, next becomes current (even if next is None -> gap)
         if state.should_promote(now_ms):
             prev_cid = state.current.condition_id if state.current else None
+            was_next_none = state.next is None
             state.current = state.next
             state.next = None
             state.is_rollover_window = False
             state.rollover_miss_logged = False
             state.rollover_started_emitted = False
             if self.on_event:
+                if was_next_none and prev_cid:
+                    self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
                 self.on_event("rollover_completed", {"asset": asset, "prev_condition_id": prev_cid, "new_condition_id": state.current.condition_id if state.current else None})
-            return "rollover_completed"
+            return "coverage_gap" if was_next_none else "rollover_completed"
 
         # Lookahead: need to discover next?
         if state.needs_rollover_lookahead(now_ms, self.lead_ms):

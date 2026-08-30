@@ -74,6 +74,10 @@ class CollectorEventType(StrEnum):
     collector_started = "collector_started"
     collector_restarted = "collector_restarted"
     clock_issue = "clock_issue"
+    # Kaggle 10-min upload
+    kaggle_upload_started = "kaggle_upload_started"
+    kaggle_upload_success = "kaggle_upload_success"
+    kaggle_upload_failed = "kaggle_upload_failed"
 
 
 class DisconnectReason(StrEnum):

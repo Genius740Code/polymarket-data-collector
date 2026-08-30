@@ -1,11 +1,26 @@
-# §0 — configurable assets, not hardcoded
-assets: [BTC, ETH, SOL]
+# §0 — configurable assets, all 7 Polymarket 5m markets (only 5m window, 1d too long for test - assume 5m validates others)
+assets: [BTC, ETH, SOL, HYPE, BNB, XRP, DOGE]
 series_ids:
   BTC: "BTC"
   ETH: "ETH"
   SOL: "SOL"
+  HYPE: "HYPE"
+  BNB: "BNB"
+  XRP: "XRP"
+  DOGE: "DOGE"
 schema_version: "3.2.0"
-window_size_seconds: 300  # 300=5min, 900=15min, 3600=1h, 14400=4h, 86400=1d
+window_size_seconds: 300  # 300=5m only for test
+
+# test_mode: 4×5m = 20 min, every 10 min upload to Kaggle then analyse nulls/data loss
+test_mode:
+  enabled: false
+  num_markets: 4
+  window_size_seconds: 300
+
+kaggle:
+  upload_interval_seconds: 3600
+  test_upload_interval_seconds: 600
+  dataset_prefix: "gghgg1/polymarket-5m-crypto"
 
 # §1 — rollover
 rollover_lead_seconds: 30
@@ -44,7 +59,7 @@ ws:
 cursor_store:
   mode: "per_asset"  # "per_asset" (one SQLite per asset) OR "shared_wal" (single WAL-mode file)
   path: "/home/fese/polymarket-collector/data/cursor_state"
-  # per_asset -> /home/fese/polymarket-collector/data/cursor_state/{BTC,ETH,SOL}.db
+  # per_asset -> /home/fese/polymarket-collector/data/cursor_state/{BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}.db
   # shared_wal -> /home/fese/polymarket-collector/data/cursor_state/shared.db (opened WAL mode)
   flush_interval_seconds: 5
 
@@ -95,6 +110,7 @@ watchdog:
     - clock_issue
     - resolution_stuck
     - book_anomaly
+    - kaggle_upload_failed
   daily_summary_hour_utc: 0
 
 # §11A capacity planning — override after pilot run

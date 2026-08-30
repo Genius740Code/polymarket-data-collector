@@ -114,6 +114,8 @@ class MarketsLog:
             import datetime as dtmod
             date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
             self.writer.append("collector_events", row, asset=asset, date_str=date_str)
+        # also enqueue markets_log schema rows (mixed markets + events) when no separate writer
+        # markets_log rows are handled via append(market) path; collector_events are separate
 
     def _normalize_rows(self, rows: List[Dict]) -> List[Dict]:
         """Ensure all rows have union of keys (pyarrow from_pylist drops cols not in first row)."""

@@ -10,10 +10,10 @@ from .collector import Collector
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Polymarket collector — BTC/ETH/SOL markets (PLAN.md v3)")
+    ap = argparse.ArgumentParser(description="Polymarket collector — BTC/ETH/SOL/HYPE/BNB/XRP/DOGE 5m markets (PLAN.md v4) — 5m-only, 4 markets, 10-min Kaggle")
     ap.add_argument("--config", default=None, help="path to collector.yaml")
-    ap.add_argument("--test-mode", action="store_true", help="live test mode: collect real markets then analyse and exit")
-    ap.add_argument("--test-markets", type=int, default=None, help="override number of windows for test mode (default 3)")
+    ap.add_argument("--test-mode", action="store_true", help="live test mode: collect 4×5m live windows for 7 assets, 10-min Kaggle, then analyse and exit")
+    ap.add_argument("--test-markets", type=int, default=None, help="override number of windows for test mode (default 4)")
     ap.add_argument("--no-accelerate", action="store_true", help="(deprecated) kept for compat")
     ap.add_argument("--window-size", type=int, default=None, help="window size in seconds (300=5min, 900=15min, 3600=1h, 14400=4h, 86400=1d)")
     ap.add_argument("--series-id", type=str, default=None, help="override series ID per asset (format: ASSET-WINDOW, e.g. BTC-1H)")
