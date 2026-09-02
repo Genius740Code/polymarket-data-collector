@@ -229,6 +229,11 @@ def export_per_asset_single_file(
     """Export one flat parquet per asset per dataset (Kaggle style).
 
     Returns dict {relative_out_path: rows}
+
+    Note: The 3 global datasets (markets_log, collector_events, resync_episodes)
+    are always exported as single files in the Kaggle staging folder, even if
+    they contain 0 rows. This ensures the staging always has 31 files (7 assets x 4
+    per-asset + 3 globals) for the dataset gghgg1/polymarket-5m-crypto.
     """
     base = Path(data_dir)
     out = Path(out_dir) if out_dir else base / "export"
@@ -237,19 +242,15 @@ def export_per_asset_single_file(
     if datasets is None:
         datasets = ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes"]
     if assets is None:
-        # discover from config or from existing hive dirs
-        assets = ["BTC", "ETH", "SOL"]
-        # try discover from book_snapshots_500ms partitions
-        try:
-            snap_root = base / "book_snapshots_500ms"
-            if snap_root.exists():
-                discovered = set()
-                for p in snap_root.glob("date=*/asset=*"):
-                    discovered.add(p.name.split("=", 1)[1].upper() if "=" in p.name else p.name.upper())
-                if discovered:
-                    assets = sorted(discovered)
-        except Exception:
-            pass
+        # Always use the 7 known assets — hardcoded per plan.md §0
+        # Do NOT discover dynamically from hive partitions, as this fails
+        # when the data directory is freshly cleaned (no hive dirs exist yet).
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+
+    # The 3 global datasets that should always appear in Kaggle staging
+    global_datasets = {"markets_log", "collector_events", "resync_episodes"}
+    # Per-asset datasets that get one file per asset
+    per_asset_datasets = {"book_snapshots_500ms", "book_events", "trades", "chainlink_events"}
 
     stats: dict = {}
     for ds in datasets:
@@ -258,31 +259,47 @@ def export_per_asset_single_file(
             for asset in assets:
                 au = asset.upper()
                 table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance)
-                if table is None or table.num_rows == 0:
-                    continue
                 # enforce schema ordering already done, ensure per-asset single file
                 out_path = out / f"{au}_{ds}.parquet"
                 # handle clean_view alias: book_snapshots_500ms -> but user may want book_snapshots_clean too
+                if table is not None and table.num_rows > 0:
+                    tmp_path = out_path.with_suffix(".parquet.tmp")
+                    pq.write_table(table, str(tmp_path), compression="zstd")
+                    tmp_path.rename(out_path)
+                    stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
+                else:
+                    # Create empty parquet file — ensure 31-file staging even with fresh data
+                    tmp_path = out_path.with_suffix(".parquet.tmp")
+                    pq.write_table(pa.table({}), str(tmp_path), compression="zstd")
+                    tmp_path.rename(out_path)
+                    stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
+        elif ds in global_datasets:
+            # Global dataset: always create a single file in staging, even if 0 rows
+            table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
+            if ds == "markets_log":
+                out_path = out / "markets.parquet"
+            elif ds == "collector_events":
+                out_path = out / "collector_events.parquet"
+            else:  # resync_episodes
+                out_path = out / "resync_episodes.parquet"
+            # Always write the file (even if table is None or 0 rows) to ensure 31-file staging
+            if table is not None and table.num_rows > 0:
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
                 tmp_path.rename(out_path)
-                stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
-        else:
-            # non-asset: single global file — Kaggle expects markets.parquet (not markets_log.parquet) plus collector_events / resync_episodes
-            table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
-            if table is None or table.num_rows == 0:
-                continue
-            # Friendly name for Kaggle: markets_log → markets.parquet
-            if ds == "markets_log":
-                out_path = out / "markets.parquet"
             else:
-                out_path = out / f"{ds}.parquet"
-            tmp_path = out_path.with_suffix(".parquet.tmp")
-            pq.write_table(table, str(tmp_path), compression="zstd")
-            tmp_path.rename(out_path)
+                # Create empty parquet file — use _get_schema from this module for global datasets
+                global_schema = _get_schema(ds, l2_levels)
+                # Build empty data dict with schema column names
+                empty_data = {col: [] for col in global_schema.names}
+                table = pa.table(empty_data)
+                tmp_path = out_path.with_suffix(".parquet.tmp")
+                pq.write_table(table, str(tmp_path), compression="zstd")
+                tmp_path.rename(out_path)
             stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
-            # keep backward compat alias for markets_log if needed — but don't create duplicate file in Kaggle staging (would make 32 not 31)
-            # if local export needs it, it can be created outside Kaggle staging; for Kaggle we keep only markets.parquet
+        else:
+            # Should not happen with default datasets, but skip
+            pass
     return stats
 
 

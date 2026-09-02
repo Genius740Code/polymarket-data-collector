@@ -1,0 +1,149 @@
+/home/fese/polymarket-data-collector/src/polymarket_collector/storage/export.py:318: FutureWarning: promote has been superseded by promote_options='default'.
+  table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
+/home/fese/polymarket-data-collector/src/polymarket_collector/storage/export.py:318: FutureWarning: promote has been superseded by promote_options='default'.
+  table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
+[test-mode:real] aligning to next 5m market boundary 2026-09-02T15:50:00+00:00 — waiting 42.4s so we start on fresh market (not halfway) — 5m-only, 7 assets
+[test-mode:real] boundary reached, starting collector (fresh market)
+[startup] recovering cursor state for assets: ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
+[startup] no cursor for BTC
+[startup] no cursor for ETH
+[startup] no cursor for SOL
+[startup] no cursor for HYPE
+[startup] no cursor for BNB
+[startup] no cursor for XRP
+[startup] no cursor for DOGE
+[test-mode:real] QUICK TEST — 2×300s (5m-only) = 10min total, 7 assets ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
+[test-mode] chunks: every 2 markets → kaggle every 600s (10min), one-file-per-asset staging (31 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals
+[test-mode:real] flushed 0 rows
+[test-mode:real] compacted markets_latest -> data/markets_latest/markets_latest.parquet
+[test-mode] final kaggle check: since_last=5s uploads=0/1 → uploading final
+[test-kaggle:final] compacted data/markets_latest/markets_latest.parquet
+[test-kaggle:final] clean_view rows 0
+✓ Kaggle API credentials found in /home/fese/.kaggle/kaggle.json
+=== Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE'] -> data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto ===
+staging prepared: 30 files, dataset gghgg1/polymarket-5m-crypto
+=== Step 2: Uploading 5m staging to Kaggle gghgg1/polymarket-5m-crypto ===
+Starting upload for file HYPE_book_snapshots_500ms.parquet
+  0%|          | 0.00/130k [00:00<?, ?B/s]100%|██████████| 130k/130k [00:00<00:00, 180kB/s]
+Upload successful: HYPE_book_snapshots_500ms.parquet (130KB)
+Starting upload for file BTC_chainlink_events.parquet
+  0%|          | 0.00/10.2k [00:00<?, ?B/s]100%|██████████| 10.2k/10.2k [00:00<00:00, 22.4kB/s]
+Upload successful: BTC_chainlink_events.parquet (10KB)
+Starting upload for file SOL_trades.parquet
+  0%|          | 0.00/13.0k [00:00<?, ?B/s]100%|██████████| 13.0k/13.0k [00:00<00:00, 26.7kB/s]
+Upload successful: SOL_trades.parquet (13KB)
+Starting upload for file BTC_trades.parquet
+  0%|          | 0.00/12.9k [00:00<?, ?B/s]100%|██████████| 12.9k/12.9k [00:00<00:00, 26.9kB/s]
+Upload successful: BTC_trades.parquet (13KB)
+Starting upload for file markets.parquet
+  0%|          | 0.00/22.1k [00:00<?, ?B/s]100%|██████████| 22.1k/22.1k [00:00<00:00, 45.2kB/s]
+Upload successful: markets.parquet (22KB)
+Starting upload for file ETH_trades.parquet
+  0%|          | 0.00/12.8k [00:00<?, ?B/s]100%|██████████| 12.8k/12.8k [00:00<00:00, 26.9kB/s]
+Upload successful: ETH_trades.parquet (13KB)
+Starting upload for file XRP_book_events.parquet
+  0%|          | 0.00/13.6k [00:00<?, ?B/s]100%|██████████| 13.6k/13.6k [00:00<00:00, 27.8kB/s]
+Upload successful: XRP_book_events.parquet (14KB)
+Starting upload for file HYPE_chainlink_events.parquet
+  0%|          | 0.00/9.70k [00:00<?, ?B/s]100%|██████████| 9.70k/9.70k [00:00<00:00, 20.0kB/s]
+Upload successful: HYPE_chainlink_events.parquet (10KB)
+Starting upload for file DOGE_book_events.parquet
+  0%|          | 0.00/13.5k [00:00<?, ?B/s]100%|██████████| 13.5k/13.5k [00:00<00:00, 27.4kB/s]
+Upload successful: DOGE_book_events.parquet (14KB)
+Starting upload for file collector_events.parquet
+  0%|          | 0.00/7.32k [00:00<?, ?B/s]100%|██████████| 7.32k/7.32k [00:00<00:00, 19.8kB/s]
+Upload successful: collector_events.parquet (7KB)
+Starting upload for file HYPE_trades.parquet
+  0%|          | 0.00/12.7k [00:00<?, ?B/s]100%|██████████| 12.7k/12.7k [00:00<00:00, 13.7kB/s]
+Upload successful: HYPE_trades.parquet (13KB)
+Starting upload for file ETH_chainlink_events.parquet
+  0%|          | 0.00/10.0k [00:00<?, ?B/s]100%|██████████| 10.0k/10.0k [00:00<00:00, 20.7kB/s]
+Upload successful: ETH_chainlink_events.parquet (10KB)
+Starting upload for file XRP_chainlink_events.parquet
+  0%|          | 0.00/9.69k [00:00<?, ?B/s]100%|██████████| 9.69k/9.69k [00:00<00:00, 11.4kB/s]
+Upload successful: XRP_chainlink_events.parquet (10KB)
+Starting upload for file BNB_book_events.parquet
+  0%|          | 0.00/13.6k [00:00<?, ?B/s]100%|██████████| 13.6k/13.6k [00:00<00:00, 28.1kB/s]
+Upload successful: BNB_book_events.parquet (14KB)
+Starting upload for file XRP_book_snapshots_500ms.parquet
+  0%|          | 0.00/137k [00:00<?, ?B/s]100%|██████████| 137k/137k [00:00<00:00, 187kB/s]
+Upload successful: XRP_book_snapshots_500ms.parquet (137KB)
+Starting upload for file BTC_book_snapshots_500ms.parquet
+  0%|          | 0.00/137k [00:00<?, ?B/s]100%|██████████| 137k/137k [00:00<00:00, 185kB/s]
+Upload successful: BTC_book_snapshots_500ms.parquet (137KB)
+Starting upload for file DOGE_chainlink_events.parquet
+  0%|          | 0.00/9.59k [00:00<?, ?B/s]100%|██████████| 9.59k/9.59k [00:00<00:00, 19.8kB/s]
+Upload successful: DOGE_chainlink_events.parquet (10KB)
+Starting upload for file ETH_book_snapshots_500ms.parquet
+  0%|          | 0.00/137k [00:00<?, ?B/s]100%|██████████| 137k/137k [00:00<00:00, 186kB/s]
+Upload successful: ETH_book_snapshots_500ms.parquet (137KB)
+Starting upload for file XRP_trades.parquet
+  0%|          | 0.00/12.9k [00:00<?, ?B/s]100%|██████████| 12.9k/12.9k [00:00<00:00, 26.3kB/s]
+Upload successful: XRP_trades.parquet (13KB)
+Starting upload for file DOGE_trades.parquet
+  0%|          | 0.00/12.8k [00:00<?, ?B/s]100%|██████████| 12.8k/12.8k [00:00<00:00, 33.4kB/s]
+Upload successful: DOGE_trades.parquet (13KB)
+Starting upload for file BNB_chainlink_events.parquet
+  0%|          | 0.00/10.1k [00:00<?, ?B/s]100%|██████████| 10.1k/10.1k [00:00<00:00, 20.8kB/s]
+Upload successful: BNB_chainlink_events.parquet (10KB)
+Starting upload for file BNB_book_snapshots_500ms.parquet
+  0%|          | 0.00/133k [00:00<?, ?B/s]100%|██████████| 133k/133k [00:00<00:00, 184kB/s]
+Upload successful: BNB_book_snapshots_500ms.parquet (133KB)
+Starting upload for file BNB_trades.parquet
+  0%|          | 0.00/13.0k [00:00<?, ?B/s]100%|██████████| 13.0k/13.0k [00:00<00:00, 27.1kB/s]
+Upload successful: BNB_trades.parquet (13KB)
+Starting upload for file HYPE_book_events.parquet
+  0%|          | 0.00/13.5k [00:00<?, ?B/s]100%|██████████| 13.5k/13.5k [00:00<00:00, 27.7kB/s]
+Upload successful: HYPE_book_events.parquet (13KB)
+Starting upload for file BTC_book_events.parquet
+  0%|          | 0.00/13.5k [00:00<?, ?B/s]100%|██████████| 13.5k/13.5k [00:00<00:00, 28.3kB/s]
+Upload successful: BTC_book_events.parquet (14KB)
+Starting upload for file SOL_book_snapshots_500ms.parquet
+  0%|          | 0.00/137k [00:00<?, ?B/s]100%|██████████| 137k/137k [00:00<00:00, 187kB/s]
+Upload successful: SOL_book_snapshots_500ms.parquet (137KB)
+Starting upload for file SOL_book_events.parquet
+  0%|          | 0.00/13.6k [00:00<?, ?B/s]100%|██████████| 13.6k/13.6k [00:00<00:00, 27.7kB/s]
+Upload successful: SOL_book_events.parquet (14KB)
+Starting upload for file ETH_book_events.parquet
+  0%|          | 0.00/13.5k [00:00<?, ?B/s]100%|██████████| 13.5k/13.5k [00:00<00:00, 28.0kB/s]
+Upload successful: ETH_book_events.parquet (13KB)
+Starting upload for file SOL_chainlink_events.parquet
+  0%|          | 0.00/9.75k [00:00<?, ?B/s]100%|██████████| 9.75k/9.75k [00:00<00:00, 20.0kB/s]
+Upload successful: SOL_chainlink_events.parquet (10KB)
+Starting upload for file DOGE_book_snapshots_500ms.parquet
+  0%|          | 0.00/136k [00:00<?, ?B/s]100%|██████████| 136k/136k [00:00<00:00, 183kB/s]
+/home/fese/polymarket-data-collector/src/polymarket_collector/collector.py:960: FutureWarning: promote has been superseded by promote_options='default'.
+  info = count_dataset(ds)
+/home/fese/polymarket-data-collector/src/polymarket_collector/collector.py:1033: FutureWarning: promote has been superseded by promote_options='default'.
+  ce_tbl = count_dataset("collector_events")["table"]
+/home/fese/polymarket-data-collector/src/polymarket_collector/collector.py:850: FutureWarning: promote has been superseded by promote_options='default'.
+  build_clean_view(self.config.storage.data_dir)
+Upload successful: DOGE_book_snapshots_500ms.parquet (136KB)
+⚠ Kaggle dataset_status not ready after 10m (timeout): gghgg1/polymarket-5m-crypto
+✗ Upload failed gghgg1/polymarket-5m-crypto, NOT pruning (data retained for retry)
+[test-kaggle:final] interim upload completed successfully, cumulative staging updated.
+[test-kaggle:final] WARN staging files 30 != expected 31 (one-file-per-asset)
+[analyse] date=2026-09-02 start_ms=1788364185000 num_markets=2 window=300 -> test_analysis_final.json
+[analyse] book_snapshots_500ms: 2401 rows in 27 files, exists=True
+[analyse] book_snapshots_clean: 0 rows in 0 files, exists=False
+[analyse] book_events: 83 rows in 21 files, exists=True
+[analyse] trades: 416 rows in 21 files, exists=True
+[analyse] chainlink_events: 949 rows in 21 files, exists=True
+[analyse] collector_events: 32 rows in 12 files, exists=True
+[analyse] markets_log: 7 rows in 7 files, exists=True
+[analyse] markets_latest: 7 rows in 1 files, exists=True
+[analyse] resync_episodes: 0 rows in 0 files, exists=False
+[analyse] wrote data/test_analysis_final.json completeness 28.58% clean 0.0% loss 100.0%
+[test-kaggle:final] interim completeness 28.58% clean 0.0%
+[analyse] date=2026-09-02 start_ms=1788364185000 num_markets=2 window=300 -> test_analysis.json
+[analyse] book_snapshots_500ms: 2401 rows in 27 files, exists=True
+[analyse] book_snapshots_clean: 0 rows in 0 files, exists=False
+[analyse] book_events: 83 rows in 21 files, exists=True
+[analyse] trades: 416 rows in 21 files, exists=True
+[analyse] chainlink_events: 949 rows in 21 files, exists=True
+[analyse] collector_events: 32 rows in 12 files, exists=True
+[analyse] markets_log: 7 rows in 7 files, exists=True
+[analyse] markets_latest: 7 rows in 1 files, exists=True
+[analyse] resync_episodes: 0 rows in 0 files, exists=False
+[analyse] wrote data/test_analysis.json completeness 28.58% clean 0.0% loss 100.0%
+test mode completed — data in ./data

@@ -855,13 +855,19 @@ class Collector:
         try:
             from pathlib import Path as _P2
             import json as _js
-            out_path = _P2(self.config.storage.data_dir) / "test_analysis.json"
+            data_dir = Path(self.config.storage.data_dir)
+            out_path = data_dir / "test_analysis.json"
+            # ensure data dir exists
+            data_dir.mkdir(parents=True, exist_ok=True)
             existing = _js.loads(out_path.read_text()) if out_path.exists() else {}
             existing["kaggle_uploads_during_test"] = kaggle_uploads
             existing["finished_at_utc"] = analysis["finished_at_utc"]
             out_path.write_text(_js.dumps(existing, indent=2, default=str))
-        except Exception:
-            pass
+            # also write final analysis version
+            final_path = data_dir / "test_analysis_final.json"
+            final_path.write_text(_js.dumps(analysis, indent=2, default=str))
+        except Exception as e:
+            print(f"[test-mode] warning: could not write analysis files: {e}")
         # One more clean_view build for fresh book_snapshots_clean before exit
         try:
             from .storage.clean_view import build_clean_view
