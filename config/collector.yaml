@@ -20,7 +20,7 @@ test_mode:
 
 # kaggle: prod hourly, test every 10 min (4 markets)
 kaggle:
-  upload_interval_seconds: 3600
+  upload_interval_seconds: 600  # Changed to 10min for continuous testing
   test_upload_interval_seconds: 600
   dataset_prefix: "gghgg1/polymarket-5m-crypto"
 
@@ -60,9 +60,9 @@ ws:
 # §1B — crash / restart cursor store
 cursor_store:
   mode: "per_asset"  # "per_asset" (one SQLite per asset) OR "shared_wal" (single WAL-mode file)
-  path: "/home/fese/polymarket-collector/data/cursor_state"
-  # per_asset -> /home/fese/polymarket-collector/data/cursor_state/{BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}.db
-  # shared_wal -> /home/fese/polymarket-collector/data/cursor_state/shared.db (opened WAL mode)
+  path: "./data/cursor_state"
+  # per_asset -> ./data/cursor_state/{BTC,ETH,SOL,HYPE,BNB,XRP,DOGE}.db
+  # shared_wal -> ./data/cursor_state/shared.db (opened WAL mode)
   flush_interval_seconds: 5
 
 # §6 / §6A — chainlink + settlement
@@ -74,12 +74,12 @@ chainlink:
 
 # §10A — write batching / backpressure
 storage:
-  data_dir: "/home/fese/polymarket-collector/data"
+  data_dir: "./data"
   flush_interval_seconds: 60
   flush_row_count_threshold: 5000
   buffer_max_rows: 50000
   wal_enabled: true
-  wal_dir: "/home/fese/polymarket-collector/data/_wal"
+  wal_dir: "./data/_wal"
   disk_space_check_interval_seconds: 30
   disk_space_min_bytes: 1073741824  # 1 GiB — alert before full
   compaction_schedule: "daily"  # cron or interval for compaction job
@@ -89,7 +89,7 @@ storage:
 raw_archive:
   enabled: true
   retention_hours: 36   # 24–48h per spec
-  path: "/home/fese/polymarket-collector/data/raw_ws_archive"
+  path: "./data/raw_ws_archive"
   format: "jsonl"
 
 # §14 — clock
