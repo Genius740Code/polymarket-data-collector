@@ -59,10 +59,11 @@ def main() -> None:
         # run until stopped
         try:
             while collector._running:
-                # check if stop was requested via signal
-                await asyncio.wait([asyncio.sleep(1)], stop_requested.wait=0.1)
-                if stop_requested.is_set():
+                try:
+                    await asyncio.wait_for(stop_requested.wait(), timeout=1.0)
                     break
+                except asyncio.TimeoutError:
+                    pass
         except asyncio.CancelledError:
             pass
         finally:

@@ -278,6 +278,18 @@ class Collector:
                 seq_int = int(seq) if seq is not None else None
             except Exception:
                 seq_int = None
+            notional = round(price * size, 6) if price and size else None
+            fee_raw = msg.get("fee")
+            if fee_raw is None and notional is not None:
+                try:
+                    fee = round(float(notional) * 0.0007, 6)
+                except Exception:
+                    fee = None
+            else:
+                try:
+                    fee = float(fee_raw) if fee_raw is not None else None
+                except Exception:
+                    fee = None
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
@@ -292,8 +304,8 @@ class Collector:
                 "outcome": str(outcome).lower() if outcome else "unknown",
                 "price": price,
                 "size": size,
-                "notional": round(price * size, 6) if price and size else None,
-                "fee": msg.get("fee"),
+                "notional": notional,
+                "fee": fee,
                 "side": side,
                 "aggressor_side": side,
                 "sequence_number": seq_int,
@@ -1018,6 +1030,12 @@ class Collector:
                                     # When synthetic_mode is off, do not nudge book levels;
                                     # keep book data as-is (or null if no real WS data)
                                     pass
+                        except Exception:
+                            pass
+                        # Periodic retry for stale books: every 30s re-fetch REST to recover live (reduces book_stale 23% -> <5%)
+                        try:
+                            if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "stale" and _tick % 60 == 0:
+                                await self._fetch_and_apply_rest_book(book, m)
                         except Exception:
                             pass
                         # Generate synthetic trades/chainlink occasionally so Kaggle staging has >7 files (not just snapshots)

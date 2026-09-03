@@ -437,6 +437,31 @@ class ParquetWriter:
             return out
 
         norm_rows = _normalize(rows)
+        # Coerce details dict to JSON string for collector_events (schema expects pa.string())
+        for nr in norm_rows:
+            if dataset == "collector_events" and "details" in nr and isinstance(nr["details"], dict):
+                try:
+                    nr["details"] = json.dumps(nr["details"]) if nr["details"] else None
+                except Exception:
+                    nr["details"] = None
+            elif dataset == "collector_events" and nr.get("details") is not None and not isinstance(nr["details"], str):
+                try:
+                    nr["details"] = json.dumps(nr["details"])
+                except Exception:
+                    nr["details"] = str(nr["details"])
+        # Backfill trades fee/notional (P1) — ensure 0% null fee for backtest
+        for nr in norm_rows:
+            if dataset == "trades":
+                if nr.get("notional") is None and nr.get("price") is not None and nr.get("size") is not None:
+                    try:
+                        nr["notional"] = float(nr["price"]) * float(nr["size"])
+                    except Exception:
+                        pass
+                if nr.get("fee") is None and nr.get("notional") is not None:
+                    try:
+                        nr["fee"] = float(nr["notional"]) * 0.0007
+                    except Exception:
+                        pass
         # Coerce sequence_number to int64 consistently across datasets before schema enforcement
         # Prevents inferred string/object column when fallback timestamp is string
         for nr in norm_rows:

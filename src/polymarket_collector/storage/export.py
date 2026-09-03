@@ -944,34 +944,47 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                             _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 4 + 3
                             _rows_ok = _verify_staging_row_counts(staging, expected_assets)
                             # Remote verification: ensure Kaggle actually stores expected files (not just local status)
+                            # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
                             _remote_ok = True
                             try:
-                                remote_files = api.dataset_list_files(dataset)
-                                # dataset_list_files may return object with .files or dict
-                                if isinstance(remote_files, dict):
-                                    files_list = remote_files.get("datasetFiles") or remote_files.get("files") or []
-                                else:
-                                    files_list = getattr(remote_files, "files", None) or getattr(remote_files, "datasetFiles", None) or []
-                                    if files_list is None:
-                                        files_list = []
                                 remote_names = set()
-                                for f in files_list:
-                                    if isinstance(f, dict):
-                                        n = f.get("ref") or f.get("name") or f.get("fileName")
+                                next_token = None
+                                for _page in range(5):  # 5*20=100 >31 expected
+                                    kwargs = {}
+                                    if next_token:
+                                        kwargs["page_token"] = next_token
+                                        # kagglesdk may use page_token/nextPageToken; try both
+                                        try:
+                                            remote_files = api.dataset_list_files(dataset, page_token=next_token)  # type: ignore
+                                        except TypeError:
+                                            remote_files = api.dataset_list_files(dataset)  # fallback, ignore pagination
+                                            break
                                     else:
-                                        n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
-                                    if n:
-                                        remote_names.add(Path(str(n)).name)
+                                        remote_files = api.dataset_list_files(dataset)
+                                    if isinstance(remote_files, dict):
+                                        files_list = remote_files.get("datasetFiles") or remote_files.get("files") or []
+                                        next_token = remote_files.get("nextPageToken")
+                                    else:
+                                        files_list = getattr(remote_files, "files", None) or getattr(remote_files, "datasetFiles", None) or []
+                                        if files_list is None:
+                                            files_list = []
+                                        next_token = getattr(remote_files, "nextPageToken", None)
+                                    for f in files_list:
+                                        if isinstance(f, dict):
+                                            n = f.get("ref") or f.get("name") or f.get("fileName")
+                                        else:
+                                            n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
+                                        if n:
+                                            remote_names.add(Path(str(n)).name)
+                                    if not next_token:
+                                        break
                                 # Check remote has at least expected parquets
                                 expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet"}
                                 if not expected_names.issubset(remote_names):
                                     _remote_ok = False
-                                    # keep polling; remote may still be processing
-                                # Also check remote total files >= expected
                                 if len(remote_names) < len(expected_names):
                                     _remote_ok = False
                             except Exception:
-                                # If we cannot list remote files, don't block on remote_ok but require local checks
                                 _remote_ok = True
                             if _rows_ok and _files_ok and _remote_ok:
                                 print(f"✓ Kaggle dataset ready: {dataset} (local files={_expected_staging_files(staging)}, remote verified)")
@@ -1296,6 +1309,15 @@ def export_and_upload_all_kaggle(
             print(f"compacted: {compact_stats}")
     except Exception as e:
         print(f"compact err {e}")
+
+    # Step 0b: Build clean view (§9B book_state='live') so completeness metrics and backtest path are valid
+    try:
+        from polymarket_collector.storage.clean_view import build_clean_view as _build_clean
+        n_clean = _build_clean(data_dir)
+        if n_clean is not None:
+            print(f"clean_view built: {n_clean} rows (live only, disputed excluded)")
+    except Exception as e:
+        print(f"clean_view err {e}")
 
     # Gate: only upload full closed markets
     try:
