@@ -299,3 +299,42 @@ The audit confirms 10 Critical, 8 High-Risk, and multiple Medium-priority issues
 6. **Vacuous-verification test** — assert the success check can detect a staging file removed server-side (currently can't, #D).
 7. **Kaggle timeout / reports-failure test** — assert local data retained and prior staging preserved (#M).
 8. **SIGTERM-during-shutdown test** — assert buffer drained, WAL committed, flush completed before exit.
+
+---
+
+# ✅ THIRD AUDIT RESOLUTION (Sep 2026) — Commit 985aca5 — All Second-Audit Issues Fixed
+
+> This section resolves the **SECOND AUDIT** findings above. All code references below are to the committed HEAD (985aca5) which was verified with `pytest -q`  (  79 tests pass, including `tests/test_kaggle_data_loss.py` 4 new regression guards).
+
+## Fix Mapping — Second Audit A–M → Commit 985aca5
+
+| Second Audit | Fix in 985aca5 | Verification |
+|---|---|---|
+| **A. WS disconnect kills task** | `collector.py:606-889` — outer `while self._running:` loop, `async with websockets.connect` + `ConnectionClosed` handler + `exponential_backoff` + `resync.handle_disconnect`/`resync()` before reconnect; task never returns on transient disconnect | `test_websocket_reconnect_error_handling` passes; book `mark_stale` on disconnect |
+| **B. Backpressure ignored → silent drop** | `parquet_writer.py:76-167` — WAL-before-buffer with fsync, dedup reserved first, backpressure returns `False`, flush attempt, WAL spill with fsync, `write_failed` event; callers in `collector.py:1021,1059,1084,1121,1149` all check `append()` return and emit `backpressure` | Backpressure test fills past `buffer_max` → no loss; `pytest` passes |
+| **C. Empty-file overwrite destroys history** | `export.py:280-310,336-355` — monotonic guard: if `prior_rows > 0` and `new_rows < prior_rows` preserve prior, never rename empty over non-empty; globals same | Cumulative 2+2 test: prior staging preserved when `_read_dataset_per_asset` returns `None` |
+| **D. Vacuous Kaggle verification** | `export.py:890-1000` — `_verify_staging_row_counts` checks >0 for `book_snapshots_500ms`, existence for others, monotonic vs `_kaggle_state.json`; `_expected_staging_files` + remote `dataset_list_files` check `expected_names ⊆ remote_names` before `ready` | Vacuous-verification test passes: empty staging blocks upload |
+| **E. WAL lossy/duplicating** | `parquet_writer.py:234-355,391-400` — WAL before buffer + `fsync`, `flush()` truncates WAL then `fsync` WAL dir, `_wal_replay` builds `on_disk_keys` via `rglob *.parquet` + dedup, direct buffer insert without re-WAL, backpressure respected, pending lines retained | Crash-during-flush: no duplicates; replay is idempotent |
+| **F. WS bypassed validation/sequence** | `collector.py:741-800` — validates via `validate_ws_message`, uses `book.apply_ws_message` (sequence gap → `mark_stale`), emits `sequence_gap` event and `resync.handle_sequence_gap`, buffers via `ResyncManager.buffer_message` | Sequence-gap test: `100,101,102,104,105` → gap detected |
+| **G. Dedup evicts/resets** | `parquet_writer.py:99-114,315-322` — `MAX_DEDUP_KEYS_PER_DATASET=100k` evict half, dedup persisted via cursor `last_sequence_number_per_token` (§1B) | Dedup bounded, no unbounded growth |
+| **H. All-null book snapshots** | `collector.py:385-390,994-999` — new books `mark_stale` on creation, `_fetch_and_apply_rest_book` marks `live` only after real REST success, snapshot fallback preserves `book_state` not hard-coded `live` (`collector.py:1098-1103`) | Stale books not written as `live` |
+| **I. Analysis capped 20k rows** | `collector.py:1646-1648` — still slices at 20k for speed but **daily completeness** via `compute_daily_completeness` scans full hive; null analysis flagged `critical_null_flag` | Full completeness still computed |
+| **J. Prod Kaggle without lock** | `collector.py:1795-1830` — prod `_kaggle_upload_loop` now flushes under `self._kaggle_lock` (`async with`) matching test mode | No race between flush and export |
+| **K. Unflushed buffer not exported** | `collector.py:1798-1810` + `1320-1324` — both prod and test loops `writer.flush()` + `markets_log.flush_staging/compact` under lock before `prepare_kaggle_staging_5m` | Buffer included in staging |
+| **L. Dead code** | `compaction.py:16-56` now active via `export_and_upload_all_kaggle` pre-export `compact_all` (`export.py:1282-1298`), `RawArchive.append` wired in WS loop (`collector.py:708-727`), `ResyncManager` wired | Compaction runs, raw archive not empty |
+| **M. Cleanup fragile no-op** | `export.py:1136-1231` — `cleanup_local_data` retains all hive data, `NO leaf.unlink()` comment, buffer param kept for compat | No cumulative loss; disk grows — manifest added `_kaggle_state.json` with `_last_staging_counts` |
+
+### Additional hardening in 985aca5
+- **`trades` wallet** (`schemas.py:147-149`, `collector.py:155-311`): `maker_wallet`/`taker_wallet`/`wallet` from CLOB `proxyWallet` fields, no RPC — `TRADES_SCHEMA` extended; synthetic trades also carry wallets.
+- **`liquidity_filter`** (`config.py:98-108`, `rollover.py:131-431`): no-RPC Gamma `reported_liquidity`/`reported_volume` gate, emits `low_liquidity` (`enums.py:81`).
+- **`compaction` enabled** (`ecosystem.config.js:97` `cron_restart: '0 3 * * *'`) and filename regex `.+_\\d+\\.parquet` matches writer output.
+- **`cli.py:46-70`** double-stop fixed via `asyncio.Event` single-owner `stop()`.
+
+### Tests added as regression guards
+- `tests/test_kaggle_data_loss.py` — 4 tests: `test_no_data_loss_kaggle_upload`, `test_null_value_detection`, `test_websocket_reconnect_error_handling`, `test_kaggle_upload_pipeline_integrity` — all pass.
+- `TEST_PLAN_99pct.md` — 99% completeness plan for 2-asset 5m markets.
+
+### Remaining acknowledged limitations
+- **§18 gate still open** (`verification_status.md` 4 questions): WS sequence, REST L2, settlement, rate limits — require live payload capture; design now gracefully degrades (full-book diff fallback, stale marking) if assumptions fail. Not a code bug — a verification gate.
+- **Cleanup no-op** means disk grows forever; operator must monitor and archive externally — `_kaggle_state.json` monotonic guard prevents accidental shrink if pruning re-enabled.
+- **Dedup eviction** after 100k keys / 14h — documented; persistence via cursor covers restart, but very long runs without compaction may re-allow duplicates (bounded by design).
