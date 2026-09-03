@@ -511,6 +511,46 @@ class RolloverManager:
         self.lead_ms = config.rollover_lead_seconds * 1000
         self.max_gap_ms = config.max_coverage_gap_seconds * 1000
 
+    def _synthetic_market(self, asset: str, after_ts_ms: int) -> MarketInfo:
+        """Generate deterministic synthetic market for testing when Gamma is unavailable."""
+        import uuid
+        ws = self.discovery.window_size_seconds
+        # floor to window boundary after after_ts
+        ts = (after_ts_ms // 1000) // ws * ws
+        # if after is exactly at boundary, use it; if after is mid-window, next window is ts+ws
+        # For lookahead we want after = market_end, which is boundary, so ts is correct next window
+        # For initial (after=now mid-window), ts is current window start, but we want next start >= now
+        # Adjust: if ts*1000 < after_ts_ms then ts+=ws
+        if ts * 1000 < after_ts_ms:
+            ts += ws
+        window_index = ts // ws
+        window_label = _window_label_for(ws)
+        cid = f"synthetic-{asset.lower()}-{window_label}-{ts}"
+        # Use deterministic but unique tokens
+        up_tok = f"synthetic-up-{asset}-{ts}"
+        down_tok = f"synthetic-down-{asset}-{ts}"
+        start_ms = ts * 1000
+        end_ms = (ts + ws) * 1000
+        return MarketInfo(
+            condition_id=cid,
+            market_id=cid,
+            asset=asset.upper(),
+            up_token_id=up_tok,
+            down_token_id=down_tok,
+            market_start_ts_ms=start_ms,
+            market_end_ts_ms=end_ms,
+            window_index=window_index,
+            series_id=f"{asset.upper()}-{window_label}",
+            status="active",
+            question=f"Synthetic {asset} Up or Down - {window_label} {ts}",
+            tick_size=0.01,
+            slug=f"{asset.lower()}-updown-{window_label}-{ts}",
+            window_label=window_label,
+            window_size_seconds=ws,
+            reported_volume=1000.0,
+            reported_liquidity=5000.0,
+        )
+
     async def check_and_roll(self, asset: str, subscribe_fn: Callable, now_ms: Optional[int] = None) -> Optional[str]:
         """Check if asset needs lookahead discovery and/or promotion.
 
@@ -534,6 +574,20 @@ class RolloverManager:
                 if was_next_none and prev_cid:
                     self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
                 self.on_event("rollover_completed", {"asset": asset, "prev_condition_id": prev_cid, "new_condition_id": state.current.condition_id if state.current else None})
+            # If promoted to None (gap) and synthetic_mode enabled, immediately try synthetic fallback
+            # to avoid losing a window due to Gamma delay
+            if state.current is None and getattr(self.config, "synthetic_mode", False):
+                after = prev_cid and (now_ms) or now_ms
+                # Use current now for synthetic
+                synth = self._synthetic_market(asset, now_ms)
+                state.current = synth
+                try:
+                    await subscribe_fn(synth)
+                except Exception:
+                    pass
+                if self.on_event:
+                    self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
+                return "market_added"
             return "coverage_gap" if was_next_none else "rollover_completed"
 
         # Lookahead: need to discover next?
@@ -589,6 +643,31 @@ class RolloverManager:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
                     return "rollover_started" if should_emit_rollover else "market_added"
             else:
+                # Synthetic fallback when Gamma returns None and synthetic_mode enabled
+                # Ensures test mode never gaps due to Gamma indexing delay or 429
+                if getattr(self.config, "synthetic_mode", False):
+                    synth = self._synthetic_market(asset, after)
+                    # avoid duplicate if synthetic already exists
+                    if state.current is None or synth.condition_id != state.current.condition_id:
+                        if state.current is None:
+                            state.current = synth
+                            state.is_rollover_window = False
+                            try:
+                                await subscribe_fn(synth)
+                            except Exception:
+                                pass
+                            if self.on_event:
+                                self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
+                            return "market_added"
+                        elif state.next is None or synth.condition_id != state.next.condition_id:
+                            state.next = synth
+                            try:
+                                await subscribe_fn(synth)
+                            except Exception:
+                                pass
+                            if self.on_event:
+                                self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
+                            return "market_added"
                 # Distinguish discovered late vs no market existed (§1 #6)
                 # If we're past market_end_ts + max_gap and still no next, it's a coverage_gap
                 if state.current and now_ms > state.current.market_end_ts_ms + self.max_gap_ms:

@@ -308,18 +308,17 @@ def export_per_asset_single_file(
                         stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows
                         continue
                     # For book_snapshots_500ms 0 rows is never valid — fail closed (keep prior if any, else abort write)
+                    # If no prior data and 0 new rows, do NOT create an empty file that could be uploaded.
+                    # Instead, skip the write and preserve the prior file if it exists; otherwise
+                    # leave the output path uncreated (staging will be missing this file, which
+                    # _verify_staging_row_counts will catch and block the Kaggle upload).
                     if ds == "book_snapshots_500ms":
-                        # No prior to preserve and no new rows -> do not create empty bare table that would be uploaded
-                        # Create empty with proper schema so file exists, but mark as 0 and let verification fail
-                        if schema is not None:
-                            empty_data = {col: [] for col in schema.names}
-                            table = pa.table(empty_data)
-                        else:
-                            table = pa.table({})
-                        tmp_path = out_path.with_suffix(".parquet.tmp")
-                        pq.write_table(table, str(tmp_path), compression="zstd")
-                        tmp_path.rename(out_path)
-                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
+                        if table is None or table.num_rows == 0:
+                            # No new data and no prior to preserve — abort write entirely
+                            # prior_rows guard above already handles the case where prior exists
+                            # If we are here, prior was None or 0, so just skip writing
+                            stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
+                            continue
                     else:
                         # trades/book_events/chainlink_events legitimately 0 early -> write proper schema-empty, not bare pa.table({})
                         if schema is not None:

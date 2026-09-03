@@ -1,0 +1,332 @@
+Authentication required to call the Kaggle API.
+
+First, you will need a Kaggle account. You can sign up at
+  https://www.kaggle.com/account/login
+
+Recommended: log in with OAuth via a web-based authorization flow.
+No token to manage; credentials are cached locally for you.
+    kaggle auth login
+
+If you'd rather not use OAuth, generate an API token at
+  https://www.kaggle.com/settings/api  (click "Generate New Token" under "API")
+and supply it to the CLI in one of these ways:
+
+  Option A: Environment variable
+    export KAGGLE_API_TOKEN=xxxxxxxxxxxxxx  # token copied from the settings UI
+
+  Option B: API token file
+    Save the token to ~/.kaggle/access_token
+2-market dry test synthetic=True
+/home/fese/polymarket-collector/src/polymarket_collector/collector.py:1365: FutureWarning: promote has been superseded by promote_options='default'.
+  except Exception as e:
+/home/fese/polymarket-collector/src/polymarket_collector/storage/compaction.py:83: FutureWarning: promote has been superseded by promote_options='default'.
+  rows = compact_dataset(leaf_dir, temp_suffix=temp_suffix)
+/home/fese/polymarket-collector/src/polymarket_collector/storage/export.py:336: FutureWarning: promote has been superseded by promote_options='default'.
+  table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
+/home/fese/polymarket-collector/src/polymarket_collector/collector.py:1658: FutureWarning: promote has been superseded by promote_options='default'.
+  p = base / "markets_latest" / "markets_latest.parquet"
+[test-mode:real] aligning to next 5m market boundary 2026-09-03T19:35:00+00:00 — waiting 18.0s so we start on fresh market (not halfway) — 5m-only, 7 assets
+[test-mode:real] boundary reached, starting collector (fresh market)
+[startup] recovering cursor state for assets: ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
+[startup] no cursor for BTC
+[startup] no cursor for ETH
+[startup] no cursor for SOL
+[startup] no cursor for HYPE
+[startup] no cursor for BNB
+[startup] no cursor for XRP
+[startup] no cursor for DOGE
+[startup] replayed 1 rows from WAL after crash/restart
+[test-mode:real] QUICK TEST — 2×300s (5m-only) = 10min total, 7 assets ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
+[test-mode] chunks: every 2 markets → kaggle every 600s (10min), one-file-per-asset staging (31 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals
+[test-mode:real] 30s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[flush] 409 rows
+[test-mode:real] 60s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 90s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[flush] 1368 rows
+[test-mode:real] 120s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 150s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[flush] 1384 rows
+[test-mode:real] 180s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 210s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[flush] 1387 rows
+[test-mode:real] 241s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 271s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 690s, kaggle 0 uploads
+[flush] 1423 rows
+[test-mode:real] 301s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 331s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[flush] 206 rows
+[test-mode:real] 361s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 391s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[flush] 205 rows
+[test-mode:real] 421s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 451s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[flush] 214 rows
+[test-mode:real] 481s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 511s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[flush] 1 rows
+[test-mode:real] 541s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[test-mode:real] 571s elapsed, windows per asset: {'BTC': [5961547], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 0 uploads
+[flush] 202 rows
+[test-kaggle:t10min] flushed 7 rows before staging (lock held, snapshots go to fresh buffer)
+[test-kaggle:t10min] compacted data/markets_latest/markets_latest.parquet
+[test-kaggle:t10min] clean_view rows 4724
+⚠ No Kaggle API credentials configured.
+  Setup: 1) ~/.kaggle/kaggle.json {"username":"gghgg1","key":"KGAT_..."} chmod 600
+        2) env KAGGLE_API_TOKEN=KGAT_... (new) or KAGGLE_USERNAME/KEY
+compacted: {'book_snapshots_500ms/date=2026-09-03/asset=BTC': 1254, 'book_snapshots_500ms/date=2026-09-03/asset=ETH': 597, 'book_snapshots_500ms/date=2026-09-03/asset=BNB': 597, 'book_snapshots_500ms/date=2026-09-03/asset=DOGE': 597, 'book_snapshots_500ms/date=2026-09-03/asset=XRP': 597, 'book_snapshots_500ms/date=2026-09-03/asset=SOL': 597, 'book_snapshots_500ms/date=2026-09-03/asset=HYPE': 597, 'book_events/date=2026-09-03/asset=BTC': 45, 'book_events/date=2026-09-03/asset=ETH': 29, 'book_events/date=2026-09-03/asset=BNB': 22, 'book_events/date=2026-09-03/asset=DOGE': 16, 'book_events/date=2026-09-03/asset=XRP': 21, 'book_events/date=2026-09-03/asset=SOL': 28, 'book_events/date=2026-09-03/asset=HYPE': 25, 'trades/date=2026-09-03/asset=BTC': 223, 'trades/date=2026-09-03/asset=ETH': 108, 'trades/date=2026-09-03/asset=BNB': 104, 'trades/date=2026-09-03/asset=DOGE': 105, 'trades/date=2026-09-03/asset=XRP': 107, 'trades/date=2026-09-03/asset=SOL': 107, 'trades/date=2026-09-03/asset=HYPE': 101, 'chainlink_events/date=2026-09-03/asset=BTC': 492, 'chainlink_events/date=2026-09-03/asset=ETH': 246, 'chainlink_events/date=2026-09-03/asset=BNB': 241, 'chainlink_events/date=2026-09-03/asset=DOGE': 243, 'chainlink_events/date=2026-09-03/asset=XRP': 245, 'chainlink_events/date=2026-09-03/asset=SOL': 233, 'chainlink_events/date=2026-09-03/asset=HYPE': 239, 'collector_events/date=2026-09-03': 129}
+clean_view built: 4724 rows (live only, disputed excluded)
+=== Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE'] -> data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto ===
+staging prepared: 31 files, dataset gghgg1/polymarket-5m-crypto
+dry-run: skipping Kaggle upload + prune
+[test-kaggle:t10min] dry_run — skipping delete (no Kaggle creds). Would prune closed markets with 120s buffer after real upload.
+[test-kaggle:t10min] staging OK 31 files (one per asset: BTC/ETH/..._book_snapshots, trades, book_events, chainlink +3 globals)
+[analyse] date=2026-09-03 start_ms=1788464100000 num_markets=2 window=300 -> test_analysis_t10min.json
+[analyse] book_snapshots_500ms: 4836 rows in 7 files, exists=True
+[analyse] book_snapshots_clean: 4724 rows in 7 files, exists=True
+[analyse] book_events: 186 rows in 7 files, exists=True
+[analyse] trades: 855 rows in 7 files, exists=True
+[analyse] chainlink_events: 1939 rows in 7 files, exists=True
+[analyse] collector_events: 129 rows in 1 files, exists=True
+[analyse] markets_log: 8 rows in 8 files, exists=True
+[analyse] markets_latest: 8 rows in 1 files, exists=True
+[analyse] resync_episodes: 0 rows in 0 files, exists=False
+[analyse] wrote data/test_analysis_t10min.json completeness 57.57% clean 56.24% loss 43.76%
+[test-kaggle:t10min] interim completeness 57.57% clean 56.24%
+[test-mode:real] 601s elapsed, windows per asset: {'BTC': [5961547, 5961548], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 1 uploads
+[test-mode:real] 631s elapsed, windows per asset: {'BTC': [5961547, 5961548], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 1 uploads/home/fese/polymarket-collector/src/polymarket_collector/collector.py:1731: FutureWarning: promote has been superseded by promote_options='default'.
+  pyl = ce_tbl.to_pylist()
+
+[test-mode:real] 661s elapsed, windows per asset: {'BTC': [5961547, 5961548], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 1 uploads
+[flush] 12 rows
+[test-mode:real] 691s elapsed, windows per asset: {'BTC': [5961547, 5961548], 'ETH': [5961547], 'SOL': [5961547], 'HYPE': [5961547], 'BNB': [5961547], 'XRP': [5961547], 'DOGE': [5961547]}, timeout 690s, kaggle 1 uploads
+[test-mode:real] timeout 690s reached, stopping with progress {'BTC': {5961547, 5961548}, 'ETH': {5961547}, 'SOL': {5961547}, 'HYPE': {5961547}, 'BNB': {5961547}, 'XRP': {5961547}, 'DOGE': {5961547}}
+[test-mode:real] flushed 0 rows
+[test-mode:real] compacted markets_latest -> data/markets_latest/markets_latest.parquet
+[test-mode] final kaggle skipped (last 85s ago, 1 chunks already) — quick-test done
+[analyse] date=2026-09-03 start_ms=1788464100000 num_markets=2 window=300 -> test_analysis.json
+[analyse] book_snapshots_500ms: 4836 rows in 7 files, exists=True
+[analyse] book_snapshots_clean: 4724 rows in 7 files, exists=True
+[analyse] book_events: 186 rows in 7 files, exists=True
+[analyse] trades: 855 rows in 7 files, exists=True
+[analyse] chainlink_events: 1939 rows in 7 files, exists=True
+[analyse] collector_events: 151 rows in 17 files, exists=True
+[analyse] markets_log: 8 rows in 8 files, exists=True
+[analyse] markets_latest: 8 rows in 1 files, exists=True
+[analyse] resync_episodes: 0 rows in 0 files, exists=False
+[analyse] wrote data/test_analysis.json completeness 57.57% clean 56.24% loss 43.76%
+done
+exists True
+CHECKS {
+  "book_state_histogram": {
+    "stale": 112,
+    "live": 4724
+  },
+  "live_pct": 97.68,
+  "expected_book_snapshots": 8400,
+  "actual_book_snapshots": 4836,
+  "actual_clean_snapshots": 4724,
+  "snapshot_completeness_pct": 57.57,
+  "clean_completeness_pct": 56.24,
+  "daily_completeness": [
+    {
+      "date": "2026-09-03",
+      "asset": "BTC",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 1254,
+      "actual_clean_snapshots": 1142,
+      "missing_intervals": 171658,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.006608796296296297
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "ETH",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "BNB",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "DOGE",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "XRP",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "SOL",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    },
+    {
+      "date": "2026-09-03",
+      "asset": "HYPE",
+      "expected_snapshots": 172800,
+      "actual_snapshots": 597,
+      "actual_clean_snapshots": 597,
+      "missing_intervals": 172203,
+      "disconnect_duration_ms": 0,
+      "resync_episode_count": 0,
+      "total_gap_ms": 0,
+      "sequence_gaps": 0,
+      "duplicate_events": 0,
+      "write_failures": 0,
+      "rollover_misses": 0,
+      "coverage_gaps": 0,
+      "process_downtime_ms": 0,
+      "resolution_stuck": 9,
+      "sanity_violations": 0,
+      "completeness_ratio": 0.0034548611111111112
+    }
+  ],
+  "sample_up_bid": 0.49,
+  "sample_chainlink_price": 64879.1,
+  "sample_chainlink_twap": 64897.89,
+  "depth_columns_present": 12,
+  "book_state_sample": "stale",
+  "is_rollover_window_sample": false,
+  "price_bounds_ok": true,
+  "l2_level_1_sample": {
+    "up_bid_level_1_price": 0.49,
+    "up_bid_level_1_size": 15.0,
+    "up_ask_level_1_price": 0.51,
+    "up_ask_level_1_size": 15.0,
+    "down_bid_level_1_price": 0.49,
+    "down_bid_level_1_size": 15.0,
+    "down_ask_level_1_price": 0.51,
+    "down_ask_level_1_size": 15.0
+  },
+  "chainlink_has_twap": true,
+  "chainlink_has_price": true,
+  "chainlink_twap_window": 300,
+  "collector_events_by_type": {
+    "resolution_stuck": 63,
+    "connected": 68,
+    "collector_started": 2,
+    "rollover_started": 8,
+    "market_added": 8,
+    "rollover_completed": 1,
+    "ws_disconnected": 1
+  },
+  "sequence_gaps": 0,
+  "resync_failed": 0,
+  "coverage_gaps": 0,
+  "rollover_miss": 0,
+  "book_anomaly": 0,
+  "missing_intervals": 3676,
+  "data_loss_pct": 43.76,
+  "critical_null_pct": {
+    "up_bid": 0.0,
+    "up_ask": 0.0,
+    "down_bid": 0.0,
+    "down_ask": 0.0,
+    "up_bid_size": 0.0,
+    "up_ask_size": 0.0
+  },
+  "critical_null_flag": false,
+  "trades_rows": 855,
+  "chainlink_rows": 1939
+}
+DATASETS {'book_snapshots_500ms': 4836, 'book_snapshots_clean': 4724, 'book_events': 186, 'trades': 855, 'chainlink_events': 1939, 'collector_events': 151, 'markets_log': 8, 'markets_latest': 8, 'resync_episodes': 0}
+KAGGLE {'exists': True, 'files': 31, 'expected': 31, 'dataset': 'gghgg1/polymarket-5m-crypto', 'file_list': ['BNB_book_events.parquet', 'BNB_book_snapshots_500ms.parquet', 'BNB_chainlink_events.parquet', 'BNB_trades.parquet', 'BTC_book_events.parquet', 'BTC_book_snapshots_500ms.parquet', 'BTC_chainlink_events.parquet', 'BTC_trades.parquet', 'DOGE_book_events.parquet', 'DOGE_book_snapshots_500ms.parquet', 'DOGE_chainlink_events.parquet', 'DOGE_trades.parquet', 'ETH_book_events.parquet', 'ETH_book_snapshots_500ms.parquet', 'ETH_chainlink_events.parquet', 'ETH_trades.parquet', 'HYPE_book_events.parquet', 'HYPE_book_snapshots_500ms.parquet', 'HYPE_chainlink_events.parquet', 'HYPE_trades.parquet'], 'metadata': {'title': 'Polymarket 5m Crypto', 'id': 'gghgg1/polymarket-5m-crypto', 'licenses': [{'name': 'CC BY-NC-SA 4.0'}], 'resources': [{'path': 'HYPE_book_snapshots_500ms.parquet', 'description': 'HYPE_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BTC_chainlink_events.parquet', 'description': 'BTC_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'SOL_trades.parquet', 'description': 'SOL_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BTC_trades.parquet', 'description': 'BTC_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'markets.parquet', 'description': 'markets.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'ETH_trades.parquet', 'description': 'ETH_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'XRP_book_events.parquet', 'description': 'XRP_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'HYPE_chainlink_events.parquet', 'description': 'HYPE_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'DOGE_book_events.parquet', 'description': 'DOGE_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'collector_events.parquet', 'description': 'collector_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'HYPE_trades.parquet', 'description': 'HYPE_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'ETH_chainlink_events.parquet', 'description': 'ETH_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'XRP_chainlink_events.parquet', 'description': 'XRP_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'resync_episodes.parquet', 'description': 'resync_episodes.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BNB_book_events.parquet', 'description': 'BNB_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'XRP_book_snapshots_500ms.parquet', 'description': 'XRP_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BTC_book_snapshots_500ms.parquet', 'description': 'BTC_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'DOGE_chainlink_events.parquet', 'description': 'DOGE_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'ETH_book_snapshots_500ms.parquet', 'description': 'ETH_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'XRP_trades.parquet', 'description': 'XRP_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'DOGE_trades.parquet', 'description': 'DOGE_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BNB_chainlink_events.parquet', 'description': 'BNB_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BNB_book_snapshots_500ms.parquet', 'description': 'BNB_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BNB_trades.parquet', 'description': 'BNB_trades.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'HYPE_book_events.parquet', 'description': 'HYPE_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'BTC_book_events.parquet', 'description': 'BTC_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'SOL_book_snapshots_500ms.parquet', 'description': 'SOL_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'SOL_book_events.parquet', 'description': 'SOL_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'ETH_book_events.parquet', 'description': 'ETH_book_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'SOL_chainlink_events.parquet', 'description': 'SOL_chainlink_events.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}, {'path': 'DOGE_book_snapshots_500ms.parquet', 'description': 'DOGE_book_snapshots_500ms.parquet 5m crypto — gghgg1/polymarket-5m-crypto'}]}}
+up_bid {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+up_ask {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+down_bid {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+down_ask {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+up_bid_size {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+book_state {'null': 0, 'null_pct': 0.0, 'zeros': 0, 'zero_pct': 0}
+book_state_histogram {'stale': 112, 'live': 4724}
+critical_null_flag False
+data_loss 43.76
+snapshot_completeness 57.57
+clean_completeness 56.24

@@ -53,24 +53,24 @@ def test_clean_view_filters_stale_and_disputed():
         table = pa.Table.from_pylist(snapshots)
         pq.write_table(table, str(src_dir / "part-000.parquet"))
 
-        # build clean view (default: exclude stale + disputed/unknown)
+        # build clean view (default: exclude stale + disputed only — unknown is normal for active markets)
         n = build_clean_view(tmp)
-        assert n == 1  # only snapshot 1 qualifies (live + not disputed/unknown)
+        assert n == 2  # snapshots 1 and 4 qualify (live + not disputed); unknown not excluded
 
         clean = load_clean(tmp)
         assert clean is not None
-        assert clean.num_rows == 1
+        assert clean.num_rows == 2
         ids = [r["snapshot_id"] for r in clean.to_pylist()]
         assert "1" in ids
+        assert "4" in ids
         assert "2" not in ids  # stale
         assert "3" not in ids  # disputed
-        assert "4" not in ids  # unknown
 
         # opt-in disputed
         n2 = build_clean_view(tmp, opt_in_disputed=True)
         clean2 = load_clean(tmp)
         assert clean2 is not None
-        # with opt_in, disputed/unknown included but stale still excluded → 3 rows (1,3,4)
+        # with opt_in, disputed included but stale still excluded → 3 rows (1,3,4)
         assert clean2.num_rows == 3
 
 

@@ -45,7 +45,7 @@ event_thresholds:
 # §0 — synthetic-mode flag: when True, allows fallback synthetic data paths;
 # default off — real WS/REST must be the only data source in production
 # FORCED OFF: synthetic data generation is disabled in production mode
-synthetic_mode: true
+synthetic_mode: false
 
 # §1A — WS resync
 ws:

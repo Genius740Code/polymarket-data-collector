@@ -1,950 +1,0 @@
-[test-mode:real] aligning to next 5m market boundary 2026-08-30T17:20:00+00:00 — waiting 33.6s so we start on fresh market (not halfway) — 5m-only, 7 assets
-[test-mode:real] boundary reached, starting collector (fresh market)
-[startup] recovering cursor state for assets: ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
-[startup] no cursor for BTC
-[startup] no cursor for ETH
-[startup] no cursor for SOL
-[startup] no cursor for HYPE
-[startup] no cursor for BNB
-[startup] no cursor for XRP
-[startup] no cursor for DOGE
-[test-mode:real] QUICK TEST — 4×300s (5m-only) = 20min total, 7 assets ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
-[test-mode] chunks: every 2 markets → kaggle every 600s (10min), one-file-per-asset staging (31 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals
-[test-mode:real] 30s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 60s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[flush] 760 rows
-[test-mode:real] 90s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 120s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[flush] 1345 rows
-[test-mode:real] 150s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 180s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[flush] 1362 rows
-[test-mode:real] 210s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 240s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[flush] 1365 rows
-[test-mode:real] 270s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 300s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[flush] 2006 rows
-[test-mode:real] 330s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 360s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[flush] 1374 rows
-[test-mode:real] 390s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 420s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[flush] 1385 rows
-[test-mode:real] 450s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 480s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[flush] 1359 rows
-[test-mode:real] 510s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[test-mode:real] 540s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[flush] 1350 rows
-[test-mode:real] 570s elapsed, windows per asset: {'BTC': [5960368], 'ETH': [5960368], 'SOL': [5960368], 'HYPE': [5960368], 'BNB': [5960368], 'XRP': [5960368], 'DOGE': [5960368]}, timeout 1290s, kaggle 0 uploads
-[test-kaggle:t10min] flushed 1964 rows before staging (lock held, snapshots go to fresh buffer)
-[test-kaggle:t10min] compacted /home/fese/polymarket-collector/data/markets_latest/markets_latest.parquet
-/home/fese/polymarket-collector/src/polymarket_collector/collector.py:682: FutureWarning: promote has been superseded by promote_options='default'.
-  built = build_clean_view(self.config.storage.data_dir)
-[test-kaggle:t10min] clean_view rows 0
-✓ Kaggle API credentials found in /home/fese/.kaggle/kaggle.json
-=== Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE'] -> /home/fese/polymarket-collector/data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto ===
-/home/fese/polymarket-collector/src/polymarket_collector/storage/export.py:260: FutureWarning: promote has been superseded by promote_options='default'.
-  table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance)
-staging prepared: 28 files, dataset gghgg1/polymarket-5m-crypto
-=== Step 2: Uploading 5m staging to Kaggle gghgg1/polymarket-5m-crypto ===
-Starting upload for file HYPE_book_snapshots_500ms.parquet
-  0%|          | 0.00/126k [00:00<?, ?B/s]100%|██████████| 126k/126k [00:00<00:00, 223kB/s]
-Upload successful: HYPE_book_snapshots_500ms.parquet (126KB)
-Starting upload for file BTC_chainlink_events.parquet
-  0%|          | 0.00/34.4k [00:00<?, ?B/s]100%|██████████| 34.4k/34.4k [00:00<00:00, 89.2kB/s]
-Upload successful: BTC_chainlink_events.parquet (34KB)
-Starting upload for file SOL_trades.parquet
-  0%|          | 0.00/23.0k [00:00<?, ?B/s]100%|██████████| 23.0k/23.0k [00:00<00:00, 61.1kB/s]
-Upload successful: SOL_trades.parquet (23KB)
-Starting upload for file BTC_trades.parquet
-  0%|          | 0.00/23.4k [00:00<?, ?B/s]100%|██████████| 23.4k/23.4k [00:00<00:00, 27.3kB/s]
-Upload successful: BTC_trades.parquet (23KB)
-Starting upload for file ETH_trades.parquet
-  0%|          | 0.00/23.7k [00:00<?, ?B/s]100%|██████████| 23.7k/23.7k [00:00<00:00, 61.8kB/s]
-Upload successful: ETH_trades.parquet (24KB)
-Starting upload for file XRP_book_events.parquet
-  0%|          | 0.00/8.79k [00:00<?, ?B/s]100%|██████████| 8.79k/8.79k [00:00<00:00, 22.4kB/s]
-Upload successful: XRP_book_events.parquet (9KB)
-Starting upload for file HYPE_chainlink_events.parquet
-  0%|          | 0.00/28.9k [00:00<?, ?B/s]100%|██████████| 28.9k/28.9k [00:00<00:00, 73.6kB/s]
-Upload successful: HYPE_chainlink_events.parquet (29KB)
-Starting upload for file DOGE_book_events.parquet
-  0%|          | 0.00/9.29k [00:00<?, ?B/s]100%|██████████| 9.29k/9.29k [00:00<00:00, 24.0kB/s]
-Upload successful: DOGE_book_events.parquet (9KB)
-Starting upload for file HYPE_trades.parquet
-  0%|          | 0.00/23.2k [00:00<?, ?B/s]100%|██████████| 23.2k/23.2k [00:00<00:00, 59.7kB/s]
-Upload successful: HYPE_trades.parquet (23KB)
-Starting upload for file ETH_chainlink_events.parquet
-  0%|          | 0.00/32.9k [00:00<?, ?B/s]100%|██████████| 32.9k/32.9k [00:00<00:00, 83.9kB/s]
-Upload successful: ETH_chainlink_events.parquet (33KB)
-Starting upload for file XRP_chainlink_events.parquet
-  0%|          | 0.00/27.6k [00:00<?, ?B/s]100%|██████████| 27.6k/27.6k [00:00<00:00, 73.2kB/s]
-Upload successful: XRP_chainlink_events.parquet (28KB)
-Starting upload for file BNB_book_events.parquet
-  0%|          | 0.00/9.76k [00:00<?, ?B/s]100%|██████████| 9.76k/9.76k [00:00<00:00, 25.5kB/s]
-Upload successful: BNB_book_events.parquet (10KB)
-Starting upload for file XRP_book_snapshots_500ms.parquet
-  0%|          | 0.00/125k [00:00<?, ?B/s]100%|██████████| 125k/125k [00:00<00:00, 227kB/s]
-Upload successful: XRP_book_snapshots_500ms.parquet (125KB)
-Starting upload for file BTC_book_snapshots_500ms.parquet
-  0%|          | 0.00/128k [00:00<?, ?B/s]100%|██████████| 128k/128k [00:00<00:00, 223kB/s]
-Upload successful: BTC_book_snapshots_500ms.parquet (128KB)
-Starting upload for file DOGE_chainlink_events.parquet
-  0%|          | 0.00/28.7k [00:00<?, ?B/s]100%|██████████| 28.7k/28.7k [00:00<00:00, 65.2kB/s]
-Upload successful: DOGE_chainlink_events.parquet (29KB)
-Starting upload for file ETH_book_snapshots_500ms.parquet
-  0%|          | 0.00/127k [00:00<?, ?B/s]100%|██████████| 127k/127k [00:00<00:00, 227kB/s]
-Upload successful: ETH_book_snapshots_500ms.parquet (127KB)
-Starting upload for file XRP_trades.parquet
-  0%|          | 0.00/23.1k [00:00<?, ?B/s]100%|██████████| 23.1k/23.1k [00:00<00:00, 61.0kB/s]
-Upload successful: XRP_trades.parquet (23KB)
-Starting upload for file DOGE_trades.parquet
-  0%|          | 0.00/23.8k [00:00<?, ?B/s]100%|██████████| 23.8k/23.8k [00:00<00:00, 61.5kB/s]
-Upload successful: DOGE_trades.parquet (24KB)
-Starting upload for file BNB_chainlink_events.parquet
-  0%|          | 0.00/30.7k [00:00<?, ?B/s]100%|██████████| 30.7k/30.7k [00:00<00:00, 73.5kB/s]
-Upload successful: BNB_chainlink_events.parquet (31KB)
-Starting upload for file BNB_book_snapshots_500ms.parquet
-  0%|          | 0.00/127k [00:00<?, ?B/s]100%|██████████| 127k/127k [00:00<00:00, 227kB/s]
-Upload successful: BNB_book_snapshots_500ms.parquet (127KB)
-Starting upload for file BNB_trades.parquet
-  0%|          | 0.00/22.5k [00:00<?, ?B/s]100%|██████████| 22.5k/22.5k [00:00<00:00, 52.5kB/s]
-Upload successful: BNB_trades.parquet (23KB)
-Starting upload for file HYPE_book_events.parquet
-  0%|          | 0.00/8.96k [00:00<?, ?B/s]100%|██████████| 8.96k/8.96k [00:00<00:00, 24.0kB/s]
-Upload successful: HYPE_book_events.parquet (9KB)
-Starting upload for file BTC_book_events.parquet
-  0%|          | 0.00/8.97k [00:00<?, ?B/s]100%|██████████| 8.97k/8.97k [00:00<00:00, 23.3kB/s]
-Upload successful: BTC_book_events.parquet (9KB)
-Starting upload for file SOL_book_snapshots_500ms.parquet
-  0%|          | 0.00/127k [00:00<?, ?B/s]100%|██████████| 127k/127k [00:00<00:00, 236kB/s]
-Upload successful: SOL_book_snapshots_500ms.parquet (127KB)
-Starting upload for file SOL_book_events.parquet
-  0%|          | 0.00/9.20k [00:00<?, ?B/s]100%|██████████| 9.20k/9.20k [00:00<00:00, 18.2kB/s]
-Upload successful: SOL_book_events.parquet (9KB)
-Starting upload for file ETH_book_events.parquet
-  0%|          | 0.00/9.24k [00:00<?, ?B/s]100%|██████████| 9.24k/9.24k [00:00<00:00, 24.7kB/s]
-Upload successful: ETH_book_events.parquet (9KB)
-Starting upload for file SOL_chainlink_events.parquet
-  0%|          | 0.00/29.7k [00:00<?, ?B/s]100%|██████████| 29.7k/29.7k [00:00<00:00, 73.3kB/s]
-Upload successful: SOL_chainlink_events.parquet (30KB)
-Starting upload for file DOGE_book_snapshots_500ms.parquet
-  0%|          | 0.00/127k [00:00<?, ?B/s]100%|██████████| 127k/127k [00:01<00:00, 122kB/s]
-Upload successful: DOGE_book_snapshots_500ms.parquet (127KB)
-⚠ Kaggle dataset_status not ready after 10m, assuming success: gghgg1/polymarket-5m-crypto
-✓ Upload success gghgg1/polymarket-5m-crypto, pruning hive after verified ready...
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110701417.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110426771.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110942744.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110520464.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110822127.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110580804.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110460360.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110761851.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788111000152.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110641080.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788110882457.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110942768.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110761876.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110701447.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110426791.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110882482.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110520487.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110580832.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110641106.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110822152.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788111000184.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788110460245.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788111000280.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110426848.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110822241.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110942840.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110580903.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110761949.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110641180.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110460302.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110520576.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110701595.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788110882553.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110701666.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110426886.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110761997.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110641228.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110942889.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110822306.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110580951.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110882607.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788111000344.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110520636.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788110460338.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110701631.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110460320.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110882580.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110641204.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110761973.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110822278.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110942864.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788111000313.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110426867.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110580927.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788110520602.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110426810.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110822184.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110882505.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110701484.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110520509.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110580855.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110761900.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110942792.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110460265.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788110641130.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788111000215.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110460284.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110641155.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110761925.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110701538.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110942817.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110882529.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110426829.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110822211.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788111000247.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110580880.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788110520531.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=BTC/book_events_1788110641366.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=ETH/book_events_1788110641388.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=ETH/book_events_1788110701765.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=BNB/book_events_1788110701772.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=BNB/book_events_1788110641386.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=DOGE/book_events_1788110641372.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=DOGE/book_events_1788110701782.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=SOL/book_events_1788110641381.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=SOL/book_events_1788110701767.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=HYPE/book_events_1788110641383.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-06/asset=HYPE/book_events_1788110701769.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110943050.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110520704.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110426934.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110822351.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110882713.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110762065.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110581024.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788111000441.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110641374.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788110701760.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110942951.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110520724.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110581027.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110641296.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110822393.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110882655.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788111000424.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110426937.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110762067.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788110701775.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110520708.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110701736.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110641307.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110822429.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110460426.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788111000381.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110762088.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110426956.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110942955.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110581031.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788110882664.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110460428.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110581033.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110762100.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110822382.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110641310.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110942958.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110701779.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788111000385.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110882720.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788110426943.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110882716.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110641377.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110701762.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110460439.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110943011.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788111000383.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110426958.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110520726.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110822380.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788110581053.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110943061.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110701784.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110641299.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110520734.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110426939.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110882661.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110822353.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788111000376.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788110581029.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110520779.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788111000378.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110943052.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110641303.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110426941.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110701777.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110460424.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788110822355.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=BTC/book_events_1788110460395.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=ETH/book_events_1788110426961.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=ETH/book_events_1788110520715.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=ETH/book_events_1788110460401.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=BNB/book_events_1788110520730.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=BNB/book_events_1788110460434.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=DOGE/book_events_1788110426954.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=DOGE/book_events_1788110460445.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=DOGE/book_events_1788110520732.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=SOL/book_events_1788110460441.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=SOL/book_events_1788110520719.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=HYPE/book_events_1788110426964.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=HYPE/book_events_1788110520728.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-04/asset=HYPE/book_events_1788110460443.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=BTC/book_events_1788110943054.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=BTC/book_events_1788111000444.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=ETH/book_events_1788111000429.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=ETH/book_events_1788110943020.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=BNB/book_events_1788111000439.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=BNB/book_events_1788110943031.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=DOGE/book_events_1788110943063.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=DOGE/book_events_1788111000426.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=XRP/book_events_1788111000405.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=XRP/book_events_1788110943065.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=SOL/book_events_1788111000433.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=SOL/book_events_1788110943056.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=HYPE/book_events_1788111000436.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-09/asset=HYPE/book_events_1788110943059.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=BTC/book_events_1788110581036.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=ETH/book_events_1788110520742.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=ETH/book_events_1788110581038.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=BNB/book_events_1788110520758.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=BNB/book_events_1788110581047.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=DOGE/book_events_1788110520772.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=DOGE/book_events_1788110581050.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=XRP/book_events_1788110641329.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=XRP/book_events_1788110581045.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=XRP/book_events_1788110520764.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=SOL/book_events_1788110581041.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=SOL/book_events_1788110641325.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-05/asset=HYPE/book_events_1788110581043.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BTC/book_events_1788110822365.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BTC/book_events_1788110701789.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BTC/book_events_1788110762091.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=ETH/book_events_1788110762093.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=ETH/book_events_1788110701796.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=ETH/book_events_1788110822385.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BNB/book_events_1788110762083.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BNB/book_events_1788110822376.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=BNB/book_events_1788110701812.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=DOGE/book_events_1788110762098.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=DOGE/book_events_1788110701823.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=XRP/book_events_1788110762086.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=XRP/book_events_1788110822391.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=SOL/book_events_1788110762079.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=SOL/book_events_1788110822387.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=HYPE/book_events_1788110762081.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=HYPE/book_events_1788110701806.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-07/asset=HYPE/book_events_1788110822371.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=BTC/book_events_1788111000450.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=ETH/book_events_1788111000455.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=BNB/book_events_1788111000469.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=DOGE/book_events_1788111000477.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=SOL/book_events_1788111000459.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-10/asset=HYPE/book_events_1788111000463.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=BTC/book_events_1788110822432.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=BTC/book_events_1788110882707.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=ETH/book_events_1788110882675.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=BNB/book_events_1788110882718.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=BNB/book_events_1788110822410.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=DOGE/book_events_1788110822417.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=DOGE/book_events_1788110882703.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=XRP/book_events_1788110822414.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=XRP/book_events_1788110942997.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=XRP/book_events_1788110882709.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=SOL/book_events_1788110882685.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=SOL/book_events_1788110822401.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=HYPE/book_events_1788110942985.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=1788-11-08/asset=HYPE/book_events_1788110882692.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=BTC/trades_1788110701681.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=BTC/trades_1788110641335.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=ETH/trades_1788110641379.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=ETH/trades_1788110701745.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=BNB/trades_1788110701752.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=BNB/trades_1788110641338.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=DOGE/trades_1788110641347.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=DOGE/trades_1788110701699.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=XRP/trades_1788110641363.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=XRP/trades_1788110701754.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=SOL/trades_1788110701687.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=SOL/trades_1788110641368.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=HYPE/trades_1788110701692.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-06/asset=HYPE/trades_1788110641370.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110641280.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110882634.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110581006.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788111000359.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110942928.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110460381.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110701757.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110822333.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110426916.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110762048.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788110520683.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110581009.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788111000362.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110641314.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110460430.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110520688.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110882639.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110822336.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110426918.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110701739.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110762070.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788110942932.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110460387.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110822360.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110762058.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110701727.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110520695.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110641284.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110581015.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110882646.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110426926.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788111000371.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788110942940.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110460391.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110641292.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110822349.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110701733.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110882651.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788111000421.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110581020.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110942944.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110762063.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110426932.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788110520702.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110426928.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110581018.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110942963.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110822346.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788111000373.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110701730.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110460422.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110641288.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110882649.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110520697.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788110762060.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110641322.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110701721.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788111000365.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110942936.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110581011.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110460383.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110762053.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110520711.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110822339.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110426920.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788110882641.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110701742.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110882644.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110426924.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110822341.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110762055.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788111000368.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110520693.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110641318.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110581013.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110460432.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788110942966.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BTC/trades_1788110460420.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BTC/trades_1788110520669.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BTC/trades_1788110426899.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=ETH/trades_1788110426948.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=ETH/trades_1788110520713.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=ETH/trades_1788110460397.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BNB/trades_1788110460411.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BNB/trades_1788110520671.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=BNB/trades_1788110426952.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=DOGE/trades_1788110460437.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=DOGE/trades_1788110520675.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=DOGE/trades_1788110426906.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=XRP/trades_1788110460414.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=XRP/trades_1788110520673.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=XRP/trades_1788110426904.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=SOL/trades_1788110426950.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=SOL/trades_1788110460403.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=SOL/trades_1788110520717.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=HYPE/trades_1788110520722.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=HYPE/trades_1788110460407.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-04/asset=HYPE/trades_1788110426902.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=BTC/trades_1788111000388.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=BTC/trades_1788110943042.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=ETH/trades_1788110943044.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=ETH/trades_1788111000392.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=BNB/trades_1788110943029.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=BNB/trades_1788111000399.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=DOGE/trades_1788111000419.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=DOGE/trades_1788110943038.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=XRP/trades_1788110943034.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=XRP/trades_1788111000417.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=SOL/trades_1788111000412.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=SOL/trades_1788110943046.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=HYPE/trades_1788111000414.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-09/asset=HYPE/trades_1788110943025.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BTC/trades_1788110641242.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BTC/trades_1788110520737.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BTC/trades_1788110580976.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=ETH/trades_1788110580978.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=ETH/trades_1788110520740.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=ETH/trades_1788110641244.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BNB/trades_1788110520753.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BNB/trades_1788110641248.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=BNB/trades_1788110580984.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=DOGE/trades_1788110580990.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=DOGE/trades_1788110520767.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=DOGE/trades_1788110641252.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=XRP/trades_1788110580988.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=XRP/trades_1788110641250.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=XRP/trades_1788110520761.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=SOL/trades_1788110641246.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=SOL/trades_1788110580980.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=SOL/trades_1788110520744.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=HYPE/trades_1788110641332.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=HYPE/trades_1788110580982.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-05/asset=HYPE/trades_1788110520749.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=BTC/trades_1788110822363.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=BTC/trades_1788110762072.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=ETH/trades_1788110762013.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=ETH/trades_1788110701791.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=ETH/trades_1788110822378.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=BNB/trades_1788110822373.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=BNB/trades_1788110701808.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=BNB/trades_1788110762022.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=DOGE/trades_1788110762096.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=DOGE/trades_1788110822291.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=DOGE/trades_1788110701819.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=XRP/trades_1788110762026.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=XRP/trades_1788110822259.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=XRP/trades_1788110701815.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=SOL/trades_1788110822369.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=SOL/trades_1788110762074.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=SOL/trades_1788110701798.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=HYPE/trades_1788110701802.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=HYPE/trades_1788110822389.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-07/asset=HYPE/trades_1788110762018.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=BTC/trades_1788111000446.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=ETH/trades_1788111000452.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=BNB/trades_1788111000466.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=DOGE/trades_1788111000473.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=XRP/trades_1788111000471.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-10/asset=HYPE/trades_1788111000461.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BTC/trades_1788110942969.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BTC/trades_1788110822421.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BTC/trades_1788110882666.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=ETH/trades_1788110822398.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=ETH/trades_1788110882670.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=ETH/trades_1788110943008.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BNB/trades_1788110942988.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BNB/trades_1788110882694.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=BNB/trades_1788110822434.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=DOGE/trades_1788110943000.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=DOGE/trades_1788110882699.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=DOGE/trades_1788110822427.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=XRP/trades_1788110882711.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=XRP/trades_1788110822425.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=XRP/trades_1788110942992.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=SOL/trades_1788110822423.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=SOL/trades_1788110882679.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=SOL/trades_1788110942975.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=HYPE/trades_1788110942980.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=HYPE/trades_1788110822404.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-08/asset=HYPE/trades_1788110882687.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=BTC/chainlink_events_1788110641353.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=BTC/chainlink_events_1788110701684.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=ETH/chainlink_events_1788110641355.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=ETH/chainlink_events_1788110701747.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=BNB/chainlink_events_1788110701694.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=BNB/chainlink_events_1788110641341.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=DOGE/chainlink_events_1788110641350.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=DOGE/chainlink_events_1788110701701.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=XRP/chainlink_events_1788110701697.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=XRP/chainlink_events_1788110641344.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=SOL/chainlink_events_1788110701689.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=SOL/chainlink_events_1788110641358.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=HYPE/chainlink_events_1788110641361.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-06/asset=HYPE/chainlink_events_1788110701749.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110581022.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788111000131.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110882637.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110942906.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110822320.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110762051.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110460351.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110426908.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110641255.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110701718.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788110520686.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110882622.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110762034.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110641258.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788111000167.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110942909.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110460372.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110701704.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110822324.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110426910.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110580993.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788110520677.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110426946.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110520679.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110581000.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110641269.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110942920.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110701710.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110460377.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110762041.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110882627.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788110822358.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788111000262.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110762046.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110426914.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110701715.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110822331.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110942948.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110882632.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788111000328.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110520682.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110460379.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110641277.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788110581004.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110460390.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110882629.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788111000296.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110822329.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110426930.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110762044.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110942924.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110581002.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110701713.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110641273.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788110520700.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110520691.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110701724.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110822326.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110942913.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110460375.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788111000199.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110426922.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110762036.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110641262.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110580995.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788110882659.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110460385.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110426912.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110701707.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110520707.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110882624.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110580997.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110762039.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110822344.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110641265.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788110942916.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788111000230.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BTC/chainlink_events_1788110426762.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BTC/chainlink_events_1788110460393.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BTC/chainlink_events_1788110520654.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=ETH/chainlink_events_1788110460399.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=ETH/chainlink_events_1788110426784.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=ETH/chainlink_events_1788110520657.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BNB/chainlink_events_1788110426842.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BNB/chainlink_events_1788110520663.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=BNB/chainlink_events_1788110460413.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=DOGE/chainlink_events_1788110520667.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=DOGE/chainlink_events_1788110426880.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=DOGE/chainlink_events_1788110460416.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=XRP/chainlink_events_1788110460418.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=XRP/chainlink_events_1788110520665.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=XRP/chainlink_events_1788110426861.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=SOL/chainlink_events_1788110426804.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=SOL/chainlink_events_1788110520660.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=SOL/chainlink_events_1788110460405.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=HYPE/chainlink_events_1788110460409.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=HYPE/chainlink_events_1788110426823.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-04/asset=HYPE/chainlink_events_1788110520662.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=BTC/chainlink_events_1788110943015.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=BTC/chainlink_events_1788111000390.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=ETH/chainlink_events_1788110943017.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=ETH/chainlink_events_1788111000395.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=BNB/chainlink_events_1788111000401.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=BNB/chainlink_events_1788110943048.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=DOGE/chainlink_events_1788110943040.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=DOGE/chainlink_events_1788111000408.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=XRP/chainlink_events_1788111000404.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=XRP/chainlink_events_1788110943036.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=SOL/chainlink_events_1788110943023.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=SOL/chainlink_events_1788111000397.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=HYPE/chainlink_events_1788111000410.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-09/asset=HYPE/chainlink_events_1788110943027.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BTC/chainlink_events_1788110641068.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BTC/chainlink_events_1788110520739.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BTC/chainlink_events_1788110580964.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=ETH/chainlink_events_1788110580966.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=ETH/chainlink_events_1788110520774.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=ETH/chainlink_events_1788110641093.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BNB/chainlink_events_1788110641168.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BNB/chainlink_events_1788110520756.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=BNB/chainlink_events_1788110580986.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=DOGE/chainlink_events_1788110641217.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=DOGE/chainlink_events_1788110520770.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=DOGE/chainlink_events_1788110580974.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=XRP/chainlink_events_1788110580972.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=XRP/chainlink_events_1788110520776.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=XRP/chainlink_events_1788110641193.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=SOL/chainlink_events_1788110520747.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=SOL/chainlink_events_1788110580969.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=SOL/chainlink_events_1788110641119.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=HYPE/chainlink_events_1788110520751.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=HYPE/chainlink_events_1788110580970.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-05/asset=HYPE/chainlink_events_1788110641143.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BTC/chainlink_events_1788110701787.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BTC/chainlink_events_1788110822113.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BTC/chainlink_events_1788110762010.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=ETH/chainlink_events_1788110762015.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=ETH/chainlink_events_1788110701794.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=ETH/chainlink_events_1788110822367.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BNB/chainlink_events_1788110822225.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BNB/chainlink_events_1788110762024.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=BNB/chainlink_events_1788110701810.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=DOGE/chainlink_events_1788110762031.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=DOGE/chainlink_events_1788110822294.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=DOGE/chainlink_events_1788110701821.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=XRP/chainlink_events_1788110762029.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=XRP/chainlink_events_1788110701817.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=XRP/chainlink_events_1788110822263.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=SOL/chainlink_events_1788110822168.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=SOL/chainlink_events_1788110762077.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=SOL/chainlink_events_1788110701800.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=HYPE/chainlink_events_1788110701804.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=HYPE/chainlink_events_1788110822198.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-07/asset=HYPE/chainlink_events_1788110762020.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-10/asset=BTC/chainlink_events_1788111000448.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-10/asset=ETH/chainlink_events_1788111000454.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-10/asset=BNB/chainlink_events_1788111000467.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-10/asset=DOGE/chainlink_events_1788111000475.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-10/asset=SOL/chainlink_events_1788111000457.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BTC/chainlink_events_1788110942972.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BTC/chainlink_events_1788110882669.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BTC/chainlink_events_1788110822396.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=ETH/chainlink_events_1788110882673.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=ETH/chainlink_events_1788110822420.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=ETH/chainlink_events_1788110943005.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BNB/chainlink_events_1788110822408.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BNB/chainlink_events_1788110882697.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=BNB/chainlink_events_1788110942990.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=DOGE/chainlink_events_1788110882701.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=DOGE/chainlink_events_1788110943003.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=DOGE/chainlink_events_1788110822416.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=XRP/chainlink_events_1788110942995.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=XRP/chainlink_events_1788110822412.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=XRP/chainlink_events_1788110882705.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=SOL/chainlink_events_1788110882682.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=SOL/chainlink_events_1788110822400.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=SOL/chainlink_events_1788110942977.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=HYPE/chainlink_events_1788110882690.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=HYPE/chainlink_events_1788110942982.parquet (cutoff 1788111529138)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-08/asset=HYPE/chainlink_events_1788110822406.parquet (cutoff 1788111529138)
-[test-kaggle:t10min] test-buffer prune (120s) extra: {'book_snapshots_500ms': 77, 'book_events': 158, 'trades': 194, 'chainlink_events': 194} — closed markets only, open window kept
-[test-kaggle:t10min] WARN staging files 28 != expected 31 (one-file-per-asset)
-[analyse] date=2026-08-30 start_ms=1788110400000 num_markets=4 window=300 -> test_analysis_t10min.json
-[analyse] book_snapshots_500ms: 0 rows in 0 files, exists=True
-[analyse] book_snapshots_clean: 0 rows in 0 files, exists=True
-[analyse] book_events: 0 rows in 0 files, exists=True
-[analyse] trades: 0 rows in 0 files, exists=True
-[analyse] chainlink_events: 0 rows in 0 files, exists=True
-[analyse] collector_events: 0 rows in 0 files, exists=True
-[analyse] markets_log: 0 rows in 0 files, exists=True
-[analyse] markets_latest: 21 rows in 1 files, exists=True
-[analyse] resync_episodes: 0 rows in 0 files, exists=True
-[analyse] wrote /home/fese/polymarket-collector/data/test_analysis_t10min.json completeness 0.0% clean 0.0% loss 100.0%
-[test-kaggle:t10min] interim completeness 0.0% clean 0.0%
-[test-mode:real] 600s elapsed, windows per asset: {'BTC': [5960368, 5960369, 5960370], 'ETH': [5960368, 5960369, 5960370], 'SOL': [5960368, 5960369, 5960370], 'HYPE': [5960368, 5960369, 5960370], 'BNB': [5960368, 5960369, 5960370], 'XRP': [5960368, 5960369, 5960370], 'DOGE': [5960368, 5960369, 5960370]}, timeout 1290s, kaggle 1 uploads
-[flush] 13 rows
-[test-mode:real] 1263s elapsed, windows per asset: {'BTC': [5960368, 5960369, 5960370], 'ETH': [5960368, 5960369, 5960370], 'SOL': [5960368, 5960369, 5960370], 'HYPE': [5960368, 5960369, 5960370], 'BNB': [5960368, 5960369, 5960370], 'XRP': [5960368, 5960369, 5960370], 'DOGE': [5960368, 5960369, 5960370]}, timeout 1290s, kaggle 1 uploads
-[test-mode:real] 1293s elapsed, windows per asset: {'BTC': [5960368, 5960369, 5960370], 'ETH': [5960368, 5960369, 5960370], 'SOL': [5960368, 5960369, 5960370], 'HYPE': [5960368, 5960369, 5960370], 'BNB': [5960368, 5960369, 5960370], 'XRP': [5960368, 5960369, 5960370], 'DOGE': [5960368, 5960369, 5960370]}, timeout 1290s, kaggle 1 uploads
-[test-mode:real] timeout 1290s reached, stopping with progress {'BTC': {5960368, 5960369, 5960370}, 'ETH': {5960368, 5960369, 5960370}, 'SOL': {5960368, 5960369, 5960370}, 'HYPE': {5960368, 5960369, 5960370}, 'BNB': {5960368, 5960369, 5960370}, 'XRP': {5960368, 5960369, 5960370}, 'DOGE': {5960368, 5960369, 5960370}}
-[test-mode:real] flushed 0 rows
-[test-mode:real] compacted markets_latest -> /home/fese/polymarket-collector/data/markets_latest/markets_latest.parquet
-[test-mode] final kaggle check: since_last=40s uploads=1/2 → uploading final
-[test-kaggle:final] compacted /home/fese/polymarket-collector/data/markets_latest/markets_latest.parquet
-[test-kaggle:final] clean_view rows 0
-✓ Kaggle API credentials found in /home/fese/.kaggle/kaggle.json
-=== Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE'] -> /home/fese/polymarket-collector/data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto ===
-staging prepared: 28 files, dataset gghgg1/polymarket-5m-crypto
-=== Step 2: Uploading 5m staging to Kaggle gghgg1/polymarket-5m-crypto ===
-Starting upload for file HYPE_book_snapshots_500ms.parquet
-  0%|          | 0.00/65.0k [00:00<?, ?B/s]100%|██████████| 65.0k/65.0k [00:00<00:00, 136kB/s]
-Upload successful: HYPE_book_snapshots_500ms.parquet (65KB)
-Starting upload for file BTC_chainlink_events.parquet
-  0%|          | 0.00/6.24k [00:00<?, ?B/s]100%|██████████| 6.24k/6.24k [00:00<00:00, 15.9kB/s]
-Upload successful: BTC_chainlink_events.parquet (6KB)
-Starting upload for file SOL_trades.parquet
-  0%|          | 0.00/7.57k [00:00<?, ?B/s]100%|██████████| 7.57k/7.57k [00:00<00:00, 8.35kB/s]
-Upload successful: SOL_trades.parquet (8KB)
-Starting upload for file BTC_trades.parquet
-  0%|          | 0.00/7.16k [00:00<?, ?B/s]100%|██████████| 7.16k/7.16k [00:00<00:00, 18.6kB/s]
-Upload successful: BTC_trades.parquet (7KB)
-Starting upload for file ETH_trades.parquet
-  0%|          | 0.00/7.53k [00:00<?, ?B/s]100%|██████████| 7.53k/7.53k [00:00<00:00, 19.7kB/s]
-Upload successful: ETH_trades.parquet (8KB)
-Starting upload for file XRP_book_events.parquet
-  0%|          | 0.00/7.37k [00:00<?, ?B/s]100%|██████████| 7.37k/7.37k [00:00<00:00, 8.67kB/s]
-Upload successful: XRP_book_events.parquet (7KB)
-Starting upload for file HYPE_chainlink_events.parquet
-  0%|          | 0.00/5.49k [00:00<?, ?B/s]100%|██████████| 5.49k/5.49k [00:00<00:00, 14.3kB/s]
-Upload successful: HYPE_chainlink_events.parquet (5KB)
-Starting upload for file DOGE_book_events.parquet
-  0%|          | 0.00/7.42k [00:00<?, ?B/s]100%|██████████| 7.42k/7.42k [00:00<00:00, 17.8kB/s]
-Upload successful: DOGE_book_events.parquet (7KB)
-Starting upload for file HYPE_trades.parquet
-  0%|          | 0.00/7.42k [00:00<?, ?B/s]100%|██████████| 7.42k/7.42k [00:00<00:00, 20.1kB/s]
-Upload successful: HYPE_trades.parquet (7KB)
-Starting upload for file ETH_chainlink_events.parquet
-  0%|          | 0.00/6.14k [00:00<?, ?B/s]100%|██████████| 6.14k/6.14k [00:00<00:00, 16.2kB/s]
-Upload successful: ETH_chainlink_events.parquet (6KB)
-Starting upload for file XRP_chainlink_events.parquet
-  0%|          | 0.00/5.49k [00:00<?, ?B/s]100%|██████████| 5.49k/5.49k [00:00<00:00, 6.37kB/s]
-Upload successful: XRP_chainlink_events.parquet (5KB)
-Starting upload for file BNB_book_events.parquet
-  0%|          | 0.00/7.25k [00:00<?, ?B/s]100%|██████████| 7.25k/7.25k [00:00<00:00, 18.4kB/s]
-Upload successful: BNB_book_events.parquet (7KB)
-Starting upload for file XRP_book_snapshots_500ms.parquet
-  0%|          | 0.00/64.2k [00:00<?, ?B/s]100%|██████████| 64.2k/64.2k [00:00<00:00, 141kB/s]
-Upload successful: XRP_book_snapshots_500ms.parquet (64KB)
-Starting upload for file BTC_book_snapshots_500ms.parquet
-  0%|          | 0.00/66.2k [00:00<?, ?B/s]100%|██████████| 66.2k/66.2k [00:00<00:00, 72.7kB/s]
-Upload successful: BTC_book_snapshots_500ms.parquet (66KB)
-Starting upload for file DOGE_chainlink_events.parquet
-  0%|          | 0.00/5.45k [00:00<?, ?B/s]100%|██████████| 5.45k/5.45k [00:00<00:00, 14.2kB/s]
-Upload successful: DOGE_chainlink_events.parquet (5KB)
-Starting upload for file ETH_book_snapshots_500ms.parquet
-  0%|          | 0.00/66.2k [00:00<?, ?B/s]100%|██████████| 66.2k/66.2k [00:00<00:00, 149kB/s]
-Upload successful: ETH_book_snapshots_500ms.parquet (66KB)
-Starting upload for file XRP_trades.parquet
-  0%|          | 0.00/7.34k [00:00<?, ?B/s]100%|██████████| 7.34k/7.34k [00:00<00:00, 19.4kB/s]
-Upload successful: XRP_trades.parquet (7KB)
-Starting upload for file DOGE_trades.parquet
-  0%|          | 0.00/7.56k [00:00<?, ?B/s]100%|██████████| 7.56k/7.56k [00:00<00:00, 20.2kB/s]
-Upload successful: DOGE_trades.parquet (8KB)
-Starting upload for file BNB_chainlink_events.parquet
-  0%|          | 0.00/5.85k [00:00<?, ?B/s]100%|██████████| 5.85k/5.85k [00:00<00:00, 15.5kB/s]
-Upload successful: BNB_chainlink_events.parquet (6KB)
-Starting upload for file BNB_book_snapshots_500ms.parquet
-  0%|          | 0.00/65.8k [00:00<?, ?B/s]100%|██████████| 65.8k/65.8k [00:00<00:00, 145kB/s]
-Upload successful: BNB_book_snapshots_500ms.parquet (66KB)
-Starting upload for file BNB_trades.parquet
-  0%|          | 0.00/7.48k [00:00<?, ?B/s]100%|██████████| 7.48k/7.48k [00:00<00:00, 17.9kB/s]
-Upload successful: BNB_trades.parquet (7KB)
-Starting upload for file HYPE_book_events.parquet
-  0%|          | 0.00/7.38k [00:00<?, ?B/s]100%|██████████| 7.38k/7.38k [00:00<00:00, 19.6kB/s]
-Upload successful: HYPE_book_events.parquet (7KB)
-Starting upload for file BTC_book_events.parquet
-  0%|          | 0.00/7.29k [00:00<?, ?B/s]100%|██████████| 7.29k/7.29k [00:00<00:00, 19.0kB/s]
-Upload successful: BTC_book_events.parquet (7KB)
-Starting upload for file SOL_book_snapshots_500ms.parquet
-  0%|          | 0.00/66.1k [00:00<?, ?B/s]100%|██████████| 66.1k/66.1k [00:00<00:00, 150kB/s]
-Upload successful: SOL_book_snapshots_500ms.parquet (66KB)
-Starting upload for file SOL_book_events.parquet
-  0%|          | 0.00/7.41k [00:00<?, ?B/s]100%|██████████| 7.41k/7.41k [00:00<00:00, 19.9kB/s]
-Upload successful: SOL_book_events.parquet (7KB)
-Starting upload for file ETH_book_events.parquet
-  0%|          | 0.00/7.29k [00:00<?, ?B/s]100%|██████████| 7.29k/7.29k [00:00<00:00, 18.8kB/s]
-Upload successful: ETH_book_events.parquet (7KB)
-Starting upload for file SOL_chainlink_events.parquet
-  0%|          | 0.00/5.81k [00:00<?, ?B/s]100%|██████████| 5.81k/5.81k [00:00<00:00, 14.9kB/s]
-Upload successful: SOL_chainlink_events.parquet (6KB)
-Starting upload for file DOGE_book_snapshots_500ms.parquet
-  0%|          | 0.00/65.7k [00:00<?, ?B/s]100%|██████████| 65.7k/65.7k [00:00<00:00, 148kB/s]
-Upload successful: DOGE_book_snapshots_500ms.parquet (66KB)
-⚠ Kaggle dataset_status not ready after 10m, assuming success: gghgg1/polymarket-5m-crypto
-✓ Upload success gghgg1/polymarket-5m-crypto, pruning hive after verified ready...
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788111653268.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788111653287.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BTC/book_snapshots_500ms_1788111693285.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788111653301.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=ETH/book_snapshots_500ms_1788111693308.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788111653343.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=BNB/book_snapshots_500ms_1788111693377.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788111653369.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=DOGE/book_snapshots_500ms_1788111693423.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788111653356.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=XRP/book_snapshots_500ms_1788111693401.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788111653315.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=SOL/book_snapshots_500ms_1788111693331.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788111693354.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_snapshots_500ms/date=2026-08-30/asset=HYPE/book_snapshots_500ms_1788111653328.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BTC/book_events_1788111693456.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=ETH/book_events_1788111693496.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=BNB/book_events_1788111693498.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=DOGE/book_events_1788111693487.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=XRP/book_events_1788111693464.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=SOL/book_events_1788111693459.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/book_events/date=2026-08-30/asset=HYPE/book_events_1788111693461.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BTC/trades_1788111693447.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=ETH/trades_1788111693440.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=BNB/trades_1788111693452.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=DOGE/trades_1788111693445.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=XRP/trades_1788111693454.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=SOL/trades_1788111693449.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=2026-08-30/asset=HYPE/trades_1788111693442.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=BTC/trades_1788111693489.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=ETH/trades_1788111693473.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=BNB/trades_1788111693479.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=DOGE/trades_1788111693481.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=XRP/trades_1788111693493.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=SOL/trades_1788111693491.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/trades/date=1788-11-16/asset=HYPE/trades_1788111693475.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BTC/chainlink_events_1788111693437.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=ETH/chainlink_events_1788111693298.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=BNB/chainlink_events_1788111693368.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=DOGE/chainlink_events_1788111693414.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=XRP/chainlink_events_1788111693391.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=SOL/chainlink_events_1788111693321.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=2026-08-30/asset=HYPE/chainlink_events_1788111693345.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=BTC/chainlink_events_1788111693466.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=ETH/chainlink_events_1788111693468.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=BNB/chainlink_events_1788111693485.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=DOGE/chainlink_events_1788111693471.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=XRP/chainlink_events_1788111693470.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=SOL/chainlink_events_1788111693484.parquet (cutoff 1788112209341)
-pruned verified hive: /home/fese/polymarket-collector/data/chainlink_events/date=1788-11-16/asset=HYPE/chainlink_events_1788111693477.parquet (cutoff 1788112209341)
-[test-kaggle:final] test-buffer prune (120s) extra: {'book_snapshots_500ms': 15, 'book_events': 7, 'trades': 14, 'chainlink_events': 14} — closed markets only, open window kept
-[test-kaggle:final] WARN staging files 28 != expected 31 (one-file-per-asset)
-[analyse] date=2026-08-30 start_ms=1788110400000 num_markets=4 window=300 -> test_analysis_final.json
-[analyse] book_snapshots_500ms: 0 rows in 0 files, exists=True
-[analyse] book_snapshots_clean: 0 rows in 0 files, exists=True
-[analyse] book_events: 0 rows in 0 files, exists=True
-[analyse] trades: 0 rows in 0 files, exists=True
-[analyse] chainlink_events: 0 rows in 0 files, exists=True
-[analyse] collector_events: 0 rows in 0 files, exists=True
-[analyse] markets_log: 0 rows in 0 files, exists=True
-[analyse] markets_latest: 28 rows in 1 files, exists=True
-[analyse] resync_episodes: 0 rows in 0 files, exists=True
-[analyse] wrote /home/fese/polymarket-collector/data/test_analysis_final.json completeness 0.0% clean 0.0% loss 100.0%
-[test-kaggle:final] interim completeness 0.0% clean 0.0%
-[analyse] date=2026-08-30 start_ms=1788110400000 num_markets=4 window=300 -> test_analysis.json
-[analyse] book_snapshots_500ms: 0 rows in 0 files, exists=True
-[analyse] book_snapshots_clean: 0 rows in 0 files, exists=True
-[analyse] book_events: 0 rows in 0 files, exists=True
-[analyse] trades: 0 rows in 0 files, exists=True
-[analyse] chainlink_events: 0 rows in 0 files, exists=True
-[analyse] collector_events: 0 rows in 0 files, exists=True
-[analyse] markets_log: 0 rows in 0 files, exists=True
-[analyse] markets_latest: 28 rows in 1 files, exists=True
-[analyse] resync_episodes: 0 rows in 0 files, exists=True
-[analyse] wrote /home/fese/polymarket-collector/data/test_analysis.json completeness 0.0% clean 0.0% loss 100.0%
-test mode completed — data in /home/fese/polymarket-collector/data

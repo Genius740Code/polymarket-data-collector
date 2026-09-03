@@ -981,9 +981,16 @@ class Collector:
                 now_ms = int(time.time() * 1000)
                 bucket = (now_ms // 500) * 500
                 _tick += 1
-                # Emit snapshot per active market
+                # Emit snapshot per active market — only if bucket within [market_start, market_end)
+                # This prevents double-writing for next market before its start (was causing 2x duplication)
                 for asset in self.config.assets:
                     for m in self.rollover.active_markets(asset):
+                        # Time-gate: only snapshot if bucket is within this market's window
+                        try:
+                            if bucket < m.market_start_ts_ms or bucket >= m.market_end_ts_ms:
+                                continue
+                        except Exception:
+                            pass
                         book = self.books.get(m.condition_id)
                         if book is None:
                             try:

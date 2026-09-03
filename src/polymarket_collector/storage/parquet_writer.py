@@ -103,13 +103,8 @@ class ParquetWriter:
                 if self.on_event:
                     self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
                 return True
-            # reserve key immediately to prevent duplicate WAL entries under concurrency
-            self._seen_keys[dataset].add(dedup_key)
-            if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
-                keys = list(self._seen_keys[dataset])
-                evict_count = len(keys) // 2
-                for k in keys[:evict_count]:
-                    self._seen_keys[dataset].discard(k)
+# reserve key immediately to prevent duplicate WAL entries under concurrency
+        self._seen_keys[dataset].add(dedup_key)
             # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
             # caller will retry with same key and be deduped — this is idempotent and prevents duplicate WAL.
 
@@ -521,23 +516,34 @@ class ParquetWriter:
                         if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
                             nr[fld] = None
                 else:
+                    # Only fill placeholders for datasets where the field is REQUIRED (not nullable)
+                    # — never inject test-condition into collector_events where condition_id is nullable (§8)
+                    schema = SCHEMAS.get(dataset)
                     for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
-                        if fld in (SCHEMAS.get(dataset).names if SCHEMAS.get(dataset) else []) or fld in nr:
-                            if nr.get(fld) is None:
-                                if fld == "condition_id":
-                                    nr[fld] = nr.get("condition_id") or "test-condition"
-                                elif fld == "market_id":
-                                    nr[fld] = nr.get("market_id") or "test-market"
-                                elif fld == "series_id":
-                                    nr[fld] = nr.get("series_id") or "TEST-5MIN"
-                                elif fld == "asset":
-                                    nr[fld] = nr.get("asset") or (asset or "BTC")
-                                elif fld == "trade_id":
-                                    nr[fld] = nr.get("trade_id") or str(uuid.uuid4())
-                                elif fld == "event_id":
-                                    nr[fld] = nr.get("event_id") or str(uuid.uuid4())
-                                elif fld == "resync_id":
-                                    nr[fld] = nr.get("resync_id") or str(uuid.uuid4())
+                        # Check if this field exists in schema and is required
+                        is_required = False
+                        if schema is not None:
+                            try:
+                                field = schema.field(fld)
+                                is_required = not field.nullable
+                            except Exception:
+                                is_required = False
+                        # Only auto-fill if required; nullable fields stay None (no fake test-condition)
+                        if is_required and nr.get(fld) is None:
+                            if fld == "condition_id":
+                                nr[fld] = "test-condition"
+                            elif fld == "market_id":
+                                nr[fld] = "test-market"
+                            elif fld == "series_id":
+                                nr[fld] = "TEST-5MIN"
+                            elif fld == "asset":
+                                nr[fld] = asset or "BTC"
+                            elif fld == "trade_id":
+                                nr[fld] = str(uuid.uuid4())
+                            elif fld == "event_id":
+                                nr[fld] = str(uuid.uuid4())
+                            elif fld == "resync_id":
+                                nr[fld] = str(uuid.uuid4())
         except Exception:
             pass
         # sort rows by time then condition_id before writing (time first, condition_id second)

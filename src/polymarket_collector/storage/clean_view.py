@@ -1,7 +1,8 @@
 """Canonical clean view for research — §9B.
 
 book_snapshots_clean = SELECT * FROM book_snapshots_500ms WHERE book_state='live'
-  AND condition_id NOT IN (markets with resolution_outcome in disputed/unknown)
+  AND condition_id NOT IN (markets with resolution_outcome in disputed)
+  — unknown is NOT excluded (active markets are unknown until resolved; excluding would make clean 0% during live)
 
 This is the default read path for backtests; querying book_snapshots_500ms
 directly includes stale/resyncing intentionally.
@@ -37,13 +38,14 @@ def build_clean_view(
     if not src_root.exists():
         return 0
 
-    # load disputed/unknown condition_ids from markets_latest
+    # load disputed condition_ids from markets_latest — §9B clean view excludes only disputed
+    # (unknown is normal for active markets and must NOT be excluded, otherwise clean is 0% during live collection)
     excluded: set[str] = set()
     if latest_path.exists() and not opt_in_disputed:
         try:
             tbl = pq.read_table(str(latest_path))
             for row in tbl.to_pylist():
-                if row.get("resolution_outcome") in ("disputed", "unknown"):
+                if row.get("resolution_outcome") in ("disputed",):
                     cid = row.get("condition_id")
                     if cid:
                         excluded.add(cid)
