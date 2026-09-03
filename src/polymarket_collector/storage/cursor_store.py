@@ -149,6 +149,20 @@ class CursorStore:
         finally:
             conn.close()
 
+    def sync(self) -> None:
+        """Compatibility alias — flush durable state. SQLite is synchronous on save(),
+        so this is a no-op checkpoint that ensures WAL is checkpointed if needed."""
+        if self.wal_mode:
+            try:
+                conn = self._connect()
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
     # -- factory helpers (§1B concurrency spec) -----------------------------
     @classmethod
     def for_asset(cls, config, asset: str) -> "CursorStore":

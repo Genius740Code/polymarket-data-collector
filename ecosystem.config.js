@@ -86,18 +86,18 @@ module.exports = {
     // Disabled by default; enable by setting `cron_restart` or run manually:
     //   .venv/bin/polymarket-compact --data-dir ./data
     //
-    // {
-    //   name: 'polymarket-compact',
-    //   cwd,
-    //   script: python,
-    //   args: '-m polymarket_collector.storage.compaction --data-dir ./data',
-    //   interpreter: 'none',
-    //   exec_mode: 'fork',
-    //   autorestart: false,
-    //   cron_restart: '0 3 * * *',   // 03:00 UTC daily
-    //   time: true,
-    //   out_file: path.join(cwd, 'logs', 'compact-out.log'),
-    //   error_file: path.join(cwd, 'logs', 'compact-error.log'),
-    // },
+    {
+      name: 'polymarket-compact',
+      cwd,
+      script: python,
+      args: '-m polymarket_collector.storage.compaction --data-dir ./data',
+      interpreter: 'none',
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '0 3 * * *',   // 03:00 UTC daily
+      time: true,
+      out_file: path.join(cwd, 'logs', 'compact-out.log'),
+      error_file: path.join(cwd, 'logs', 'compact-error.log'),
+    },
   ],
 };

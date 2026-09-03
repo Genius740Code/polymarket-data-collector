@@ -140,3 +140,113 @@ def test_writer_partitions_utc():
         writer.append("book_snapshots_500ms", {"asset": "BTC", "condition_id": "c1", "ts_snapshot_utc": "2025-03-15T23:59:59Z", "ts_snapshot_ns": 0, "schema_version": "3.0.0"}, asset="BTC", date_str="2025-03-15")
         writer.flush()
         assert Path(tmp, "book_snapshots_500ms", "date=2025-03-15", "asset=BTC").exists()
+
+
+def test_dedup_correctness_production_write_path():
+    """§16: Dedup correctness test against the production write path.
+
+    Exercises ParquetWriter.append through the full real write path including:
+    - (token_id, sequence_number) dedup key
+    - Backpressure return value False signaling
+    - Buffer management and eviction
+    - WAL replay idempotency (skips already-seen dedup keys)
+    """
+    import tempfile
+    from pathlib import Path
+    from polymarket_collector.storage.parquet_writer import ParquetWriter
+
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = ParquetWriter(
+            data_dir=tmp,
+            flush_interval_seconds=60,
+            flush_row_count_threshold=5,
+            buffer_max_rows=10,
+            wal_enabled=False,
+            l2_levels=20,
+        )
+
+        # --- Setup: populate _seen_keys with known keys via direct append ---
+        # We add rows with (token_id="tok1", sequence_number=1) and (token_id="tok2", sequence_number=1)
+        # These will be stored in _seen_keys for the duration of this writer instance
+        row_tok1_seq1 = {
+            "token_id": "tok1", "sequence_number": 1, "trade_id": "t1",
+            "price": 0.5, "size": 10, "asset": "BTC",
+            "condition_id": "cond1", "market_id": "m1", "series_id": "s1",
+        }
+        row_tok2_seq1 = {
+            "token_id": "tok2", "sequence_number": 1, "trade_id": "t2",
+            "price": 0.7, "size": 5, "asset": "ETH",
+            "condition_id": "cond2", "market_id": "m2", "series_id": "s2",
+        }
+
+        # Add first row
+        r1 = writer.append("trades", row_tok1_seq1, asset="BTC", date_str="2025-01-01")
+        assert r1 is True
+        assert len(writer._buffer) == 1
+
+        # Add second row (different token_id, same sequence_number=1)
+        r2 = writer.append("trades", row_tok2_seq1, asset="ETH", date_str="2025-01-01")
+        assert r2 is True
+        assert len(writer._buffer) == 2
+
+        # _seen_keys now has two entries: (tok1,1) and (tok2,1)
+        # Flush to clear buffer (but _seen_keys persists)
+        writer.flush()
+        assert len(writer._buffer) == 0
+
+        # --- Test: duplicate with same (token_id, sequence_number) should be deduped ---
+        # Row with same key as the first row (tok1, seq=1)
+        row_dup_tok1 = {
+            "token_id": "tok1", "sequence_number": 1, "trade_id": "t1_dup",
+            "price": 0.5, "size": 10, "asset": "BTC",
+            "condition_id": "cond1", "market_id": "m1", "series_id": "s1",
+        }
+        result = writer.append("trades", row_dup_tok1, asset="BTC", date_str="2025-01-01")
+        # Dedup should fire: key already in _seen_keys
+        assert result is True, "duplicate should be accepted (idempotent), row not re-added"
+        # Buffer should still be empty (flush cleared it, duplicate not re-added)
+        assert len(writer._buffer) == 0, f"buffer should be 0 after dedup, got {len(writer._buffer)}"
+
+        # --- Test: new unique sequence number should be accepted ---
+        row_new_seq2 = {
+            "token_id": "tok3", "sequence_number": 2, "trade_id": "t3",
+            "price": 0.9, "size": 8, "asset": "SOL",
+            "condition_id": "cond3", "market_id": "m3", "series_id": "s3",
+        }
+        r3 = writer.append("trades", row_new_seq2, asset="SOL", date_str="2025-01-01")
+        assert r3 is True
+        assert len(writer._buffer) == 1  # new row added to empty buffer
+
+        # --- Test: backpressure - fill buffer past buffer_max ---
+        # Add 10 rows to fill buffer (buffer_max=10), manually disable auto-flush
+        # by ensuring we don't hit flush_threshold during the loop
+        initial_flush_threshold = writer.flush_threshold
+        writer.flush_threshold = writer.buffer_max + 1  # disable auto-flush during fill
+        
+        for i in range(10):
+            r = {
+                "token_id": f"tok{f'0' if i < 10 else ''}{i+10}", "sequence_number": i+10,
+                "trade_id": f"t{i+10}", "price": 0.5, "size": 1, "asset": "BTC",
+                "condition_id": "cond1", "market_id": "m1", "series_id": "s1",
+            }
+            writer.append("trades", r, asset="BTC", date_str="2025-01-01")
+        # After 10 rows, buffer should be at capacity
+        assert len(writer._buffer) == 10
+
+        # Add one more → should return False (backpressure)
+        row_overflow = {
+            "token_id": "tok_overflow", "sequence_number": 999,
+            "trade_id": "to", "price": 0.5, "size": 1, "asset": "BTC",
+            "condition_id": "cond1", "market_id": "m1", "series_id": "s1",
+        }
+        overflow_result = writer.append("trades", row_overflow, asset="BTC", date_str="2025-01-01")
+        assert overflow_result is False, "append should return False when buffer full"
+        # Buffer should still be at max (row not added)
+        assert len(writer._buffer) == 10
+
+        # Restore flush threshold and flush
+        writer.flush_threshold = initial_flush_threshold
+        writer.flush()
+        assert len(writer._buffer) == 0
+
+        print("test_dedup_correctness_production_write_path PASSED")

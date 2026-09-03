@@ -42,6 +42,11 @@ event_thresholds:
   depth_change_threshold_pct: 0.15
   crossing_threshold: 0.0  # book_crossed is boolean, not thresholded
 
+# §0 — synthetic-mode flag: when True, allows fallback synthetic data paths;
+# default off — real WS/REST must be the only data source in production
+# FORCED OFF: synthetic data generation is disabled in production mode
+synthetic_mode: false
+
 # §1A — WS resync
 ws:
   url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"

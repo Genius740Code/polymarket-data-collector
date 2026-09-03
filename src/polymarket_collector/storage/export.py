@@ -268,7 +268,18 @@ def export_per_asset_single_file(
                     tmp_path.rename(out_path)
                     stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
                 else:
-                    # Create empty parquet file — ensure 31-file staging even with fresh data
+                    # If prior staging file exists and has rows, preserve it (never overwrite with empty)
+                    # This prevents cumulative history destruction when read fails transiently
+                    if out_path.exists():
+                        try:
+                            prior = pq.read_table(str(out_path))
+                            if prior.num_rows > 0:
+                                # Keep prior staging file — don't destroy cumulative history
+                                stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior.num_rows
+                                continue  # skip write, preserve existing file
+                        except Exception:
+                            pass  # if can't read prior, proceed to write empty
+                    # No prior data or prior was empty — write empty parquet file to maintain 31-file staging structure
                     tmp_path = out_path.with_suffix(".parquet.tmp")
                     pq.write_table(pa.table({}), str(tmp_path), compression="zstd")
                     tmp_path.rename(out_path)
@@ -282,7 +293,16 @@ def export_per_asset_single_file(
                 out_path = out / "collector_events.parquet"
             else:  # resync_episodes
                 out_path = out / "resync_episodes.parquet"
-            # Always write the file (even if table is None or 0 rows) to ensure 31-file staging
+            # Preserve prior staging file if it has rows — never overwrite cumulative history with empty
+            if out_path.exists():
+                try:
+                    prior = pq.read_table(str(out_path))
+                    if prior.num_rows > 0:
+                        # Keep prior staging file — don't destroy cumulative history
+                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior.num_rows
+                        continue  # skip write, preserve existing file
+                except Exception:
+                    pass  # if can't read prior, proceed to write new file
             if table is not None and table.num_rows > 0:
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
@@ -675,7 +695,7 @@ def upload_to_kaggle(
         if not (folder / "dataset-metadata.json").exists():
             print(f"staging missing dataset-metadata.json: {folder}")
             return False
-        return _upload_kaggle_folder(folder, dataset_name)
+        return _upload_kaggle_folder(folder, dataset_name, expected_assets=["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"])
     if parquet_path is not None:
         p = Path(parquet_path)
         if not p.exists():
@@ -692,16 +712,22 @@ def upload_to_kaggle(
             "licenses": [{"name": "CC BY-NC-SA 4.0"}],
             "resources": [{"path": p.name, "description": p.name}],
         }, indent=2))
-        ok = _upload_kaggle_folder(tmp, dataset_name)
+        ok = _upload_kaggle_folder(tmp, dataset_name, expected_assets=["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"])
         shutil.rmtree(str(tmp.parent), ignore_errors=True)
         return ok
     print("upload_to_kaggle: need staging_dir or parquet_path")
     return False
 
 
-def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5) -> bool:
-    """Folder upload with retry 5× jitter and dataset_status polling (plan.md §5)."""
+def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, expected_assets: List[str] | None = None) -> bool:
+    """Folder upload with retry 5× jitter and dataset_status polling (plan.md §5).
+
+    If expected_assets is provided, verify staging row counts after status=ready
+    to prevent cumulative data loss from empty staging files.
+    """
     import random
+    if expected_assets is None:
+        expected_assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     try:
         # kaggle uses ~/.kaggle/kaggle.json or env KAGGLE_USERNAME/KEY
         api = __import__("kaggle").api  # type: ignore
@@ -748,15 +774,29 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5) -> 
                         # status may be dict with 'status' or object
                         s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
                         if s == "ready":
-                            print(f"✓ Kaggle dataset ready: {dataset}")
+                            # verify staging has data with rows (not empty from prior overwrite)
+                            # and verify file count matches expected 31 files (7 assets x 4 datasets + 3 globals)
+                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 4 + 3
+                            _rows_ok = _verify_staging_row_counts(staging, expected_assets)
+                            if _rows_ok and _files_ok:
+                                print(f"✓ Kaggle dataset ready: {dataset}")
+                                _write_kaggle_state(staging, dataset, version_notes)
+                                return True
+                            elif not _rows_ok:
+                                print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
+                            elif not _files_ok:
+                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 4 + 3}; waiting for complete upload")
+                        elif s in ("failed", "error"):
+                            print(f"✗ Kaggle dataset in error state: {dataset}")
                             _write_kaggle_state(staging, dataset, version_notes)
-                            return True
+                            return False
                     except Exception:
                         pass
                     _time.sleep(10)
-                print(f"⚠ Kaggle dataset_status not ready after 10m, assuming success: {dataset}")
+                print(f"⚠ Kaggle dataset_status not ready after 10m, failing closed: {dataset}")
+                # Do NOT assume success; return False to block cleanup/prune
                 _write_kaggle_state(staging, dataset, version_notes)
-                return True
+                return False
             except Exception as e:
                 last_err = e
                 msg = str(e)
@@ -774,6 +814,59 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5) -> 
         import traceback
         traceback.print_exc()
         return False
+
+
+def _expected_staging_files(staging: Path) -> int:
+    """Count expected parquet files in staging directory for Kaggle version."""
+    parquet_files = [p for p in staging.glob("*.parquet") if not p.name.endswith(".tmp")]
+    # 7 assets x 4 per-asset datasets + 3 globals = 31 files
+    # per-asset: book_snapshots_500ms, book_events, trades, chainlink_events
+    # globals: markets_log, collector_events, resync_episodes
+    return len(parquet_files)
+
+
+def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> bool:
+    """Verify that each staging file exists and per-asset files have rows.
+
+    Returns True if all expected files exist, False otherwise.
+    Per-asset files must have >0 rows to prevent loss of cumulative history.
+    Global files (markets_log/collector_events/resync_episodes) are allowed
+    to be empty on first upload (0 rows is valid early in collection), so
+    only existence + readable parquet is required.
+    """
+    per_asset_datasets = {"book_snapshots_500ms", "book_events", "trades", "chainlink_events"}
+    # global filenames as written by export_per_asset_single_file()
+    global_file_map = {
+        "markets_log": "markets.parquet",
+        "collector_events": "collector_events.parquet",
+        "resync_episodes": "resync_episodes.parquet",
+    }
+
+    # Check per-asset files: expected_assets x 4 datasets must have >0 rows
+    for asset in expected_assets:
+        au = asset.upper()
+        for ds in per_asset_datasets:
+            fpath = staging / f"{au}_{ds}.parquet"
+            if not fpath.exists():
+                return False
+            try:
+                t = pq.read_table(str(fpath))
+                if t.num_rows == 0:
+                    return False
+            except Exception:
+                return False
+
+    # Check global files — existence only (empty is valid at beginning)
+    for ds, fname in global_file_map.items():
+        fpath = staging / fname
+        if not fpath.exists():
+            return False
+        try:
+            pq.read_table(str(fpath))
+        except Exception:
+            return False
+
+    return True
 
 
 def _write_kaggle_state(staging: Path, dataset: str, notes: str):
@@ -805,11 +898,14 @@ def cleanup_local_data(
     checkpoint_ms: int | None = None,
     buffer_seconds: int | None = None,
 ) -> dict:
-    """Safe post-upload cleanup — only after Kaggle ready, never delete open window.
+    """Safe post-upload cleanup — only delete data older than buffer, fail closed.
 
-    Uses checkpoint_ms (from _kaggle_state.json last_upload_unix_ms) falling back to mtime-keep.
-    Requires market_end_ts_ms < checkpoint-buffer before deleting hive partition.
-    Prod default buffer 2h (7200s) per plan.md; quick-test uses 120s so 2-market chunks are removable while keeping open window safe.
+    **CRITICAL CHANGE**: Never automatically delete local hive partitions after Kaggle upload.
+    Previously, data older than the 2h buffer was deleted, causing permanent data loss
+    from future Kaggle versions. Now: data is retained indefinitely; only files with
+    market_end_ts_ms in the far future are protected, and all other files are kept.
+
+    The buffer parameter is retained for config compatibility but has no deleting effect.
     """
     import datetime as _dt2
     if timeframe_labels is None:
@@ -833,16 +929,19 @@ def cleanup_local_data(
                     pass
         if checkpoint_ms is None:
             checkpoint_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000) - keep_seconds * 1000
-    # buffer: prod 2h (7200s), quick-test 120s when keep_seconds small — use buffer_seconds if given else derive
+    # buffer: previously used 2h (7200s) to delete old data — THIS IS NOW DISABLED
+    # to prevent permanent Kaggle cumulative data loss. All hive data is retained.
+    # The buffer_ms is calculated but not used for deletion guard.
     if buffer_seconds is None:
-        # if keep_seconds <= 300 (5min) treat as test → use keep_seconds as buffer; else 2h
-        buffer_seconds = keep_seconds if keep_seconds <= 300 else 7200
+        buffer_seconds = 7200  # kept for config compatibility, no-op
     buffer_ms = buffer_seconds * 1000
     cutoff_ms = checkpoint_ms - buffer_ms
     now_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000)
     stats: dict = {}
     # Hive safe prune: inspect markets_latest for market_end per condition, then walk hive partitions
-    # Simpler for 5m-only: scan hive partitions, read one file's max(market_end_ts_ms) if present, else use mtime
+    # Simpler for 5m-only: scan hive partitions, read one file's max(market_end_ts_ms) if present
+    # CRITICAL: Do NOT delete files — retain all data to prevent Kaggle cumulative data loss
+    # (Only perform the "never delete open window" guard without actual deletion)
     for dataset in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "collector_events", "markets_log"]:
         ds_root = base / dataset
         if not ds_root.exists():
@@ -851,9 +950,8 @@ def cleanup_local_data(
             if leaf.name.endswith(".tmp"):
                 continue
             try:
-                # never delete open window (market_end > now)
-                # Try to read max market_end from file if column exists
-                can_delete = False
+                # never delete open window (market_end > now) — just verify, don't delete
+                # Read max market_end from file if column exists
                 try:
                     t = pq.read_table(str(leaf), columns=None)
                     # check hive file's market_end if present
@@ -868,24 +966,25 @@ def cleanup_local_data(
                                     max_end = max(int(_dt2.datetime.fromisoformat(v.replace("Z","+00:00")).timestamp()*1000) for v in vals)
                                 else:
                                     max_end = max(int(v) for v in vals)
-                                if max_end < cutoff_ms and max_end < now_ms:
-                                    can_delete = True
+                                if max_end < now_ms:
+                                    # market is closed, but we NO LONGER delete it
+                                    # previously: can_delete = True would lead to leaf.unlink()
+                                    # now: explicitly do NOT delete
+                                    pass  # data retained, no-op
                                 else:
-                                    can_delete = False
-                                break
+                                    # market still open, also retain
+                                    pass
+                            break
                     else:
-                        # no market_end column → fallback to mtime vs cutoff
-                        mtime_ms = int(leaf.stat().st_mtime * 1000)
-                        can_delete = mtime_ms < cutoff_ms
+                        # no market_end column — retain file (cannot verify age)
+                        pass
                 except Exception:
-                    mtime_ms = int(leaf.stat().st_mtime * 1000)
-                    can_delete = mtime_ms < cutoff_ms
-                if can_delete:
-                    leaf.unlink()
-                    stats[dataset] = stats.get(dataset, 0) + 1
-                    print(f"pruned verified hive: {leaf} (cutoff {cutoff_ms})")
+                    # error reading file — retain it
+                    pass
+                # NOTE: NO leaf.unlink() call — all data retained
             except Exception:
                 pass
+    # Return empty stats — no deletion occurred
     return stats
 
 
@@ -934,6 +1033,27 @@ def export_and_upload_all_kaggle(
         "dry_run": dry_run,
     }
 
+    # Step 0: Compact hive data (§10A) — merge small parquet files before export
+    # This ensures staging files are compacted, reducing file count and improving upload efficiency.
+    # compaction is best-effort: if no compactable files exist, it is a no-op.
+    try:
+        from polymarket_collector.storage.compaction import compact_all as _compact_all
+        compact_stats = _compact_all(
+            data_dir,
+            datasets=[
+                "book_snapshots_500ms",
+                "book_events",
+                "trades",
+                "chainlink_events",
+                "collector_events",
+                "resync_episodes",
+            ],
+        )
+        if compact_stats:
+            print(f"compacted: {compact_stats}")
+    except Exception as e:
+        print(f"compact err {e}")
+
     # Gate: only upload full closed markets
     try:
         latest = base / "markets_latest" / "markets_latest.parquet"
@@ -964,7 +1084,7 @@ def export_and_upload_all_kaggle(
 
     # Step 2: Upload to Kaggle (single dataset)
     print(f"=== Step 2: Uploading 5m staging to Kaggle {dataset_prefix} ===")
-    ok = _upload_kaggle_folder(staging, dataset_prefix)
+    ok = _upload_kaggle_folder(staging, dataset_prefix, expected_assets=assets)
     result["kaggle_uploads"][dataset_prefix] = {
         "status": "success" if ok else "failed",
         "staging": str(staging),

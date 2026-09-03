@@ -43,11 +43,13 @@ def main() -> None:
     async def run():
         collector = Collector(cfg)
         loop = asyncio.get_running_loop()
+        stop_requested = asyncio.Event()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(collector.stop()))
+                loop.add_signal_handler(sig, stop_requested.set)
             except NotImplementedError:
                 pass
+        is_test = cfg.test_mode.enabled or args.test_mode
         if is_test:
             # live test — runs real pipeline for N windows, then analyses data and exits
             await collector.run_test_mode(num_markets=cfg.test_mode.num_markets, accelerate=cfg.test_mode.accelerate)
@@ -57,10 +59,14 @@ def main() -> None:
         # run until stopped
         try:
             while collector._running:
-                await asyncio.sleep(1)
+                # check if stop was requested via signal
+                await asyncio.wait([asyncio.sleep(1)], stop_requested.wait=0.1)
+                if stop_requested.is_set():
+                    break
         except asyncio.CancelledError:
             pass
         finally:
+            # single code path owns stop() exactly once
             await collector.stop()
             print("collector stopped")
 

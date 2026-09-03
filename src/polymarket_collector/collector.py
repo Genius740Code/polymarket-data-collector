@@ -18,8 +18,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+
 from .book import Level, OrderBookState, snapshot_bucket_ms
-from .chainlink import chainlink_event_from_ws
 from .clock import check_clock_drift, is_clock_issue
 from .config import CollectorConfig
 from .enums import BookState, CollectorEventType, MarketStatus, ResolutionOutcome
@@ -29,7 +34,7 @@ from .storage.export import (
     _validate_kaggle_config,
 )
 from .rollover import MarketInfo, RolloverManager
-from .resync import ResyncManager
+from .resync import ResyncManager, exponential_backoff
 from .storage.cursor_store import CursorState, CursorStore
 from .storage.markets_log import MarketsLog
 from .storage.parquet_writer import ParquetWriter
@@ -221,40 +226,46 @@ class Collector:
             except Exception:
                 pass
             return True
-        # REST failed or empty — generate synthetic realistic book so we don't stay 100% null
-        # This ensures test shows non-null and passes null audit; real live WS will overwrite when available
-        try:
-            import random as _rnd
-            base = 0.5 + _rnd.uniform(-0.05, 0.05)
-            base = max(0.1, min(0.9, base))
-            spread = _rnd.uniform(0.01, 0.03)
-            up_mid = base
-            down_mid = 1 - base
-            for outcome_key, book_obj, mid in [("up", book.up, up_mid), ("down", book.down, down_mid)]:
-                bids = []
-                asks = []
-                for i in range(self.config.l2_levels):
-                    bid_price = round(max(0.01, mid - spread/2 - i*0.01 - _rnd.uniform(0,0.005)), 2)
-                    ask_price = round(min(0.99, mid + spread/2 + i*0.01 + _rnd.uniform(0,0.005)), 2)
-                    bid_size = round(_rnd.uniform(10, 200), 2)
-                    ask_size = round(_rnd.uniform(10, 200), 2)
-                    bids.append([bid_price, bid_size])
-                    asks.append([ask_price, ask_size])
-                book_obj.bids.levels = [Level(price=p, size=s) for p,s in bids]
-                book_obj.asks.levels = [Level(price=p, size=s) for p,s in asks]
-            book.book_state = BookState.live
-            book.resync_id = None
-            return True
-        except Exception:
+        # REST failed or empty — handle based on synthetic_mode
+        if self.config.synthetic_mode:
+            # Generate synthetic realistic book so we don't stay 100% null
+            # This is gated behind synthetic_mode; real live WS will overwrite when available
             try:
-                for b in [book.up, book.down]:
-                    if not b.bids.levels or b.bids.best_price() is None:
-                        b.bids.levels = [Level(price=0.49, size=100)]
-                    if not b.asks.levels or b.asks.best_price() is None:
-                        b.asks.levels = [Level(price=0.51, size=100)]
+                import random as _rnd
+                base = 0.5 + _rnd.uniform(-0.05, 0.05)
+                base = max(0.1, min(0.9, base))
+                spread = _rnd.uniform(0.01, 0.03)
+                up_mid = base
+                down_mid = 1 - base
+                for outcome_key, book_obj, mid in [("up", book.up, up_mid), ("down", book.down, down_mid)]:
+                    bids = []
+                    asks = []
+                    for i in range(self.config.l2_levels):
+                        bid_price = round(max(0.01, mid - spread/2 - i*0.01 - _rnd.uniform(0,0.005)), 2)
+                        ask_price = round(min(0.99, mid + spread/2 + i*0.01 + _rnd.uniform(0,0.005)), 2)
+                        bid_size = round(_rnd.uniform(10, 200), 2)
+                        ask_size = round(_rnd.uniform(10, 200), 2)
+                        bids.append([bid_price, bid_size])
+                        asks.append([ask_price, ask_size])
+                    book_obj.bids.levels = [Level(price=p, size=s) for p,s in bids]
+                    book_obj.asks.levels = [Level(price=p, size=s) for p,s in asks]
                 book.book_state = BookState.live
+                book.resync_id = None
+                return True
             except Exception:
-                pass
+                try:
+                    for b in [book.up, book.down]:
+                        if not b.bids.levels or b.bids.best_price() is None:
+                            b.bids.levels = [Level(price=0.49, size=100)]
+                        if not b.asks.levels or b.asks.best_price() is None:
+                            b.asks.levels = [Level(price=0.51, size=100)]
+                except Exception:
+                    pass
+                return False
+        else:
+            # synthetic_mode off: do not fabricate data. Book remains in its current state.
+            # No synthetic fallback — downstream should see null/stale and react accordingly.
+            # If book has null best prices, that's acceptable — downstream should handle
             return False
 
     def _beat(self) -> None:
@@ -270,18 +281,80 @@ class Collector:
             pass
 
     def _persist_cursor_sync(self) -> None:
-        """Sync cursor state to durable storage."""
-        try:
-            for store in self.cursor_stores.values():
-                store.sync()
-        except Exception:
-            pass
+        """Persist cursor state to durable storage (§1B).
+
+        Builds CursorState per asset from current rollover state + book
+        sequence numbers and saves via CursorStore. Previously was a no-op
+        (called non-existent sync), so crash recovery never worked.
+        """
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        for asset, store in self.cursor_stores.items():
+            try:
+                au = asset.upper()
+                state_obj = self.rollover.states.get(au)
+                cur = state_obj.current if state_obj else None
+                nxt = state_obj.next if state_obj else None
+                # Aggregate last sequence numbers from books for this asset
+                seqs: dict = {}
+                last_snap = None
+                for cid, book in self.books.items():
+                    if getattr(book, "asset", "").upper() == au:
+                        # merge book sequence_numbers
+                        for tok, seq in getattr(book, "sequence_numbers", {}).items():
+                            try:
+                                seqs[str(tok)] = int(seq)
+                            except Exception:
+                                pass
+                # Determine current_condition_id / window_index
+                if cur:
+                    cid = cur.condition_id
+                    widx = cur.window_index
+                    next_cid = nxt.condition_id if nxt else None
+                elif seqs or self.books:
+                    # fallback: pick any book for this asset
+                    fallback_cid = next((b.condition_id for b in self.books.values() if getattr(b, "asset", "").upper() == au), None)
+                    cid = fallback_cid
+                    widx = 0
+                    next_cid = None
+                else:
+                    # no market yet — still persist empty cursor with last_snap
+                    cid = None
+                    widx = 0
+                    next_cid = None
+                # last snapshot ts: use most recent book update or now
+                # Prefer rollover state's last_discovery or now
+                last_snap = now_ms
+                cs = CursorState(
+                    asset=au,
+                    current_window_index=int(widx),
+                    current_condition_id=cid,
+                    next_condition_id=next_cid,
+                    last_sequence_number_per_token=seqs,
+                    last_snapshot_written_ts=last_snap,
+                )
+                store.save(cs)
+                # ensure WAL checkpoint if shared_wal mode
+                try:
+                    store.sync()
+                except Exception:
+                    pass
+            except Exception:
+                continue
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self, enable_kaggle_loop: bool = True) -> None:
         self._running = True
         # §1B crash recovery: load cursor state, force resync if market still active
         await self._recover_from_cursor()
+
+        # §10A WAL replay: recover any rows written before crash
+        try:
+            n = self.writer._wal_replay()
+            if n:
+                print(f"[startup] replayed {n} rows from WAL after crash/restart")
+        except Exception as e:
+            print(f"[startup] WAL replay err {e}")
 
         # start per-asset WS tasks (stubbed — real WS connect loops)
         for asset in self.config.assets:
@@ -312,51 +385,402 @@ class Collector:
     async def _run_asset_loop(self, asset: str) -> None:
         """Per-asset WS loop — Gamma discovery + CLOB WS, §1 rollover dual-tracking.
 
-        Minimal implementation: polls discovery every 2s via RolloverManager, maintains
-        OrderBookState, buffers WS messages for resync. Real WS connect uses websockets.
-        Stub keeps collector runnable for tests without live network.
+        Connects to wss://ws-subscriptions-clob.polymarket.com/ws/market,
+        applies WS messages via OrderBookState.apply_ws_message, and buffers
+        them into ResyncManager for disconnect/resync support.
+        Falls back to discovery polling when no live WS available.
+        ON RECONNECT: loops with exponential backoff on disconnect, never lets
+        the task return on a transient WS disconnect.
         """
-        # In test mode this is overridden by live discovery; keep loop alive for heartbeat
+        ws_url = self.config.ws.url
+        rest_fetcher = self._fetch_rest_book
+
+        # Attempt WebSocket connection if websockets is available
+        if not HAS_WEBSOCKETS:
+            # No websockets library — fall back to discovery poll
+            while self._running:
+                try:
+                    async def _sub(market):
+                        self.markets[market.condition_id] = market
+                        try:
+                            row = market.to_markets_row()
+                            self.markets_log.append(row)
+                        except Exception:
+                            pass
+                        if market.condition_id not in self.books:
+                            try:
+                                self.books[market.condition_id] = OrderBookState(
+                                    asset=market.asset,
+                                    condition_id=market.condition_id,
+                                    market_id=market.market_id,
+                                    series_id=market.series_id,
+                                    window_index=market.window_index,
+                                    up_token_id=market.up_token_id,
+                                    down_token_id=market.down_token_id,
+                                    market_end_ts_ms=market.market_end_ts_ms,
+                                    schema_version=self.config.schema_version,
+                                    l2_levels=self.config.l2_levels,
+                                )
+                            except Exception:
+                                self.books[market.condition_id] = OrderBookState(
+                                    asset=market.asset, condition_id=market.condition_id,
+                                    market_id=market.market_id, series_id=market.series_id,
+                                    window_index=market.window_index,
+                                    up_token_id=market.up_token_id, down_token_id=market.down_token_id,
+                                    market_end_ts_ms=market.market_end_ts_ms,
+                                )
+                    await self.rollover.check_and_roll(asset, _sub)
+                except Exception:
+                    pass
+                await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+            return
+
+ # Connect with automatic reconnect on disconnect via resync
+        # Track tokens already subscribed on this connection to avoid resending duplicates
         while self._running:
+            attempt = 0
+            initial_backoff_ms = 1_000
+            max_backoff_ms = 60_000
             try:
-                # Trigger rollover lookahead via RolloverManager
-                async def _sub(market):
-                    # register market in self.markets for analysis tracking
-                    self.markets[market.condition_id] = market
-                    # also log to markets_log for markets_latest compaction
+                async with websockets.connect(ws_url) as ws:
+                    subscribed_tokens: set[str] = set()
+
+                    async def _ensure_ws_subscription() -> None:
+                        """Subscribe to all active market tokens for this asset (§1 dual-tracking)."""
+                        try:
+                            markets = self.rollover.active_markets(asset)
+                            tokens: list[str] = []
+                            for m in markets:
+                                if m.up_token_id:
+                                    tokens.append(m.up_token_id)
+                                if m.down_token_id:
+                                    tokens.append(m.down_token_id)
+                            # dedup + only new tokens
+                            new_tokens = [t for t in tokens if t not in subscribed_tokens]
+                            if not new_tokens:
+                                return
+                            # Polymarket CLOB expects {"assets_ids": [...], "type": "market"}
+                            payload = json.dumps({"assets_ids": tokens, "type": "market"})
+                            await ws.send(payload)
+                            subscribed_tokens.update(tokens)
+                            if self.on_event:
+                                try:
+                                    self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            if self.on_event:
+                                try:
+                                    self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": str(e)})
+                                except Exception:
+                                    pass
+
+                    async def _on_market(market: MarketInfo) -> None:
+                        self.markets[market.condition_id] = market
+                        try:
+                            row = market.to_markets_row()
+                            self.markets_log.append(row)
+                        except Exception:
+                            pass
+                        if market.condition_id not in self.books:
+                            try:
+                                self.books[market.condition_id] = OrderBookState(
+                                    asset=market.asset,
+                                    condition_id=market.condition_id,
+                                    market_id=market.market_id,
+                                    series_id=market.series_id,
+                                    window_index=market.window_index,
+                                    up_token_id=market.up_token_id,
+                                    down_token_id=market.down_token_id,
+                                    market_end_ts_ms=market.market_end_ts_ms,
+                                    schema_version=self.config.schema_version,
+                                    l2_levels=self.config.l2_levels,
+                                )
+                            except Exception:
+                                self.books[market.condition_id] = OrderBookState(
+                                    asset=market.asset, condition_id=market.condition_id,
+                                    market_id=market.market_id, series_id=market.series_id,
+                                    window_index=market.window_index,
+                                    up_token_id=market.up_token_id, down_token_id=market.down_token_id,
+                                    market_end_ts_ms=market.market_end_ts_ms,
+                                )
+                        # subscribe newly discovered market tokens
+                        try:
+                            await _ensure_ws_subscription()
+                        except Exception:
+                            pass
+
+                    # Initial discovery before reading (ensure at least current market)
                     try:
-                        row = market.to_markets_row()
-                        self.markets_log.append(row)
+                        await self.rollover.check_and_roll(asset, _on_market)
+                        await _ensure_ws_subscription()
                     except Exception:
                         pass
-                    # track books placeholder with full MarketInfo fields
-                    if market.condition_id not in self.books:
+
+                    # Background discovery poller while WS is open (dual-tracking 30s lookahead)
+                    async def _discovery_poller() -> None:
+                        while self._running:
+                            try:
+                                await self.rollover.check_and_roll(asset, _on_market)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+
+                    disc_task = asyncio.create_task(_discovery_poller(), name=f"discovery-{asset}")
+
+                    try:
+                        async for message in ws:
+                            if not self._running:
+                                break
+                            # §13 raw archive — persist every raw WS frame for replay/re-derive
+                            try:
+                                raw_payload: dict | str
+                                if isinstance(message, bytes):
+                                    try:
+                                        raw_payload = json.loads(message.decode())
+                                    except Exception:
+                                        raw_payload = message.decode(errors="ignore")
+                                elif isinstance(message, str):
+                                    try:
+                                        raw_payload = json.loads(message)
+                                    except Exception:
+                                        raw_payload = message
+                                else:
+                                    raw_payload = message  # type: ignore
+                                # normalize to dict if json string, else keep string
+                                if isinstance(raw_payload, dict):
+                                    self.raw_archive.append(asset, raw_payload)
+                                else:
+                                    self.raw_archive.append(asset, str(raw_payload))
+                            except Exception:
+                                pass
+
+                            try:
+                                msg = json.loads(message) if isinstance(message, str) else message  # type: ignore
+                                if isinstance(message, bytes):
+                                    try:
+                                        msg = json.loads(message.decode())
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                continue
+
+                            # Validate WS message via shared validator
+                            try:
+                                validate_ws_message(msg if isinstance(msg, dict) else {})
+                            except Exception:
+                                # invalid messages are dropped; book will be marked stale
+                                pass
+
+                            # Handle list payloads (some WS frames are arrays of events)
+                            msgs = msg if isinstance(msg, list) else [msg]
+                            for single_msg in msgs:
+                                if not isinstance(single_msg, dict):
+                                    continue
+                                # Apply to order book — handles sequence gap detection,
+                                # level updates, and book_state transitions internally
+                                # Try condition_id first, then token_id/asset_id resolution via books scan
+                                book = None
+                                cid = single_msg.get("condition_id")
+                                tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
+                                if cid and cid in self.books:
+                                    book = self.books[cid]
+                                elif tok:
+                                    # scan for token match (up/down) — Polymarket price_change uses asset_id==token_id
+                                    for b in self.books.values():
+                                        if b.up_token_id == tok or b.down_token_id == tok:
+                                            book = b
+                                            break
+                                # fallback token key
+                                if book is None:
+                                    book = self.books.get(tok) if tok else None
+                                if book is not None:
+                                    try:
+                                        applied, reason = book.apply_ws_message(single_msg)
+                                        # Emit sequence_gap event when gap detected §1A
+                                        if reason and "sequence_gap" in reason:
+                                            if self.on_event:
+                                                self.on_event(
+                                                    CollectorEventType.sequence_gap,
+                                                    {"asset": asset, "condition_id": book.condition_id,
+                                                     "expected": book.sequence_numbers.get(str(single_msg.get("token_id") or single_msg.get("asset_id")) or "unknown", 0) + 1,
+                                                     "received": int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0,
+                                                     "reason": reason},
+                                                )
+                                            # Trigger resync/disconnect lifecycle on gap
+                                            try:
+                                                self.resync.handle_sequence_gap(
+                                                    asset, book.condition_id, self.books, expected=int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0, received=1
+                                                )
+                                            except Exception:
+                                                pass
+                                        if not applied and self.on_event:
+                                            self.on_event(
+                                                CollectorEventType.book_anomaly,
+                                                {"asset": asset, "reason": reason, "msg": str(single_msg)[:500]},
+                                            )
+                                    except Exception as e:
+                                        if self.on_event:
+                                            self.on_event(
+                                                CollectorEventType.book_anomaly,
+                                                {"asset": asset, "ws_error": str(e)},
+                                            )
+
+                                # Buffer message for resync/replay on disconnect
+                                try:
+                                    resync_id = single_msg.get("resync_id", "")
+                                    # also buffer under asset-scoped active resync episode if any
+                                    if not resync_id:
+                                        # find active episode for this asset
+                                        for rid, ep in list(self.resync._episodes.items()):
+                                            if ep.asset == asset.upper() and ep.resync_completed_ts_utc is None:
+                                                resync_id = rid
+                                                break
+                                        if not resync_id:
+                                            resync_id = f"asset-{asset}"
+                                            if resync_id not in self.resync._buffers:
+                                                from collections import deque as _dq
+                                                self.resync._buffers[resync_id] = _dq()
+                                    self.resync.buffer_message(resync_id, single_msg)
+                                except Exception:
+                                    pass
+                    finally:
                         try:
-                            self.books[market.condition_id] = OrderBookState(
-                                asset=market.asset,
-                                condition_id=market.condition_id,
-                                market_id=market.market_id,
-                                series_id=market.series_id,
-                                window_index=market.window_index,
-                                up_token_id=market.up_token_id,
-                                down_token_id=market.down_token_id,
-                                market_end_ts_ms=market.market_end_ts_ms,
-                                schema_version=self.config.schema_version,
-                                l2_levels=self.config.l2_levels,
-                            )
+                            disc_task.cancel()
                         except Exception:
-                            # fallback minimal
-                            self.books[market.condition_id] = OrderBookState(
-                                asset=market.asset, condition_id=market.condition_id,
-                                market_id=market.market_id, series_id=market.series_id,
-                                window_index=market.window_index,
-                                up_token_id=market.up_token_id, down_token_id=market.down_token_id,
-                                market_end_ts_ms=market.market_end_ts_ms,
-                            )
-                await self.rollover.check_and_roll(asset, _sub)
+                            pass
+                        try:
+                            await disc_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+                # Connection closed — mark stale, request resync, then reconnect
+                if self._running:
+                    resync_id = str(uuid.uuid4())
+                    self.resync.handle_disconnect(asset, None, reason="ws_connection_close", books=self.books)
+                    self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
+            except asyncio.CancelledError:
+                # Clean, expected shutdown — just exit
+                if not self._running:
+                    return
+                # fall through to reconnect logic below
+            except websockets.exceptions.ConnectionClosed:
+                # Transient disconnect — mark stale, request resync, then reconnect
+                if self._running:
+                    resync_id = str(uuid.uuid4())
+                    self.resync.handle_disconnect(asset, None, reason="ws_connection_close", books=self.books)
+                    self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
+            except Exception as e:
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": str(e)})
+                    except Exception:
+                        pass
+
+            # Exponential backoff reconnect while running
+            if not self._running:
+                return
+            attempt += 1
+            backoff_s = min(
+                exponential_backoff(attempt, initial_backoff_ms, max_backoff_ms, jitter=True),
+                60,
+            )
+            if self.on_event:
+                self.on_event(
+                    CollectorEventType.ws_reconnect_attempt,
+                    {"asset": asset, "attempt": attempt, "backoff_s": backoff_s},
+                )
+            # Attempt REST resync for all stale books before reconnecting WS
+            try:
+                stale_books = [b for b in self.books.values() if b.asset.upper() == asset.upper() and b.book_state.value == "stale"]
+                for book in stale_books:
+                    try:
+                        res = await self.resync.resync(asset, book.condition_id, self.books, resync_id)
+                        if res:
+                            break  # resync succeeded for this book
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+            # Drain any buffered messages before reconnect
+            try:
+                self.resync.buffer_message(str(uuid.uuid4()), None)  # no-op marker
+            except Exception:
+                pass
+            await asyncio.sleep(backoff_s)
+
+    async def _ws_message_loop(self, asset: str, ws_url: str, rest_fetcher) -> None:
+        """WebSocket message loop for per-asset CLOB market channel.
+
+        Connects to the WS endpoint, reads messages, and dispatches them to
+        OrderBookState.apply_ws_message for book updates and ResyncManager
+        for buffering during disconnect/restore.
+        """
+        from .resync import ResyncManager  # local import to avoid circular
+
+        # We'll buffer messages per condition_id for resync
+        # ResyncManager is shared across assets; use its buffer_message
+        resync: ResyncManager = self.resync
+
+        async with websockets.connect(ws_url) as ws:
+            async for message in ws:
+                if not self._running:
+                    break
+                try:
+                    msg = json.loads(message) if isinstance(message, str) else message
+                except Exception:
+                    continue
+
+                # Validate WS message via shared validator
+                try:
+                    validate_ws_message(msg)
+                except Exception:
+                    # invalid messages are dropped; book will be marked stale
+                    pass
+
+                # Apply to order book — this handles sequence gap detection,
+                # level updates, and book_state transitions internally
+                book = self.books.get(msg.get("condition_id") or msg.get("token_id"))
+                if book is not None:
+                    try:
+                        applied, reason = book.apply_ws_message(msg)
+                        # Emit sequence_gap event when gap detected §1A
+                        if reason and "sequence_gap" in reason:
+                            if self.on_event:
+                                self.on_event(
+                                    CollectorEventType.sequence_gap,
+                                    {"asset": asset, "condition_id": book.condition_id,
+                                     "expected": book.sequence_numbers.get(str(msg.get("token_id") or msg.get("asset_id")) or "unknown", 0) + 1,
+                                     "received": int(seq) if (seq := msg.get("sequence_number") or msg.get("seq")) else 0,
+                                     "reason": reason},
+                                )
+                            # Trigger resync/disconnect lifecycle on gap
+                            try:
+                                self.resync.handle_sequence_gap(
+                                    asset, book.condition_id, self.books,
+                                    expected=int(seq) if (seq := msg.get("sequence_number") or msg.get("seq")) else 0,
+                                    received=1
+                                )
+                            except Exception:
+                                pass
+                        if not applied and self.on_event:
+                            self.on_event(
+                                CollectorEventType.book_anomaly,
+                                {"asset": asset, "reason": reason, "msg": str(msg)},
+                            )
+                    except Exception as e:
+                        if self.on_event:
+                            self.on_event(
+                                CollectorEventType.book_anomaly,
+                                {"asset": asset, "ws_error": str(e)},
+                            )
+
+                # Buffer message for resync/replay on disconnect
+                try:
+                    resync.buffer_message(str(msg.get("resync_id", "")), msg)
+                except Exception:
+                    pass
 
     async def _snapshot_loop(self) -> None:
         """Single scheduler 500ms aligned to UTC epoch grid (§3) for all 7 assets — also bootstraps book data via REST/synthetic to avoid 100% nulls."""
@@ -399,7 +823,7 @@ class Collector:
                             else:
                                 # Small random walk to simulate live price movement (avoid static book)
                                 # Nudge top levels ±0.005 occasionally
-                                if _tick % 8 == 0 and _rnd.random() < 0.3:
+                                if self.config.synthetic_mode and _tick % 8 == 0 and _rnd.random() < 0.3:
                                     for side in [book.up.bids, book.up.asks, book.down.bids, book.down.asks]:
                                         if side.levels and side.levels[0].price is not None:
                                             delta = _rnd.uniform(-0.005, 0.005)
@@ -407,44 +831,55 @@ class Collector:
                                                 if lvl.price is not None:
                                                     new_price = round(max(0.01, min(0.99, lvl.price + delta)), 2)
                                                     lvl.price = new_price
+                                elif not self.config.synthetic_mode:
+                                    # When synthetic_mode is off, do not nudge book levels;
+                                    # keep book data as-is (or null if no real WS data)
+                                    pass
                         except Exception:
                             pass
                         # Generate synthetic trades/chainlink occasionally so Kaggle staging has >7 files (not just snapshots)
-                        # Trades: ~1 per 4 snapshots per asset (every 2s)
-                        if _tick % 4 == 0 and _rnd.random() < 0.7:
-                            try:
-                                price = book.up.bids.best_price() or 0.5
-                                if price is None:
-                                    price = 0.5
-                                size = round(_rnd.uniform(5, 50), 2)
-                                self.writer.append("trades", {
-                                    "ts_source": str(bucket),
-                                    "ts_received_ns": bucket * 1_000_000,
-                                    "condition_id": m.condition_id,
-                                    "market_id": m.market_id,
-                                    "series_id": m.series_id,
-                                    "window_index": m.window_index,
-                                    "asset": m.asset,
-                                    "trade_id": str(uuid.uuid4()),
-                                    "transaction_hash": uuid.uuid4().hex + uuid.uuid4().hex[:8],
-                                    "token_id": m.up_token_id if _rnd.random()<0.5 else m.down_token_id,
-                                    "outcome": "up" if _rnd.random()<0.5 else "down",
-                                    "price": max(0.01, min(0.99, price + _rnd.uniform(-0.02, 0.02))),
-                                    "size": size,
-                                    "notional": round(price*size,2),
-                                    "fee": round(price*size*0.0007,4),
-                                    "side": "BUY" if _rnd.random()<0.5 else "SELL",
-                                    "aggressor_side": "BUY" if _rnd.random()<0.5 else "SELL",
-                                    "sequence_number": _tick,
-                                }, asset=m.asset)
-                            except Exception:
-                                pass
+                        # GATED: only when synthetic_mode is enabled
+                        if self.config.synthetic_mode:
+                            # Trades: ~1 per 4 snapshots per asset (every 2s)
+                            if _tick % 4 == 0 and _rnd.random() < 0.7:
+                                try:
+                                    price = book.up.bids.best_price() or 0.5
+                                    if price is None:
+                                        price = 0.5
+                                    size = round(_rnd.uniform(5, 50), 2)
+                                    result = self.writer.append("trades", {
+                                        "ts_source": str(bucket),
+                                        "ts_received_ns": bucket * 1_000_000,
+                                        "condition_id": m.condition_id,
+                                        "market_id": m.market_id,
+                                        "series_id": m.series_id,
+                                        "window_index": m.window_index,
+                                        "asset": m.asset,
+                                        "trade_id": str(uuid.uuid4()),
+                                        "transaction_hash": uuid.uuid4().hex + uuid.uuid4().hex[:8],
+                                        "token_id": m.up_token_id if _rnd.random()<0.5 else m.down_token_id,
+                                        "outcome": "up" if _rnd.random()<0.5 else "down",
+                                        "price": max(0.01, min(0.99, price + _rnd.uniform(-0.02, 0.02))),
+                                        "size": size,
+                                        "notional": round(price*size,2),
+                                        "fee": round(price*size*0.0007,4),
+                                        "side": "BUY" if _rnd.random()<0.5 else "SELL",
+                                        "aggressor_side": "BUY" if _rnd.random()<0.5 else "SELL",
+                                        "sequence_number": _tick,
+                                    }, asset=m.asset)
+                                    if not result:
+                                        try:
+                                            self._collector_event(CollectorEventType.backpressure, {"dataset": "trades", "asset": m.asset})
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                         # Chainlink: ~1 per 2 snapshots per asset (every 1s)
-                        if _tick % 2 == 0 and _rnd.random() < 0.8:
+                        if self.config.synthetic_mode and _tick % 2 == 0 and _rnd.random() < 0.8:
                             try:
                                 base_price = {"BTC": 65000, "ETH": 3500, "SOL": 150, "HYPE": 20, "BNB": 600, "XRP": 0.6, "DOGE": 0.15}.get(m.asset, 100)
                                 price = base_price * (1 + _rnd.uniform(-0.002, 0.002))
-                                self.writer.append("chainlink_events", {
+                                result = self.writer.append("chainlink_events", {
                                     "ts_source": str(bucket),
                                     "ts_received_ns": bucket * 1_000_000,
                                     "asset": m.asset,
@@ -457,9 +892,15 @@ class Collector:
                                     "report_id": uuid.uuid4().hex,
                                     "sequence_number": _tick,
                                 }, asset=m.asset)
+                                if not result:
+                                    # Backpressure: WAL-persisted, will be replayed on restart; log event
+                                    try:
+                                        self._collector_event(CollectorEventType.backpressure, {"dataset": "chainlink_events", "asset": m.asset})
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
-                        # Build snapshot row via book.snapshot()
+# Build snapshot row via book.snapshot()
                         try:
                             row = book.snapshot(ts_ms=bucket).to_flat_dict()
                             # Ensure is_rollover_window reflects current rollover state
@@ -481,16 +922,18 @@ class Collector:
                                 "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
                                 "is_rollover_window": self.rollover.states[m.asset].is_rollover_window,
                                 "book_state": "live",
-                                "book_crossed": False,
                             }
-                        try:
-                            self.writer.append("book_snapshots_500ms", row, asset=m.asset)
-                        except Exception:
-                            pass
-                        # Also emit book_events occasionally for coverage
-                        if _tick % 10 == 0 and _rnd.random() < 0.4:
+                        result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
+                        if not result:
+                            # Backpressure: row is WAL-persisted for crash recovery; emit event
                             try:
-                                self.writer.append("book_events", {
+                                self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket})
+                            except Exception:
+                                pass
+                        # Also emit book_events occasionally for coverage
+                        if self.config.synthetic_mode and _tick % 10 == 0 and _rnd.random() < 0.4:
+                            try:
+                                result = self.writer.append("book_events", {
                                     "ts_source": str(bucket),
                                     "ts_received_ns": bucket * 1_000_000,
                                     "condition_id": m.condition_id,
@@ -509,6 +952,11 @@ class Collector:
                                     "old_ask_size": 100, "new_ask_size": 98,
                                     "threshold_config_id": self._threshold_config_id,
                                 }, asset=m.asset)
+                                if not result:
+                                    try:
+                                        self._collector_event(CollectorEventType.backpressure, {"dataset": "book_events", "asset": m.asset})
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                 # Periodic collector_events heartbeat
@@ -518,8 +966,12 @@ class Collector:
                     except Exception:
                         pass
                 self._beat()
-            except Exception:
-                pass
+            except Exception as e:
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.book_anomaly, {"asset": "all", "snapshot_error": str(e)})
+                    except Exception:
+                        pass
             # sleep until next 500ms boundary
             try:
                 now = time.time()

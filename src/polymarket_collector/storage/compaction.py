@@ -16,14 +16,22 @@ import pyarrow as pa
 def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     """Compact one dataset partition (e.g. data/book_snapshots_500ms/date=.../asset=...).
 
-    Merges all part-*.parquet files in a leaf partition dir into one.
+    Merges all {dataset}_{ts_ms}.parquet files in a leaf partition dir into one.
+    Uses the SAME naming pattern as the writer: {dataset}_{ts_ms}.parquet.
     Returns number of rows after compaction. No-op if <=1 file.
     """
     if not dataset_path.is_dir():
         return 0
-    parts = sorted(dataset_path.glob("part-*.parquet"))
-    # exclude temp files
-    parts = [p for p in parts if not p.name.endswith(temp_suffix)]
+    # Match writer's naming pattern: {dataset}_{ts_ms}.parquet
+    # e.g. book_snapshots_500ms_1700000000000.parquet
+    import re
+    parts = []
+    for p in dataset_path.iterdir():
+        if p.is_file() and p.suffix == ".parquet" and not p.name.endswith(temp_suffix):
+            # Accept the writer's naming pattern: {dataset}_{ts_ms}.parquet
+            if re.match(r".+_\d+\.parquet$", p.name):
+                parts.append(p)
+    parts = sorted(parts)
     if len(parts) <= 1:
         return 0
     tables = []

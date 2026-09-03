@@ -143,6 +143,7 @@ class CollectorConfig(BaseSettings):
     capacity: CapacityConfig = Field(default_factory=CapacityConfig)
     kaggle: KaggleConfig = Field(default_factory=KaggleConfig)
     test_mode: TestModeConfig = Field(default_factory=TestModeConfig)
+    synthetic_mode: bool = False  # when True, allows fallback synthetic data; default off for prod safety
 
     # optional overrides for tests
     _config_path: Optional[str] = None
