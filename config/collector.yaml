@@ -20,8 +20,8 @@ test_mode:
 
 # kaggle: prod hourly, test every 10 min (4 markets)
 kaggle:
-  upload_interval_seconds: 600  # Changed to 10min for continuous testing
-  test_upload_interval_seconds: 600
+  upload_interval_seconds: 3600  # prod hourly
+  test_upload_interval_seconds: 600  # test every 10 min (2 uploads in 20 min)
   dataset_prefix: "gghgg1/polymarket-5m-crypto"
 
 # §1 — rollover
@@ -119,6 +119,15 @@ watchdog:
     - book_anomaly
     - kaggle_upload_failed
   daily_summary_hour_utc: 0
+
+# §0 — liquidity filtering (no RPC, uses Gamma reported_volume/reported_liquidity only)
+# If enabled, markets with liquidity < min_liquidity OR volume < min_volume are skipped
+# for that window (emit low_liquidity) and next window is tried. Wallet saving is always on.
+liquidity_filter:
+  enabled: false
+  min_liquidity: 1000   # require liquidityNum >= 1000 (e.g. $1000)
+  min_volume: 500       # require volumeNum >= 500
+  min_spread_liquidity_check: false
 
 # §11A capacity planning — override after pilot run
 capacity:

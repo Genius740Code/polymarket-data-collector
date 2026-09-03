@@ -64,6 +64,7 @@ class Collector:
             l2_levels=config.l2_levels,
             schema_version=config.schema_version,
             on_event=self._writer_event,
+            synthetic_mode=getattr(config, "synthetic_mode", False),
         )
         self.markets_log = MarketsLog(config.storage.data_dir, writer=self.writer)
         self.raw_archive = RawArchive(
@@ -151,6 +152,164 @@ class Collector:
         """Fire a collector_events row for write-status tracking (no-op if not needed)."""
         pass
 
+    @staticmethod
+    def _extract_wallets(msg: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Extract maker/taker wallet from CLOB trade payload — no RPC.
+        Checks many key variants (proxyWallet, maker, taker, owner, etc) used across
+        Polymarket WS/REST versions. Returns (maker_wallet, taker_wallet, wallet).
+        wallet = taker if present else maker for single-col queries.
+        """
+        def _find(keys: list[str]) -> Optional[str]:
+            for k in keys:
+                v = msg.get(k)
+                if v:
+                    s = str(v).strip()
+                    if s and s.lower() != "none" and s.lower() != "null":
+                        # heuristic: wallet-like 0x + 40 hex or at least 6 chars
+                        return s
+            # also check nested under 'order'/'maker_orders' etc
+            for nk in ("order", "maker_orders", "taker_orders"):
+                nested = msg.get(nk)
+                if isinstance(nested, dict):
+                    for k in keys:
+                        v = nested.get(k)
+                        if v:
+                            return str(v).strip()
+                elif isinstance(nested, list) and nested:
+                    for item in nested:
+                        if isinstance(item, dict):
+                            for k in keys:
+                                v = item.get(k)
+                                if v:
+                                    return str(v).strip()
+            return None
+
+        # proxyWallet on Polymarket is the taker/aggressor — no RPC, just CLOB field
+        # keep maker_keys without proxyWallet so single wallet maps to taker
+        maker_keys = ["maker_wallet", "maker", "makerAddress", "maker_address", "owner", "maker_proxy_wallet"]
+        taker_keys = ["taker_wallet", "taker", "takerAddress", "taker_address", "taker_proxy_wallet", "proxyWallet", "proxy_wallet"]
+        # generic wallet key last resort
+        generic_keys = ["wallet", "address", "user", "account"]
+
+        maker = _find(maker_keys)
+        taker = _find(taker_keys)
+        generic = _find(generic_keys) if not maker and not taker else None
+        # fallback: if message has 'side' and 'proxyWallet', treat as taker (aggressor)
+        if not taker and not maker and generic:
+            # assign generic to taker for now
+            taker = generic
+        wallet = taker or maker or generic
+        return maker, taker, wallet
+
+    def _handle_trade_message(self, msg: dict, asset: str, now_ns: int, now_bucket_ms: int | None = None) -> bool:
+        """Parse a CLOB trade WS message and persist to trades with wallet — no RPC.
+        Returns True if a trade row was written.
+        """
+        # heuristic: trade messages have price+size and either event_type last_trade_price/trade or hash
+        event_type = str(msg.get("event_type") or msg.get("type") or msg.get("eventType") or "").lower()
+        is_trade = False
+        if event_type in ("last_trade_price", "trade", "market_trade", "trade_price"):
+            is_trade = True
+        elif msg.get("price") is not None and msg.get("size") is not None and msg.get("asset_id"):
+            # book update also has price/size but via price_changes; if price_changes present, not a trade
+            if "price_changes" not in msg and "bids" not in msg and "asks" not in msg:
+                is_trade = True
+        elif msg.get("transaction_hash") or msg.get("transactionHash"):
+            is_trade = True
+        if not is_trade:
+            return False
+
+        try:
+            token_id = str(msg.get("token_id") or msg.get("asset_id") or msg.get("asset") or msg.get("tokenId") or "")
+            if not token_id:
+                return False
+            # resolve market/condition for this token via books scan
+            market = None
+            condition_id = msg.get("condition_id") or msg.get("conditionId")
+            if condition_id and condition_id in self.markets:
+                market = self.markets[condition_id]
+            else:
+                for b in self.books.values():
+                    if b.up_token_id == token_id or b.down_token_id == token_id:
+                        market = self.markets.get(b.condition_id)
+                        condition_id = b.condition_id
+                        break
+            if market is None:
+                # still need condition_id for row; use token-derived fallback
+                condition_id = condition_id or token_id
+                # try to find any active market for this asset as fallback
+                for m in self.rollover.active_markets(asset):
+                    if m.up_token_id == token_id or m.down_token_id == token_id:
+                        market = m
+                        condition_id = m.condition_id
+                        break
+            price_raw = msg.get("price")
+            size_raw = msg.get("size") or msg.get("amount")
+            if price_raw is None or size_raw is None:
+                return False
+            try:
+                price = float(price_raw)
+                size = float(size_raw)
+            except Exception:
+                return False
+            # sanity bounds §3A
+            if not (0 <= price <= 1) or size < 0:
+                return False
+            maker_wallet, taker_wallet, wallet = self._extract_wallets(msg)
+            # synthetic fallback: if no wallet in live message, leave null (not fabricated)
+            # but allow wallet to be null — schema nullable
+            side = str(msg.get("side") or msg.get("aggressor_side") or "").upper() or None
+            outcome = msg.get("outcome")
+            if not outcome:
+                # infer from token vs market
+                if market and token_id == market.up_token_id:
+                    outcome = "up"
+                elif market and token_id == market.down_token_id:
+                    outcome = "down"
+                else:
+                    outcome = "up" if msg.get("asset_id") == token_id else "unknown"
+            trade_id = str(msg.get("trade_id") or msg.get("tradeId") or msg.get("id") or uuid.uuid4())
+            tx_hash = str(msg.get("transaction_hash") or msg.get("transactionHash") or msg.get("hash") or "")
+            if not tx_hash:
+                tx_hash = None
+            ts_source = str(msg.get("timestamp") or msg.get("ts") or msg.get("ts_source") or now_bucket_ms or int(now_ns // 1_000_000))
+            seq = msg.get("sequence_number") or msg.get("seq") or msg.get("sequence")
+            try:
+                seq_int = int(seq) if seq is not None else None
+            except Exception:
+                seq_int = None
+            row = {
+                "ts_source": ts_source,
+                "ts_received_ns": now_ns,
+                "condition_id": str(condition_id),
+                "market_id": market.market_id if market else str(condition_id),
+                "series_id": market.series_id if market else f"{asset.upper()}-5m",
+                "window_index": market.window_index if market else 0,
+                "asset": asset.upper(),
+                "trade_id": trade_id,
+                "transaction_hash": tx_hash,
+                "token_id": token_id,
+                "outcome": str(outcome).lower() if outcome else "unknown",
+                "price": price,
+                "size": size,
+                "notional": round(price * size, 6) if price and size else None,
+                "fee": msg.get("fee"),
+                "side": side,
+                "aggressor_side": side,
+                "sequence_number": seq_int,
+                "maker_wallet": maker_wallet,
+                "taker_wallet": taker_wallet,
+                "wallet": wallet,
+            }
+            ok = self.writer.append("trades", row, asset=asset.upper())
+            if not ok:
+                self._collector_event(CollectorEventType.backpressure, {"dataset": "trades", "asset": asset})
+            else:
+                self._collector_event(CollectorEventType.market_added, {"asset": asset, "trade_id": trade_id, "wallet": wallet}) if wallet else None
+            return ok
+        except Exception:
+            return False
+
     async def _fetch_rest_book(self, asset: str, condition_id: str) -> Optional[dict]:
         """Fetch a full order-book snapshot via REST for resync — tries token_id first, then legacy params."""
         import httpx
@@ -207,12 +366,10 @@ class Collector:
             except Exception:
                 continue
         if any_success and merged:
-            # Atomic replace with both sides at once – avoids single-side wipe in book.replace_from_rest_snapshot
             try:
                 book.replace_from_rest_snapshot(merged)
             except Exception:
                 pass
-            # Also apply levels incrementally for each side present in merged
             try:
                 for outcome in ("up", "down"):
                     b = merged.get(f"{outcome}_bids")
@@ -223,6 +380,11 @@ class Collector:
                         book._apply_levels(side_bids, b, is_bid=True)
                     if a:
                         book._apply_levels(side_asks, a, is_bid=False)
+            except Exception:
+                pass
+            # Real REST success → mark live (fixes 5b stale book never going live)
+            try:
+                book.mark_live()
             except Exception:
                 pass
             return True
@@ -409,7 +571,7 @@ class Collector:
                             pass
                         if market.condition_id not in self.books:
                             try:
-                                self.books[market.condition_id] = OrderBookState(
+                                _nb = OrderBookState(
                                     asset=market.asset,
                                     condition_id=market.condition_id,
                                     market_id=market.market_id,
@@ -422,13 +584,18 @@ class Collector:
                                     l2_levels=self.config.l2_levels,
                                 )
                             except Exception:
-                                self.books[market.condition_id] = OrderBookState(
+                                _nb = OrderBookState(
                                     asset=market.asset, condition_id=market.condition_id,
                                     market_id=market.market_id, series_id=market.series_id,
                                     window_index=market.window_index,
                                     up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                                     market_end_ts_ms=market.market_end_ts_ms,
                                 )
+                            try:
+                                _nb.mark_stale(resync_id=str(uuid.uuid4()))
+                            except Exception:
+                                pass
+                            self.books[market.condition_id] = _nb
                     await self.rollover.check_and_roll(asset, _sub)
                 except Exception:
                     pass
@@ -484,7 +651,7 @@ class Collector:
                             pass
                         if market.condition_id not in self.books:
                             try:
-                                self.books[market.condition_id] = OrderBookState(
+                                _nb2 = OrderBookState(
                                     asset=market.asset,
                                     condition_id=market.condition_id,
                                     market_id=market.market_id,
@@ -497,13 +664,18 @@ class Collector:
                                     l2_levels=self.config.l2_levels,
                                 )
                             except Exception:
-                                self.books[market.condition_id] = OrderBookState(
+                                _nb2 = OrderBookState(
                                     asset=market.asset, condition_id=market.condition_id,
                                     market_id=market.market_id, series_id=market.series_id,
                                     window_index=market.window_index,
                                     up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                                     market_end_ts_ms=market.market_end_ts_ms,
                                 )
+                            try:
+                                _nb2.mark_stale(resync_id=str(uuid.uuid4()))
+                            except Exception:
+                                pass
+                            self.books[market.condition_id] = _nb2
                         # subscribe newly discovered market tokens
                         try:
                             await _ensure_ws_subscription()
@@ -625,6 +797,12 @@ class Collector:
                                                 CollectorEventType.book_anomaly,
                                                 {"asset": asset, "ws_error": str(e)},
                                             )
+
+                                # Trade handling — persist with wallet (no RPC) §5
+                                try:
+                                    self._handle_trade_message(single_msg, asset, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
+                                except Exception:
+                                    pass
 
                                 # Buffer message for resync/replay on disconnect
                                 try:
@@ -813,6 +991,11 @@ class Collector:
                                     up_token_id=m.up_token_id, down_token_id=m.down_token_id,
                                     market_end_ts_ms=m.market_end_ts_ms,
                                 )
+                            # New books start stale until first real data (fixes 5b live-with-nulls)
+                            try:
+                                book.mark_stale(resync_id=str(uuid.uuid4()))
+                            except Exception:
+                                pass
                             self.books[m.condition_id] = book
                         # If book is still empty (any side empty), bootstrap via REST or synthetic so snapshots aren't 100% null
                         try:
@@ -847,6 +1030,9 @@ class Collector:
                                     if price is None:
                                         price = 0.5
                                     size = round(_rnd.uniform(5, 50), 2)
+                                    # synthetic wallet — deterministic fake 0x...
+                                    _maker = "0x" + uuid.uuid4().hex[:40]
+                                    _taker = "0x" + uuid.uuid4().hex[:40]
                                     result = self.writer.append("trades", {
                                         "ts_source": str(bucket),
                                         "ts_received_ns": bucket * 1_000_000,
@@ -866,6 +1052,9 @@ class Collector:
                                         "side": "BUY" if _rnd.random()<0.5 else "SELL",
                                         "aggressor_side": "BUY" if _rnd.random()<0.5 else "SELL",
                                         "sequence_number": _tick,
+                                        "maker_wallet": _maker,
+                                        "taker_wallet": _taker,
+                                        "wallet": _taker,
                                     }, asset=m.asset)
                                     if not result:
                                         try:
@@ -906,6 +1095,12 @@ class Collector:
                             # Ensure is_rollover_window reflects current rollover state
                             row["is_rollover_window"] = self.rollover.states[m.asset].is_rollover_window
                         except Exception as e:
+                            # Preserve actual book_state (fixes 5a hard-coded live)
+                            _bs = getattr(book, "book_state", None)
+                            try:
+                                _bs_val = _bs.value if hasattr(_bs, "value") else str(_bs) if _bs else "stale"
+                            except Exception:
+                                _bs_val = "stale"
                             row = {
                                 "ts_snapshot_utc": datetime.datetime.fromtimestamp(bucket/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00","Z"),
                                 "ts_snapshot_ns": bucket * 1_000_000,
@@ -921,7 +1116,7 @@ class Collector:
                                 "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
                                 "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
                                 "is_rollover_window": self.rollover.states[m.asset].is_rollover_window,
-                                "book_state": "live",
+                                "book_state": _bs_val,
                             }
                         result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
                         if not result:
@@ -1600,13 +1795,39 @@ class Collector:
                 if not has_data:
                     print("[kaggle] no hive data yet, skipping")
                 else:
-                    res = export_and_upload_all_kaggle(
-                        data_dir=self.config.storage.data_dir,
-                        assets=self.config.assets,
-                        timeframe_labels=["5m"],
-                        l2_levels=self.config.l2_levels,
-                        dry_run=not _has_creds,
-                    )
+                    # Flush buffer under kaggle lock so staging includes in-memory rows (fixes 2b unflushed buffer)
+                    # Uses same lock as test mode and flush loop to avoid races with snapshot append
+                    if hasattr(self, "_kaggle_lock"):
+                        async with self._kaggle_lock:
+                            try:
+                                n = self.writer.flush()
+                                if n:
+                                    print(f"[kaggle loop] flushed {n} rows before staging (lock held)")
+                            except Exception as e:
+                                print(f"[kaggle loop] flush err {e}")
+                            try:
+                                self.markets_log.flush_staging()
+                            except Exception:
+                                pass
+                            try:
+                                self.markets_log.compact()
+                            except Exception:
+                                pass
+                            res = export_and_upload_all_kaggle(
+                                data_dir=self.config.storage.data_dir,
+                                assets=self.config.assets,
+                                timeframe_labels=["5m"],
+                                l2_levels=self.config.l2_levels,
+                                dry_run=not _has_creds,
+                            )
+                    else:
+                        res = export_and_upload_all_kaggle(
+                            data_dir=self.config.storage.data_dir,
+                            assets=self.config.assets,
+                            timeframe_labels=["5m"],
+                            l2_levels=self.config.l2_levels,
+                            dry_run=not _has_creds,
+                        )
                     export_n = len(res.get("export", {}))
                     kag = res.get("kaggle_uploads", {})
                     succ = sum(1 for v in kag.values() if v.get("status")=="success")

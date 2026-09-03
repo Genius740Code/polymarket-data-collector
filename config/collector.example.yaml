@@ -113,6 +113,13 @@ watchdog:
     - kaggle_upload_failed
   daily_summary_hour_utc: 0
 
+# §0 liquidity filtering (no RPC — uses Gamma reported_volume/reported_liquidity)
+liquidity_filter:
+  enabled: false
+  min_liquidity: 1000
+  min_volume: 500
+  min_spread_liquidity_check: false
+
 # §11A capacity planning — override after pilot run
 capacity:
   estimated_row_bytes_uncompressed: 2500  # snapshot row; measured in pilot

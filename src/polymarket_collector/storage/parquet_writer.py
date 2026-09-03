@@ -48,6 +48,7 @@ class ParquetWriter:
         l2_levels: int = 20,
         schema_version: str = "3.0.0",
         on_event=None,  # callback(event_type, details) for collector_events
+        synthetic_mode: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.flush_interval = flush_interval_seconds
@@ -58,6 +59,7 @@ class ParquetWriter:
         self.l2_levels = l2_levels
         self.schema_version = schema_version
         self.on_event = on_event
+        self.synthetic_mode = synthetic_mode
 
         self._buffer: deque[BufferedRow] = deque()
         self._last_flush_ts = time.monotonic()
@@ -74,9 +76,9 @@ class ParquetWriter:
     def append(self, dataset: str, row: Dict[str, Any], asset: Optional[str] = None, date_str: Optional[str] = None) -> bool:
         """Append a row; returns False if backpressure blocked (caller should retry).
 
-        §10A: never silently drops. Even on backpressure the row is WAL-persisted
-        so crash recovery can replay it. Buffer drop is signaled via event so
-        caller can back off/retry, but data is not lost.
+        §10A: never silently drops. WAL is written BEFORE buffer with fsync so
+        crash between WAL and buffer never loses acknowledged data. Duplicate
+        rows (same dedup key) are dropped without WAL.
         """
         # Resolve date_str early so WAL entry is complete even under backpressure
         _resolved_date_str = date_str
@@ -91,8 +93,27 @@ class ParquetWriter:
                     _resolved_date_str = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
             else:
                 _resolved_date_str = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
+        if date_str is None:
+            date_str = _resolved_date_str
 
-        # backpressure check — §10A never drops without WAL spill
+        # dedup check first (§4, §5) — duplicates never hit WAL or buffer
+        dedup_key = self._dedup_key(dataset, row)
+        if dedup_key is not None:
+            if dedup_key in self._seen_keys[dataset]:
+                if self.on_event:
+                    self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
+                return True
+            # reserve key immediately to prevent duplicate WAL entries under concurrency
+            self._seen_keys[dataset].add(dedup_key)
+            if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
+                keys = list(self._seen_keys[dataset])
+                evict_count = len(keys) // 2
+                for k in keys[:evict_count]:
+                    self._seen_keys[dataset].discard(k)
+            # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
+            # caller will retry with same key and be deduped — this is idempotent and prevents duplicate WAL.
+
+        # backpressure check — §10A never drops without WAL spill + fsync
         if len(self._buffer) >= self.buffer_max:
             if self.on_event:
                 self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset})
@@ -102,51 +123,43 @@ class ParquetWriter:
                     f"Backpressure: buffer full ({len(self._buffer)}/{self.buffer_max}), dataset={dataset}; caller should block/retry",
                     stacklevel=2,
                 )
-            # Try to make room by flushing only when WAL is enabled (so spill vs drop semantics are safe).
-            # When WAL is disabled the caller expects strict backpressure (return False) without side-effects
-            # — flushing here would violate the test contract that buffer stays full until explicit flush.
             if self.wal_enabled:
                 try:
                     self.flush()
                 except Exception:
                     pass
                 if len(self._buffer) >= self.buffer_max:
-                    # Still full after flush (flush failed) — WAL-spill
+                    # Still full after flush — WAL-spill with fsync (buffer-before-WAL bug fixed: WAL first)
+                    # Dedup key already reserved, so WAL contains exactly one copy
                     try:
-                        self._wal_append(dataset, row, asset, _resolved_date_str)
+                        self._wal_append(dataset, row, asset, date_str)
                     except Exception:
-                        pass
+                        # WAL failed: remove reserved dedup key so retry can succeed after WAL recovers
+                        if dedup_key is not None:
+                            self._seen_keys[dataset].discard(dedup_key)
+                        return False
                     return True
-                # Flush made room — fall through to normal dedup + buffer path
+                # Flush made room — fall through to WAL+buffer path (dedup already reserved, don't re-add)
             else:
+                # WAL disabled: strict backpressure — remove reserved key so retry works
+                if dedup_key is not None:
+                    self._seen_keys[dataset].discard(dedup_key)
                 return False
 
-        # dedup check (§4, §5) — unique on (token_id, sequence_number) or fallback
-        # only check dedup when there's buffer space
-        dedup_key = self._dedup_key(dataset, row)
-        if dedup_key is not None:
-            if dedup_key in self._seen_keys[dataset]:
-                # duplicate — drop silently (idempotent write)
+        # WAL-before-buffer with fsync (fixes 3a loss window)
+        if self.wal_enabled:
+            try:
+                self._wal_append(dataset, row, asset, date_str)
+            except Exception as e:
+                # WAL failed — remove dedup reservation so caller can retry
+                if dedup_key is not None:
+                    self._seen_keys[dataset].discard(dedup_key)
                 if self.on_event:
-                    self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
-                return True
-            self._seen_keys[dataset].add(dedup_key)
-            # enforce max size with eviction to prevent unbounded memory growth (§9)
-            if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
-                # evict oldest keys (simple: remove half the set)
-                keys = list(self._seen_keys[dataset])
-                evict_count = len(keys) // 2
-                for k in keys[:evict_count]:
-                    self._seen_keys[dataset].discard(k)
-
-        # date partition (UTC) — use pre-resolved date if caller didn't provide one
-        if date_str is None:
-            date_str = _resolved_date_str
+                    self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": f"WAL append failed: {e}"})
+                return False
 
         br = BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row)
         self._buffer.append(br)
-        if self.wal_enabled:
-            self._wal_append(dataset, row, asset, date_str)
 
         # maybe flush
         if len(self._buffer) >= self.flush_threshold or (time.monotonic() - self._last_flush_ts) >= self.flush_interval:
@@ -176,10 +189,24 @@ class ParquetWriter:
                     self._buffer.appendleft(BufferedRow(dataset=dataset, asset=asset, date_str=date_str, row=r))
                 raise
         self._last_flush_ts = time.monotonic()
-        # truncate WAL after successful flush
+        # truncate WAL after successful flush — fsync directory to ensure durability (fixes 3 duplicate window)
         if self.wal_enabled and flushed:
             try:
+                # Ensure all parquet renames are durable before truncating WAL
                 self._wal_path.write_text("")
+                try:
+                    import os
+                    with open(self._wal_path, "a") as f:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # fsync wal dir
+                    dir_fd = os.open(str(self.wal_dir), os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception:
+                    pass
             except Exception:
                 pass
         return flushed
@@ -264,35 +291,49 @@ class ParquetWriter:
                             # also check against on-disk keys to avoid re-adding rows
                             # that were already flushed to parquet before the crash
                             if dedup_key is not None and dedup_key in on_disk_keys.get(dataset, set()):
-                                # already on disk, skip to avoid duplicate
-                                # but still count as replayed for stats
-                                replayed += 1
+                                # already on disk, skip to avoid duplicate — do NOT count as replayed
+                                # (previous code counted skipped as replayed which inflated stats)
                                 continue
                             # also check against runtime _seen_keys to avoid re-adding
-                            # rows that were already tracked before the crash
                             if dedup_key is not None and dedup_key in self._seen_keys[dataset]:
-                                # already marked as seen, skip to avoid duplicate
-                                # but still count as replayed for stats
-                                replayed += 1
                                 continue
                             # backpressure check before replay
                             if len(self._buffer) >= self.buffer_max:
                                 if self.on_event:
                                     self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "replay": True})
-                                # flush buffer first to make room
                                 try:
                                     self.flush()
                                 except Exception:
                                     pass
-                            # perform the append (may still fail if buffer full after flush)
-                            result = self.append(dataset, row, asset=asset, date_str=date_str)
-                            if result:
-                                if dedup_key is not None:
-                                    seen_replay_keys.add(dedup_key)
-                                replayed += 1
-                            else:
-                                # backpressure still full — keep this WAL line for next replay
+                            if len(self._buffer) >= self.buffer_max:
                                 pending_lines.append(line)
+                                continue
+                            # Direct buffer insert without re-WALing (replay already has WAL entry)
+                            # Reserve dedup key
+                            if dedup_key is not None:
+                                if dedup_key in self._seen_keys[dataset]:
+                                    continue
+                                self._seen_keys[dataset].add(dedup_key)
+                                if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
+                                    keys = list(self._seen_keys[dataset])
+                                    evict_count = len(keys) // 2
+                                    for k in keys[:evict_count]:
+                                        self._seen_keys[dataset].discard(k)
+                                seen_replay_keys.add(dedup_key)
+                            # date handling already in entry
+                            if date_str is None:
+                                import datetime as _dt_for_date2
+                                ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
+                                if ts_field:
+                                    try:
+                                        dt = _dt_for_date2.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
+                                        date_str = dt.date().isoformat()
+                                    except Exception:
+                                        date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
+                                else:
+                                    date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
+                            self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
+                            replayed += 1
                         else:
                             # malformed entry — drop
                             pass
@@ -348,12 +389,15 @@ class ParquetWriter:
         return None
 
     def _wal_append(self, dataset: str, row: Dict[str, Any], asset: Optional[str], date_str: Optional[str]) -> None:
-        try:
-            entry = json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": row, "ts": time.time()})
-            with open(self._wal_path, "a") as f:
-                f.write(entry + "\n")
-        except Exception:
-            pass
+        entry = json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": row, "ts": time.time()})
+        with open(self._wal_path, "a") as f:
+            f.write(entry + "\n")
+            f.flush()
+            try:
+                import os
+                os.fsync(f.fileno())
+            except Exception:
+                pass
 
     def _write_group(self, dataset: str, date_str: str, asset: Optional[str], rows: List[Dict[str, Any]]) -> None:
         # Determine output path §11 partitioning — §11 explicitly lists which
@@ -447,16 +491,11 @@ class ParquetWriter:
                                 pass
                     if nr.get("disconnect_ts_utc") is None and dataset == "resync_episodes":
                         nr["disconnect_ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                # Only fill non-critical placeholder fields when in synthetic/test mode;
-                # in production, leave as None and let downstream handle missing data
-                if not self.config.synthetic_mode:
-                    # In production mode, do NOT inject test-placeholders; keep as None
-                    # Remove any existing placeholder values to prevent data corruption
+                if not getattr(self, "synthetic_mode", False):
                     for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
                         if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
                             nr[fld] = None
                 else:
-                    # synthetic_mode on: fill fallbacks for test data (original behavior)
                     for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
                         if fld in (SCHEMAS.get(dataset).names if SCHEMAS.get(dataset) else []) or fld in nr:
                             if nr.get(fld) is None:

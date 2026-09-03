@@ -131,6 +131,7 @@ class MarketDiscovery:
         backoff_max_s: float = 8.0,
         on_event=None,
         window_size_seconds: int = 300,
+        liquidity_filter=None,
     ):
         self.rest_market_url = rest_market_url
         self.poll_interval = poll_interval_s
@@ -139,6 +140,7 @@ class MarketDiscovery:
         self._backoff_s = poll_interval_s
         self.window_size_seconds = window_size_seconds
         self.window_multiplier = window_size_seconds // 300
+        self.liquidity_filter = liquidity_filter  # LiquidityFilterConfig or None
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
@@ -194,7 +196,13 @@ class MarketDiscovery:
                         except Exception:
                             pass
                         self._backoff_s = self.poll_interval
-                        return self._parse_gamma_market(asset, m0, cand_ts)
+                        parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                        # liquidity filtering — no RPC, uses reported_liquidity/reported_volume only
+                        if parsed is not None and not self._passes_liquidity_filter(parsed):
+                            # try next candidate window instead of returning low-liq market
+                            continue
+                        if parsed is not None:
+                            return parsed
             except Exception as e:
                 continue
         # No market found for either candidate — let poll retry / fallback
@@ -212,7 +220,10 @@ class MarketDiscovery:
                     resp.raise_for_status()
                     data = resp.json()
                     self._backoff_s = self.poll_interval
-                    return self._parse_market_response(asset, data, after_ts_ms)
+                    parsed2 = self._parse_market_response(asset, data, after_ts_ms)
+                    if parsed2 is not None and not self._passes_liquidity_filter(parsed2):
+                        return None
+                    return parsed2
             except Exception as e:
                 if self.on_event:
                     self.on_event("subscription_failed", {"asset": asset, "error": str(e)})
@@ -420,6 +431,57 @@ class MarketDiscovery:
             reported_liquidity=data.get("reported_liquidity") or data.get("liquidityNum") or data.get("liquidity"),
         )
 
+    def _passes_liquidity_filter(self, market: MarketInfo) -> bool:
+        """Liquidity filtering — no RPC, uses reported_volume/liquidity only.
+        Returns True if market passes filter or filtering disabled.
+        Emits low_liquidity event if filtered out.
+        """
+        lf = self.liquidity_filter
+        if lf is None or not getattr(lf, "enabled", False):
+            return True
+        min_liq = getattr(lf, "min_liquidity", 0) or 0
+        min_vol = getattr(lf, "min_volume", 0) or 0
+        # treat None as 0 for filtering (unknown liquidity = fail when threshold >0)
+        liq = market.reported_liquidity if market.reported_liquidity is not None else 0
+        vol = market.reported_volume if market.reported_volume is not None else 0
+        try:
+            liq_f = float(liq)
+        except Exception:
+            liq_f = 0
+        try:
+            vol_f = float(vol)
+        except Exception:
+            vol_f = 0
+        if min_liq and liq_f < float(min_liq):
+            if self.on_event:
+                try:
+                    self.on_event("low_liquidity", {
+                        "asset": market.asset,
+                        "condition_id": market.condition_id,
+                        "slug": market.slug,
+                        "reported_liquidity": liq_f,
+                        "required": float(min_liq),
+                        "reason": f"liquidity {liq_f} < {min_liq}",
+                    })
+                except Exception:
+                    pass
+            return False
+        if min_vol and vol_f < float(min_vol):
+            if self.on_event:
+                try:
+                    self.on_event("low_liquidity", {
+                        "asset": market.asset,
+                        "condition_id": market.condition_id,
+                        "slug": market.slug,
+                        "reported_volume": vol_f,
+                        "required": float(min_vol),
+                        "reason": f"volume {vol_f} < {min_vol}",
+                    })
+                except Exception:
+                    pass
+            return False
+        return True
+
 
 class RolloverManager:
     """Coordinates per-asset dual-tracking overlap (§1)."""
@@ -431,13 +493,19 @@ class RolloverManager:
         ws = getattr(config, "window_size_seconds", None)
         if ws is None:
             ws = getattr(getattr(config, "test_mode", None), "window_size_seconds", 300)
+        # liquidity filter config (no RPC)
+        lf = getattr(config, "liquidity_filter", None)
         self.discovery = discovery or MarketDiscovery(
             rest_market_url=config.ws.rest_market_url,
             poll_interval_s=config.discovery_poll_interval_seconds,
             backoff_max_s=config.discovery_backoff_max_seconds,
             on_event=on_event,
             window_size_seconds=ws,
+            liquidity_filter=lf,
         )
+        # if external discovery passed, inject liquidity_filter if missing
+        if discovery is not None and getattr(discovery, "liquidity_filter", None) is None and lf is not None:
+            discovery.liquidity_filter = lf
         self.on_event = on_event
         self.states: Dict[str, RolloverState] = {a.upper(): RolloverState(asset=a.upper()) for a in config.assets}
         self.lead_ms = config.rollover_lead_seconds * 1000

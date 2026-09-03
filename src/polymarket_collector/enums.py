@@ -78,6 +78,8 @@ class CollectorEventType(StrEnum):
     kaggle_upload_started = "kaggle_upload_started"
     kaggle_upload_success = "kaggle_upload_success"
     kaggle_upload_failed = "kaggle_upload_failed"
+    # liquidity filtering — no RPC, Gamma only
+    low_liquidity = "low_liquidity"
 
 
 class DisconnectReason(StrEnum):

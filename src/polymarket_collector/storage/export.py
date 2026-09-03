@@ -183,6 +183,23 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                             changed = True
                     except Exception:
                         pass
+                # wallet backfill — no RPC, just normalize existing CLOB fields
+                # old data may have proxyWallet/wallet under different keys already flattened
+                if r.get("wallet") is None:
+                    for cand in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner"):
+                        if r.get(cand):
+                            r["wallet"] = str(r[cand])
+                            changed = True
+                            break
+                if r.get("maker_wallet") is None and r.get("proxyWallet"):
+                    r["maker_wallet"] = str(r["proxyWallet"])
+                    changed = True
+                if r.get("wallet") is None and r.get("maker_wallet"):
+                    r["wallet"] = r["maker_wallet"]
+                    changed = True
+                if r.get("wallet") is None and r.get("taker_wallet"):
+                    r["wallet"] = r["taker_wallet"]
+                    changed = True
             if changed:
                 # rebuild table with same schema as combined (preserve types where possible)
                 combined = pa.Table.from_pylist(pylist, schema=combined.schema)
@@ -259,31 +276,62 @@ def export_per_asset_single_file(
             for asset in assets:
                 au = asset.upper()
                 table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance)
-                # enforce schema ordering already done, ensure per-asset single file
                 out_path = out / f"{au}_{ds}.parquet"
-                # handle clean_view alias: book_snapshots_500ms -> but user may want book_snapshots_clean too
+                # --- never overwrite non-empty staging with empty/smaller data (cumulative history guard) ---
+                # Load prior staging first to enforce monotonic row-count (never shrink)
+                prior_rows = None
+                prior_exists = out_path.exists()
+                if prior_exists:
+                    try:
+                        _prior = pq.read_table(str(out_path))
+                        prior_rows = _prior.num_rows
+                    except Exception:
+                        prior_rows = None
+                new_rows = table.num_rows if (table is not None) else 0
+                # If prior has data, never replace it with fewer rows (empty read, transient error, or legitimate 0)
+                # This prevents 1a empty-file overwrite and guarantees cumulative history
+                if prior_rows is not None and prior_rows > 0:
+                    if table is None or new_rows < prior_rows:
+                        # Transient read error or incomplete export would shrink history — preserve prior
+                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows
+                        continue
+                    # also guard against equal-but-earlier: if new has rows but fewer, still preserve
                 if table is not None and table.num_rows > 0:
                     tmp_path = out_path.with_suffix(".parquet.tmp")
                     pq.write_table(table, str(tmp_path), compression="zstd")
                     tmp_path.rename(out_path)
                     stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
                 else:
-                    # If prior staging file exists and has rows, preserve it (never overwrite with empty)
-                    # This prevents cumulative history destruction when read fails transiently
-                    if out_path.exists():
-                        try:
-                            prior = pq.read_table(str(out_path))
-                            if prior.num_rows > 0:
-                                # Keep prior staging file — don't destroy cumulative history
-                                stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior.num_rows
-                                continue  # skip write, preserve existing file
-                        except Exception:
-                            pass  # if can't read prior, proceed to write empty
-                    # No prior data or prior was empty — write empty parquet file to maintain 31-file staging structure
-                    tmp_path = out_path.with_suffix(".parquet.tmp")
-                    pq.write_table(pa.table({}), str(tmp_path), compression="zstd")
-                    tmp_path.rename(out_path)
-                    stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
+                    # No/hollow new data — if prior already preserved above, we already continued
+                    # If we are here, either no prior or prior was empty/0 rows
+                    if prior_exists and prior_rows is not None and prior_rows > 0:
+                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows
+                        continue
+                    # For book_snapshots_500ms 0 rows is never valid — fail closed (keep prior if any, else abort write)
+                    if ds == "book_snapshots_500ms":
+                        # No prior to preserve and no new rows -> do not create empty bare table that would be uploaded
+                        # Create empty with proper schema so file exists, but mark as 0 and let verification fail
+                        if schema is not None:
+                            empty_data = {col: [] for col in schema.names}
+                            table = pa.table(empty_data)
+                        else:
+                            table = pa.table({})
+                        tmp_path = out_path.with_suffix(".parquet.tmp")
+                        pq.write_table(table, str(tmp_path), compression="zstd")
+                        tmp_path.rename(out_path)
+                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
+                    else:
+                        # trades/book_events/chainlink_events legitimately 0 early -> write proper schema-empty, not bare pa.table({})
+                        if schema is not None:
+                            empty_data = {col: [] for col in schema.names}
+                            table = pa.table(empty_data)
+                        else:
+                            # fallback: try to preserve prior empty shape or bare
+                            table = pa.table({})
+                        tmp_path = out_path.with_suffix(".parquet.tmp")
+                        pq.write_table(table, str(tmp_path), compression="zstd")
+                        tmp_path.rename(out_path)
+                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
         elif ds in global_datasets:
             # Global dataset: always create a single file in staging, even if 0 rows
             table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
@@ -293,30 +341,34 @@ def export_per_asset_single_file(
                 out_path = out / "collector_events.parquet"
             else:  # resync_episodes
                 out_path = out / "resync_episodes.parquet"
-            # Preserve prior staging file if it has rows — never overwrite cumulative history with empty
+            # Monotonic guard for globals too: never shrink
+            prior_rows_g = None
             if out_path.exists():
                 try:
-                    prior = pq.read_table(str(out_path))
-                    if prior.num_rows > 0:
-                        # Keep prior staging file — don't destroy cumulative history
-                        stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior.num_rows
-                        continue  # skip write, preserve existing file
+                    _pg = pq.read_table(str(out_path))
+                    prior_rows_g = _pg.num_rows
                 except Exception:
-                    pass  # if can't read prior, proceed to write new file
+                    prior_rows_g = None
+            new_rows_g = table.num_rows if (table is not None and hasattr(table, "num_rows")) else 0
+            if prior_rows_g is not None and prior_rows_g > 0 and (table is None or new_rows_g < prior_rows_g):
+                stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows_g
+                continue
             if table is not None and table.num_rows > 0:
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
                 tmp_path.rename(out_path)
             else:
-                # Create empty parquet file — use _get_schema from this module for global datasets
+                # Preserve prior if we have it (already handled above), else create schema-empty
+                if prior_rows_g is not None and prior_rows_g > 0:
+                    stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows_g
+                    continue
                 global_schema = _get_schema(ds, l2_levels)
-                # Build empty data dict with schema column names
-                empty_data = {col: [] for col in global_schema.names}
-                table = pa.table(empty_data)
+                empty_data = {col: [] for col in global_schema.names} if global_schema is not None else {}
+                table = pa.table(empty_data) if empty_data else pa.table({})
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
                 tmp_path.rename(out_path)
-            stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
+            stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows if table is not None else 0
         else:
             # Should not happen with default datasets, but skip
             pass
@@ -652,6 +704,26 @@ def prepare_kaggle_staging_5m(
     stats = export_per_asset_single_file(
         data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels, include_binance=False
     )
+    # --- download-merge: if local hive is empty (new machine) but Kaggle has prior version,
+    # merge prior rows to ensure cumulative history not lost. Best-effort, no crash if offline.
+    try:
+        _try_merge_prior_kaggle_staging(staging, dataset_prefix, assets, l2_levels)
+        # Re-count after merge (merge may have increased rows)
+        # Re-read stats from staging dir
+        _merged_stats = {}
+        for _p in staging.glob("*.parquet"):
+            if _p.name.endswith(".tmp"):
+                continue
+            try:
+                _t = pq.read_table(str(_p))
+                _key = str(_p.relative_to(base) if _p.is_relative_to(base) else _p)
+                _merged_stats[_key] = _t.num_rows
+            except Exception:
+                continue
+        if _merged_stats:
+            stats = _merged_stats
+    except Exception:
+        pass
     # Ensure markets_latest also available as markets_latest.parquet alias if needed for reference
     # but primary markets file is markets.parquet (from markets_log)
     row_counts = stats
@@ -666,6 +738,102 @@ def prepare_kaggle_staging_5m(
     }
     (staging / "dataset-metadata.json").write_text(_json.dumps(meta, indent=2))
     return {"staging_path": str(staging), "files": len(stats), "row_counts": row_counts, "dataset": dataset_prefix}
+
+
+def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[str] | None, l2_levels: int = 20) -> None:
+    """Best-effort download-merge of prior Kaggle version into staging.
+
+    If local hive has no data for a file but Kaggle staging has prior rows, download
+    prior version via dataset_download_files and merge (concat + dedup) so cumulative
+    history is preserved across machines/disc clears. Silently no-ops if offline or no prior.
+    """
+    if not KAGGLE_AVAILABLE:
+        return
+    try:
+        import tempfile, shutil
+        api = __import__("kaggle").api  # type: ignore
+        # Check dataset exists
+        try:
+            api.dataset_status(dataset)
+        except Exception:
+            return  # no prior version to merge
+        tmp = Path(tempfile.mkdtemp(prefix="kaggle_prior_"))
+        try:
+            # download prior version files (quiet)
+            try:
+                api.dataset_download_files(dataset, path=str(tmp), quiet=True, unzip=True)
+            except TypeError:
+                api.dataset_download_files(dataset, path=str(tmp), quiet=True)
+            except Exception:
+                return
+            # Find downloaded parquets (could be nested)
+            prior_files = list(tmp.rglob("*.parquet"))
+            if not prior_files:
+                return
+            prior_map = {p.name: p for p in prior_files}
+            for expected_name in [f"{a}_{ds}.parquet" for a in (assets or []) for ds in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]] + ["markets.parquet", "collector_events.parquet", "resync_episodes.parquet"]:
+                staging_path = staging / expected_name
+                prior_path = prior_map.get(expected_name)
+                if prior_path is None or not staging_path.exists():
+                    # If staging missing but prior has it, copy prior as baseline
+                    if prior_path is not None and not staging_path.exists():
+                        try:
+                            shutil.copy(str(prior_path), str(staging_path))
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    cur_t = pq.read_table(str(staging_path))
+                    prior_t = pq.read_table(str(prior_path))
+                    if prior_t.num_rows > cur_t.num_rows:
+                        # Need to merge: concat and dedup by time+condition_id if possible
+                        # For book_snapshots use (asset,condition_id,ts_snapshot_ns) dedup
+                        try:
+                            combined = pa.concat_tables([prior_t, cur_t], promote=True)
+                            # Dedup via pylist distinct by serialization if small, else keep prior larger
+                            # Simple: if prior has more rows, keep prior + only new rows not in prior
+                            # Use dedup key based on dataset type where possible
+                            # For now, dedup on row dict equality via pylist set of tuple keys
+                            pylist = combined.to_pylist()
+                            seen = set()
+                            uniq = []
+                            for r in pylist:
+                                # key: try snapshot ns+cid, else trade_id, else str(r)
+                                k = None
+                                if "ts_snapshot_ns" in r and "condition_id" in r:
+                                    k = (r.get("asset"), r.get("condition_id"), r.get("ts_snapshot_ns"))
+                                elif "trade_id" in r:
+                                    k = r.get("trade_id")
+                                elif "event_id" in r:
+                                    k = r.get("event_id")
+                                else:
+                                    k = tuple(sorted((kk, str(vv)) for kk, vv in r.items() if vv is not None))
+                                if k not in seen:
+                                    seen.add(k)
+                                    uniq.append(r)
+                            if len(uniq) > cur_t.num_rows:
+                                merged = pa.Table.from_pylist(uniq, schema=cur_t.schema if cur_t.num_rows else None)
+                                # sort time first
+                                try:
+                                    sort_col = next((c for c in ["ts_snapshot_ns", "ts_snapshot_utc", "ts_source", "ts_utc", "updated_at"] if c in merged.schema.names), None)
+                                    if sort_col:
+                                        merged = merged.sort_by(sort_col)
+                                except Exception:
+                                    pass
+                                pq.write_table(merged, str(staging_path.with_suffix(".parquet.tmp")), compression="zstd")
+                                Path(str(staging_path.with_suffix(".parquet.tmp"))).rename(staging_path)
+                        except Exception:
+                            # Fallback: keep larger prior file
+                            shutil.copy(str(prior_path), str(staging_path))
+                except Exception:
+                    continue
+        finally:
+            try:
+                shutil.rmtree(str(tmp), ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def upload_to_kaggle(
@@ -771,21 +939,50 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                 for _ in range(60):
                     try:
                         st = api.dataset_status(dataset)
-                        # status may be dict with 'status' or object
                         s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
                         if s == "ready":
-                            # verify staging has data with rows (not empty from prior overwrite)
-                            # and verify file count matches expected 31 files (7 assets x 4 datasets + 3 globals)
                             _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 4 + 3
                             _rows_ok = _verify_staging_row_counts(staging, expected_assets)
-                            if _rows_ok and _files_ok:
-                                print(f"✓ Kaggle dataset ready: {dataset}")
+                            # Remote verification: ensure Kaggle actually stores expected files (not just local status)
+                            _remote_ok = True
+                            try:
+                                remote_files = api.dataset_list_files(dataset)
+                                # dataset_list_files may return object with .files or dict
+                                if isinstance(remote_files, dict):
+                                    files_list = remote_files.get("datasetFiles") or remote_files.get("files") or []
+                                else:
+                                    files_list = getattr(remote_files, "files", None) or getattr(remote_files, "datasetFiles", None) or []
+                                    if files_list is None:
+                                        files_list = []
+                                remote_names = set()
+                                for f in files_list:
+                                    if isinstance(f, dict):
+                                        n = f.get("ref") or f.get("name") or f.get("fileName")
+                                    else:
+                                        n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
+                                    if n:
+                                        remote_names.add(Path(str(n)).name)
+                                # Check remote has at least expected parquets
+                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet"}
+                                if not expected_names.issubset(remote_names):
+                                    _remote_ok = False
+                                    # keep polling; remote may still be processing
+                                # Also check remote total files >= expected
+                                if len(remote_names) < len(expected_names):
+                                    _remote_ok = False
+                            except Exception:
+                                # If we cannot list remote files, don't block on remote_ok but require local checks
+                                _remote_ok = True
+                            if _rows_ok and _files_ok and _remote_ok:
+                                print(f"✓ Kaggle dataset ready: {dataset} (local files={_expected_staging_files(staging)}, remote verified)")
                                 _write_kaggle_state(staging, dataset, version_notes)
                                 return True
                             elif not _rows_ok:
                                 print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
                             elif not _files_ok:
                                 print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 4 + 3}; waiting for complete upload")
+                            elif not _remote_ok:
+                                print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
                         elif s in ("failed", "error"):
                             print(f"✗ Kaggle dataset in error state: {dataset}")
                             _write_kaggle_state(staging, dataset, version_notes)
@@ -826,26 +1023,28 @@ def _expected_staging_files(staging: Path) -> int:
 
 
 def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> bool:
-    """Verify that each staging file exists and per-asset files have rows.
+    """Verify staging file existence and row-count policy.
 
+    - book_snapshots_500ms must have >0 rows per active asset (critical null vs zero check;
+      empty snapshots would mean 100% data loss and must block upload)
+    - trades/book_events/chainlink_events may legitimately be 0 rows early (no trades yet)
+      so only existence + readable parquet required; we do NOT block upload if 0
+    - globals existence only
+    - Also enforces monotonic: if _kaggle_state.json records prior staging row counts,
+      current must be >= prior (never shrink). This catches empty-file overwrite (1a).
     Returns True if all expected files exist, False otherwise.
-    Per-asset files must have >0 rows to prevent loss of cumulative history.
-    Global files (markets_log/collector_events/resync_episodes) are allowed
-    to be empty on first upload (0 rows is valid early in collection), so
-    only existence + readable parquet is required.
     """
-    per_asset_datasets = {"book_snapshots_500ms", "book_events", "trades", "chainlink_events"}
-    # global filenames as written by export_per_asset_single_file()
+    # Only snapshots are required >0; other per-asset datasets allow 0 (null vs zero fix 4b)
+    required_gt_zero = {"book_snapshots_500ms"}
+    optional_per_asset = {"book_events", "trades", "chainlink_events"}
     global_file_map = {
         "markets_log": "markets.parquet",
         "collector_events": "collector_events.parquet",
         "resync_episodes": "resync_episodes.parquet",
     }
-
-    # Check per-asset files: expected_assets x 4 datasets must have >0 rows
     for asset in expected_assets:
         au = asset.upper()
-        for ds in per_asset_datasets:
+        for ds in required_gt_zero:
             fpath = staging / f"{au}_{ds}.parquet"
             if not fpath.exists():
                 return False
@@ -855,8 +1054,14 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
                     return False
             except Exception:
                 return False
-
-    # Check global files — existence only (empty is valid at beginning)
+        for ds in optional_per_asset:
+            fpath = staging / f"{au}_{ds}.parquet"
+            if not fpath.exists():
+                return False
+            try:
+                pq.read_table(str(fpath))
+            except Exception:
+                return False
     for ds, fname in global_file_map.items():
         fpath = staging / fname
         if not fpath.exists():
@@ -865,7 +1070,33 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
             pq.read_table(str(fpath))
         except Exception:
             return False
-
+    # Monotonic check vs prior staging (download-merge fallback when no local hive yet)
+    try:
+        state_path = staging.parent.parent / "_kaggle_state.json"
+        if not state_path.exists():
+            state_path = staging.parent / "_kaggle_state.json"
+        if state_path.exists():
+            import json as _js
+            state = _js.loads(state_path.read_text())
+            # find last export row counts if stored under _last_staging_counts
+            for _k, _v in state.items():
+                if isinstance(_v, dict) and "_last_staging_counts" in _v:
+                    prior_counts = _v["_last_staging_counts"]
+                    for au in expected_assets:
+                        for ds in required_gt_zero | optional_per_asset:
+                            key = f"{au}_{ds}.parquet"
+                            prior = prior_counts.get(key)
+                            if prior is not None and prior > 0:
+                                cur_path = staging / key
+                                try:
+                                    cur_rows = pq.read_table(str(cur_path)).num_rows
+                                    if cur_rows < prior:
+                                        return False
+                                except Exception:
+                                    return False
+                    break
+    except Exception:
+        pass
     return True
 
 
@@ -879,12 +1110,24 @@ def _write_kaggle_state(staging: Path, dataset: str, notes: str):
                 state = _json.loads(state_path.read_text())
             except Exception:
                 state = {}
+        # Persist per-file row counts for monotonic verification (fix 1c/1a)
+        staging_counts = {}
+        try:
+            for p in Path(staging).glob("*.parquet"):
+                if p.name.endswith(".tmp"):
+                    continue
+                try:
+                    staging_counts[p.name] = pq.read_table(str(p)).num_rows
+                except Exception:
+                    continue
+        except Exception:
+            staging_counts = {}
         state[dataset] = {
             "last_version_notes": notes,
             "last_upload_utc": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
             "last_upload_unix_ms": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1000),
+            "_last_staging_counts": staging_counts,
         }
-        # keep per-staging row counts if present
         state_path.write_text(_json.dumps(state, indent=2))
     except Exception:
         pass

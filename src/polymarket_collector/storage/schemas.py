@@ -124,7 +124,8 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("threshold_config_id", pa.string(), nullable=True),
 ])
 
-# §5 trades — time first, condition_id second, with transaction_hash
+# §5 trades — time first, condition_id second, with transaction_hash + wallet fields (no RPC)
+# wallet fields come from CLOB REST/WS (proxyWallet/maker/taker) — no on-chain RPC required
 TRADES_SCHEMA = pa.schema([
     pa.field("ts_source", pa.string(), nullable=True),
     pa.field("ts_received_ns", pa.int64(), nullable=False),
@@ -144,6 +145,10 @@ TRADES_SCHEMA = pa.schema([
     pa.field("side", pa.string(), nullable=True),
     pa.field("aggressor_side", pa.string(), nullable=True),
     pa.field("sequence_number", pa.int64(), nullable=True),
+    # wallet — from CLOB trade payload (maker/taker proxy wallet), no RPC
+    pa.field("maker_wallet", pa.string(), nullable=True),   # maker proxy wallet (0x...)
+    pa.field("taker_wallet", pa.string(), nullable=True),   # taker proxy wallet (0x...)
+    pa.field("wallet", pa.string(), nullable=True),         # canonical wallet (taker if present else maker) for single-col queries
 ])
 
 # §6 chainlink_events — time first

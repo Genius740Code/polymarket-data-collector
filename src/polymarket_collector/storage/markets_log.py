@@ -75,11 +75,18 @@ class MarketsLog:
         row.setdefault("market_start_ts_ms", None)
         row.setdefault("market_end_ts_ms", None)
         self._staging.append(row)
-        # if writer provided, also enqueue for batched parquet flush
         if self.writer:
             import datetime as dtmod
             date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
-            self.writer.append("markets_log", row, asset=None, date_str=date_str)
+            ok = self.writer.append("markets_log", row, asset=None, date_str=date_str)
+            if not ok:
+                # Backpressure: staging already holds row, writer WAL-persisted if enabled;
+                # do NOT drop — will be retried on next flush_staging if writer was WAL-disabled
+                try:
+                    # Keep in staging for retry; writer will be retried via flush_staging fallback
+                    pass
+                except Exception:
+                    pass
 
     def append_event(
         self,
@@ -109,11 +116,12 @@ class MarketsLog:
             "schema_version": "3.2.0",
         }
         self._staging.append(row)
-        # if writer provided, also enqueue for batched parquet flush
         if self.writer:
             import datetime as dtmod
             date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
-            self.writer.append("collector_events", row, asset=asset, date_str=date_str)
+            ok = self.writer.append("collector_events", row, asset=asset, date_str=date_str)
+            if not ok:
+                pass  # staged already, will be retried
         # also enqueue markets_log schema rows (mixed markets + events) when no separate writer
         # markets_log rows are handled via append(market) path; collector_events are separate
 

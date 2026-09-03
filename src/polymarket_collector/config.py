@@ -95,6 +95,18 @@ class TestModeConfig(BaseModel):
     window_size_seconds: int = 300  # override default 5-min window size (test only uses 5m)
 
 
+class LiquidityFilterConfig(BaseModel):
+    """Liquidity filtering — §0 before enabling asset + §3 volume/liquidity gate.
+    No RPC — uses Gamma reported_volume/reported_liquidity only.
+    If market's liquidity < min_liquidity OR volume < min_volume, skip collection
+    for that window (emit low_liquidity event) and try next window's market.
+    """
+    enabled: bool = False  # off by default — collect all unless user opts in
+    min_liquidity: float = 0.0  # e.g. 500 means require liquidityNum >= 500
+    min_volume: float = 0.0  # e.g. 1000 means require volumeNum >= 1000
+    min_spread_liquidity_check: bool = False  # if true, check spread via book snapshot too
+
+
 class CapacityConfig(BaseModel):
     estimated_row_bytes_uncompressed: int = 2500
     parquet_compression_ratio: float = 0.25
@@ -143,6 +155,7 @@ class CollectorConfig(BaseSettings):
     capacity: CapacityConfig = Field(default_factory=CapacityConfig)
     kaggle: KaggleConfig = Field(default_factory=KaggleConfig)
     test_mode: TestModeConfig = Field(default_factory=TestModeConfig)
+    liquidity_filter: LiquidityFilterConfig = Field(default_factory=LiquidityFilterConfig)
     synthetic_mode: bool = False  # when True, allows fallback synthetic data; default off for prod safety
 
     # optional overrides for tests
