@@ -1,142 +1,0 @@
-dry test start synthetic=True
-/home/fese/polymarket-collector/src/polymarket_collector/collector.py:1363: FutureWarning: promote has been superseded by promote_options='default'.
-  built = build_clean_view(self.config.storage.data_dir)
-/home/fese/polymarket-collector/src/polymarket_collector/storage/compaction.py:83: FutureWarning: promote has been superseded by promote_options='default'.
-  rows = compact_dataset(leaf_dir, temp_suffix=temp_suffix)
-/home/fese/polymarket-collector/src/polymarket_collector/storage/export.py:337: FutureWarning: promote has been superseded by promote_options='default'.
-  table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
-/home/fese/polymarket-collector/src/polymarket_collector/storage/export.py:710: FutureWarning: promote has been superseded by promote_options='default'.
-  _try_merge_prior_kaggle_staging(staging, dataset_prefix, assets, l2_levels)
-[test-mode:real] aligning to next 5m market boundary 2026-09-03T19:25:00+00:00 — waiting 85.0s so we start on fresh market (not halfway) — 5m-only, 7 assets
-[test-mode:real] boundary reached, starting collector (fresh market)
-[startup] recovering cursor state for assets: ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
-[startup] no cursor for BTC
-[startup] no cursor for ETH
-[startup] no cursor for SOL
-[startup] no cursor for HYPE
-[startup] no cursor for BNB
-[startup] no cursor for XRP
-[startup] no cursor for DOGE
-[startup] replayed 1 rows from WAL after crash/restart
-[test-mode:real] QUICK TEST — 1×300s (5m-only) = 5min total, 7 assets ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE']
-[test-mode] chunks: every 2 markets → kaggle every 600s (10min), one-file-per-asset staging (31 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals
-[test-mode:real] 30s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[flush] 1347 rows
-[test-mode:real] 60s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[test-mode:real] 90s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[flush] 1381 rows
-[test-mode:real] 120s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[test-mode:real] 150s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[flush] 1365 rows
-[test-mode:real] 180s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[test-mode:real] 210s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[flush] 1356 rows
-[test-mode:real] 241s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[test-mode:real] 271s elapsed, windows per asset: {'BTC': [], 'ETH': [], 'SOL': [], 'HYPE': [], 'BNB': [], 'XRP': [], 'DOGE': []}, timeout 390s, kaggle 0 uploads
-[flush] 1550 rows
-[test-mode:real] 301s elapsed, windows per asset: {'BTC': [5961545], 'ETH': [5961545], 'SOL': [5961545], 'HYPE': [5961545], 'BNB': [5961545], 'XRP': [5961545], 'DOGE': [5961545]}, timeout 390s, kaggle 0 uploads
-[test-mode:real] all assets have 1 windows (completed={'BTC': {5961545}, 'ETH': {5961545}, 'SOL': {5961545}, 'HYPE': {5961545}, 'BNB': {5961545}, 'XRP': {5961545}, 'DOGE': {5961545}}), stopping
-[test-mode:real] flushed 0 rows
-[test-mode:real] compacted markets_latest -> data/markets_latest/markets_latest.parquet
-[test-mode] final kaggle check: since_last=301s uploads=0/1 → uploading final
-[test-kaggle:final] compacted data/markets_latest/markets_latest.parquet
-[test-kaggle:final] clean_view rows 4185
-✓ Kaggle API credentials found in /home/fese/.kaggle/access_token
-compacted: {'book_snapshots_500ms/date=2026-09-03/asset=BTC': 657, 'book_snapshots_500ms/date=2026-09-03/asset=ETH': 597, 'book_snapshots_500ms/date=2026-09-03/asset=BNB': 657, 'book_snapshots_500ms/date=2026-09-03/asset=DOGE': 597, 'book_snapshots_500ms/date=2026-09-03/asset=XRP': 597, 'book_snapshots_500ms/date=2026-09-03/asset=SOL': 597, 'book_snapshots_500ms/date=2026-09-03/asset=HYPE': 597, 'book_events/date=2026-09-03/asset=BTC': 25, 'book_events/date=2026-09-03/asset=ETH': 26, 'book_events/date=2026-09-03/asset=BNB': 27, 'book_events/date=2026-09-03/asset=DOGE': 26, 'book_events/date=2026-09-03/asset=XRP': 24, 'book_events/date=2026-09-03/asset=SOL': 28, 'book_events/date=2026-09-03/asset=HYPE': 27, 'trades/date=2026-09-03/asset=BTC': 116, 'trades/date=2026-09-03/asset=ETH': 107, 'trades/date=2026-09-03/asset=BNB': 122, 'trades/date=2026-09-03/asset=DOGE': 103, 'trades/date=2026-09-03/asset=XRP': 95, 'trades/date=2026-09-03/asset=SOL': 97, 'trades/date=2026-09-03/asset=HYPE': 109, 'chainlink_events/date=2026-09-03/asset=BTC': 261, 'chainlink_events/date=2026-09-03/asset=ETH': 235, 'chainlink_events/date=2026-09-03/asset=BNB': 260, 'chainlink_events/date=2026-09-03/asset=DOGE': 238, 'chainlink_events/date=2026-09-03/asset=XRP': 236, 'chainlink_events/date=2026-09-03/asset=SOL': 240, 'chainlink_events/date=2026-09-03/asset=HYPE': 242, 'collector_events/date=2026-09-03': 50}
-clean_view built: 4185 rows (live only, disputed excluded)
-=== Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH', 'SOL', 'HYPE', 'BNB', 'XRP', 'DOGE'] -> data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto ===
-Dataset URL: https://www.kaggle.com/datasets/gghgg1/polymarket-5m-crypto
-staging prepared: 31 files, dataset gghgg1/polymarket-5m-crypto
-=== Step 2: Uploading 5m staging to Kaggle gghgg1/polymarket-5m-crypto ===
-Starting upload for file HYPE_book_snapshots_500ms.parquet
-  0%|          | 0.00/130k [00:00<?, ?B/s]100%|██████████| 130k/130k [00:01<00:00, 118kB/s]
-Upload successful: HYPE_book_snapshots_500ms.parquet (130KB)
-Starting upload for file BTC_chainlink_events.parquet
-  0%|          | 0.00/71.1k [00:00<?, ?B/s]100%|██████████| 71.1k/71.1k [00:00<00:00, 76.8kB/s]
-Upload successful: BTC_chainlink_events.parquet (71KB)
-Starting upload for file SOL_trades.parquet
-  0%|          | 0.00/66.3k [00:00<?, ?B/s]100%|██████████| 66.3k/66.3k [00:00<00:00, 145kB/s]
-Upload successful: SOL_trades.parquet (66KB)
-Starting upload for file BTC_trades.parquet
-  0%|          | 0.00/77.7k [00:00<?, ?B/s]100%|██████████| 77.7k/77.7k [00:00<00:00, 170kB/s]
-Upload successful: BTC_trades.parquet (78KB)
-Starting upload for file markets.parquet
-  0%|          | 0.00/13.8k [00:00<?, ?B/s]100%|██████████| 13.8k/13.8k [00:00<00:00, 36.9kB/s]
-Upload successful: markets.parquet (14KB)
-Starting upload for file ETH_trades.parquet
-  0%|          | 0.00/66.7k [00:00<?, ?B/s]100%|██████████| 66.7k/66.7k [00:00<00:00, 72.5kB/s]
-Upload successful: ETH_trades.parquet (67KB)
-Starting upload for file XRP_book_events.parquet
-  0%|          | 0.00/11.2k [00:00<?, ?B/s]100%|██████████| 11.2k/11.2k [00:00<00:00, 14.1kB/s]
-Upload successful: XRP_book_events.parquet (11KB)
-Starting upload for file HYPE_chainlink_events.parquet
-  0%|          | 0.00/58.9k [00:00<?, ?B/s]100%|██████████| 58.9k/58.9k [00:00<00:00, 136kB/s]
-Upload successful: HYPE_chainlink_events.parquet (59KB)
-Starting upload for file DOGE_book_events.parquet
-  0%|          | 0.00/11.0k [00:00<?, ?B/s]100%|██████████| 11.0k/11.0k [00:00<00:00, 12.9kB/s]
-Upload successful: DOGE_book_events.parquet (11KB)
-Starting upload for file collector_events.parquet
-  0%|          | 0.00/12.6k [00:00<?, ?B/s]100%|██████████| 12.6k/12.6k [00:00<00:00, 31.9kB/s]
-Upload successful: collector_events.parquet (13KB)
-Starting upload for file HYPE_trades.parquet
-  0%|          | 0.00/68.6k [00:00<?, ?B/s]100%|██████████| 68.6k/68.6k [00:00<00:00, 147kB/s]
-Upload successful: HYPE_trades.parquet (69KB)
-Starting upload for file ETH_chainlink_events.parquet
-  0%|          | 0.00/64.7k [00:00<?, ?B/s]100%|██████████| 64.7k/64.7k [00:00<00:00, 70.5kB/s]
-Upload successful: ETH_chainlink_events.parquet (65KB)
-Starting upload for file XRP_chainlink_events.parquet
-  0%|          | 0.00/58.0k [00:00<?, ?B/s]100%|██████████| 58.0k/58.0k [00:00<00:00, 138kB/s]
-Upload successful: XRP_chainlink_events.parquet (58KB)
-Starting upload for file resync_episodes.parquet
-  0%|          | 0.00/2.14k [00:00<?, ?B/s]100%|██████████| 2.14k/2.14k [00:00<00:00, 5.44kB/s]
-Upload successful: resync_episodes.parquet (2KB)
-Starting upload for file BNB_book_events.parquet
-  0%|          | 0.00/11.1k [00:00<?, ?B/s]100%|██████████| 11.1k/11.1k [00:00<00:00, 13.2kB/s]
-Upload successful: BNB_book_events.parquet (11KB)
-Starting upload for file XRP_book_snapshots_500ms.parquet
-  0%|          | 0.00/136k [00:00<?, ?B/s]100%|██████████| 136k/136k [00:00<00:00, 211kB/s]
-Upload successful: XRP_book_snapshots_500ms.parquet (136KB)
-Starting upload for file BTC_book_snapshots_500ms.parquet
-  0%|          | 0.00/156k [00:00<?, ?B/s]100%|██████████| 156k/156k [00:01<00:00, 138kB/s]
-Upload successful: BTC_book_snapshots_500ms.parquet (156KB)
-Starting upload for file DOGE_chainlink_events.parquet
-  0%|          | 0.00/58.0k [00:00<?, ?B/s]100%|██████████| 58.0k/58.0k [00:00<00:00, 65.2kB/s]
-Upload successful: DOGE_chainlink_events.parquet (58KB)
-Starting upload for file ETH_book_snapshots_500ms.parquet
-  0%|          | 0.00/135k [00:00<?, ?B/s]100%|██████████| 135k/135k [00:01<00:00, 123kB/s]
-Upload successful: ETH_book_snapshots_500ms.parquet (135KB)
-Starting upload for file XRP_trades.parquet
-  0%|          | 0.00/66.1k [00:00<?, ?B/s]100%|██████████| 66.1k/66.1k [00:00<00:00, 71.8kB/s]
-Upload successful: XRP_trades.parquet (66KB)
-Starting upload for file DOGE_trades.parquet
-  0%|          | 0.00/66.2k [00:00<?, ?B/s]100%|██████████| 66.2k/66.2k [00:00<00:00, 143kB/s]
-Upload successful: DOGE_trades.parquet (66KB)
-Starting upload for file BNB_chainlink_events.parquet
-  0%|          | 0.00/62.2k [00:00<?, ?B/s]100%|██████████| 62.2k/62.2k [00:00<00:00, 68.2kB/s]
-Upload successful: BNB_chainlink_events.parquet (62KB)
-Starting upload for file BNB_book_snapshots_500ms.parquet
-  0%|          | 0.00/139k [00:00<?, ?B/s]100%|██████████| 139k/139k [00:00<00:00, 220kB/s]
-Upload successful: BNB_book_snapshots_500ms.parquet (139KB)
-Starting upload for file BNB_trades.parquet
-  0%|          | 0.00/71.0k [00:00<?, ?B/s]100%|██████████| 71.0k/71.0k [00:00<00:00, 162kB/s]
-Upload successful: BNB_trades.parquet (71KB)
-Starting upload for file HYPE_book_events.parquet
-  0%|          | 0.00/11.2k [00:00<?, ?B/s]100%|██████████| 11.2k/11.2k [00:00<00:00, 29.0kB/s]
-Upload successful: HYPE_book_events.parquet (11KB)
-Starting upload for file BTC_book_events.parquet
-  0%|          | 0.00/11.1k [00:00<?, ?B/s]100%|██████████| 11.1k/11.1k [00:00<00:00, 28.2kB/s]
-Upload successful: BTC_book_events.parquet (11KB)
-Starting upload for file SOL_book_snapshots_500ms.parquet
-  0%|          | 0.00/135k [00:00<?, ?B/s]100%|██████████| 135k/135k [00:00<00:00, 200kB/s]
-Upload successful: SOL_book_snapshots_500ms.parquet (135KB)
-Starting upload for file SOL_book_events.parquet
-  0%|          | 0.00/10.9k [00:00<?, ?B/s]100%|██████████| 10.9k/10.9k [00:00<00:00, 27.2kB/s]
-Upload successful: SOL_book_events.parquet (11KB)
-Starting upload for file ETH_book_events.parquet
-  0%|          | 0.00/11.7k [00:00<?, ?B/s]100%|██████████| 11.7k/11.7k [00:00<00:00, 30.8kB/s]
-Upload successful: ETH_book_events.parquet (12KB)
-Starting upload for file SOL_chainlink_events.parquet
-  0%|          | 0.00/60.4k [00:00<?, ?B/s]100%|██████████| 60.4k/60.4k [00:00<00:00, 65.1kB/s]
-Upload successful: SOL_chainlink_events.parquet (60KB)
-Starting upload for file DOGE_book_snapshots_500ms.parquet
-  0%|          | 0.00/136k [00:00<?, ?B/s]100%|██████████| 136k/136k [00:00<00:00, 213kB/s]

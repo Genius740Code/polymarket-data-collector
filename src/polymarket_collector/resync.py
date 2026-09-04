@@ -72,11 +72,13 @@ class ResyncManager:
         rest_fetcher: Callable[..., Any],  # async (asset, condition_id) -> rest snapshot dict
         on_event=None,
         on_book_state_change=None,
+        on_episode_persist=None,
     ):
         self.config = config
         self.rest_fetcher = rest_fetcher
         self.on_event = on_event
         self.on_book_state_change = on_book_state_change
+        self.on_episode_persist = on_episode_persist
         self._episodes: Dict[str, ResyncEpisode] = {}  # resync_id -> episode
         self._buffers: Dict[str, deque] = {}  # resync_id -> buffered WS messages
         self._rest_attempt_counts: Dict[str, int] = {}
@@ -104,6 +106,11 @@ class ResyncManager:
                     self.on_book_state_change(book, BookState.stale)
         if self.on_event:
             self.on_event(CollectorEventType.ws_disconnected, ep.to_dict())
+        if self.on_episode_persist:
+            try:
+                self.on_episode_persist(ep.to_dict())
+            except Exception:
+                pass
         return resync_id
 
     def handle_reconnect(self, resync_id: str) -> None:
@@ -124,6 +131,11 @@ class ResyncManager:
             pass
         if self.on_event:
             self.on_event(CollectorEventType.ws_reconnected, ep.to_dict())
+        if self.on_episode_persist:
+            try:
+                self.on_episode_persist(ep.to_dict())
+            except Exception:
+                pass
 
     # -- buffering during REST fetch ---------------------------------------
     def buffer_message(self, resync_id: str, msg: dict) -> None:
@@ -139,6 +151,14 @@ class ResyncManager:
         ep = self._episodes.get(resync_id)
         if not ep:
             return False
+
+        # Ensure reconnect timestamp is set before first REST fetch (fixes 100% null gap_duration)
+        if ep.reconnect_ts_utc is None:
+            try:
+                self.handle_reconnect(resync_id)
+                ep = self._episodes.get(resync_id) or ep
+            except Exception:
+                pass
 
         cfg = self.config.ws
         max_duration_s = cfg.max_resync_duration_seconds
@@ -156,6 +176,12 @@ class ResyncManager:
         while True:
             ep.resync_attempt_count += 1
             ep.resync_rest_fetch_ts_utc = _now_iso()
+            # persist attempt timestamp even on failure (ensures not 100% null)
+            if self.on_episode_persist:
+                try:
+                    self.on_episode_persist(ep.to_dict())
+                except Exception:
+                    pass
             try:
                 snapshot = await self.rest_fetcher(asset, condition_id)
                 if snapshot is None:
@@ -201,6 +227,11 @@ class ResyncManager:
                 ep.resync_completed_ts_utc = _now_iso()
                 if self.on_event:
                     self.on_event(CollectorEventType.resync_completed, ep.to_dict())
+                if self.on_episode_persist:
+                    try:
+                        self.on_episode_persist(ep.to_dict())
+                    except Exception:
+                        pass
                 # cleanup buffer
                 self._buffers.pop(resync_id, None)
                 return True
@@ -208,10 +239,32 @@ class ResyncManager:
             except Exception as e:
                 if self.on_event:
                     self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "attempt": ep.resync_attempt_count, "error": str(e)})
+                # persist episode even on failed attempt (fixes gap_duration null)
+                if self.on_episode_persist:
+                    try:
+                        self.on_episode_persist(ep.to_dict())
+                    except Exception:
+                        pass
                 # check escalation timeout
                 elapsed = time.monotonic() - start_ts
                 if elapsed >= max_duration_s:
                     # escalate — treat as page operator (§1A retry policy)
+                    # Mark gap metrics even on escalation so episode is not 100% null
+                    if ep.gap_duration_ms is None and ep.reconnect_ts_utc is not None:
+                        try:
+                            import datetime as _dt2
+                            disc = _dt2.datetime.fromisoformat(ep.disconnect_ts_utc.replace("Z", "+00:00"))
+                            recon = _dt2.datetime.fromisoformat(ep.reconnect_ts_utc.replace("Z", "+00:00"))
+                            ep.gap_duration_ms = int((recon - disc).total_seconds() * 1000)
+                            ep.snapshots_missed_estimate = ep.gap_duration_ms // 500
+                        except Exception:
+                            ep.gap_duration_ms = int(elapsed * 1000)
+                            ep.snapshots_missed_estimate = ep.gap_duration_ms // 500
+                    if self.on_episode_persist:
+                        try:
+                            self.on_episode_persist(ep.to_dict())
+                        except Exception:
+                            pass
                     if self.on_event:
                         self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed})
                     return False
@@ -244,6 +297,15 @@ class ResyncManager:
             if self.on_event:
                 self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "error": str(e)})
         return None
+
+    def ensure_all_reconnected(self) -> None:
+        """Set reconnect timestamp for any episode still pending (e.g., on collector stop)."""
+        for ep in list(self._episodes.values()):
+            if ep.reconnect_ts_utc is None:
+                try:
+                    self.handle_reconnect(ep.resync_id)
+                except Exception:
+                    pass
 
     def get_episode(self, resync_id: str) -> Optional[ResyncEpisode]:
         return self._episodes.get(resync_id)

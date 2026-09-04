@@ -156,7 +156,7 @@ class CollectorConfig(BaseSettings):
     kaggle: KaggleConfig = Field(default_factory=KaggleConfig)
     test_mode: TestModeConfig = Field(default_factory=TestModeConfig)
     liquidity_filter: LiquidityFilterConfig = Field(default_factory=LiquidityFilterConfig)
-    synthetic_mode: bool = False  # when True, allows fallback synthetic data; default off for prod safety
+    synthetic_mode: bool = False  # DEPRECATED: synthetic data permanently disabled - always False, kept for backward compat
 
     # optional overrides for tests
     _config_path: Optional[str] = None

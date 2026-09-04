@@ -26,11 +26,27 @@ class MarketsLog:
         self.writer = writer  # optional ParquetWriter (batched)
         # small staging store for buffering before parquet flush (§9A)
         self._staging: List[Dict] = []
+        self._seen_condition_ids: set = set()  # dedup within process lifetime (fixes duplicate 5961540)
 
     def append(self, market: Dict, updated_at: Optional[str] = None) -> None:
         """Append a new state snapshot for a market (condition_id)."""
         import datetime
         row = dict(market)
+        # Dedup: skip if same condition_id already staged (prevents 2x rows from concurrent discovery)
+        cid = row.get("condition_id") or market.get("condition_id")
+        if cid and cid in self._seen_condition_ids:
+            # Allow update if status/resolution changed, otherwise skip duplicate active row
+            # Check existing staged row for same cid has same status - if so skip
+            for existing in self._staging:
+                if existing.get("condition_id") == cid and existing.get("status") == row.get("status", "active") and existing.get("resolution_outcome", "unknown") == row.get("resolution_outcome", "unknown"):
+                    return
+            # Also check if already exists in committed latest (via writer dedup handled in compact) - still stage update if different, else skip
+            # For exact duplicate active+unknown, skip
+            if row.get("status", "active") == "active" and row.get("resolution_outcome", "unknown") == "unknown":
+                # Check if we've already seen this cid recently - skip duplicate
+                return
+        if cid:
+            self._seen_condition_ids.add(cid)
         row["updated_at"] = updated_at or datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
         # §3.1 alias: recorded_at mirrors updated_at for Kaggle JSON
         if not row.get("recorded_at"):

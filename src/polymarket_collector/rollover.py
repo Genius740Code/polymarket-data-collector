@@ -300,24 +300,37 @@ class MarketDiscovery:
         except Exception:
             tick_size = 0.01
 
-        # §3.1 slug / §3.3 volume/liquidity population
+        # §3.1 slug / §3.3 volume/liquidity population (robust fallback, fixes 86% null misread)
         slug_val = data.get("slug") or data.get("marketSlug") or data.get("market_slug") or self._slug_for(asset, ts_seconds)
-        # volume / liquidity may be string or number, try volumeNum first
-        reported_volume = data.get("volumeNum")
-        if reported_volume is None:
-            reported_volume = data.get("volume")
-        reported_liquidity = data.get("liquidityNum")
-        if reported_liquidity is None:
-            reported_liquidity = data.get("liquidity")
-        # coerce to float where possible
-        try:
-            reported_volume = float(reported_volume) if reported_volume is not None else None
-        except Exception:
-            reported_volume = None
-        try:
-            reported_liquidity = float(reported_liquidity) if reported_liquidity is not None else None
-        except Exception:
-            reported_liquidity = None
+        # volume / liquidity may be string/number under many keys; Gamma v2 uses volume/liquidity as strings
+        reported_volume = (
+            data.get("volumeNum") if data.get("volumeNum") is not None else
+            data.get("volume_num") if data.get("volume_num") is not None else
+            data.get("volume")
+        )
+        reported_liquidity = (
+            data.get("liquidityNum") if data.get("liquidityNum") is not None else
+            data.get("liquidity_num") if data.get("liquidity_num") is not None else
+            data.get("liquidity")
+        )
+        # also try nested inside 'market' dict if present
+        if reported_volume is None and isinstance(data.get("market"), dict):
+            reported_volume = data["market"].get("volumeNum") or data["market"].get("volume")
+        if reported_liquidity is None and isinstance(data.get("market"), dict):
+            reported_liquidity = data["market"].get("liquidityNum") or data["market"].get("liquidity")
+        # coerce to float where possible; empty string -> None (upcoming market has 0 volume, not error)
+        def _to_float(v):
+            if v is None or v == "" or (isinstance(v, str) and v.strip().lower() in ("none","null")):
+                return None
+            try:
+                # handle comma string "1,234.56"
+                if isinstance(v, str):
+                    v = v.replace(",", "")
+                return float(v)
+            except Exception:
+                return None
+        reported_volume = _to_float(reported_volume)
+        reported_liquidity = _to_float(reported_liquidity)
 
         window_label = _window_label_for(ws)
 
@@ -512,39 +525,8 @@ class RolloverManager:
         self.max_gap_ms = config.max_coverage_gap_seconds * 1000
 
     def _synthetic_market(self, asset: str, after_ts_ms: int) -> MarketInfo:
-        """Generate deterministic synthetic market for testing when Gamma is unavailable."""
-        import uuid
-        ws = self.discovery.window_size_seconds
-        # floor to window boundary — for after=now mid-window this is current window start (desired for initial)
-        # for after=market_end (boundary) this is next window start
-        ts = (after_ts_ms // 1000) // ws * ws
-        window_index = ts // ws
-        window_label = _window_label_for(ws)
-        cid = f"synthetic-{asset.lower()}-{window_label}-{ts}"
-        # Use deterministic but unique tokens
-        up_tok = f"synthetic-up-{asset}-{ts}"
-        down_tok = f"synthetic-down-{asset}-{ts}"
-        start_ms = ts * 1000
-        end_ms = (ts + ws) * 1000
-        return MarketInfo(
-            condition_id=cid,
-            market_id=cid,
-            asset=asset.upper(),
-            up_token_id=up_tok,
-            down_token_id=down_tok,
-            market_start_ts_ms=start_ms,
-            market_end_ts_ms=end_ms,
-            window_index=window_index,
-            series_id=f"{asset.upper()}-{window_label}",
-            status="active",
-            question=f"Synthetic {asset} Up or Down - {window_label} {ts}",
-            tick_size=0.01,
-            slug=f"{asset.lower()}-updown-{window_label}-{ts}",
-            window_label=window_label,
-            window_size_seconds=ws,
-            reported_volume=1000.0,
-            reported_liquidity=5000.0,
-        )
+        """REMOVED: synthetic markets permanently disabled - never generate fake markets."""
+        raise RuntimeError("synthetic markets disabled - _synthetic_market should never be called")
 
     async def check_and_roll(self, asset: str, subscribe_fn: Callable, now_ms: Optional[int] = None) -> Optional[str]:
         """Check if asset needs lookahead discovery and/or promotion.
@@ -569,20 +551,7 @@ class RolloverManager:
                 if was_next_none and prev_cid:
                     self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
                 self.on_event("rollover_completed", {"asset": asset, "prev_condition_id": prev_cid, "new_condition_id": state.current.condition_id if state.current else None})
-            # If promoted to None (gap) and synthetic_mode enabled, immediately try synthetic fallback
-            # to avoid losing a window due to Gamma delay
-            if state.current is None and getattr(self.config, "synthetic_mode", False):
-                after = prev_cid and (now_ms) or now_ms
-                # Use current now for synthetic
-                synth = self._synthetic_market(asset, now_ms)
-                state.current = synth
-                try:
-                    await subscribe_fn(synth)
-                except Exception:
-                    pass
-                if self.on_event:
-                    self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
-                return "market_added"
+            # No synthetic fallback - if next is None, stay gapped and emit coverage_gap
             return "coverage_gap" if was_next_none else "rollover_completed"
 
         # Lookahead: need to discover next?
@@ -609,11 +578,7 @@ class RolloverManager:
                 if state.initial_discovery_attempts == 1 and self.on_event:
                     # lightweight trace, not the heavy rollover_started event
                     self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after, "initial": True})
-            # Synthetic mode: generate deterministic market without Gamma (avoids 429/indexing delays)
-            if getattr(self.config, "synthetic_mode", False):
-                next_market = self._synthetic_market(asset, after)
-            else:
-                next_market = await self.discovery.fetch_next_market(asset, after)
+            next_market = await self.discovery.fetch_next_market(asset, after)
             if next_market:
                 # reset emission flags on success
                 state.rollover_started_emitted = False  # allow next window to emit again
@@ -642,32 +607,7 @@ class RolloverManager:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
                     return "rollover_started" if should_emit_rollover else "market_added"
             else:
-                # Synthetic fallback when Gamma returns None and synthetic_mode enabled
-                # Ensures test mode never gaps due to Gamma indexing delay or 429
-                if getattr(self.config, "synthetic_mode", False):
-                    synth = self._synthetic_market(asset, after)
-                    # avoid duplicate if synthetic already exists
-                    if state.current is None or synth.condition_id != state.current.condition_id:
-                        if state.current is None:
-                            state.current = synth
-                            state.is_rollover_window = False
-                            try:
-                                await subscribe_fn(synth)
-                            except Exception:
-                                pass
-                            if self.on_event:
-                                self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
-                            return "market_added"
-                        elif state.next is None or synth.condition_id != state.next.condition_id:
-                            state.next = synth
-                            try:
-                                await subscribe_fn(synth)
-                            except Exception:
-                                pass
-                            if self.on_event:
-                                self.on_event("market_added", {"asset": asset, "condition_id": synth.condition_id, "synthetic": True})
-                            return "market_added"
-                # Distinguish discovered late vs no market existed (§1 #6)
+                # No synthetic fallback - distinguish discovered late vs no market existed (§1 #6)
                 # If we're past market_end_ts + max_gap and still no next, it's a coverage_gap
                 if state.current and now_ms > state.current.market_end_ts_ms + self.max_gap_ms:
                     if not state.rollover_miss_logged:

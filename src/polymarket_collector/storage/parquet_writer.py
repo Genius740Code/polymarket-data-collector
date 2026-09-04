@@ -511,39 +511,11 @@ class ParquetWriter:
                                 pass
                     if nr.get("disconnect_ts_utc") is None and dataset == "resync_episodes":
                         nr["disconnect_ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                if not getattr(self, "synthetic_mode", False):
-                    for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
-                        if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
-                            nr[fld] = None
-                else:
-                    # Only fill placeholders for datasets where the field is REQUIRED (not nullable)
-                    # — never inject test-condition into collector_events where condition_id is nullable (§8)
-                    schema = SCHEMAS.get(dataset)
-                    for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
-                        # Check if this field exists in schema and is required
-                        is_required = False
-                        if schema is not None:
-                            try:
-                                field = schema.field(fld)
-                                is_required = not field.nullable
-                            except Exception:
-                                is_required = False
-                        # Only auto-fill if required; nullable fields stay None (no fake test-condition)
-                        if is_required and nr.get(fld) is None:
-                            if fld == "condition_id":
-                                nr[fld] = "test-condition"
-                            elif fld == "market_id":
-                                nr[fld] = "test-market"
-                            elif fld == "series_id":
-                                nr[fld] = "TEST-5MIN"
-                            elif fld == "asset":
-                                nr[fld] = asset or "BTC"
-                            elif fld == "trade_id":
-                                nr[fld] = str(uuid.uuid4())
-                            elif fld == "event_id":
-                                nr[fld] = str(uuid.uuid4())
-                            elif fld == "resync_id":
-                                nr[fld] = str(uuid.uuid4())
+                # Synthetic permanently disabled - never inject test placeholders, quarantine/test values become None
+                for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
+                    if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
+                        nr[fld] = None
+                # Also drop rows that would have been fake test placeholders for required fields - let Arrow error surface (no silent fake data)
         except Exception:
             pass
         # sort rows by time then condition_id before writing (time first, condition_id second)
