@@ -515,14 +515,9 @@ class RolloverManager:
         """Generate deterministic synthetic market for testing when Gamma is unavailable."""
         import uuid
         ws = self.discovery.window_size_seconds
-        # floor to window boundary after after_ts
+        # floor to window boundary — for after=now mid-window this is current window start (desired for initial)
+        # for after=market_end (boundary) this is next window start
         ts = (after_ts_ms // 1000) // ws * ws
-        # if after is exactly at boundary, use it; if after is mid-window, next window is ts+ws
-        # For lookahead we want after = market_end, which is boundary, so ts is correct next window
-        # For initial (after=now mid-window), ts is current window start, but we want next start >= now
-        # Adjust: if ts*1000 < after_ts_ms then ts+=ws
-        if ts * 1000 < after_ts_ms:
-            ts += ws
         window_index = ts // ws
         window_label = _window_label_for(ws)
         cid = f"synthetic-{asset.lower()}-{window_label}-{ts}"
@@ -614,7 +609,11 @@ class RolloverManager:
                 if state.initial_discovery_attempts == 1 and self.on_event:
                     # lightweight trace, not the heavy rollover_started event
                     self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after, "initial": True})
-            next_market = await self.discovery.fetch_next_market(asset, after)
+            # Synthetic mode: generate deterministic market without Gamma (avoids 429/indexing delays)
+            if getattr(self.config, "synthetic_mode", False):
+                next_market = self._synthetic_market(asset, after)
+            else:
+                next_market = await self.discovery.fetch_next_market(asset, after)
             if next_market:
                 # reset emission flags on success
                 state.rollover_started_emitted = False  # allow next window to emit again
