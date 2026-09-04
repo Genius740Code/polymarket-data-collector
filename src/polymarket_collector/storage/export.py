@@ -89,6 +89,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     if not patterns:
         return None
     tables: List[pa.Table] = []
+    _read_errors: List[str] = []
     for p in patterns:
         if p.name.endswith(".tmp"):
             continue
@@ -125,9 +126,16 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                 except Exception:
                     pass
             tables.append(t)
-        except Exception:
+        except Exception as e:
+            _read_errors.append(f"{p}: {e}")
+            print(f"[export] WARN failed to read {p}: {e}")
             continue
+    if _read_errors:
+        print(f"[export] WARN {len(_read_errors)} parquet files failed to read for {dataset} asset={asset}: {_read_errors[:3]}")
     if not tables:
+        # If all files failed, return None so caller triggers monotonic guard / abort instead of empty success
+        if _read_errors:
+            print(f"[export] ERROR all {len(patterns)} files failed for {dataset} asset={asset} — aborting read")
         return None
     combined = pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
@@ -203,8 +211,59 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             if changed:
                 # rebuild table with same schema as combined (preserve types where possible)
                 combined = pa.Table.from_pylist(pylist, schema=combined.schema)
-        except Exception:
+        except Exception as e:
+            print(f"[export] WARN backfill failed for {dataset}: {e}")
             pass
+    # dedup before sort: remove exact duplicate rows that writer missed (WAL replay, buffer races)
+    # For resync_episodes keep latest per resync_id, for snapshots keep first per (asset,condition_id,ts_snapshot_ns)
+    try:
+        if combined.num_rows > 1:
+            if dataset == "book_snapshots_500ms" and all(c in combined.schema.names for c in ["asset", "condition_id", "ts_snapshot_ns"]):
+                pylist = combined.to_pylist()
+                seen = set()
+                uniq = []
+                for r in pylist:
+                    k = (r.get("asset"), r.get("condition_id"), r.get("ts_snapshot_ns"))
+                    if k not in seen:
+                        seen.add(k)
+                        uniq.append(r)
+                if len(uniq) < combined.num_rows:
+                    combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+            elif dataset == "resync_episodes" and "resync_id" in combined.schema.names:
+                # keep latest row per resync_id (max reconnect_ts or last occurrence)
+                pylist = combined.to_pylist()
+                latest = {}
+                for r in pylist:
+                    rid = r.get("resync_id")
+                    # keep last occurrence as latest (append order is chronological due to sort later, but use dict overwrite)
+                    latest[rid] = r
+                if len(latest) < combined.num_rows:
+                    combined = pa.Table.from_pylist(list(latest.values()), schema=combined.schema)
+            elif dataset == "collector_events" and "event_id" in combined.schema.names:
+                pylist = combined.to_pylist()
+                seen = set()
+                uniq = []
+                for r in pylist:
+                    eid = r.get("event_id")
+                    if eid not in seen:
+                        seen.add(eid)
+                        uniq.append(r)
+                if len(uniq) < combined.num_rows:
+                    combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+            elif dataset == "trades" and "trade_id" in combined.schema.names and "token_id" in combined.schema.names:
+                pylist = combined.to_pylist()
+                seen = set()
+                uniq = []
+                for r in pylist:
+                    k = (r.get("token_id"), r.get("trade_id"))
+                    if k not in seen:
+                        seen.add(k)
+                        uniq.append(r)
+                if len(uniq) < combined.num_rows:
+                    combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+    except Exception as e:
+        print(f"[export] WARN dedup failed for {dataset}: {e}")
+        pass
     # sort by time then condition_id
     schema = _get_schema(dataset)
     sort_keys = _sort_keys_for_schema(combined.schema if schema is None else schema)

@@ -47,6 +47,25 @@ class MarketInfo:
     reported_volume: Optional[float] = None
     reported_liquidity: Optional[float] = None
 
+    def _derived_resolution_outcome(self) -> str:
+        """Derive resolution vs unknown — until settlement fetch, keep unknown (no fabrication)."""
+        # Gamma active/closed flag alone is not settlement; keep unknown until settlement_source populated
+        return "unknown"
+
+    def _derived_status(self) -> str:
+        """Map Gamma active field to status: active / closed / resolved when settlement known."""
+        # self.status is always "active" at discovery; lifecycle transitions happen via settlement
+        # Keep "active" until market_end_ts_ms passed, then "closed" (resolved still requires settlement)
+        import time as _t
+        try:
+            now_ms = int(_t.time() * 1000)
+            if now_ms >= self.market_end_ts_ms:
+                # market ended but not yet resolved via settlement fetch
+                return "closed"
+            return self.status or "active"
+        except Exception:
+            return self.status or "active"
+
     @property
     def market_end_ts(self) -> int:
         return self.market_end_ts_ms
@@ -77,8 +96,8 @@ class MarketInfo:
             "asset": self.asset,
             "up_token_id": self.up_token_id,
             "down_token_id": self.down_token_id,
-            "status": self.status,
-            "resolution_outcome": "unknown",
+            "status": self._derived_status(),
+            "resolution_outcome": self._derived_resolution_outcome(),
             "question": self.question,
             "tick_size": self.tick_size,
             "reported_volume": self.reported_volume,

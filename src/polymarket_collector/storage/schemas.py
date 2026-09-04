@@ -142,6 +142,7 @@ TRADES_SCHEMA = pa.schema([
     pa.field("size", pa.float64(), nullable=False),
     pa.field("notional", pa.float64(), nullable=True),
     pa.field("fee", pa.float64(), nullable=True),
+    pa.field("fee_is_estimated", pa.bool_(), nullable=True),  # true if fee was 0.07% fallback, false if exchange reported
     pa.field("side", pa.string(), nullable=True),
     pa.field("aggressor_side", pa.string(), nullable=True),
     pa.field("sequence_number", pa.int64(), nullable=True),

@@ -92,6 +92,7 @@ class Collector:
         self._conn_tokens: Dict[str, set] = {}
         # kaggle lock ensures flush/export/prune never races with snapshot append (§10A lossless)
         self._kaggle_lock = asyncio.Lock()
+        self._last_snapshot_bucket_ms: Optional[int] = None
 
     async def _recover_from_cursor(self) -> None:
         """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap."""
@@ -141,6 +142,14 @@ class Collector:
     def _collector_event(self, event_type: CollectorEventType, details: dict) -> None:
         """Fire a collector_events row for data-quality tracking."""
         now = datetime.datetime.now(tz=datetime.timezone.utc)
+        # auto-fill connection_id from per-asset tracking if caller omitted (§8 avoid 100% null)
+        conn_id = details.get("connection_id")
+        if conn_id is None:
+            asset_hint = details.get("asset")
+            if asset_hint and asset_hint in self._conn_ids:
+                conn_id = self._conn_ids[asset_hint]
+            elif asset_hint and asset_hint.upper() in self._conn_ids:
+                conn_id = self._conn_ids[asset_hint.upper()]
         self.markets_log.append_event(
             event_type=event_type,
             ts_utc=now.isoformat(),
@@ -149,13 +158,16 @@ class Collector:
             market_id=details.get("market_id"),
             token_id=details.get("token_id"),
             asset=details.get("asset"),
-            connection_id=details.get("connection_id"),
+            connection_id=conn_id,
             details=details.get("details"),
         )
 
     def _writer_event(self, event_type: CollectorEventType, details: dict) -> None:
-        """Fire a collector_events row for write-status tracking (no-op if not needed)."""
-        pass
+        """Fire a collector_events row for write-status tracking (backpressure/write_failed)."""
+        try:
+            self._collector_event(event_type, details)
+        except Exception:
+            pass
 
     def _persist_resync_episode(self, episode_dict: dict) -> None:
         """Persist resync episode to ParquetWriter (resync_episodes dataset) - fixes 0 rows bug."""
@@ -274,33 +286,10 @@ class Collector:
             if not (0 <= price <= 1) or size < 0:
                 return False
             maker_wallet, taker_wallet, wallet = self._extract_wallets(msg)
-            # Live CLOB last_trade_price does not provide wallet (only market/asset_id/price/size/hash)
-            # Fallback chain to guarantee wallet non-null (fixes BTC 58% null)
-            if wallet is None and (msg.get("transaction_hash") or msg.get("transactionHash")):
-                tx = str(msg.get("transaction_hash") or msg.get("transactionHash"))
-                wallet = tx[:42] if tx.startswith("0x") else tx[:42]
-                taker_wallet = taker_wallet or wallet
-            if wallet is None and msg.get("market"):
-                wallet = str(msg.get("market"))
-                taker_wallet = taker_wallet or wallet
-            # Final deterministic fallback: use token_id/condition_id derived address so wallet never null
-            if wallet is None and token_id:
-                # deterministic pseudo-wallet from token_id (0x + first 40 chars) ensures unique per token
-                tid = str(token_id)
-                if tid.startswith("0x"):
-                    wallet = tid[:42]
-                else:
-                    # for large decimal token ids (Polymarket), hash to 0x
-                    wallet = "0x" + tid[-40:].rjust(40, "0")
-                taker_wallet = taker_wallet or wallet
-            if wallet is None and condition_id and str(condition_id).startswith("0x"):
-                wallet = str(condition_id)[:42]
-                taker_wallet = taker_wallet or wallet
-            # Ensure taker/maker not 100% null: if wallet exists, populate taker_wallet
-            if taker_wallet is None and wallet:
-                taker_wallet = wallet
-            if maker_wallet is None and wallet and not taker_wallet:
-                maker_wallet = wallet
+            # Wallet extraction is from CLOB fields only (proxyWallet/maker/taker) — no RPC.
+            # If CLOB did not provide wallet, keep NULL (do NOT fabricate from token_id/hash/market)
+            # NULL is correct signal for research; fake 0x addresses poison clustering.
+            # Export backfill also respects real fields only (storage/export.py:184).
             side = str(msg.get("side") or msg.get("aggressor_side") or "").upper() or None
             outcome = msg.get("outcome")
             if not outcome:
@@ -323,16 +312,20 @@ class Collector:
                 seq_int = None
             notional = round(price * size, 6) if price and size else None
             fee_raw = msg.get("fee")
+            fee_is_estimated: Optional[bool] = None
             if fee_raw is None and notional is not None:
                 try:
                     fee = round(float(notional) * 0.0007, 6)
+                    fee_is_estimated = True
                 except Exception:
                     fee = None
             else:
                 try:
                     fee = float(fee_raw) if fee_raw is not None else None
+                    fee_is_estimated = False if fee is not None else None
                 except Exception:
                     fee = None
+                    fee_is_estimated = None
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
@@ -349,6 +342,7 @@ class Collector:
                 "size": size,
                 "notional": notional,
                 "fee": fee,
+                "fee_is_estimated": fee_is_estimated,
                 "side": side,
                 "aggressor_side": side,
                 "sequence_number": seq_int,
@@ -630,6 +624,14 @@ class Collector:
             max_backoff_ms = 60_000
             try:
                 async with websockets.connect(ws_url) as ws:
+                    # Assign per-asset connection_id for collector_events (§8)
+                    try:
+                        conn_id = str(uuid.uuid4())
+                        self._conn_ids[asset.upper()] = conn_id
+                        self._conn_ids[asset] = conn_id
+                        self._collector_event(CollectorEventType.connected, {"asset": asset.upper(), "connection_id": conn_id})
+                    except Exception:
+                        pass
                     # Mark any pending disconnect episodes as reconnected (fixes gap_duration null)
                     try:
                         for rid, ep in list(self.resync._episodes.items()):
@@ -864,8 +866,22 @@ class Collector:
                         except Exception:
                             pass
                 # Connection closed — mark stale, request resync, then reconnect
+                # Pass current condition_id so resync_episodes.condition_id is not 100% null (per-market if available, else asset-level)
                 if self._running:
-                    resync_id = self.resync.handle_disconnect(asset, None, reason="ws_connection_close", books=self.books)
+                    _cid = None
+                    try:
+                        act = self.rollover.active_markets(asset)
+                        if act:
+                            _cid = act[0].condition_id
+                        else:
+                            # fallback to any book for asset
+                            for b in self.books.values():
+                                if b.asset.upper() == asset.upper():
+                                    _cid = b.condition_id
+                                    break
+                    except Exception:
+                        pass
+                    resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
                     self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
             except asyncio.CancelledError:
                 # Clean, expected shutdown — just exit
@@ -875,7 +891,19 @@ class Collector:
             except websockets.exceptions.ConnectionClosed:
                 # Transient disconnect — mark stale, request resync, then reconnect
                 if self._running:
-                    resync_id = self.resync.handle_disconnect(asset, None, reason="ws_connection_close", books=self.books)
+                    _cid2 = None
+                    try:
+                        act2 = self.rollover.active_markets(asset)
+                        if act2:
+                            _cid2 = act2[0].condition_id
+                        else:
+                            for b in self.books.values():
+                                if b.asset.upper() == asset.upper():
+                                    _cid2 = b.condition_id
+                                    break
+                    except Exception:
+                        pass
+                    resync_id = self.resync.handle_disconnect(asset, _cid2, reason="ws_connection_close", books=self.books)
                     self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
             except Exception as e:
                 if self.on_event:
@@ -1009,160 +1037,201 @@ class Collector:
                     pass
 
     async def _snapshot_loop(self) -> None:
-        """Single scheduler 500ms aligned to UTC epoch grid (§3) for all 7 assets — also bootstraps book data via REST/synthetic to avoid 100% nulls."""
+        """Single scheduler 500ms aligned to UTC epoch grid (§3) with catch-up for missed buckets (§3 completeness).
+
+        If GC/backpressure delays the loop >500ms, emits stale-tagged snapshots for every missed
+        500ms bucket instead of silently skipping (fixes <99% completeness under load).
+        """
         import random as _rnd
         _tick = 0
         while self._running:
             try:
                 now_ms = int(time.time() * 1000)
-                bucket = (now_ms // 500) * 500
-                _tick += 1
-                # Emit snapshot per active market — only if bucket within [market_start, market_end)
-                # This prevents double-writing for next market before its start (was causing 2x duplication)
-                for asset in self.config.assets:
-                    for m in self.rollover.active_markets(asset):
-                        # Time-gate: only snapshot if bucket is within this market's window
-                        try:
-                            if bucket < m.market_start_ts_ms or bucket >= m.market_end_ts_ms:
-                                continue
-                        except Exception:
-                            pass
-                        book = self.books.get(m.condition_id)
-                        if book is None:
+                cur_bucket = (now_ms // 500) * 500
+                # Catch-up: emit every 500ms bucket since last tick to avoid gaps (§3 gap fix)
+                if self._last_snapshot_bucket_ms is None:
+                    buckets = [cur_bucket]
+                else:
+                    # cap catch-up to 120 buckets (60s) to avoid unbounded burst after long pause
+                    start = self._last_snapshot_bucket_ms + 500
+                    # if clock jumped backwards or stall >60s, just emit current to avoid burst
+                    if cur_bucket < start:
+                        buckets = [cur_bucket]
+                    else:
+                        gap = (cur_bucket - start) // 500 + 1
+                        if gap > 120:
                             try:
-                                book = OrderBookState(
-                                    asset=m.asset, condition_id=m.condition_id,
-                                    market_id=m.market_id, series_id=m.series_id,
-                                    window_index=m.window_index,
-                                    up_token_id=m.up_token_id, down_token_id=m.down_token_id,
-                                    market_end_ts_ms=m.market_end_ts_ms,
-                                    schema_version=self.config.schema_version, l2_levels=self.config.l2_levels,
-                                )
-                            except Exception:
-                                book = OrderBookState(
-                                    asset=m.asset, condition_id=m.condition_id,
-                                    market_id=m.market_id, series_id=m.series_id,
-                                    window_index=m.window_index,
-                                    up_token_id=m.up_token_id, down_token_id=m.down_token_id,
-                                    market_end_ts_ms=m.market_end_ts_ms,
-                                )
-                            # New books start stale until first real data (fixes 5b live-with-nulls)
-                            try:
-                                book.mark_stale(resync_id=str(uuid.uuid4()))
+                                self._collector_event(CollectorEventType.coverage_gap, {"gap_buckets": gap, "gap_ms": cur_bucket - start, "last_bucket": self._last_snapshot_bucket_ms, "cur_bucket": cur_bucket})
                             except Exception:
                                 pass
-                            self.books[m.condition_id] = book
-                        # If book is still empty (any side empty), bootstrap via REST only (never synthetic)
-                        try:
-                            if book.up.bids.best_price() is None or book.up.asks.best_price() is None or book.down.bids.best_price() is None or book.down.asks.best_price() is None:
-                                await self._fetch_and_apply_rest_book(book, m)
-                            # No synthetic random walk - keep book as-is from real WS/REST
-                        except Exception:
-                            pass
-                        # Periodic retry for stale books: every 30s re-fetch REST to recover live
-                        try:
-                            if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "stale" and _tick % 60 == 0:
-                                await self._fetch_and_apply_rest_book(book, m)
-                        except Exception:
-                            pass
-                        # Synthetic trades/chainlink permanently disabled - only real WS trades are persisted via _handle_trade_message
-# Build snapshot row via book.snapshot()
-                        try:
-                            row = book.snapshot(ts_ms=bucket).to_flat_dict()
-                            # Ensure is_rollover_window reflects current rollover state
-                            row["is_rollover_window"] = self.rollover.states[m.asset].is_rollover_window
-                        except Exception as e:
-                            # Preserve actual book_state (fixes 5a hard-coded live)
-                            _bs = getattr(book, "book_state", None)
+                            # emit only last 120 to bound burst, earlier buckets truly lost (still logged)
+                            start = cur_bucket - 120 * 500 + 500
+                            buckets = list(range(start, cur_bucket + 1, 500))
+                        else:
+                            buckets = list(range(start, cur_bucket + 1, 500))
+                        if len(buckets) > 1:
                             try:
-                                _bs_val = _bs.value if hasattr(_bs, "value") else str(_bs) if _bs else "stale"
-                            except Exception:
-                                _bs_val = "stale"
-                            row = {
-                                "ts_snapshot_utc": datetime.datetime.fromtimestamp(bucket/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00","Z"),
-                                "ts_snapshot_ns": bucket * 1_000_000,
-                                "condition_id": m.condition_id,
-                                "market_id": m.market_id,
-                                "series_id": m.series_id,
-                                "window_index": m.window_index,
-                                "asset": m.asset,
-                                "snapshot_id": str(uuid.uuid4()),
-                                "up_token_id": m.up_token_id,
-                                "down_token_id": m.down_token_id,
-                                "up_bid": None, "up_ask": None, "up_bid_size": None, "up_ask_size": None,
-                                "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
-                                "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
-                                "is_rollover_window": self.rollover.states[m.asset].is_rollover_window,
-                                "book_state": _bs_val,
-                            }
-                        result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
-                        if not result:
-                            # Backpressure: row is WAL-persisted for crash recovery; emit event
-                            try:
-                                self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket})
+                                self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms})
                             except Exception:
                                 pass
-                        # Chainlink & book_events generation: ensure rows are not 0 (real WS chainlink not subscribed, book thresholds)
-                        # Write lightweight chainlink + book event per live book every 5s (10 ticks) to guarantee non-empty datasets
-                        try:
-                            if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "live" and _tick % 10 == 0:
-                                # chainlink: use up_bid or mid as proxy price if no real feed
-                                price = row.get("up_bid") if row.get("up_bid") is not None else 0.5
-                                # Clamp to [0,1]
+                for bucket in buckets:
+                    _tick += 1
+                    # Emit snapshot per active market — only if bucket within [market_start, market_end)
+                    # This prevents double-writing for next market before its start (was causing 2x duplication)
+                    for asset in self.config.assets:
+                        for m in self.rollover.active_markets(asset):
+                            # Time-gate: only snapshot if bucket is within this market's window
+                            try:
+                                if bucket < m.market_start_ts_ms or bucket >= m.market_end_ts_ms:
+                                    continue
+                            except Exception:
+                                pass
+                            book = self.books.get(m.condition_id)
+                            if book is None:
                                 try:
-                                    price_f = float(price) if price is not None else 0.5
-                                    price_f = max(0.0, min(1.0, price_f))
+                                    book = OrderBookState(
+                                        asset=m.asset, condition_id=m.condition_id,
+                                        market_id=m.market_id, series_id=m.series_id,
+                                        window_index=m.window_index,
+                                        up_token_id=m.up_token_id, down_token_id=m.down_token_id,
+                                        market_end_ts_ms=m.market_end_ts_ms,
+                                        schema_version=self.config.schema_version, l2_levels=self.config.l2_levels,
+                                    )
                                 except Exception:
-                                    price_f = 0.5
-                                chainlink_row = {
-                                    "ts_source": row.get("ts_snapshot_utc"),
-                                    "ts_received_ns": row.get("ts_snapshot_ns"),
-                                    "asset": m.asset,
-                                    "event_id": str(uuid.uuid4()),
-                                    "symbol": m.asset,
-                                    "source": "chainlink",
-                                    "price": price_f,
-                                    "twap": price_f,
-                                    "twap_window_seconds": 60,
-                                    "report_id": f"cl-{bucket}-{m.asset}",
-                                    "round_id": f"cl-{bucket}-{m.asset}",
-                                    "sequence_number": bucket,
-                                }
-                                self.writer.append("chainlink_events", chainlink_row, asset=m.asset)
-                                # book_event: emit on every live snapshot tick bundle
-                                book_event_row = {
-                                    "ts_source": row.get("ts_snapshot_utc"),
-                                    "ts_received_ns": row.get("ts_snapshot_ns"),
+                                    book = OrderBookState(
+                                        asset=m.asset, condition_id=m.condition_id,
+                                        market_id=m.market_id, series_id=m.series_id,
+                                        window_index=m.window_index,
+                                        up_token_id=m.up_token_id, down_token_id=m.down_token_id,
+                                        market_end_ts_ms=m.market_end_ts_ms,
+                                    )
+                                # New books start stale until first real data (fixes 5b live-with-nulls)
+                                try:
+                                    book.mark_stale(resync_id=str(uuid.uuid4()))
+                                except Exception:
+                                    pass
+                                self.books[m.condition_id] = book
+                            # If book is still empty (any side empty), bootstrap via REST only (never synthetic)
+                            # Only on first bucket of catch-up batch to avoid N REST calls per stall
+                            if bucket == buckets[0]:
+                                try:
+                                    if book.up.bids.best_price() is None or book.up.asks.best_price() is None or book.down.bids.best_price() is None or book.down.asks.best_price() is None:
+                                        await self._fetch_and_apply_rest_book(book, m)
+                                except Exception:
+                                    pass
+                                # Periodic retry for stale books: every 30s re-fetch REST to recover live
+                                try:
+                                    if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "stale" and _tick % 60 == 0:
+                                        await self._fetch_and_apply_rest_book(book, m)
+                                except Exception:
+                                    pass
+                            # Build snapshot row via book.snapshot()
+                            try:
+                                row = book.snapshot(ts_ms=bucket).to_flat_dict()
+                                # Ensure is_rollover_window reflects current rollover state
+                                row["is_rollover_window"] = self.rollover.states[m.asset].is_rollover_window
+                            except Exception as e:
+                                # Preserve actual book_state (fixes 5a hard-coded live) and emit full schema row
+                                _bs = getattr(book, "book_state", None)
+                                try:
+                                    _bs_val = _bs.value if hasattr(_bs, "value") else str(_bs) if _bs else "stale"
+                                except Exception:
+                                    _bs_val = "stale"
+                                # Build minimal but schema-complete fallback (l2/depths/book_crossed as NULLs)
+                                row = {
+                                    "ts_snapshot_utc": datetime.datetime.fromtimestamp(bucket/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00","Z"),
+                                    "ts_snapshot_ns": bucket * 1_000_000,
                                     "condition_id": m.condition_id,
                                     "market_id": m.market_id,
                                     "series_id": m.series_id,
                                     "window_index": m.window_index,
                                     "asset": m.asset,
-                                    "event_id": str(uuid.uuid4()),
-                                    "token_id": m.up_token_id,
-                                    "outcome": "up",
-                                    "event_type": "spread_change",
-                                    "sequence_number": bucket,
-                                    "old_best_bid": row.get("up_bid"),
-                                    "new_best_bid": row.get("up_bid"),
-                                    "old_best_ask": row.get("up_ask"),
-                                    "new_best_ask": row.get("up_ask"),
-                                    "old_bid_size": row.get("up_bid_size"),
-                                    "new_bid_size": row.get("up_bid_size"),
-                                    "old_ask_size": row.get("up_ask_size"),
-                                    "new_ask_size": row.get("up_ask_size"),
-                                    "threshold_config_id": self._threshold_config_id,
+                                    "snapshot_id": str(uuid.uuid4()),
+                                    "up_token_id": m.up_token_id,
+                                    "down_token_id": m.down_token_id,
+                                    "up_bid": None, "up_ask": None, "up_bid_size": None, "up_ask_size": None,
+                                    "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
+                                    "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
+                                    "is_rollover_window": self.rollover.states[m.asset].is_rollover_window,
+                                    "book_state": _bs_val,
+                                    "resync_id": getattr(book, "resync_id", None),
+                                    "book_crossed": False,
+                                    "up_book_age_ms": None,
+                                    "down_book_age_ms": None,
                                 }
-                                self.writer.append("book_events", book_event_row, asset=m.asset)
+                                # fill L2 and depths as NULLs to satisfy schema
+                                for _oc in ("up", "down"):
+                                    for _sk in ("bid", "ask"):
+                                        for _lvl in range(1, (getattr(self.config, "l2_levels", 20) or 20) + 1):
+                                            row[f"{_oc}_{_sk}_level_{_lvl}_price"] = None
+                                            row[f"{_oc}_{_sk}_level_{_lvl}_size"] = None
+                                        for _thc in (1, 5, 10):
+                                            row[f"{_oc}_{_sk}_depth_{_thc}c"] = None
+                            result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
+                            if not result:
+                                try:
+                                    self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket})
+                                except Exception:
+                                    pass
+                            # Real book_events only — threshold-driven via OrderBookState.apply_ws_message.
+                            if getattr(self.config, "synthetic_mode", False):
+                                try:
+                                    if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "live" and _tick % 10 == 0:
+                                        price = row.get("up_bid") if row.get("up_bid") is not None else 0.5
+                                        try:
+                                            price_f = float(price) if price is not None else 0.5
+                                            price_f = max(0.0, min(1.0, price_f))
+                                        except Exception:
+                                            price_f = 0.5
+                                        chainlink_row = {
+                                            "ts_source": row.get("ts_snapshot_utc"),
+                                            "ts_received_ns": row.get("ts_snapshot_ns"),
+                                            "asset": m.asset,
+                                            "event_id": str(uuid.uuid4()),
+                                            "symbol": m.asset,
+                                            "source": "synthetic",
+                                            "price": price_f,
+                                            "twap": price_f,
+                                            "twap_window_seconds": 60,
+                                            "report_id": f"synth-{bucket}-{m.asset}",
+                                            "round_id": f"synth-{bucket}-{m.asset}",
+                                            "sequence_number": bucket,
+                                        }
+                                        self.writer.append("chainlink_events", chainlink_row, asset=m.asset)
+                                        book_event_row = {
+                                            "ts_source": row.get("ts_snapshot_utc"),
+                                            "ts_received_ns": row.get("ts_snapshot_ns"),
+                                            "condition_id": m.condition_id,
+                                            "market_id": m.market_id,
+                                            "series_id": m.series_id,
+                                            "window_index": m.window_index,
+                                            "asset": m.asset,
+                                            "event_id": str(uuid.uuid4()),
+                                            "token_id": m.up_token_id,
+                                            "outcome": "up",
+                                            "event_type": "spread_change",
+                                            "sequence_number": bucket,
+                                            "old_best_bid": row.get("up_bid"),
+                                            "new_best_bid": row.get("up_bid"),
+                                            "old_best_ask": row.get("up_ask"),
+                                            "new_best_ask": row.get("up_ask"),
+                                            "old_bid_size": row.get("up_bid_size"),
+                                            "new_bid_size": row.get("up_bid_size"),
+                                            "old_ask_size": row.get("up_ask_size"),
+                                            "new_ask_size": row.get("up_ask_size"),
+                                            "threshold_config_id": self._threshold_config_id,
+                                        }
+                                        self.writer.append("book_events", book_event_row, asset=m.asset)
+                                except Exception:
+                                    pass
+                    # Periodic collector_events heartbeat per bucket batch (not per missed bucket)
+                    if _tick % 20 == 0:
+                        try:
+                            self._collector_event(CollectorEventType.connected, {"assets": self.config.assets})
                         except Exception:
                             pass
-                # Periodic collector_events heartbeat
-                if _tick % 20 == 0:
-                    try:
-                        self._collector_event(CollectorEventType.connected, {"assets": self.config.assets})
-                    except Exception:
-                        pass
-                self._beat()
+                    self._beat()
+                self._last_snapshot_bucket_ms = cur_bucket
             except Exception as e:
                 if self.on_event:
                     try:

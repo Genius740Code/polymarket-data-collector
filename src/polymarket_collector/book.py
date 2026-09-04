@@ -92,12 +92,13 @@ class SideBook:
         return self.best_price() is None
 
     def crossed_with(self, other: "SideBook") -> bool:
-        """True if this bid side crossed with other ask side."""
+        """True if this bid side crossed with other ask side — strictly b > a (equal is not crossed)."""
         b = self.best_price()
         a = other.best_price()
         if b is None or a is None:
             return False
-        return b >= a
+        # 1e-9 tolerance for float equality; crossed only if bid strictly greater than ask
+        return (b - a) > 1e-9
 
 
 @dataclass
@@ -351,11 +352,12 @@ class OrderBookState:
 
     def _apply_levels(self, side: SideBook, levels: list, is_bid: bool) -> None:
         # Normalize to list of Level, sorted best-first, truncated/padded to l2_levels
-        # Levels with size 0 mean remove that price level
+        # Levels with size 0 mean remove that price level (§3 ghost-liquidity fix)
         # For simplicity replace whole side book with provided snapshot if it looks like full book,
         # else patch. Heuristic: if len(levels) >= l2_levels/2 treat as snapshot replace.
         # Real implementation would diff against REST snapshot shape; here we implement replace for WS "book" msgs
         new_levels: List[Level] = []
+        removals: set[float] = set()
         for lvl in levels:
             if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 price, size = lvl[0], lvl[1]
@@ -366,7 +368,8 @@ class OrderBookState:
                 except (TypeError, ValueError):
                     continue
                 if s == 0:
-                    continue  # removal
+                    removals.add(float(p))
+                    continue  # removal — tracked below
                 new_levels.append(Level(price=p, size=s))
             elif isinstance(lvl, dict):
                 p = lvl.get("price"); s = lvl.get("size")
@@ -377,6 +380,10 @@ class OrderBookState:
                 except (TypeError, ValueError):
                     continue
                 if sf == 0:
+                    try:
+                        removals.add(float(pf))
+                    except Exception:
+                        pass
                     continue
                 new_levels.append(Level(price=pf, size=sf))
         # sort best-first
@@ -385,8 +392,10 @@ class OrderBookState:
         # For delta messages that only contain changed levels, this would drop unchanged levels.
         # We handle that by merging: if incoming is small (<5 levels) patch instead of replace.
         if len(levels) < 5 and len(side.levels) > 0:
-            # patch: update/add levels, keep others
+            # patch: update/add levels, keep others, delete removals
             price_to_level: Dict[float, Level] = {lvl.price: lvl for lvl in side.levels if lvl.price is not None}
+            for rp in removals:
+                price_to_level.pop(rp, None)
             for lvl in new_levels:
                 if lvl.price is not None:
                     price_to_level[lvl.price] = lvl

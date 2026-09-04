@@ -64,6 +64,7 @@ class ParquetWriter:
         self._buffer: deque[BufferedRow] = deque()
         self._last_flush_ts = time.monotonic()
         self._seen_keys: Dict[str, Set[Tuple]] = defaultdict(set)  # dataset -> set of dedup keys
+        self._seen_order: Dict[str, deque] = defaultdict(deque)  # dataset -> insertion-order deque for LRU eviction
         self._wal_path = self.wal_dir / f"wal-{uuid.uuid4().hex}.jsonl"
         if self.wal_enabled:
             self.wal_dir.mkdir(parents=True, exist_ok=True)
@@ -81,30 +82,84 @@ class ParquetWriter:
         rows (same dedup key) are dropped without WAL.
         """
         # Resolve date_str early so WAL entry is complete even under backpressure
+        # Prefer ns bucket fields for authoritative UTC date (§11); string ISO is secondary.
         _resolved_date_str = date_str
         if _resolved_date_str is None:
             import datetime as _dt_for_date
-            ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
-            if ts_field:
+            date_derived = None
+            # 1) try ns buckets (most authoritative, avoids .500 frac parse issues)
+            for ns_key in ("ts_snapshot_ns", "ts_received_ns"):
+                ns_val = row.get(ns_key)
+                if ns_val is not None:
+                    try:
+                        ns_int = int(ns_val)
+                        # ns → ms → date UTC
+                        dt = _dt_for_date.datetime.fromtimestamp(ns_int / 1e9, tz=_dt_for_date.timezone.utc)
+                        date_derived = dt.date().isoformat()
+                        break
+                    except Exception:
+                        pass
+            # 2) try ISO string fields
+            if date_derived is None:
+                ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
+                if ts_field:
+                    try:
+                        dt = _dt_for_date.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
+                        date_derived = dt.date().isoformat()
+                    except Exception:
+                        pass
+            # 3) fallback: ns date already tried, last resort now (should rarely happen; log warn)
+            if date_derived is None:
+                # quarantining: log warn so mispartition is visible; use now but flag
                 try:
-                    dt = _dt_for_date.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
-                    _resolved_date_str = dt.date().isoformat()
+                    print(f"[parquet_writer] WARN date_str fallback to now for dataset={dataset} row keys={list(row.keys())[:5]}")
                 except Exception:
-                    _resolved_date_str = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
-            else:
-                _resolved_date_str = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
+                    pass
+                date_derived = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
+            _resolved_date_str = date_derived
         if date_str is None:
             date_str = _resolved_date_str
 
         # dedup check first (§4, §5) — duplicates never hit WAL or buffer
+        # For resync_episodes we do upsert (replace buffered row) rather than drop, so latest
+        # reconnect/gap fields survive instead of creating duplicate rows per state transition.
         dedup_key = self._dedup_key(dataset, row)
         if dedup_key is not None:
             if dedup_key in self._seen_keys[dataset]:
-                if self.on_event:
-                    self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
-                return True
-# reserve key immediately to prevent duplicate WAL entries under concurrency
-        self._seen_keys[dataset].add(dedup_key)
+                if dataset == "resync_episodes":
+                    # upsert: replace existing buffered row if still in buffer, otherwise allow re-append for update
+                    replaced = False
+                    for br in self._buffer:
+                        if br.dataset == dataset and br.row.get("resync_id") == row.get("resync_id"):
+                            br.row = dict(row)
+                            replaced = True
+                            break
+                    if replaced:
+                        return True
+                    # already flushed — allow update; remove old key so append proceeds (dedup map re-added below)
+                    self._seen_keys[dataset].discard(dedup_key)
+                else:
+                    if self.on_event:
+                        self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
+                    return True
+        # reserve key immediately to prevent duplicate WAL entries under concurrency
+        if dedup_key is not None:
+            self._seen_keys[dataset].add(dedup_key)
+            try:
+                self._seen_order[dataset].append(dedup_key)
+            except Exception:
+                pass
+            # LRU eviction: drop oldest keys when cap exceeded (preserves recent dedup for today)
+            if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
+                try:
+                    evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
+                    for _ in range(evict_count):
+                        if not self._seen_order[dataset]:
+                            break
+                        oldest = self._seen_order[dataset].popleft()
+                        self._seen_keys[dataset].discard(oldest)
+                except Exception:
+                    pass
             # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
             # caller will retry with same key and be deduped — this is idempotent and prevents duplicate WAL.
 
@@ -309,24 +364,44 @@ class ParquetWriter:
                                 if dedup_key in self._seen_keys[dataset]:
                                     continue
                                 self._seen_keys[dataset].add(dedup_key)
+                                try:
+                                    self._seen_order[dataset].append(dedup_key)
+                                except Exception:
+                                    pass
                                 if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
-                                    keys = list(self._seen_keys[dataset])
-                                    evict_count = len(keys) // 2
-                                    for k in keys[:evict_count]:
-                                        self._seen_keys[dataset].discard(k)
+                                    try:
+                                        evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
+                                        for _ in range(evict_count):
+                                            if not self._seen_order[dataset]:
+                                                break
+                                            oldest = self._seen_order[dataset].popleft()
+                                            self._seen_keys[dataset].discard(oldest)
+                                    except Exception:
+                                        pass
                                 seen_replay_keys.add(dedup_key)
-                            # date handling already in entry
+                            # date handling already in entry — prefer ns bucket for correctness
                             if date_str is None:
                                 import datetime as _dt_for_date2
-                                ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
-                                if ts_field:
-                                    try:
-                                        dt = _dt_for_date2.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
-                                        date_str = dt.date().isoformat()
-                                    except Exception:
+                                date_str = None
+                                for ns_key in ("ts_snapshot_ns", "ts_received_ns"):
+                                    ns_val = row.get(ns_key)
+                                    if ns_val is not None:
+                                        try:
+                                            dt = _dt_for_date2.datetime.fromtimestamp(int(ns_val)/1e9, tz=_dt_for_date2.timezone.utc)
+                                            date_str = dt.date().isoformat()
+                                            break
+                                        except Exception:
+                                            pass
+                                if date_str is None:
+                                    ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
+                                    if ts_field:
+                                        try:
+                                            dt = _dt_for_date2.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
+                                            date_str = dt.date().isoformat()
+                                        except Exception:
+                                            date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
+                                    else:
                                         date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
-                                else:
-                                    date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
                             self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
                             replayed += 1
                         else:
@@ -381,6 +456,14 @@ class ParquetWriter:
             rid = row.get("report_id") or row.get("round_id")
             if rid:
                 return (str(rid),)
+        if dataset == "resync_episodes":
+            rid = row.get("resync_id")
+            if rid:
+                return (str(rid),)
+        if dataset == "collector_events":
+            eid = row.get("event_id")
+            if eid:
+                return (str(eid),)
         return None
 
     def _wal_append(self, dataset: str, row: Dict[str, Any], asset: Optional[str], date_str: Optional[str]) -> None:
