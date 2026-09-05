@@ -171,8 +171,15 @@ class MarketDiscovery:
         # e.g. 5min (300s), 15min (900s), 1h (3600s), 4h (14400s), 1d (86400s)
         return (after_ts_ms // 1000) // self.window_size_seconds * self.window_size_seconds
 
-    async def fetch_next_market(self, asset: str, after_ts_ms: int) -> Optional[MarketInfo]:
-        """Query Gamma for the next market after after_ts_ms."""
+    async def fetch_next_market(self, asset: str, after_ts_ms: int, strict_adjacent: bool = False) -> Optional[MarketInfo]:
+        """Query Gamma for the next market after after_ts_ms.
+
+        strict_adjacent: during rollover lookahead only accept the ADJACENT next
+        window. Far-future windows are sometimes indexed on Gamma BEFORE the
+        adjacent one; adopting them as "next" skips a whole 5-minute window
+        (the 16:10 UTC gap on 2026-09-05). Genuine missing windows stay handled
+        by the rollover_miss/coverage_gap paths.
+        """
         import httpx
         import json
 
@@ -184,8 +191,12 @@ class MarketDiscovery:
 
         # Try Gamma first — slug is deterministic but may be indexed ~30-60s late.
         import datetime as _dt
-        # Try up to 3 windows ahead to handle missing market (gap) without skipping
-        candidates = [ts, ts + self.window_size_seconds, ts + 2 * self.window_size_seconds]
+        # Skip-ahead candidates only for initial discovery (no current market);
+        # lookahead discovery must adopt the adjacent window or wait for it.
+        if strict_adjacent:
+            candidates = [ts]
+        else:
+            candidates = [ts, ts + self.window_size_seconds, ts + 2 * self.window_size_seconds]
         for cand_ts in candidates:
             cand_slug = self._slug_for(asset, cand_ts)
             cand_params = {"slug": cand_slug}
@@ -614,7 +625,7 @@ class RolloverManager:
                 if state.initial_discovery_attempts == 1 and self.on_event:
                     # lightweight trace, not the heavy rollover_started event
                     self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after, "initial": True})
-            next_market = await self.discovery.fetch_next_market(asset, after)
+            next_market = await self.discovery.fetch_next_market(asset, after, strict_adjacent=not is_initial)
             if next_market:
                 # reset emission flags on success
                 state.rollover_started_emitted = False  # allow next window to emit again

@@ -13,6 +13,8 @@ from typing import Dict, List
 
 import pyarrow.parquet as pq
 
+from .storage.parquet_io import read_files, read_table
+
 
 @dataclass
 class DailyCompleteness:
@@ -85,12 +87,11 @@ def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[Dail
         clean_dir = base / "book_snapshots_clean" / f"date={date_str}" / f"asset={asset}"
         for p in [snap_dir, clean_dir]:
             if p.exists():
-                cnt = 0
-                for part in p.glob("*.parquet"):
-                    try:
-                        cnt += pq.read_table(str(part)).num_rows
-                    except Exception:
-                        continue
+                parts = list(p.glob("*.parquet"))
+                tbl = read_files(parts, label=f"completeness {p.name}")
+                cnt = tbl.num_rows if tbl is not None else 0
+                if parts and tbl is None:
+                    print(f"[completeness] ERROR all {len(parts)} files unreadable for {p} — counts would be silently wrong")
                 if "clean" in str(p):
                     dc.actual_clean_snapshots = cnt
                 else:
@@ -100,44 +101,40 @@ def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[Dail
         # aggregate collector_events for this date/asset
         ce_root = base / "collector_events" / f"date={date_str}"
         if ce_root.exists():
-            for part in ce_root.glob("*.parquet"):
-                try:
-                    tbl = pq.read_table(str(part))
-                    for row in tbl.to_pylist():
-                        if row.get("asset") and row["asset"].upper() != asset.upper():
-                            continue
-                        et = row.get("event_type")
-                        if et == "sequence_gap":
-                            dc.sequence_gaps += 1
-                        elif et == "duplicate_event":
-                            dc.duplicate_events += 1
-                        elif et == "write_failed":
-                            dc.write_failures += 1
-                        elif et == "rollover_miss":
-                            dc.rollover_misses += 1
-                        elif et == "coverage_gap":
-                            dc.coverage_gaps += 1
-                        elif et == "resolution_stuck":
-                            dc.resolution_stuck += 1
-                        elif et == "book_anomaly":
-                            dc.sanity_violations += 1
-                except Exception:
-                    continue
+            ce_parts = list(ce_root.glob("*.parquet"))
+            ce_tbl = read_files(ce_parts, label="completeness collector_events")
+            if ce_tbl is not None:
+                for row in ce_tbl.to_pylist():
+                    if row.get("asset") and row["asset"].upper() != asset.upper():
+                        continue
+                    et = row.get("event_type")
+                    if et == "sequence_gap":
+                        dc.sequence_gaps += 1
+                    elif et == "duplicate_event":
+                        dc.duplicate_events += 1
+                    elif et == "write_failed":
+                        dc.write_failures += 1
+                    elif et == "rollover_miss":
+                        dc.rollover_misses += 1
+                    elif et == "coverage_gap":
+                        dc.coverage_gaps += 1
+                    elif et == "resolution_stuck":
+                        dc.resolution_stuck += 1
+                    elif et == "book_anomaly":
+                        dc.sanity_violations += 1
 
         # resync episodes
         re_root = base / "resync_episodes" / f"date={date_str}"
         if re_root.exists():
-            for part in re_root.glob("*.parquet"):
-                try:
-                    tbl = pq.read_table(str(part))
-                    for row in tbl.to_pylist():
-                        if row.get("asset", "").upper() == asset.upper():
-                            dc.resync_episode_count += 1
-                            if row.get("gap_duration_ms"):
-                                dc.total_gap_ms += int(row["gap_duration_ms"])
-                                dc.disconnect_duration_ms += int(row["gap_duration_ms"])
-                except Exception:
-                    continue
+            re_parts = list(re_root.glob("*.parquet"))
+            re_tbl = read_files(re_parts, label="completeness resync_episodes")
+            if re_tbl is not None:
+                for row in re_tbl.to_pylist():
+                    if row.get("asset", "").upper() == asset.upper():
+                        dc.resync_episode_count += 1
+                        if row.get("gap_duration_ms"):
+                            dc.total_gap_ms += int(row["gap_duration_ms"])
+                            dc.disconnect_duration_ms += int(row["gap_duration_ms"])
 
         results.append(dc)
     return results

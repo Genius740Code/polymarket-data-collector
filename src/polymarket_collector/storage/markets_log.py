@@ -15,6 +15,15 @@ from typing import Dict, List, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+
+def _os_replace_safe(src, dst):
+    """Atomic tmp->final rename that works on Windows (os.replace overwrites; Path.rename raises WinError 183 if dst exists)."""
+    import os as _os
+    _os.replace(str(src), str(dst))
+
+
+from .parquet_io import read_table
+
 from ..enums import MarketStatus, ResolutionOutcome
 
 
@@ -118,6 +127,11 @@ class MarketsLog:
     ) -> None:
         """Append a collector_events row for data-quality tracking."""
         import datetime
+        # details column is pa.string() — serialize dicts so payloads survive to Parquet
+        if isinstance(details, dict):
+            details = json.dumps(details, default=str)
+        elif details is not None:
+            details = str(details)
         row = {
             "event_id": str(uuid.uuid4()),
             "event_type": event_type,
@@ -128,7 +142,7 @@ class MarketsLog:
             "market_id": market_id,
             "token_id": token_id,
             "asset": asset,
-            "details": details or {},
+            "details": details,
             "schema_version": "3.2.0",
         }
         self._staging.append(row)
@@ -176,7 +190,7 @@ class MarketsLog:
         tmp = out_dir / f"part-{uuid.uuid4().hex[:8]}.parquet.tmp"
         final = out_dir / tmp.name.replace(".tmp", "")
         pq.write_table(table, str(tmp), compression="zstd")
-        tmp.rename(final)
+        _os_replace_safe(tmp, final)
         n = len(self._staging)
         self._staging.clear()
         return n
@@ -197,7 +211,7 @@ class MarketsLog:
         if log_root.exists():
             for part in log_root.rglob("*.parquet"):
                 try:
-                    table = pq.read_table(str(part))
+                    table = read_table(part)
                     all_rows.extend(table.to_pylist())
                 except Exception:
                     continue
@@ -224,7 +238,7 @@ class MarketsLog:
         final_path = latest_dir / "markets_latest.parquet"
         pq.write_table(table, str(tmp_path), compression="zstd")
         # atomic rename (§10A)
-        tmp_path.rename(final_path)
+        _os_replace_safe(tmp_path, final_path)
         return final_path
 
     def load_latest(self, parquet_data_dir: Optional[Path] = None) -> List[Dict]:
@@ -233,6 +247,6 @@ class MarketsLog:
         if not p.exists():
             return []
         try:
-            return pq.read_table(str(p)).to_pylist()
+            return read_table(p).to_pylist()
         except Exception:
             return []

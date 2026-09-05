@@ -241,9 +241,11 @@ class ResyncManager:
                 return True
 
             except Exception as e:
-                if self.on_event:
-                    self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "attempt": ep.resync_attempt_count, "error": str(e)})
-                # persist episode even on failed attempt (fixes gap_duration null)
+                # K-4: per-attempt failures are recorded on the episode
+                # (resync_attempt_count) — emitting a resync_failed event per
+                # attempt turned rate-limited recoveries into alert noise.
+                # Only the escalation path (below) raises resync_failed.
+                # persist attempt state for honest episode bookkeeping
                 if self.on_episode_persist:
                     try:
                         self.on_episode_persist(ep.to_dict())
@@ -266,7 +268,9 @@ class ResyncManager:
                             ep.snapshots_missed_estimate = ep.gap_duration_ms // 500
                     if self.on_episode_persist:
                         try:
-                            self.on_episode_persist(ep.to_dict())
+                            d = ep.to_dict()
+                            d["escalated"] = True
+                            self.on_episode_persist(d)
                         except Exception:
                             pass
                     if self.on_event:

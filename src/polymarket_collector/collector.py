@@ -37,6 +37,7 @@ from .rollover import MarketInfo, RolloverManager
 from .resync import ResyncManager, exponential_backoff
 from .storage.cursor_store import CursorState, CursorStore
 from .storage.markets_log import MarketsLog
+from .storage.parquet_io import read_table
 from .storage.parquet_writer import ParquetWriter
 from .storage.raw_archive import RawArchive
 from .validation import validate_ws_message
@@ -93,6 +94,29 @@ class Collector:
         # kaggle lock ensures flush/export/prune never races with snapshot append (§10A lossless)
         self._kaggle_lock = asyncio.Lock()
         self._last_snapshot_bucket_ms: Optional[int] = None
+        # CRITICAL: the per-asset WS task and the resync manager call `self.on_event`
+        # in the disconnect/reconnect path. It was never defined — the first
+        # AttributeError killed the whole task silently, so reconnects never ran
+        # and every disconnect lasted until process shutdown.
+        self.on_event = self._collector_event
+        # real per-asset WS connection state — snapshots of a disconnected asset are
+        # labeled stale even if the book was REST-healed (frozen book = not live data)
+        self._ws_connected: Dict[str, bool] = {}
+        # resync episodes: hold latest state in RAM, persist each episode exactly once
+        # (previously every state transition appended a new parquet row → double rows)
+        self._episode_latest: Dict[str, dict] = {}
+        self._episode_persisted: set = set()
+        # §6/§6A chainlink: in-RAM rolling store of RTDS events for settlement lookup
+        self._chainlink_events: List[dict] = []
+        # markets whose resolution_stuck was already emitted (dedup — was spamming 1/30s)
+        self._resolution_stuck_emitted: set = set()
+        # §6A lifecycle tracking: markets advanced to closed / resolved in this process
+        self._closed_cids: set = set()
+        self._resolved_cids: set = set()
+        # windows already attributed as coverage_gap in test mode (asset, window_index)
+        self._coverage_gapped: set = set()
+        # books with a background REST heal in flight (prevents snapshot-loop stalls)
+        self._heal_inflight: set = set()
 
     async def _recover_from_cursor(self) -> None:
         """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap."""
@@ -159,7 +183,7 @@ class Collector:
             token_id=details.get("token_id"),
             asset=details.get("asset"),
             connection_id=conn_id,
-            details=details.get("details"),
+            details=details,
         )
 
     def _writer_event(self, event_type: CollectorEventType, details: dict) -> None:
@@ -170,17 +194,45 @@ class Collector:
             pass
 
     def _persist_resync_episode(self, episode_dict: dict) -> None:
-        """Persist resync episode to ParquetWriter (resync_episodes dataset) - fixes 0 rows bug."""
+        """Persist resync episode to ParquetWriter (resync_episodes dataset).
+
+        Exactly one parquet row per episode: state transitions update
+        ``self._episode_latest`` in RAM; the row is appended only when the
+        episode reaches a final state (completed, escalated, or collector
+        stop). Previously every transition appended a row, double-counting
+        episodes and stamping reconnect at shutdown.
+        """
         try:
+            rid = episode_dict.get("resync_id")
+            if not rid:
+                return
             # Never fabricate placeholder condition_id - keep None if missing (schema nullable)
             if episode_dict.get("condition_id") in ("test-condition", "test-market", "TEST-5MIN"):
                 episode_dict = dict(episode_dict)
                 episode_dict["condition_id"] = None
-            ok = self.writer.append("resync_episodes", episode_dict, asset=episode_dict.get("asset"))
-            if not ok:
-                self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
+            self._episode_latest[rid] = dict(episode_dict)
+            is_final = bool(
+                episode_dict.get("resync_completed_ts_utc") or episode_dict.get("escalated")
+            )
+            if is_final and rid not in self._episode_persisted:
+                self._episode_persisted.add(rid)
+                ok = self.writer.append("resync_episodes", episode_dict, asset=episode_dict.get("asset"))
+                if not ok:
+                    self._episode_persisted.discard(rid)
+                    self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
         except Exception:
             pass
+
+    def _persist_open_episodes_on_stop(self) -> None:
+        """At stop(): persist episodes that never reached a final state, honestly."""
+        for rid, ep in list(self._episode_latest.items()):
+            if rid in self._episode_persisted:
+                continue
+            self._episode_persisted.add(rid)
+            try:
+                self.writer.append("resync_episodes", ep, asset=ep.get("asset"))
+            except Exception:
+                pass
 
     @staticmethod
     def _extract_wallets(msg: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -230,6 +282,38 @@ class Collector:
             taker = generic
         wallet = taker or maker or generic
         return maker, taker, wallet
+
+    def _append_book_event(self, ev: dict, book: "OrderBookState", asset: str, msg: dict) -> None:
+        """Persist one §4 book_events row captured by OrderBookState.apply_ws_message."""
+        try:
+            row = {
+                "ts_source": str(ev.get("ts_source")) if ev.get("ts_source") is not None else None,
+                "ts_received_ns": int(time.time_ns()),
+                "condition_id": book.condition_id,
+                "market_id": book.market_id,
+                "series_id": book.series_id,
+                "window_index": int(book.window_index),
+                "asset": asset.upper(),
+                "event_id": str(uuid.uuid4()),
+                "token_id": str(ev.get("token_id") or ""),
+                "outcome": str(ev.get("outcome") or "unknown"),
+                "event_type": str(ev.get("event_type") or "price_change"),
+                "sequence_number": None,
+                "old_best_bid": ev.get("old_best_bid"),
+                "new_best_bid": ev.get("new_best_bid"),
+                "old_best_ask": ev.get("old_best_ask"),
+                "new_best_ask": ev.get("new_best_ask"),
+                "old_bid_size": ev.get("old_bid_size"),
+                "new_bid_size": ev.get("new_bid_size"),
+                "old_ask_size": ev.get("old_ask_size"),
+                "new_ask_size": ev.get("new_ask_size"),
+                "threshold_config_id": self._threshold_config_id,
+            }
+            ok = self.writer.append("book_events", row, asset=asset.upper())
+            if not ok:
+                self._collector_event(CollectorEventType.backpressure, {"dataset": "book_events", "asset": asset})
+        except Exception:
+            pass
 
     def _handle_trade_message(self, msg: dict, asset: str, now_ns: int, now_bucket_ms: int | None = None) -> bool:
         """Parse a CLOB trade WS message and persist to trades with wallet — no RPC.
@@ -311,9 +395,12 @@ class Collector:
             except Exception:
                 seq_int = None
             notional = round(price * size, 6) if price and size else None
-            # Real fee only if exchange provides; never fabricate 0.07% — keep NULL and flag via exporter
-            # Per AGENT.md good data: fee stays NULL if not observed, fee_is_estimated stays NULL
+            # Fee: the CLOB trade payload carries the exchange-reported fee rate
+            # (fee_rate_bps, "0" on current 5m markets) — compute the amount from
+            # it instead of storing NULL (was the 100% null fee column on Kaggle).
             fee_raw = msg.get("fee")
+            fee_rate_bps = msg.get("fee_rate_bps") or msg.get("feeRateBps")
+            fee: Optional[float] = None
             fee_is_estimated: Optional[bool] = None
             if fee_raw is not None:
                 try:
@@ -321,9 +408,14 @@ class Collector:
                     fee_is_estimated = False
                 except Exception:
                     fee = None
-            else:
-                fee = None
-                fee_is_estimated = None
+            elif fee_rate_bps is not None and notional is not None:
+                try:
+                    fee = round(notional * float(fee_rate_bps) / 10_000.0, 6)
+                    # amount derived from the exchange-reported rate — not a fallback guess
+                    fee_is_estimated = False
+                except Exception:
+                    fee = None
+                    fee_is_estimated = None
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
@@ -351,43 +443,65 @@ class Collector:
             ok = self.writer.append("trades", row, asset=asset.upper())
             if not ok:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "trades", "asset": asset})
-            else:
-                self._collector_event(CollectorEventType.market_added, {"asset": asset, "trade_id": trade_id, "wallet": wallet}) if wallet else None
+            # (trade rows are counted in the trades dataset — do NOT emit market_added here)
             return ok
         except Exception:
             return False
 
+    async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
+        """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
+        try:
+            await self._fetch_and_apply_rest_book(book, market)
+        except Exception:
+            pass
+
     async def _fetch_rest_book(self, asset: str, condition_id: str) -> Optional[dict]:
-        """Fetch a full order-book snapshot via REST for resync — tries token_id first, then legacy params."""
+        """Fetch a full order-book snapshot via REST for resync — merged both outcomes.
+
+        Returns {'up_bids': […], 'up_asks': […], 'down_bids': […], 'down_asks': […]}.
+        The previous version returned a single token's raw book, which
+        replace_from_rest_snapshot then applied to BOTH outcomes — corrupting the
+        down book on every resync and contributing to the stale epidemic.
+        """
         import httpx
-        # Try token-based fetch for both UP/DOWN tokens if we have market info
         m = self.markets.get(condition_id)
+        merged: dict = {}
         if m:
-            for token_id in [m.up_token_id, m.down_token_id]:
-                try:
-                    async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=6) as client:
+                for outcome, token_id in (("up", m.up_token_id), ("down", m.down_token_id)):
+                    try:
                         resp = await client.get(
                             self.config.ws.rest_book_url,
                             params={"token_id": token_id},
                         )
-                        if resp.status_code == 200:
-                            j = resp.json()
-                            # Normalize to expected snapshot shape if needed: wrap as up_bids etc
-                            if isinstance(j, dict) and ("bids" in j or "asks" in j):
-                                # Single token book — return as is for later merging; caller will handle per-token
-                                return j
-                except Exception:
-                    pass
-        # Fallback legacy params
+                        if resp.status_code == 429:
+                            await asyncio.sleep(1.0)
+                            continue
+                        if resp.status_code != 200:
+                            continue
+                        j = resp.json()
+                        if not isinstance(j, dict):
+                            continue
+                        bids = j.get("bids") or []
+                        asks = j.get("asks") or []
+                        if bids or asks:
+                            merged[f"{outcome}_bids"] = bids
+                            merged[f"{outcome}_asks"] = asks
+                    except Exception:
+                        continue
+        if merged:
+            return merged
+        # Fallback legacy params (endpoint contract verified via §18 gate)
         try:
-            import httpx as _httpx
-            async with _httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=6) as client:
                 resp = await client.get(
                     self.config.ws.rest_book_url,
                     params={"asset": asset, "condition_id": condition_id},
                 )
                 if resp.status_code == 200:
-                    return resp.json()
+                    j = resp.json()
+                    if isinstance(j, dict) and ("bids" in j or "asks" in j):
+                        return j
         except Exception:
             pass
         return None
@@ -527,6 +641,27 @@ class Collector:
         except Exception as e:
             print(f"[startup] WAL replay err {e}")
 
+        # K-2: seed the in-RAM chainlink store from parquet so resolution works for
+        # windows that opened before this process (restart mid-window, first window)
+        try:
+            from .storage.parquet_io import read_dataset_dir
+            _cl = read_dataset_dir(Path(self.config.storage.data_dir) / "chainlink_events", label="startup chainlink seed")
+            if _cl is not None and _cl.num_rows > 0:
+                cutoff_ms = int(time.time() * 1000) - 30 * 60 * 1000
+                seeded = 0
+                for r in _cl.to_pylist():
+                    ts = r.get("ts_received_ns")
+                    if ts is None:
+                        continue
+                    ts_ms = int(ts) // 1_000_000
+                    if ts_ms >= cutoff_ms:
+                        self._chainlink_events.append({**r, "_ts_ms": ts_ms})
+                        seeded += 1
+                if seeded:
+                    print(f"[startup] seeded {seeded} chainlink events from parquet (resolution ground truth)")
+        except Exception as e:
+            print(f"[startup] chainlink seed skipped: {e}")
+
         # start per-asset WS tasks (stubbed — real WS connect loops)
         for asset in self.config.assets:
             t = asyncio.create_task(self._run_asset_loop(asset), name=f"asset-{asset}")
@@ -543,6 +678,9 @@ class Collector:
 
         # resolution stuck monitor (§6A) — unresolved > max wait
         self._resolution_task = asyncio.create_task(self._resolution_stuck_loop(), name="resolution_stuck")
+
+        # §6 Chainlink RTDS ground truth — feeds settlement (was never started before)
+        self._chainlink_task = asyncio.create_task(self._chainlink_loop(), name="chainlink")
 
         # Kaggle upload loop — 5m-only single dataset. Prod hourly, test every 10 min
         # In test_mode, run_test_mode drives its own chunk uploads (every 2 markets) so disable background loop to avoid double upload race.
@@ -627,6 +765,7 @@ class Collector:
                         conn_id = str(uuid.uuid4())
                         self._conn_ids[asset.upper()] = conn_id
                         self._conn_ids[asset] = conn_id
+                        self._ws_connected[asset.upper()] = True
                         self._collector_event(CollectorEventType.connected, {"asset": asset.upper(), "connection_id": conn_id})
                     except Exception:
                         pass
@@ -781,7 +920,11 @@ class Collector:
                                     continue
                                 # Apply to order book — handles sequence gap detection,
                                 # level updates, and book_state transitions internally
-                                # Try condition_id first, then token_id/asset_id resolution via books scan
+                                # Try condition_id first, then token_id/asset_id resolution via books scan.
+                                # I-root-cause fix: CLOB `price_change` messages carry NO top-level
+                                # token — only per-entry `asset_id` inside `price_changes`. The old
+                                # lookup got None and silently dropped EVERY delta (~56k msgs/run);
+                                # books then only moved on full `book` events, freezing ask sides.
                                 book = None
                                 cid = single_msg.get("condition_id")
                                 tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
@@ -793,12 +936,30 @@ class Collector:
                                         if b.up_token_id == tok or b.down_token_id == tok:
                                             book = b
                                             break
+                                if book is None and isinstance(single_msg.get("price_changes"), list):
+                                    for pc in single_msg["price_changes"]:
+                                        ptok = (pc.get("asset_id") or pc.get("token_id")) if isinstance(pc, dict) else None
+                                        if not ptok:
+                                            continue
+                                        for b in self.books.values():
+                                            if b.up_token_id == ptok or b.down_token_id == ptok:
+                                                book = b
+                                                break
+                                        if book is not None:
+                                            break
                                 # fallback token key
                                 if book is None:
                                     book = self.books.get(tok) if tok else None
                                 if book is not None:
                                     try:
                                         applied, reason = book.apply_ws_message(single_msg)
+                                        # §4 book_events — threshold-driven BBO changes
+                                        # captured inside apply_ws_message, drained here
+                                        try:
+                                            for ev in book.drain_pending_events():
+                                                self._append_book_event(ev, book, asset, single_msg)
+                                        except Exception:
+                                            pass
                                         # Emit sequence_gap event when gap detected §1A
                                         if reason and "sequence_gap" in reason:
                                             if self.on_event:
@@ -878,9 +1039,10 @@ class Collector:
                                     break
                     except Exception:
                         pass
-                    resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
-                    # Do NOT auto-reconnect here — wait for real WS reconnect; gap will be closed on next connect `handle_reconnect` or on stop `ensure_all_reconnected`
-                    # This ensures resync_rest_fetch_ts_utc is set only via real resync() REST fetch per AGENT.md
+                resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
+                self._ws_connected[asset.upper()] = False
+                # Do NOT auto-reconnect here — wait for real WS reconnect; gap will be closed on next connect `handle_reconnect` or on stop `ensure_all_reconnected`
+                # This ensures resync_rest_fetch_ts_utc is set only via real resync() REST fetch per AGENT.md
             except asyncio.CancelledError:
                 # Clean, expected shutdown — just exit
                 if not self._running:
@@ -902,6 +1064,7 @@ class Collector:
                     except Exception:
                         pass
                     resync_id = self.resync.handle_disconnect(asset, _cid2, reason="ws_connection_close", books=self.books)
+                    self._ws_connected[asset.upper()] = False
                     self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
             except Exception as e:
                 if self.on_event:
@@ -923,6 +1086,10 @@ class Collector:
                     CollectorEventType.ws_reconnect_attempt,
                     {"asset": asset, "attempt": attempt, "backoff_s": backoff_s},
                 )
+            # K-4: stagger across assets — after a shared disconnect all 7 assets
+            # would otherwise hit CLOB REST within the same second and rate-limit
+            import random as _random
+            await asyncio.sleep(_random.uniform(0.0, 2.0))
             # Attempt REST resync for all stale books before reconnecting WS
             try:
                 stale_books = [b for b in self.books.values() if b.asset.upper() == asset.upper() and b.book_state.value == "stale"]
@@ -1113,14 +1280,22 @@ class Collector:
                             # Only on first bucket of catch-up batch to avoid N REST calls per stall
                             if bucket == buckets[0]:
                                 try:
-                                    if book.up.bids.best_price() is None or book.up.asks.best_price() is None or book.down.bids.best_price() is None or book.down.asks.best_price() is None:
-                                        await self._fetch_and_apply_rest_book(book, m)
+                                    if (book.up.bids.best_price() is None or book.up.asks.best_price() is None or book.down.bids.best_price() is None or book.down.asks.best_price() is None) and book.condition_id not in self._heal_inflight:
+                                        self._heal_inflight.add(book.condition_id)
+                                        _bt = asyncio.create_task(self._heal_book_bg(book, m))
+                                        _bt.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
                                 except Exception:
                                     pass
-                                # Periodic retry for stale books: every 30s re-fetch REST to recover live
+                                # K-1(root): REST heal as a BACKGROUND task — the inline
+                                # await blocked the whole 500ms scheduler for the length
+                                # of slow/rate-limited REST calls (a 15:48 heal blocked
+                                # every asset past the run's end in the 15:40 run)
                                 try:
-                                    if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "stale" and _tick % 60 == 0:
-                                        await self._fetch_and_apply_rest_book(book, m)
+                                    _bs_val = getattr(getattr(book, "book_state", None), "value", "")
+                                    if _bs_val in ("stale", "resyncing") and _tick % 60 == 0 and book.condition_id not in self._heal_inflight:
+                                        self._heal_inflight.add(book.condition_id)
+                                        _t = asyncio.create_task(self._heal_book_bg(book, m))
+                                        _t.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
                                 except Exception:
                                     pass
                             # Pre-snapshot crossed check: if book crossed persists, mark stale and trigger REST resync (fixes 15-26% crossed)
@@ -1181,6 +1356,14 @@ class Collector:
                                             row[f"{_oc}_{_sk}_level_{_lvl}_size"] = None
                                         for _thc in (1, 5, 10):
                                             row[f"{_oc}_{_sk}_depth_{_thc}c"] = None
+                            # Honest freshness labeling (I-8): if the asset's WS is
+                            # down, a REST-healed book is frozen — label stale, never
+                            # live, so the clean view reflects reality.
+                            try:
+                                if not self._ws_connected.get(m.asset.upper(), False) and row.get("book_state") == "live":
+                                    row["book_state"] = "stale"
+                            except Exception:
+                                pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
                             if not result:
                                 try:
@@ -1189,10 +1372,11 @@ class Collector:
                                     pass
                             # No synthetic fallback — real data only per AGENT.md. Gaps remain gaps.
                             # book_events are threshold-driven from apply_ws_message, chainlink via real WS (separate loop) if available.
-                    # Periodic collector_events heartbeat per bucket batch (not per missed bucket)
+                    # Periodic liveness heartbeat — a distinct event type; `connected`
+                    # is reserved for real WS connection state (was poisoning telemetry)
                     if _tick % 20 == 0:
                         try:
-                            self._collector_event(CollectorEventType.connected, {"assets": self.config.assets})
+                            self._collector_event(CollectorEventType.snapshot_heartbeat, {"assets": self.config.assets})
                         except Exception:
                             pass
                     self._beat()
@@ -1251,15 +1435,219 @@ class Collector:
                 except Exception:
                     pass
 
-    async def _resolution_stuck_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(30)
+    def _nearest_chainlink(self, ts_ms: int, asset: str, max_delta_ms: int = 2000) -> Optional[dict]:
+        """Nearest stored chainlink event for THIS ASSET to ts_ms (settlement lookup §6A).
+
+        The asset filter is essential: without it every market settled against
+        whichever symbol happened to be nearest (all six assets got BNB's price).
+        """
+        best = None
+        best_delta = None
+        for ev in self._chainlink_events:
+            if (ev.get("asset") or "").upper() != asset.upper():
+                continue
             try:
-                now_ms = int(time.time()*1000)
+                ts = int(ev.get("_ts_ms") or 0)
+            except Exception:
+                continue
+            if not ts:
+                continue
+            delta = abs(ts - ts_ms)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best = ev
+        if best is not None and best_delta is not None and best_delta <= max_delta_ms:
+            return best
+        return None
+
+    async def _chainlink_loop(self) -> None:
+        """§6 Chainlink RTDS consumer — settlement ground truth.
+
+        Connects to wss://ws-live-data.polymarket.com, subscribes to the
+        crypto_prices_chainlink topic, stores every tick in chainlink_events
+        (parquet + in-RAM rolling store used by the resolution loop).
+        """
+        import asyncio as _aio
+        import datetime as _dt
+        import json as _json
+        cfg = self.config.chainlink
+        url = cfg.ws_url
+        attempt = 0
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    self._collector_event(CollectorEventType.connected, {"asset": "CHAINLINK", "connection_id": "chainlink"})
+                    # RTDS subscribe — request both chainlink topic variants defensively
+                    try:
+                        sub = _json.dumps({"action": "subscribe", "subscriptions": [
+                            {"topic": "crypto_prices_chainlink", "type": "*"},
+                            {"topic": "crypto_prices", "type": "*"},
+                        ]})
+                        await ws.send(sub)
+                    except Exception:
+                        pass
+                    attempt = 0
+                    parsed_any = False
+                    dbg_printed = False
+                    rx_count = 0
+                    async for message in ws:
+                        if not self._running:
+                            break
+                        rx_count += 1
+                        try:
+                            msg = _json.loads(message) if isinstance(message, (str, bytes)) else message
+                        except Exception:
+                            continue
+                        payloads = msg if isinstance(msg, list) else [msg]
+                        for p in payloads:
+                            if not isinstance(p, dict):
+                                continue
+                            body = p.get("payload")
+                            # RTDS may deliver payload as a dict or as a JSON string
+                            if isinstance(body, str):
+                                try:
+                                    body = _json.loads(body)
+                                except Exception:
+                                    body = None
+                            if not isinstance(body, dict):
+                                body = p if ("price" in p or "value" in p) else None
+                            if not isinstance(body, dict):
+                                continue
+                            # RTDS crypto_prices_chainlink real shape (probed live):
+                            # {"topic": "crypto_prices_chainlink", "payload": {"symbol": "btc/usd",
+                            #  "value": 79664.0, "full_accuracy_value": "...", "timestamp": <ms>},
+                            #  "timestamp": <ms>, "type": "update"}
+                            price_raw = body.get("value") or body.get("price") or body.get("p")
+                            if price_raw is None:
+                                continue
+                            try:
+                                price = float(price_raw)
+                            except Exception:
+                                continue
+                            symbol = str(body.get("symbol") or body.get("asset") or "")
+                            sym_norm = symbol.lower().replace("-", "").replace("/", "").replace("_", "")
+                            asset = None
+                            for a in self.config.assets:
+                                if a.lower() == sym_norm[:len(a)]:
+                                    asset = a.upper()
+                                    break
+                            if asset is None:
+                                continue
+                            # normalize ts_source (ms epoch / s epoch / ISO)
+                            ts_raw = body.get("timestamp") or body.get("last_seen") or body.get("reportTimestamp")
+                            ts_ms = None
+                            try:
+                                if ts_raw is not None:
+                                    tf = float(ts_raw)
+                                    ts_ms = int(tf if tf > 1e11 else tf * 1000)
+                            except Exception:
+                                ts_ms = None
+                            now_iso = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                            ts_source_iso = (
+                                _dt.datetime.fromtimestamp(ts_ms / 1000, tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                                if ts_ms else now_iso
+                            )
+                            from .chainlink import chainlink_event_from_ws
+                            ev = chainlink_event_from_ws({
+                                "price": price,
+                                "symbol": symbol or asset,
+                                "source": "chainlink_rtds",
+                                "timestamp": ts_source_iso,
+                                "report_id": body.get("hash") or body.get("reportId"),
+                                "round_id": body.get("roundId"),
+                            }, asset, schema_version=self.config.schema_version)
+                            row = ev.to_dict()
+                            self.writer.append("chainlink_events", row, asset=asset)
+                            parsed_any = True
+                            # keep asset in the RAM row — _nearest_chainlink filters on it
+                            # (to_dict() omits it; without it no market could ever resolve)
+                            self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms or int(time.time() * 1000)})
+                            if len(self._chainlink_events) > 20000:
+                                del self._chainlink_events[:len(self._chainlink_events) - 20000]
+                    attempt = 0
+                    if self._running and not parsed_any and rx_count > 0:
+                        # connected but nothing parsed — surface the real payload shape once
+                        try:
+                            print(f"[chainlink] rx={rx_count} messages, 0 parsed — sample: {str(message)[:300]}")
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.book_anomaly, {"asset": "CHAINLINK", "ws_error": str(e)})
+                    except Exception:
+                        pass
+            if not self._running:
+                return
+            attempt += 1
+            await _aio.sleep(min(2 ** attempt, 30))
+
+    async def _resolution_stuck_loop(self) -> None:
+        """§6A resolution lifecycle: active → closed → resolved with Chainlink ground truth.
+
+        Emits resolution_stuck at most once per market when settlement is still
+        unavailable after max_resolution_wait_seconds (previously spammed
+        every 30s and never advanced market status).
+        """
+        import datetime as _dt
+        while self._running:
+            await asyncio.sleep(10)
+            try:
+                now_ms = int(time.time() * 1000)
+                wait_ms = self.config.chainlink.max_resolution_wait_seconds * 1000
                 for cid, m in list(self.markets.items()):
-                    if m.market_end_ts_ms + self.config.chainlink.max_resolution_wait_seconds*1000 < now_ms:
-                        # check if still unknown via markets_latest would need read; emit stuck if market still active and no settlement
-                        self._collector_event(CollectorEventType.resolution_stuck, {"condition_id": cid, "asset": m.asset, "market_end_ts_ms": m.market_end_ts_ms})
+                    if m.market_end_ts_ms > now_ms:
+                        continue
+                    if cid in self._resolved_cids:
+                        continue
+                    # active → closed at window end
+                    if cid not in self._closed_cids:
+                        self._closed_cids.add(cid)
+                        try:
+                            row = m.to_markets_row()
+                            row["status"] = "closed"
+                            row["resolution_ts"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                            self.markets_log.append(row)
+                        except Exception:
+                            pass
+                    # closed → resolved via nearest Chainlink open/end prices
+                    end_ev = self._nearest_chainlink(m.market_end_ts_ms, m.asset, max_delta_ms=wait_ms)
+                    # K-2: open-price tolerance 10s — the first window after startup
+                    # cannot resolve at ±2s because Chainlink's first tick lands later
+                    start_ev = self._nearest_chainlink(m.market_start_ts_ms, m.asset, max_delta_ms=10000)
+                    if end_ev is not None and start_ev is not None:
+                        end_price = end_ev.get("price")
+                        start_price = start_ev.get("price")
+                        outcome = "unknown"
+                        try:
+                            if end_price is not None and start_price is not None:
+                                outcome = "up" if end_price > start_price else ("down" if end_price < start_price else "tie")
+                        except Exception:
+                            outcome = "unknown"
+                        row = m.to_markets_row()
+                        row.update({
+                            "status": "resolved",
+                            "resolution_outcome": outcome,
+                            "settlement_price": end_price,
+                            "settlement_ts_utc": end_ev.get("ts_source"),
+                            "settlement_report_id": end_ev.get("report_id"),
+                            "settlement_tx_hash": None,
+                            "resolution_confirmed_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "settlement_source": "inferred_nearest",
+                        })
+                        self.markets_log.append(row)
+                        self._resolved_cids.add(cid)
+                        print(f"[resolution] {m.asset} window {m.window_index} resolved {outcome} (settlement {end_price} vs open {start_price})")
+                    elif now_ms >= m.market_end_ts_ms + wait_ms and cid not in self._resolution_stuck_emitted:
+                        self._resolution_stuck_emitted.add(cid)
+                        self._collector_event(CollectorEventType.resolution_stuck, {
+                            "condition_id": cid, "asset": m.asset,
+                            "market_end_ts_ms": m.market_end_ts_ms,
+                            "reason": "no chainlink settlement data within max_resolution_wait_seconds",
+                            "chainlink_events_seen": len(self._chainlink_events),
+                        })
             except Exception:
                 pass
 
@@ -1267,19 +1655,21 @@ class Collector:
         self._running = False
         for t in self._tasks:
             t.cancel()
-        for attr in ["_snapshot_task","_clock_task","_flush_task","_resolution_task","_kaggle_task"]:
+        for attr in ["_snapshot_task","_clock_task","_flush_task","_resolution_task","_kaggle_task","_chainlink_task"]:
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
         # ensure any pending resync episodes get reconnect timestamp (fixes 100% null on stop)
         try:
             self.resync.ensure_all_reconnected()
-            # flush one more persist for each episode to capture reconnect gap
+            # capture final state for each episode in RAM (non-final calls only update)
             for ep in list(self.resync._episodes.values()):
                 try:
                     self._persist_resync_episode(ep.to_dict())
                 except Exception:
                     pass
+            # write each episode exactly once (final state, honestly stamped)
+            self._persist_open_episodes_on_stop()
         except Exception:
             pass
         # final flush
@@ -1431,7 +1821,21 @@ class Collector:
                         except Exception:
                             pass
 
-                    kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
+                    # I-11: only a verified-successful upload counts as a completed
+                    # chunk — a failed attempt previously satisfied the chunk gate and
+                    # permanently blocked the final retry within the run.
+                    _up_status = None
+                    try:
+                        for _v in (res.get("kaggle_uploads") or {}).values():
+                            _up_status = _v.get("status")
+                            if _up_status == "success":
+                                break
+                    except Exception:
+                        pass
+                    if _up_status == "success":
+                        kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
+                    else:
+                        print(f"[test-kaggle:{tag}] upload NOT counted as completed chunk (status={_up_status or res.get('error')}) — data retained, retry scheduled")
                     # one-file-per-asset audit: staging should be 31 files for 7 assets
                     try:
                         st = res.get("staging", {})
@@ -1493,7 +1897,31 @@ class Collector:
                         now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
                         if m.market_end_ts_ms < now_ms:
                             completed_windows[asset].add(m.window_index)
-                all_done = all(len(s) >= num_markets for s in completed_windows.values())
+                # I-5: attribute missing markets in real time — a window that started
+                # >75s ago with no discovered market is a coverage_gap, not silence
+                now_ms_c = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
+                cur_widx = (now_ms_c // 1000) // ws
+                for asset in self.config.assets:
+                    has_market = any(
+                        m.asset.upper() == asset.upper() and m.window_index == cur_widx
+                        for m in self.markets.values()
+                    )
+                    if (not has_market and (asset, cur_widx) not in self._coverage_gapped
+                            and now_ms_c >= (cur_widx * ws + 75) * 1000):
+                        self._coverage_gapped.add((asset, cur_widx))
+                        self._collector_event(CollectorEventType.coverage_gap, {
+                            "asset": asset,
+                            "window_index": cur_widx,
+                            "window_start_ts_ms": cur_widx * ws * 1000,
+                            "slug": f"{asset.lower()}-updown-{(ws//60)}m-{cur_widx*ws}",
+                            "reason": "no market discovered 75s after window start",
+                        })
+                        print(f"[test-mode] coverage_gap: {asset} window {cur_widx} — no market discovered")
+                gap_count = {a: sum(1 for (aa, _) in self._coverage_gapped if aa == a) for a in self.config.assets}
+                all_done = all(
+                    len(completed_windows[a]) + gap_count.get(a, 0) >= num_markets
+                    for a in self.config.assets
+                )
                 if elapsed % 30 < 5:
                     prog = {a: sorted(s) for a, s in completed_windows.items()}
                     print(f"[test-mode:real] {elapsed}s elapsed, windows per asset: {prog}, timeout {timeout_s}s, kaggle {len(kaggle_uploads)} uploads")
@@ -1613,7 +2041,7 @@ class Collector:
             table = None
             for part in files:
                 try:
-                    tbl = pq.read_table(str(part))
+                    tbl = read_table(part)
                     total += tbl.num_rows
                     if table is None and tbl.num_rows>0:
                         table = tbl
@@ -1634,11 +2062,11 @@ class Collector:
                     tables = []
                     for f in files:
                         try:
-                            tables.append(pq.read_table(str(f)))
+                            tables.append(read_table(f))
                         except Exception:
                             continue
                     if tables:
-                        combined = pq.read_table(str(files[0])) if len(tables)==1 else __import__("pyarrow").concat_tables(tables, promote=True) if len(tables)>1 else None
+                        combined = read_table(files[0]) if len(tables)==1 else __import__("pyarrow").concat_tables(tables, promote_options="default") if len(tables)>1 else None
                         if combined is not None and combined.num_rows>0 and sample is None:
                             sample = combined.slice(0,1).to_pylist()[0]
                             columns = combined.column_names
@@ -1679,7 +2107,7 @@ class Collector:
                 p = base / "markets_latest" / "markets_latest.parquet"
                 if p.exists():
                     try:
-                        tbl = pq.read_table(str(p))
+                        tbl = read_table(p)
                         info = {"exists": True, "files": 1, "rows": tbl.num_rows, "sample": tbl.slice(0,1).to_pylist()[0] if tbl.num_rows else None, "columns": tbl.column_names[:16] if tbl.num_rows else None, "table": tbl}
                     except Exception as e:
                         print(f"[analyse] markets_latest read err {e}")
@@ -1708,12 +2136,22 @@ class Collector:
         checks = report["checks"]
         snap_info = report["datasets"]["book_snapshots_500ms"]
         ticks_per_market = report["ticks_per_market"]
+        # I-4: expect ticks only for markets that actually exist AND have fully
+        # elapsed — counting the just-discovered next window (2 ticks so far)
+        # inflated the denominator and faked a completeness shortfall.
         expected_snaps = num_markets * ticks_per_market * len(self.config.assets)
-        checks["expected_book_snapshots"] = expected_snaps
+        import time as _time_mod
+        _now_ms_a = int(_time_mod.time() * 1000)
+        elapsed_cids = {cid for cid, m in self.markets.items() if m.market_end_ts_ms < _now_ms_a}
+        discovered = len(elapsed_cids)
+        expected_discovered = discovered * ticks_per_market
+        checks["expected_book_snapshots"] = expected_discovered
+        checks["expected_book_snapshots_if_all_windows"] = expected_snaps
+        checks["discovered_windows_total"] = discovered
         checks["actual_book_snapshots"] = snap_info["rows"]
         checks["actual_clean_snapshots"] = report["datasets"]["book_snapshots_clean"]["rows"]
-        checks["snapshot_completeness_pct"] = round(100*snap_info["rows"]/expected_snaps,2) if expected_snaps else 0
-        checks["clean_completeness_pct"] = round(100*report["datasets"]["book_snapshots_clean"]["rows"]/expected_snaps,2) if expected_snaps else 0
+        checks["snapshot_completeness_pct"] = round(100*snap_info["rows"]/expected_discovered,2) if expected_discovered else 0
+        checks["clean_completeness_pct"] = round(100*report["datasets"]["book_snapshots_clean"]["rows"]/expected_discovered,2) if expected_discovered else 0
         # completeness.py style report per asset if date partitions exist
         try:
             from .completeness import compute_daily_completeness

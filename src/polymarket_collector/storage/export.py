@@ -25,6 +25,15 @@ from typing import List, Optional, Dict, Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def _os_replace_safe(src, dst):
+    """Atomic tmp->final rename that works on Windows (os.replace overwrites; Path.rename raises WinError 183 if dst exists)."""
+    import os as _os
+    _os.replace(str(src), str(dst))
+
+
+from .parquet_io import read_table
 import pyarrow.compute as pc
 
 from .schemas import SCHEMAS, snapshot_schema
@@ -65,6 +74,179 @@ def _get_schema(dataset: str, l2_levels: int = 20) -> Optional[pa.Schema]:
     return SCHEMAS.get(dataset)
 
 
+
+
+def _api_ts_ms(t: dict) -> str:
+    ts = t.get("timestamp")
+    if ts is None:
+        return ""
+    try:
+        f = float(ts)
+        return str(int(f if f > 1e12 else f * 1000))
+    except Exception:
+        return ""
+
+
+def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None) -> pa.Table:
+    """Fill maker_wallet/taker_wallet/wallet for trades where they are NULL.
+
+    The CLOB market channel does not carry wallets, so streamed trade rows have
+    them NULL (100% null fee/wallet columns on Kaggle). Polymarket's public
+    Data-API (data-api.polymarket.com/trades?market=<conditionId>) does carry
+    proxyWallet per trade — match by transaction_hash (unique) and enrich.
+    Read-only, best-effort: on any failure rows keep their NULLs (never
+    fabricated) and the failure is logged loudly.
+    """
+    import collections
+    import datetime as _dt
+    import httpx as _hx
+    if combined.num_rows == 0 or "wallet" not in combined.schema.names:
+        return combined
+    pylist = combined.to_pylist()
+    need_by_cid: dict = {}
+    for i, r in enumerate(pylist):
+        if r.get("wallet") is None and r.get("transaction_hash") and r.get("condition_id"):
+            need_by_cid.setdefault(r["condition_id"], []).append(i)
+    if not need_by_cid:
+        return combined
+    filled = 0
+    for cid, idxs in need_by_cid.items():
+        # one transaction can settle MULTIPLE fills (maker+taker rows share the
+        # tx hash) — key by (tx_hash, price, size) and keep a pool of wallets
+        # per key, consuming them across our rows of the same fill.
+        key_pool: dict = {}
+        try:
+            for offset in (0, 500, 1000):
+                resp = _hx.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"market": cid, "limit": 500, "offset": offset, "takerOnly": "false"},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    break
+                batch = resp.json()
+                if not batch:
+                    break
+                for t in batch:
+                    txh = (t.get("transactionHash") or "").lower()
+                    if not txh:
+                        continue
+                    k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
+                    w = t.get("proxyWallet") or t.get("wallet")
+                    if w:
+                        key_pool.setdefault(k, []).append(w)
+                        key_pool.setdefault((txh,), []).append(w)
+                if len(batch) < 500:
+                    break
+        except Exception as e:
+            print(f"[export] WARN wallet backfill skipped for {cid[:14]}…: {e}")
+            continue
+        for i in idxs:
+            r = pylist[i]
+            k = ((r.get("transaction_hash") or "").lower(), round(float(r.get("price")), 6), round(float(r.get("size")), 6))
+            pool = key_pool.get(k)
+            if not pool:
+                # fall back to tx-level match for fills whose price/size string differs
+                pool = key_pool.get((k[0],))
+            if not pool:
+                continue
+            w = pool.pop(0)
+            r["taker_wallet"] = r.get("taker_wallet") or w
+            r["wallet"] = r.get("wallet") or r["taker_wallet"]
+            filled += 1
+    if filled:
+        print(f"[export] wallet backfill: filled {filled}/{sum(len(v) for v in need_by_cid.values())} trade rows from data-api")
+    combined = pa.Table.from_pylist(pylist, schema=combined.schema)
+
+    # K-6 trade reconciliation: the CLOB last_trade_price stream COALESCES fills on
+    # liquid markets (measured 2026-09-05: BTC 12-18% of data-api fills captured,
+    # DOGE 93%) — insert missing fills as api-prefixed rows so per-market trade
+    # counts are complete. Existing rows keep their identity; only truly missing
+    # (tx_hash, price, size) fills are added — never duplicated.
+    inserted = 0
+    try:
+        by_cid: dict = {}
+        for r in combined.to_pylist():
+            if r.get("condition_id"):
+                by_cid.setdefault(r["condition_id"], []).append(r)
+        rows_to_add: list = []
+        for cid, rs in by_cid.items():
+            have: collections.Counter = collections.Counter(
+                ((r.get("transaction_hash") or "").lower(), round(float(r["price"]), 6), round(float(r["size"]), 6))
+                for r in rs if r.get("transaction_hash") and r.get("price") is not None and r.get("size") is not None
+            )
+            series_mode = collections.Counter(r.get("series_id") for r in rs).most_common(1)[0][0] if rs else None
+            n_rows = len(rs)
+            offset = 0
+            while offset <= 1500:
+                try:
+                    resp = _hx.get(
+                        "https://data-api.polymarket.com/trades",
+                        params={"market": cid, "limit": 500, "offset": offset},
+                        timeout=10,
+                    )
+                    batch = resp.json() if resp.status_code == 200 else []
+                except Exception as e:
+                    print(f"[export] WARN trade reconciliation fetch failed for {cid[:14]}…: {e}")
+                    break
+                if not batch:
+                    break
+                for t in batch:
+                    txh = (t.get("transactionHash") or "").lower()
+                    try:
+                        k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
+                    except Exception:
+                        continue
+                    if have.get(k, 0) > 0:
+                        have[k] -= 1
+                        continue
+                    w = t.get("proxyWallet") or t.get("wallet")
+                    ts_ms = _api_ts_ms(t)
+                    try:
+                        widx = int(ts_ms) // 1000 // 300 if ts_ms else (rs[0].get("window_index") or 0)
+                    except Exception:
+                        widx = rs[0].get("window_index") or 0
+                    price_f = t.get("price"); size_f = t.get("size")
+                    notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
+                    rows_to_add.append({
+                        "ts_source": ts_ms or None,
+                        "ts_received_ns": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
+                        "condition_id": cid,
+                        "market_id": rs[0].get("market_id") or cid,
+                        "series_id": series_mode or f"{asset or 'X'}-5MIN",
+                        "window_index": int(widx) if widx is not None else 0,
+                        "asset": (asset or rs[0].get("asset") or "").upper(),
+                        "trade_id": f"api-{txh[:16]}-{inserted}",
+                        "transaction_hash": txh or None,
+                        "token_id": str(t.get("asset_id") or t.get("asset") or ""),
+                        "outcome": "unknown",
+                        "price": float(price_f) if price_f is not None else None,
+                        "size": float(size_f) if size_f is not None else None,
+                        "notional": notional,
+                        "fee": None,
+                        "fee_is_estimated": None,
+                        "side": (t.get("side") or "").lower() or None,
+                        "aggressor_side": (t.get("side") or "").lower() or None,
+                        "sequence_number": None,
+                        "maker_wallet": None,
+                        "taker_wallet": w,
+                        "wallet": w,
+                    })
+                    inserted += 1
+                if len(batch) < 500:
+                    break
+                offset += 500
+        if rows_to_add:
+            combined = pa.concat_tables(
+                [combined, pa.Table.from_pylist(rows_to_add, schema=combined.schema)],
+                **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True}),
+            )
+            print(f"[export] trade reconciliation: inserted {inserted} missing fills from data-api (CLOB stream coalesces liquid fills)")
+    except Exception as e:
+        print(f"[export] WARN trade reconciliation failed: {e}")
+    return combined
+
+
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False) -> Optional[pa.Table]:
     """Read all parquet files for dataset (+ optional asset filter)."""
     base = data_dir / dataset
@@ -94,7 +276,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         if p.name.endswith(".tmp"):
             continue
         try:
-            t = pq.read_table(str(p))
+            t = read_table(p)
             # filter by asset column if per-asset requested but files are mixed
             if asset and dataset in PER_ASSET_DATASETS and "asset" in t.schema.names:
                 # if file path already guaranteed asset, skip filter; else filter
@@ -137,7 +319,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         if _read_errors:
             print(f"[export] ERROR all {len(patterns)} files failed for {dataset} asset={asset} — aborting read")
         return None
-    combined = pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
+    combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
     if dataset == "chainlink_events" and not include_binance and "source" in combined.schema.names:
         try:
@@ -150,6 +332,13 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             combined = combined.filter(mask)
         except Exception:
             pass
+    # K-user-fix: enrich streamed trades with real proxy wallets (data-api) —
+    # the CLOB market channel never carries them, so they were 100% null on Kaggle
+    if dataset == "trades" and combined.num_rows > 0:
+        try:
+            combined = _backfill_trade_wallets(combined, data_dir, asset=asset)
+        except Exception as e:
+            print(f"[export] WARN wallet backfill failed: {e}")
     # backfill trades: compute notional, fee, aggressor_side, transaction_hash where null for old 3.1.0 data
     if dataset == "trades" and combined.num_rows > 0:
         try:
@@ -330,7 +519,7 @@ def export_per_asset_single_file(
                 prior_exists = out_path.exists()
                 if prior_exists:
                     try:
-                        _prior = pq.read_table(str(out_path))
+                        _prior = read_table(out_path)
                         prior_rows = _prior.num_rows
                     except Exception:
                         prior_rows = None
@@ -346,7 +535,7 @@ def export_per_asset_single_file(
                 if table is not None and table.num_rows > 0:
                     tmp_path = out_path.with_suffix(".parquet.tmp")
                     pq.write_table(table, str(tmp_path), compression="zstd")
-                    tmp_path.rename(out_path)
+                    _os_replace_safe(tmp_path, out_path)
                     stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows
                 else:
                     # No/hollow new data — if prior already preserved above, we already continued
@@ -388,7 +577,7 @@ def export_per_asset_single_file(
                         except Exception:
                             # fallback without compression if schema mismatch
                             pq.write_table(pa.table({}), str(tmp_path))
-                        tmp_path.rename(out_path)
+                        _os_replace_safe(tmp_path, out_path)
                         stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = 0
         elif ds in global_datasets:
             # Global dataset: always create a single file in staging, even if 0 rows
@@ -403,7 +592,7 @@ def export_per_asset_single_file(
             prior_rows_g = None
             if out_path.exists():
                 try:
-                    _pg = pq.read_table(str(out_path))
+                    _pg = read_table(out_path)
                     prior_rows_g = _pg.num_rows
                 except Exception:
                     prior_rows_g = None
@@ -414,7 +603,7 @@ def export_per_asset_single_file(
             if table is not None and table.num_rows > 0:
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
-                tmp_path.rename(out_path)
+                _os_replace_safe(tmp_path, out_path)
             else:
                 # Preserve prior if we have it (already handled above), else create schema-empty
                 if prior_rows_g is not None and prior_rows_g > 0:
@@ -425,7 +614,7 @@ def export_per_asset_single_file(
                 table = pa.table(empty_data) if empty_data else pa.table({})
                 tmp_path = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(table, str(tmp_path), compression="zstd")
-                tmp_path.rename(out_path)
+                _os_replace_safe(tmp_path, out_path)
             stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = table.num_rows if table is not None else 0
         else:
             # Should not happen with default datasets, but skip
@@ -463,7 +652,7 @@ def main() -> None:
         latest = base / "markets_latest" / "markets_latest.parquet"
         if latest.exists():
             try:
-                t = pq.read_table(str(latest))
+                t = read_table(latest)
                 # sort time first
                 if "updated_at" in t.schema.names:
                     idx = pc.sort_indices(t, sort_keys=[("updated_at", "ascending"), ("condition_id", "ascending")])
@@ -471,7 +660,7 @@ def main() -> None:
                 out_path = out / "markets_latest.parquet"
                 tmp = out_path.with_suffix(".parquet.tmp")
                 pq.write_table(t, str(tmp), compression="zstd")
-                tmp.rename(out_path)
+                _os_replace_safe(tmp, out_path)
                 stats[str(out_path)] = t.num_rows
                 print(f"exported markets_latest.parquet: {t.num_rows} rows")
             except Exception as e:
@@ -824,8 +1013,8 @@ def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[st
                             pass
                     continue
                 try:
-                    cur_t = pq.read_table(str(staging_path))
-                    prior_t = pq.read_table(str(prior_path))
+                    cur_t = read_table(staging_path)
+                    prior_t = read_table(prior_path)
                     if prior_t.num_rows > cur_t.num_rows:
                         # Need to merge: concat and dedup by time+condition_id if possible
                         # For book_snapshots use (asset,condition_id,ts_snapshot_ns) dedup
@@ -1109,7 +1298,7 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
             if not fpath.exists():
                 return False
             try:
-                t = pq.read_table(str(fpath))
+                t = read_table(fpath)
                 if t.num_rows == 0:
                     return False
             except Exception:
@@ -1119,7 +1308,7 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
             if not fpath.exists():
                 return False
             try:
-                pq.read_table(str(fpath))
+                read_table(fpath)
             except Exception:
                 return False
     for ds, fname in global_file_map.items():
@@ -1127,7 +1316,7 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
         if not fpath.exists():
             return False
         try:
-            pq.read_table(str(fpath))
+            read_table(fpath)
         except Exception:
             return False
     # Monotonic check vs prior staging (download-merge fallback when no local hive yet)
@@ -1149,7 +1338,7 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
                             if prior is not None and prior > 0:
                                 cur_path = staging / key
                                 try:
-                                    cur_rows = pq.read_table(str(cur_path)).num_rows
+                                    cur_rows = read_table(cur_path).num_rows
                                     if cur_rows < prior:
                                         return False
                                 except Exception:
@@ -1177,7 +1366,7 @@ def _write_kaggle_state(staging: Path, dataset: str, notes: str):
                 if p.name.endswith(".tmp"):
                     continue
                 try:
-                    staging_counts[p.name] = pq.read_table(str(p)).num_rows
+                    staging_counts[p.name] = read_table(p).num_rows
                 except Exception:
                     continue
         except Exception:
@@ -1256,7 +1445,7 @@ def cleanup_local_data(
                 # never delete open window (market_end > now) — just verify, don't delete
                 # Read max market_end from file if column exists
                 try:
-                    t = pq.read_table(str(leaf), columns=None)
+                    t = read_table(leaf)
                     # check hive file's market_end if present
                     for col in ["market_end_ts_ms", "market_end_ts"]:
                         if col in t.schema.names:
@@ -1370,7 +1559,7 @@ def export_and_upload_all_kaggle(
     try:
         latest = base / "markets_latest" / "markets_latest.parquet"
         if latest.exists():
-            tbl = pq.read_table(str(latest))
+            tbl = read_table(latest)
             if "market_end_ts_ms" in tbl.schema.names:
                 ends = [v for v in tbl.column("market_end_ts_ms").to_pylist() if v is not None]
                 if ends and max(ends) >= int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000):
@@ -1392,6 +1581,40 @@ def export_and_upload_all_kaggle(
     if dry_run:
         print("dry-run: skipping Kaggle upload + prune")
         result["kaggle_uploads"][dataset_prefix] = {"status": "dry_run", "staging": str(staging), "files": prep["files"]}
+        return result
+
+    # Step 1b: pre-upload validation (I-12) — never call the API with a broken
+    # staging folder. Previously a missing {ASSET}_book_snapshots_500ms.parquet
+    # surfaced only as 5 retries of "does not exist" inside the Kaggle client.
+    # Empty staging is only a failure when the hive source actually holds rows —
+    # legitimately-empty datasets stage as schema-empty files and are fine.
+    import pyarrow.parquet as _pq
+    lost = []
+    for a in assets:
+        for ds_name in ("book_snapshots_500ms", "trades", "book_events", "chainlink_events"):
+            f = staging / f"{a}_{ds_name}.parquet"
+            staging_rows = 0
+            if f.exists():
+                t_chk = read_table(f)
+                staging_rows = t_chk.num_rows if t_chk is not None else 0
+            hive_root = Path(data_dir) / ds_name
+            hive_files = list(hive_root.glob(f"date=*/asset={a}/*.parquet")) if hive_root.exists() else []
+            hive_rows = 0
+            for hf in hive_files:
+                t_h = read_table(hf)
+                hive_rows += t_h.num_rows if t_h is not None else 0
+            if hive_rows > staging_rows:
+                lost.append(f"{a}_{ds_name}: staging {staging_rows} < hive {hive_rows}")
+    if lost:
+        msg = f"staging pre-validation failed (staging would lose rows): {lost[:8]}"
+        print(f"[export] {msg}")
+        print(f"[export] ✗ aborting upload — fix export reads; data retained for retry")
+        result["kaggle_uploads"][dataset_prefix] = {
+            "status": "failed",
+            "reason": msg,
+            "staging": str(staging),
+            "files": prep["files"],
+        }
         return result
 
     # Step 2: Upload to Kaggle (single dataset)

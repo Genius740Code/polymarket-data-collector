@@ -10,6 +10,15 @@ import uuid
 from pathlib import Path
 
 import pyarrow.parquet as pq
+
+
+def _os_replace_safe(src, dst):
+    """Atomic tmp->final rename that works on Windows (os.replace overwrites; Path.rename raises WinError 183 if dst exists)."""
+    import os as _os
+    _os.replace(str(src), str(dst))
+
+
+from .parquet_io import read_table
 import pyarrow as pa
 
 
@@ -37,16 +46,16 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     tables = []
     for p in parts:
         try:
-            tables.append(pq.read_table(str(p)))
+            tables.append(read_table(p))
         except Exception:
             continue
     if not tables:
         return 0
-    combined = pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
+    combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
     tmp_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet{temp_suffix}"
     final_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet"
     pq.write_table(combined, str(tmp_path), compression="zstd")
-    tmp_path.rename(final_path)
+    _os_replace_safe(tmp_path, final_path)
     # remove old parts only after successful new write
     for p in parts:
         try:

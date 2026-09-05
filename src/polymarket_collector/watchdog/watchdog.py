@@ -119,7 +119,7 @@ class Watchdog:
 
             for part in ce_dir.glob("*.parquet"):
                 try:
-                    tbl = pq.read_table(str(part))
+                    tbl = pq.ParquetFile(str(part)).read()
                 except Exception:
                     continue
                 for row in tbl.to_pylist():

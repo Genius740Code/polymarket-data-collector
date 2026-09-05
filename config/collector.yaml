@@ -49,7 +49,7 @@ raw_archive:
   format: jsonl
   path: ./data/raw_ws_archive
   retention_hours: 36
-rollover_lead_seconds: 30
+rollover_lead_seconds: 60
 schema_version: 3.2.0
 series_ids:
   BNB: BNB-5MIN
@@ -67,8 +67,8 @@ storage:
   data_dir: ./data
   disk_space_check_interval_seconds: 30
   disk_space_min_bytes: 1073741824
-  flush_interval_seconds: 60
-  flush_row_count_threshold: 5000
+  flush_interval_seconds: 30
+  flush_row_count_threshold: 1500
   wal_dir: ./data/_wal
   wal_enabled: true
 synthetic_mode: false

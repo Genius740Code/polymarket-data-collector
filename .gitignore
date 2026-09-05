@@ -20,3 +20,4 @@ build/
 .ruff_cache/
 raw_ws_archive/
 _wal/
+*.log

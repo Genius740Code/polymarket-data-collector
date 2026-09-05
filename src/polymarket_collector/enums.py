@@ -74,6 +74,9 @@ class CollectorEventType(StrEnum):
     collector_started = "collector_started"
     collector_restarted = "collector_restarted"
     clock_issue = "clock_issue"
+    # 500ms snapshot-loop liveness (do NOT misuse `connected` — that is a real
+    # WS connection-state event; a periodic heartbeat here poisoned telemetry)
+    snapshot_heartbeat = "snapshot_heartbeat"
     # Kaggle 10-min upload
     kaggle_upload_started = "kaggle_upload_started"
     kaggle_upload_success = "kaggle_upload_success"

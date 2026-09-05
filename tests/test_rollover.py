@@ -33,9 +33,10 @@ async def test_rollover_lookahead_discovers_next():
     cur = make_market(cid="cur", end_offset_ms=10_000, window_index=1)
     mgr.set_current("BTC", cur)
 
-    # mock discovery
-    async def fake_fetch(asset, after_ts_ms):
+    # mock discovery (strict_adjacent=True during lookahead: adjacent window only)
+    async def fake_fetch(asset, after_ts_ms, strict_adjacent=False):
         assert asset == "BTC"
+        assert strict_adjacent is True
         return make_market(cid="next", end_offset_ms=310_000, window_index=2)
 
     mgr.discovery.fetch_next_market = fake_fetch  # type: ignore
@@ -83,7 +84,7 @@ async def test_coverage_gap_vs_rollover_miss():
     cur = make_market(cid="cur", end_offset_ms=-6000, window_index=1)  # ended 6s ago
     mgr.states["BTC"].current = cur
     # discovery returns None (no market)
-    async def fake_fetch(asset, after):
+    async def fake_fetch(asset, after, strict_adjacent=False):
         return None
     mgr.discovery.fetch_next_market = fake_fetch  # type: ignore
 

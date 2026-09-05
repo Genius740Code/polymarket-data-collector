@@ -216,6 +216,12 @@ class OrderBookState:
         self.is_rollover_window: bool = False
         self.sequence_numbers: Dict[str, int] = {}  # token_id -> last seq
         self._stale_since_ms: Optional[int] = None
+        # §4 book_events: old/new BBO captured per applied WS message, drained by the collector
+        self.pending_events: List[dict] = []
+        self.event_thresholds: Dict[str, float] = {
+            "spread_change_threshold": 0.002,
+            "size_change_threshold_pct": 0.10,
+        }
 
     # -- state transitions (§1A) -------------------------------------------
     def mark_stale(self, resync_id: str | None = None) -> None:
@@ -283,8 +289,11 @@ class OrderBookState:
 
         # apply levels if present — handles both full book snapshots (bids/asks)
         # and incremental price_change events (price_changes array)
+        pre_bbo = {o: self._bbo(o) for o in ("up", "down")}
+        touched: Dict[str, str] = {}  # outcome -> token_id
         # price_changes path (CLOB market channel)
         if "price_changes" in msg and isinstance(msg["price_changes"], list):
+            ex_bbo: Dict[str, Dict[str, Optional[float]]] = {}  # outcome -> exchange-reported BBO
             for pc in msg["price_changes"]:
                 pc_token = pc.get("asset_id") or pc.get("token_id") or pc.get("asset")
                 pc_outcome = self._outcome_for_token(pc_token) if pc_token else None
@@ -306,11 +315,44 @@ class OrderBookState:
                 # price_change with size 0 means remove level
                 book = self.up if pc_outcome == "up" else self.down
                 side_book = book.bids if is_bid else book.asks
+                # §3A crossed-book fix: only revert the level that CAUSES a new
+                # crossing. Polymarket price_change `side` is the taker side — a
+                # market BUY lifting the ask arrives as side=BUY at the ask price,
+                # and applying it as a bid level crosses the book. If the book was
+                # already crossed, updates must still apply so the ask side can
+                # heal (reverting everything froze crossings for whole seconds).
+                was_crossed = book.bids.crossed_with(book.asks)
+                prev_size: Optional[float] = None
+                for lvl in side_book.levels:
+                    if lvl.price is not None and abs(lvl.price - p) < 1e-9:
+                        prev_size = lvl.size
+                        break
                 self._apply_price_change_level(side_book, p, s, is_bid)
+                if not was_crossed and book.bids.crossed_with(book.asks):
+                    self._apply_price_change_level(side_book, p, prev_size if prev_size is not None else 0.0, is_bid)
+                    self.pending_events.append({
+                        "event_type": "crossed_reverted",
+                        "token_id": pc_token, "outcome": pc_outcome,
+                        "price": p, "size": s, "side": side,
+                    })
+                touched.setdefault(pc_outcome, pc_token)
+                # exchange-reported authoritative BBO for this token after the change
+                try:
+                    bb = float(pc["best_bid"]) if pc.get("best_bid") not in (None, "") else None
+                    ba = float(pc["best_ask"]) if pc.get("best_ask") not in (None, "") else None
+                    if bb is not None or ba is not None:
+                        ex_bbo[pc_outcome] = {"bid": bb, "ask": ba}
+                except Exception:
+                    pass
+            # enforce BBO against the exchange's own best_bid/best_ask — heals
+            # stale ask/bid sides and guarantees the top-of-book is never crossed
+            for outcome, ex in ex_bbo.items():
+                self._enforce_bbo(outcome, ex)
             # update age
             self._last_update_ns = time.time_ns()
             # For price_change, we don't know which outcome was updated, so reset both ages slightly
             # Use timestamp from msg if available
+            self._emit_bbo_events(pre_bbo, touched, msg)
             return True, None
 
         outcome = self._outcome_for_token(token_id) if token_id else None
@@ -326,8 +368,92 @@ class OrderBookState:
                 self._up_book_age_ms = 0
             else:
                 self._down_book_age_ms = 0
+            touched.setdefault(outcome, token_id)
+            # A full `book` snapshot is a complete exchange-side state — as trustworthy
+            # as a REST fetch. Promote a stale/resyncing book to live when the snapshot
+            # fills both sides (was the 55s cold-start and post-resync stale blocks).
+            if self.book_state != BookState.live:
+                if book.bids.best_price() is not None and book.asks.best_price() is not None:
+                    self.mark_live()
 
+        self._emit_bbo_events(pre_bbo, touched, msg)
         return True, None
+
+    # -- BBO capture for §4 book_events ------------------------------------
+    def _bbo(self, outcome: str) -> Dict[str, Optional[float]]:
+        book = self.up if outcome == "up" else self.down
+        return {
+            "bid": book.bids.best_price(), "bid_size": book.bids.best_size(),
+            "ask": book.asks.best_price(), "ask_size": book.asks.best_size(),
+        }
+
+    def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], tick: float = 0.0101) -> None:
+        """Snap the book's top-of-book to the exchange-reported best_bid/best_ask.
+
+        Every CLOB price_change carries the authoritative post-change BBO for its
+        token. If our book's best disagrees by more than a tick (dropped deltas,
+        taker-side artifacts), snap the best level's price IN PLACE (keeping its
+        size — sizes self-heal on the next full `book` event; never fabricate).
+        Removes a book best that the exchange says is gone; marks stale if the
+        exchange reports a best on a side we hold empty (cannot invent a size).
+        """
+        book = self.up if outcome == "up" else self.down
+        for side, ex_best in (("bid", ex.get("bid")), ("ask", ex.get("ask"))):
+            side_book = book.bids if side == "bid" else book.asks
+            my_best = side_book.best_price()
+            if ex_best is None:
+                if my_best is not None:
+                    self._apply_price_change_level(side_book, my_best, 0.0, side == "bid")
+                continue
+            if my_best is None:
+                # exchange reports a best on a side we hold empty — leave it; the
+                # next full `book` event fills the side. (Marking stale here caused
+                # a stale churn on thin books, since deltas arrive before snapshots.)
+                continue
+            if abs(my_best - ex_best) > tick:
+                for lvl in side_book.levels:
+                    if lvl.price is not None and abs(lvl.price - my_best) < 1e-9:
+                        lvl.price = ex_best
+                        break
+                # re-sort best-first (null tail stays at the end for both sides)
+                if side == "bid":
+                    side_book.levels.sort(key=lambda l: (l.price is None, -(l.price or 0.0)))
+                else:
+                    side_book.levels.sort(key=lambda l: (l.price is None, l.price if l.price is not None else 0.0))
+                self.pending_events.append({
+                    "event_type": "bbo_snapped",
+                    "token_id": self.up_token_id if outcome == "up" else self.down_token_id,
+                    "outcome": outcome, "side": side,
+                    "book_best": my_best, "exchange_best": ex_best,
+                })
+
+    def _emit_bbo_events(self, pre_bbo: Dict[str, Dict[str, Optional[float]]], touched: Dict[str, str], msg: dict) -> None:
+        """Emit §4 book_events rows for touched outcomes whose best PRICE moved.
+
+        Fires only on best bid/ask price changes — emitting on every size delta
+        flooded the writer (~36k rows/11min), triggered writer backpressure, and
+        caused 500ms snapshot drops (the highest-value rows) in the 2026-09-05 run.
+        """
+        for outcome, token_id in touched.items():
+            pre = pre_bbo.get(outcome) or {}
+            post = self._bbo(outcome)
+            price_changed = (pre.get("bid") != post.get("bid")) or (pre.get("ask") != post.get("ask"))
+            if not price_changed:
+                continue
+            self.pending_events.append({
+                "event_type": "price_change",
+                "token_id": token_id, "outcome": outcome,
+                "old_best_bid": pre.get("bid"), "new_best_bid": post.get("bid"),
+                "old_best_ask": pre.get("ask"), "new_best_ask": post.get("ask"),
+                "old_bid_size": pre.get("bid_size"), "new_bid_size": post.get("bid_size"),
+                "old_ask_size": pre.get("ask_size"), "new_ask_size": post.get("ask_size"),
+                "ts_source": msg.get("timestamp") or msg.get("ts"),
+            })
+
+    def drain_pending_events(self) -> List[dict]:
+        evs = self.pending_events
+        self.pending_events = []
+        return evs
 
     def _outcome_for_token(self, token_id: str | None) -> Optional[str]:
         if token_id == self.up_token_id:
@@ -353,9 +479,10 @@ class OrderBookState:
     def _apply_levels(self, side: SideBook, levels: list, is_bid: bool) -> None:
         # Normalize to list of Level, sorted best-first, truncated/padded to l2_levels
         # Levels with size 0 mean remove that price level (§3 ghost-liquidity fix)
-        # For simplicity replace whole side book with provided snapshot if it looks like full book,
-        # else patch. Heuristic: if len(levels) >= l2_levels/2 treat as snapshot replace.
-        # Real implementation would diff against REST snapshot shape; here we implement replace for WS "book" msgs
+        # CLOB market-channel `book` events are FULL side snapshots — always replace.
+        # (The previous patch-when-<5-levels heuristic kept stale levels when the
+        # exchange sent an empty/thin side, freezing asks while bids moved → the
+        # mirrored crossed books seen on 2026-09-05. Empty list = side is empty.)
         new_levels: List[Level] = []
         removals: set[float] = set()
         for lvl in levels:
@@ -388,22 +515,8 @@ class OrderBookState:
                 new_levels.append(Level(price=pf, size=sf))
         # sort best-first
         new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
-        # replace (WS book messages are full snapshots; delta patching would need price-level map)
-        # For delta messages that only contain changed levels, this would drop unchanged levels.
-        # We handle that by merging: if incoming is small (<5 levels) patch instead of replace.
-        if len(levels) < 5 and len(side.levels) > 0:
-            # patch: update/add levels, keep others, delete removals
-            price_to_level: Dict[float, Level] = {lvl.price: lvl for lvl in side.levels if lvl.price is not None}
-            for rp in removals:
-                price_to_level.pop(rp, None)
-            for lvl in new_levels:
-                if lvl.price is not None:
-                    price_to_level[lvl.price] = lvl
-            merged = list(price_to_level.values())
-            merged.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
-            side.levels = merged[: self.l2_levels]
-        else:
-            side.levels = new_levels[: self.l2_levels]
+        # FULL REPLACE (book events are complete side snapshots from the exchange)
+        side.levels = new_levels[: self.l2_levels]
         # pad with null levels to l2_levels for snapshot uniformity
         while len(side.levels) < self.l2_levels:
             side.levels.append(Level(price=None, size=None))

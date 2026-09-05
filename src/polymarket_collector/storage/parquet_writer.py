@@ -20,6 +20,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+
+def _os_replace_safe(src, dst):
+    """Atomic tmp->final rename that works on Windows (os.replace overwrites; Path.rename raises WinError 183 if dst exists)."""
+    import os as _os
+    _os.replace(str(src), str(dst))
+
+
+from .parquet_io import read_table
+
 from ..enums import CollectorEventType
 from .schemas import SCHEMAS, snapshot_schema
 
@@ -62,6 +71,7 @@ class ParquetWriter:
         self.synthetic_mode = synthetic_mode
 
         self._buffer: deque[BufferedRow] = deque()
+        self._dropped_rows: Dict[str, int] = defaultdict(int)  # K-3: honest no-loss accounting
         self._last_flush_ts = time.monotonic()
         self._seen_keys: Dict[str, Set[Tuple]] = defaultdict(set)  # dataset -> set of dedup keys
         self._seen_order: Dict[str, deque] = defaultdict(deque)  # dataset -> insertion-order deque for LRU eviction
@@ -166,7 +176,7 @@ class ParquetWriter:
         # backpressure check — §10A never drops without WAL spill + fsync
         if len(self._buffer) >= self.buffer_max:
             if self.on_event:
-                self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset})
+                self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "dropped_total": self._dropped_rows.get(dataset, 0)})
             else:
                 import warnings
                 warnings.warn(
@@ -187,6 +197,7 @@ class ParquetWriter:
                         # WAL failed: remove reserved dedup key so retry can succeed after WAL recovers
                         if dedup_key is not None:
                             self._seen_keys[dataset].discard(dedup_key)
+                        self._dropped_rows[dataset] = self._dropped_rows.get(dataset, 0) + 1
                         return False
                     return True
                 # Flush made room — fall through to WAL+buffer path (dedup already reserved, don't re-add)
@@ -305,7 +316,7 @@ class ParquetWriter:
                     if parquet_file.name.endswith(".tmp"):
                         continue
                     try:
-                        t = pq.read_table(str(parquet_file))
+                        t = read_table(parquet_file)
                         # extract dedup-relevant columns based on dataset type
                         cols = t.column_names
                         for row in t.to_pylist():
@@ -673,7 +684,7 @@ class ParquetWriter:
                     raise e
             else:
                 raise
-        tmp_path.rename(final_path)
+        _os_replace_safe(tmp_path, final_path)
 
         # Optional: also write to WAL archive dir for recovery
         # (compaction job will merge small files later)

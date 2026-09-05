@@ -14,6 +14,15 @@ from typing import List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def _os_replace_safe(src, dst):
+    """Atomic tmp->final rename that works on Windows (os.replace overwrites; Path.rename raises WinError 183 if dst exists)."""
+    import os as _os
+    _os.replace(str(src), str(dst))
+
+
+from .parquet_io import read_table
 import pyarrow.compute as pc
 
 
@@ -43,7 +52,7 @@ def build_clean_view(
     excluded: set[str] = set()
     if latest_path.exists() and not opt_in_disputed:
         try:
-            tbl = pq.read_table(str(latest_path))
+            tbl = read_table(latest_path)
             for row in tbl.to_pylist():
                 if row.get("resolution_outcome") in ("disputed",):
                     cid = row.get("condition_id")
@@ -62,7 +71,7 @@ def build_clean_view(
             tables: List[pa.Table] = []
             for part in asset_dir.glob("*.parquet"):
                 try:
-                    tables.append(pq.read_table(str(part)))
+                    tables.append(read_table(part))
                 except Exception:
                     continue
             if not tables:
@@ -97,7 +106,7 @@ def build_clean_view(
             final_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
             # atomic write (§10A)
             pq.write_table(filtered, str(tmp_path), compression="zstd")
-            tmp_path.rename(final_path)
+            _os_replace_safe(tmp_path, final_path)
             written += filtered.num_rows
 
     return written
@@ -108,26 +117,22 @@ def load_clean(data_dir: str | Path, asset: Optional[str] = None, date: Optional
     base = Path(data_dir) / "book_snapshots_clean"
     if not base.exists():
         return None
-    # use dataset API for convenience
+    # file-only reads via parquet_io (hive dataset API clashes with in-file asset column)
     try:
-        import pyarrow.dataset as ds
-        dataset = ds.dataset(str(base), format="parquet", partitioning="hive")
-        # filter via scanner if asset/date provided
-        filt = None
+        files = [p for p in base.rglob("*.parquet") if not p.name.endswith(".tmp")]
         if asset:
-            filt = (ds.field("asset") == asset)
+            files = [p for p in files if f"asset={asset.upper()}" in str(p) or f"asset={asset}" in str(p)]
         if date:
-            date_f = (ds.field("date") == date)
-            filt = date_f if filt is None else filt & date_f
-        table = dataset.to_table(filter=filt) if filt is not None else dataset.to_table()
-        return table
+            files = [p for p in files if f"date={date}" in str(p)]
+        tbl = read_files(files, label="clean_view load")
+        return tbl
     except Exception:
         # fallback: read all parts
         tables = []
         pattern = base.rglob("*.parquet")
         for p in pattern:
             try:
-                tables.append(pq.read_table(str(p)))
+                tables.append(read_table(p))
             except Exception:
                 continue
         if not tables:
