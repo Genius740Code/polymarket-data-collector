@@ -69,7 +69,9 @@ def _sort_keys_for_schema(schema: pa.Schema) -> List[str]:
 
 
 def _get_schema(dataset: str, l2_levels: int = 20) -> Optional[pa.Schema]:
-    if dataset == "book_snapshots_500ms":
+    if dataset in ("book_snapshots_500ms", "book_snapshots_clean"):
+        # B-6: the clean view ships to Kaggle as its own per-asset file and
+        # carries the snapshot schema (it is the live-only subset of it)
         return snapshot_schema(l2_levels)
     return SCHEMAS.get(dataset)
 
@@ -87,75 +89,192 @@ def _api_ts_ms(t: dict) -> str:
         return ""
 
 
+def _api_ts_ms_value(t: dict) -> Optional[int]:
+    """Parse a Data-API trade timestamp (s or ms epoch) to epoch ms."""
+    ts = t.get("timestamp")
+    if ts is None:
+        return None
+    try:
+        f = float(ts)
+        return int(f if f > 1e11 else f * 1000)
+    except Exception:
+        return None
+
+
+def _api_outcome_label(t: dict) -> Optional[str]:
+    """R-3: the Data-API carries an authoritative outcome label ("Up"/"Down")
+    per fill — map it into the schema's lowercase up/down vocabulary."""
+    o = str(t.get("outcome") or "").strip().lower()
+    return o if o in ("up", "down") else None
+
+
+def _unambiguous_wallet(pool: Optional[list]) -> Optional[str]:
+    """A fill-key's leg pool names the maker/taker only when every row at that
+    key agrees — with several DISTINCT wallets at one (tx,price,size) key the
+    per-fill attribution would be a guess, and NULL is kept (never guessed)."""
+    if not pool:
+        return None
+    distinct = set(pool)
+    return next(iter(distinct)) if len(distinct) == 1 else None
+
+
 def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None) -> pa.Table:
-    """Fill maker_wallet/taker_wallet/wallet for trades where they are NULL.
+    """Fill maker_wallet/taker_wallet/wallet and missing outcome on trades.
 
     The CLOB market channel does not carry wallets, so streamed trade rows have
-    them NULL (100% null fee/wallet columns on Kaggle). Polymarket's public
-    Data-API (data-api.polymarket.com/trades?market=<conditionId>) does carry
-    proxyWallet per trade — match by transaction_hash (unique) and enrich.
-    Read-only, best-effort: on any failure rows keep their NULLs (never
-    fabricated) and the failure is logged loudly.
+    them NULL. Polymarket's public Data-API
+    (data-api.polymarket.com/trades?market=<conditionId>) carries proxyWallet
+    per fill LEG: fetched with takerOnly=false every fill appears TWICE — a SELL
+    leg (the maker's proxyWallet) and a BUY leg (the taker's proxyWallet) —
+    sharing transactionHash/price/size. Pooling the legs per side therefore
+    fills maker_wallet too (R-2) without any on-chain RPC: a row's side is the
+    aggressor side, so side=BUY → taker on the BUY leg / maker on the SELL leg.
+    Where the API itself has no wallet for a fill, NULL is kept (never
+    fabricated). Read-only, best-effort: failures are logged loudly.
     """
     import collections
     import datetime as _dt
     import httpx as _hx
+
+    def _fetch(cid: str, taker_only: bool, oldest_needed_ms: Optional[int], max_pages: int = 12) -> list:
+        """Data-API fills for a market, newest-first, stopping once older than
+        anything we need. The previous fixed 3-4 page cap truncated liquid
+        markets (BTC ~4k fills/window) — fills beyond the cap could never be
+        enriched (part of the BTC ~36% wallet-null tail)."""
+        rows: list = []
+        offset = 0
+        for _page in range(max_pages):
+            params: dict = {"market": cid, "limit": 500, "offset": offset}
+            if not taker_only:
+                params["takerOnly"] = "false"
+            try:
+                resp = _hx.get("https://data-api.polymarket.com/trades", params=params, timeout=10)
+            except Exception as e:
+                print(f"[export] WARN data-api fetch failed for {cid[:14]}…: {e}")
+                break
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < 500:
+                break
+            offset += 500
+            if oldest_needed_ms is not None:
+                ts = _api_ts_ms_value(batch[-1])
+                if ts is not None and ts < oldest_needed_ms - 120_000:
+                    break
+        return rows
+
+    def _row_ts_ms(r: dict) -> Optional[int]:
+        ts = r.get("ts_source")
+        if ts is None:
+            return None
+        try:
+            f = float(ts)
+            return int(f if f > 1e11 else f * 1000)
+        except Exception:
+            return None
+
     if combined.num_rows == 0 or "wallet" not in combined.schema.names:
         return combined
     pylist = combined.to_pylist()
     need_by_cid: dict = {}
     for i, r in enumerate(pylist):
-        if r.get("wallet") is None and r.get("transaction_hash") and r.get("condition_id"):
+        if not r.get("transaction_hash") or not r.get("condition_id"):
+            continue
+        needs_wallet = r.get("wallet") is None
+        needs_maker = r.get("maker_wallet") is None and str(r.get("side") or "").upper() in ("BUY", "SELL")
+        needs_outcome = r.get("outcome") in (None, "", "unknown")
+        if needs_wallet or needs_maker or needs_outcome:
             need_by_cid.setdefault(r["condition_id"], []).append(i)
     if not need_by_cid:
         return combined
-    filled = 0
+    filled_wallet = 0
+    filled_outcome = 0
+    legs_by_cid: dict = {}
     for cid, idxs in need_by_cid.items():
-        # one transaction can settle MULTIPLE fills (maker+taker rows share the
-        # tx hash) — key by (tx_hash, price, size) and keep a pool of wallets
-        # per key, consuming them across our rows of the same fill.
-        key_pool: dict = {}
-        try:
-            for offset in (0, 500, 1000):
-                resp = _hx.get(
-                    "https://data-api.polymarket.com/trades",
-                    params={"market": cid, "limit": 500, "offset": offset, "takerOnly": "false"},
-                    timeout=10,
-                )
-                if resp.status_code != 200:
-                    break
-                batch = resp.json()
-                if not batch:
-                    break
-                for t in batch:
-                    txh = (t.get("transactionHash") or "").lower()
-                    if not txh:
-                        continue
-                    k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
-                    w = t.get("proxyWallet") or t.get("wallet")
-                    if w:
-                        key_pool.setdefault(k, []).append(w)
-                        key_pool.setdefault((txh,), []).append(w)
-                if len(batch) < 500:
-                    break
-        except Exception as e:
-            print(f"[export] WARN wallet backfill skipped for {cid[:14]}…: {e}")
-            continue
+        oldest_needed_ms = min((_row_ts_ms(pylist[i]) for i in idxs), default=None)
+        # one fill settles as TWO data-api legs sharing (tx_hash, price, size)
+        buy_pool: dict = {}
+        sell_pool: dict = {}
+        outcome_by_key: dict = {}
+        for t in _fetch(cid, taker_only=False, oldest_needed_ms=oldest_needed_ms):
+            txh = (t.get("transactionHash") or "").lower()
+            if not txh:
+                continue
+            try:
+                k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
+            except Exception:
+                k = (txh,)
+            w = t.get("proxyWallet") or t.get("wallet")
+            side = str(t.get("side") or "").upper()
+            if w:
+                if side == "SELL":
+                    sell_pool.setdefault(k, []).append(w)
+                    sell_pool.setdefault((txh,), []).append(w)
+                elif side == "BUY":
+                    buy_pool.setdefault(k, []).append(w)
+                    buy_pool.setdefault((txh,), []).append(w)
+            o = _api_outcome_label(t)
+            if o:
+                outcome_by_key[k] = o
+                outcome_by_key.setdefault((txh,), o)
+
+        def _tx_fallback(txh: str, side: str) -> tuple[Optional[str], Optional[str]]:
+            """Tx-level attribution ONLY when the whole tx is a single
+            buyer/single seller fill — otherwise a per-fill wallet cannot be
+            assigned honestly (multi-fill txs pool wallets)."""
+            buys = sorted(set(buy_pool.get((txh,)) or []))
+            sells = sorted(set(sell_pool.get((txh,)) or []))
+            if len(buys) == 1 and len(sells) == 1:
+                return (buys[0], sells[0]) if side == "BUY" else (sells[0], buys[0])
+            return None, None
+
+        legs_by_cid[cid] = (buy_pool, sell_pool)
         for i in idxs:
             r = pylist[i]
-            k = ((r.get("transaction_hash") or "").lower(), round(float(r.get("price")), 6), round(float(r.get("size")), 6))
-            pool = key_pool.get(k)
-            if not pool:
-                # fall back to tx-level match for fills whose price/size string differs
-                pool = key_pool.get((k[0],))
-            if not pool:
-                continue
-            w = pool.pop(0)
-            r["taker_wallet"] = r.get("taker_wallet") or w
-            r["wallet"] = r.get("wallet") or r["taker_wallet"]
-            filled += 1
-    if filled:
-        print(f"[export] wallet backfill: filled {filled}/{sum(len(v) for v in need_by_cid.values())} trade rows from data-api")
+            txh = (r.get("transaction_hash") or "").lower()
+            try:
+                k = (txh, round(float(r.get("price")), 6), round(float(r.get("size")), 6))
+            except Exception:
+                k = (txh,)
+            side = str(r.get("side") or r.get("aggressor_side") or "").upper()
+            if side in ("BUY", "SELL"):
+                taker_pool = buy_pool if side == "BUY" else sell_pool
+                maker_pool = sell_pool if side == "BUY" else buy_pool
+                w = _unambiguous_wallet(taker_pool.get(k))
+                m = _unambiguous_wallet(maker_pool.get(k))
+                if w is None and m is None:
+                    takers_f, makers_f = _tx_fallback(txh, side)
+                    w = w or takers_f
+                    m = m or makers_f
+                if r.get("taker_wallet") is None and w:
+                    r["taker_wallet"] = w
+                    filled_wallet += 1
+                if r.get("maker_wallet") is None and m:
+                    r["maker_wallet"] = m
+                    filled_wallet += 1
+                if r.get("wallet") is None and (r.get("taker_wallet") or r.get("maker_wallet")):
+                    r["wallet"] = r.get("taker_wallet") or r.get("maker_wallet")
+                    filled_wallet += 1
+            elif r.get("wallet") is None:
+                # side unknown — legs cannot be attributed maker/taker; fill the
+                # canonical wallet from either leg (previous behavior)
+                either = _unambiguous_wallet((buy_pool.get(k) or []) + (sell_pool.get(k) or []))
+                if not either:
+                    either = _unambiguous_wallet(sorted(set((buy_pool.get((txh,)) or []) + (sell_pool.get((txh,)) or []))))
+                if either:
+                    r["wallet"] = either
+                    filled_wallet += 1
+            if r.get("outcome") in (None, "", "unknown"):
+                o = outcome_by_key.get(k) or outcome_by_key.get((txh,))
+                if o:
+                    r["outcome"] = o
+                    filled_outcome += 1
+    if filled_wallet or filled_outcome:
+        print(f"[export] wallet/outcome backfill: filled {filled_wallet} wallet fields and {filled_outcome} outcomes from data-api (both legs, takerOnly=false)")
     combined = pa.Table.from_pylist(pylist, schema=combined.schema)
 
     # K-6 trade reconciliation: the CLOB last_trade_price stream COALESCES fills on
@@ -163,7 +282,14 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
     # DOGE 93%) — insert missing fills as api-prefixed rows so per-market trade
     # counts are complete. Existing rows keep their identity; only truly missing
     # (tx_hash, price, size) fills are added — never duplicated.
+    # R-3: the data-api trade object carries no fee_rate_bps and (before this
+    # fix) the outcome was hardcoded "unknown". The outcome now comes from the
+    # API's own authoritative label; the fee is derived from the fee rate the
+    # exchange itself reported on this market's streamed rows (uniform across
+    # the market, 0 on current 5m markets) and flagged fee_is_estimated=True —
+    # derived, not fabricated; NULL when the market's streamed rows disagree.
     inserted = 0
+    fee_derived = 0
     try:
         by_cid: dict = {}
         for r in combined.to_pylist():
@@ -176,75 +302,138 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 for r in rs if r.get("transaction_hash") and r.get("price") is not None and r.get("size") is not None
             )
             series_mode = collections.Counter(r.get("series_id") for r in rs).most_common(1)[0][0] if rs else None
-            n_rows = len(rs)
-            offset = 0
-            while offset <= 1500:
+            fee_rate: Optional[float] = None
+            rates: set = set()
+            for r in rs:
+                if r.get("fee") is not None and r.get("fee_is_estimated") is False and r.get("notional"):
+                    try:
+                        rates.add(round(float(r["fee"]) / float(r["notional"]), 8))
+                    except Exception:
+                        pass
+            if len(rates) == 1:
+                fee_rate = rates.pop()
+            oldest_needed_ms = min((_row_ts_ms(r) for r in rs), default=None)
+            api_rows = _fetch(cid, taker_only=True, oldest_needed_ms=oldest_needed_ms)
+            for t in api_rows:
+                txh = (t.get("transactionHash") or "").lower()
                 try:
-                    resp = _hx.get(
-                        "https://data-api.polymarket.com/trades",
-                        params={"market": cid, "limit": 500, "offset": offset},
-                        timeout=10,
-                    )
-                    batch = resp.json() if resp.status_code == 200 else []
-                except Exception as e:
-                    print(f"[export] WARN trade reconciliation fetch failed for {cid[:14]}…: {e}")
-                    break
-                if not batch:
-                    break
-                for t in batch:
-                    txh = (t.get("transactionHash") or "").lower()
-                    try:
-                        k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
-                    except Exception:
-                        continue
-                    if have.get(k, 0) > 0:
-                        have[k] -= 1
-                        continue
-                    w = t.get("proxyWallet") or t.get("wallet")
-                    ts_ms = _api_ts_ms(t)
-                    try:
-                        widx = int(ts_ms) // 1000 // 300 if ts_ms else (rs[0].get("window_index") or 0)
-                    except Exception:
-                        widx = rs[0].get("window_index") or 0
-                    price_f = t.get("price"); size_f = t.get("size")
-                    notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
-                    rows_to_add.append({
-                        "ts_source": ts_ms or None,
-                        "ts_received_ns": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
-                        "condition_id": cid,
-                        "market_id": rs[0].get("market_id") or cid,
-                        "series_id": series_mode or f"{asset or 'X'}-5MIN",
-                        "window_index": int(widx) if widx is not None else 0,
-                        "asset": (asset or rs[0].get("asset") or "").upper(),
-                        "trade_id": f"api-{txh[:16]}-{inserted}",
-                        "transaction_hash": txh or None,
-                        "token_id": str(t.get("asset_id") or t.get("asset") or ""),
-                        "outcome": "unknown",
-                        "price": float(price_f) if price_f is not None else None,
-                        "size": float(size_f) if size_f is not None else None,
-                        "notional": notional,
-                        "fee": None,
-                        "fee_is_estimated": None,
-                        "side": (t.get("side") or "").lower() or None,
-                        "aggressor_side": (t.get("side") or "").lower() or None,
-                        "sequence_number": None,
-                        "maker_wallet": None,
-                        "taker_wallet": w,
-                        "wallet": w,
-                    })
-                    inserted += 1
-                if len(batch) < 500:
-                    break
-                offset += 500
+                    k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
+                except Exception:
+                    continue
+                if have.get(k, 0) > 0:
+                    have[k] -= 1
+                    continue
+                w = t.get("proxyWallet") or t.get("wallet")
+                ts_ms = _api_ts_ms(t)
+                try:
+                    widx = int(ts_ms) // 1000 // 300 if ts_ms else (rs[0].get("window_index") or 0)
+                except Exception:
+                    widx = rs[0].get("window_index") or 0
+                price_f = t.get("price"); size_f = t.get("size")
+                notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
+                fee: Optional[float] = None
+                fee_is_estimated: Optional[bool] = None
+                if fee_rate is not None and notional is not None:
+                    fee = round(notional * fee_rate, 6)
+                    fee_is_estimated = True  # derived from the market's reported rate, not reported per fill
+                    fee_derived += 1
+                # R-2: attribute the maker leg when the earlier both-legs fetch
+                # exposed it unambiguously for this fill key (single distinct wallet)
+                maker_w = None
+                leg_pools = legs_by_cid.get(cid)
+                if leg_pools:
+                    maker_w = _unambiguous_wallet(leg_pools[1].get(k))
+                rows_to_add.append({
+                    "ts_source": ts_ms or None,
+                    "ts_received_ns": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
+                    "condition_id": cid,
+                    "market_id": rs[0].get("market_id") or cid,
+                    "series_id": series_mode or f"{asset or 'X'}-5MIN",
+                    "window_index": int(widx) if widx is not None else 0,
+                    "asset": (asset or rs[0].get("asset") or "").upper(),
+                    "trade_id": f"api-{txh[:16]}-{inserted}",
+                    "transaction_hash": txh or None,
+                    "token_id": str(t.get("asset_id") or t.get("asset") or ""),
+                    "outcome": _api_outcome_label(t) or "unknown",
+                    "price": float(price_f) if price_f is not None else None,
+                    "size": float(size_f) if size_f is not None else None,
+                    "notional": notional,
+                    "fee": fee,
+                    "fee_is_estimated": fee_is_estimated,
+                    "side": (t.get("side") or "").lower() or None,
+                    "aggressor_side": (t.get("side") or "").lower() or None,
+                    "sequence_number": None,
+                    "maker_wallet": maker_w,
+                    "taker_wallet": w,
+                    "wallet": w or maker_w,
+                })
+                inserted += 1
         if rows_to_add:
             combined = pa.concat_tables(
                 [combined, pa.Table.from_pylist(rows_to_add, schema=combined.schema)],
                 **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True}),
             )
-            print(f"[export] trade reconciliation: inserted {inserted} missing fills from data-api (CLOB stream coalesces liquid fills)")
+            print(f"[export] trade reconciliation: inserted {inserted} missing fills from data-api (CLOB stream coalesces liquid fills); fee derived for {fee_derived} rows from the market's exchange-reported rate")
     except Exception as e:
         print(f"[export] WARN trade reconciliation failed: {e}")
     return combined
+
+
+def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: pa.Table) -> int:
+    """B-5: persist export-time enrichment back into the hive trades partitions.
+
+    Without this, anyone reading data/trades/ sees 100% NULL wallets — the
+    enrichment only lived in the Kaggle staging build. Rules: fill NULLs ONLY
+    (never overwrite a non-NULL value), rewrite only part files that actually
+    change, atomic per file (tmp + os.replace), so a crash leaves every file
+    complete and re-running is idempotent. api- rows (staging-only inserts)
+    have no hive counterpart and are skipped. Returns files rewritten.
+    """
+    if enriched.num_rows == 0 or "trade_id" not in enriched.schema.names:
+        return 0
+    # field updates keyed by trade_id — only rows where a NULL got filled
+    updates: dict = {}
+    cols = ("maker_wallet", "taker_wallet", "wallet", "outcome", "fee", "fee_is_estimated")
+    for r in enriched.to_pylist():
+        tid = r.get("trade_id")
+        if not tid or str(tid).startswith("api-"):
+            continue
+        updates[str(tid)] = {c: r.get(c) for c in cols}
+    if not updates:
+        return 0
+    base = Path(data_dir) / "trades"
+    if not base.exists():
+        return 0
+    parts = [p for p in base.rglob("*.parquet") if not p.name.endswith(".tmp")
+             and (asset is None or f"asset={asset.upper()}" in str(p) or asset.upper() in str(p.parent))]
+    rewritten = 0
+    for p in parts:
+        try:
+            tbl = read_table(p)
+        except Exception as e:
+            print(f"[export] WARN write-back skipped unreadable {p.name}: {e}")
+            continue
+        rows = tbl.to_pylist()
+        changed = False
+        for r in rows:
+            upd = updates.get(str(r.get("trade_id")))
+            if not upd:
+                continue
+            for c in cols:
+                cur = r.get(c)
+                fillable = cur is None or (c == "outcome" and cur == "unknown")
+                if fillable and upd[c] is not None:
+                    r[c] = upd[c]
+                    changed = True
+        if not changed:
+            continue
+        tmp = p.with_suffix(".parquet.tmp")
+        pq.write_table(pa.Table.from_pylist(rows, schema=tbl.schema), str(tmp), compression="zstd")
+        _os_replace_safe(tmp, p)
+        rewritten += 1
+    if rewritten:
+        print(f"[export] trades enrichment write-back: {rewritten} hive part files updated (NULLs filled, nothing overwritten)")
+    return rewritten
 
 
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False) -> Optional[pa.Table]:
@@ -337,6 +526,12 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     if dataset == "trades" and combined.num_rows > 0:
         try:
             combined = _backfill_trade_wallets(combined, data_dir, asset=asset)
+            # B-5: persist the enrichment into the hive so data/trades/ matches
+            # what ships to Kaggle (NULLs filled only, atomic per file)
+            try:
+                _writeback_enriched_trades(data_dir, asset, combined)
+            except Exception as e:
+                print(f"[export] WARN trades enrichment write-back failed: {e}")
         except Exception as e:
             print(f"[export] WARN wallet backfill failed: {e}")
     # backfill trades: compute notional, fee, aggressor_side, transaction_hash where null for old 3.1.0 data
@@ -485,7 +680,7 @@ def export_per_asset_single_file(
 
     Note: The 3 global datasets (markets_log, collector_events, resync_episodes)
     are always exported as single files in the Kaggle staging folder, even if
-    they contain 0 rows. This ensures the staging always has 31 files (7 assets x 4
+    they contain 0 rows. This ensures the staging always has 38 files (7 assets x 5
     per-asset + 3 globals) for the dataset gghgg1/polymarket-5m-crypto.
     """
     base = Path(data_dir)
@@ -493,7 +688,7 @@ def export_per_asset_single_file(
     out.mkdir(parents=True, exist_ok=True)
 
     if datasets is None:
-        datasets = ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes"]
+        datasets = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes"]
     if assets is None:
         # Always use the 7 known assets — hardcoded per plan.md §0
         # Do NOT discover dynamically from hive partitions, as this fails
@@ -503,7 +698,7 @@ def export_per_asset_single_file(
     # The 3 global datasets that should always appear in Kaggle staging
     global_datasets = {"markets_log", "collector_events", "resync_episodes"}
     # Per-asset datasets that get one file per asset
-    per_asset_datasets = {"book_snapshots_500ms", "book_events", "trades", "chainlink_events"}
+    per_asset_datasets = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
 
     stats: dict = {}
     for ds in datasets:
@@ -895,7 +1090,7 @@ def export_timeframe_aggregates(
 
 
 # ------------------------------------------------------------------ Kaggle upload — 5m-only, single dataset, folder versioning
-# plan.md: single dataset gghgg1/polymarket-5m-crypto contains 7*4+3=31 files (all assets share same slug).
+# plan.md: single dataset gghgg1/polymarket-5m-crypto contains 7*5+3=38 files (all assets share same slug; per-asset: snapshots, clean view, book_events, trades, chainlink).
 # Test mode uploads every 10 min (600s) gated on full closed markets only, safe delete after ready.
 
 try:
@@ -1001,7 +1196,7 @@ def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[st
             if not prior_files:
                 return
             prior_map = {p.name: p for p in prior_files}
-            for expected_name in [f"{a}_{ds}.parquet" for a in (assets or []) for ds in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]] + ["markets.parquet", "collector_events.parquet", "resync_episodes.parquet"]:
+            for expected_name in [f"{a}_{ds}.parquet" for a in (assets or []) for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]] + ["markets.parquet", "collector_events.parquet", "resync_episodes.parquet"]:
                 staging_path = staging / expected_name
                 prior_path = prior_map.get(expected_name)
                 if prior_path is None or not staging_path.exists():
@@ -1076,7 +1271,7 @@ def upload_to_kaggle(
 ) -> bool:
     """Upload to Kaggle.
 
-    Preferred: give staging_dir (folder with 31 parquets + dataset-metadata.json) → folder version upload.
+    Preferred: give staging_dir (folder with 38 parquets + dataset-metadata.json) → folder version upload.
     Legacy: parquet_path single file (kept for compat) → single-file fallback.
     Uses kaggle API dataset_create_version with retries, version notes with UTC timestamp.
     """
@@ -1177,7 +1372,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         st = api.dataset_status(dataset)
                         s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
                         if s == "ready":
-                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 4 + 3
+                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 3
                             _rows_ok = _verify_staging_row_counts(staging, expected_assets)
                             # Remote verification: ensure Kaggle actually stores expected files (not just local status)
                             # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
@@ -1215,7 +1410,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                     if not next_token:
                                         break
                                 # Check remote has at least expected parquets
-                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet"}
+                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet"}
                                 if not expected_names.issubset(remote_names):
                                     _remote_ok = False
                                 if len(remote_names) < len(expected_names):
@@ -1229,7 +1424,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                             elif not _rows_ok:
                                 print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
                             elif not _files_ok:
-                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 4 + 3}; waiting for complete upload")
+                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 3}; waiting for complete upload")
                             elif not _remote_ok:
                                 print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
                         elif s in ("failed", "error"):
@@ -1265,7 +1460,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
 def _expected_staging_files(staging: Path) -> int:
     """Count expected parquet files in staging directory for Kaggle version."""
     parquet_files = [p for p in staging.glob("*.parquet") if not p.name.endswith(".tmp")]
-    # 7 assets x 4 per-asset datasets + 3 globals = 31 files
+    # 7 assets x 5 per-asset datasets + 3 globals = 38 files
     # per-asset: book_snapshots_500ms, book_events, trades, chainlink_events
     # globals: markets_log, collector_events, resync_episodes
     return len(parquet_files)
@@ -1494,10 +1689,10 @@ def export_and_upload_all_kaggle(
     l2_levels: int = 20,
     dry_run: bool = False,
 ) -> dict:
-    """5m-only pipeline: export 7-asset staging (31 files) → Kaggle single dataset → safe prune.
+    """5m-only pipeline: export 7-asset staging (38 files) → Kaggle single dataset → safe prune.
 
     - Only full closed markets (market_end < now) are uploaded.
-    - Staging is cumulative: same filenames overwritten with larger parquet each version (31 files).
+    - Staging is cumulative: same filenames overwritten with larger parquet each version (38 files).
     - Kaggle upload uses folder versioning with retry 5 + jitter and status poll.
     - Safe delete only after ready, with 2h buffer, never deleting open window.
     Timeframe aggregation for 15m/1h removed (native only; 5m-only assumes 5m validates others).

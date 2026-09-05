@@ -1,3 +1,130 @@
+# 📌 CURRENT HANDOFF (2026-09-05) — Start Here
+
+**State:** All K-fixes and R-1…R-5 fixed and live-verified; B-round (backtest quality) done —
+see `TEST_RUN_REPORT_2026-09-05_BFIXES.md` (latest run numbers), `TEST_RUN_REPORT_2026-09-05_RFIXES.md`,
+`TEST_RUN_REPORT_2026-09-05_POSTFIX.md` (R-1…R-5 history), `TEST_RUN_REPORT_2026-09-05.md` (original issues).
+pytest 91/91 green (`pytest tests/ --ignore=tests/test_verify_gate.py`).
+
+**Verified live facts you must not re-derive (all measured 2026-09-05):**
+
+- CLOB market WS `wss://ws-subscriptions-clob.polymarket.com/ws/market`, subscribe `{"assets_ids":[...],"type":"market"}`.
+  Server kills connections at ~3–5 min age. A SECOND subscribe on an established connection is **IGNORED**
+  (token-adds require a reconnect — proven via raw WS archive). A full `book` frame arrives on (re)subscribe and
+  relives stale books. `price_change.side` is the TAKER side; every delta carries authoritative `best_bid`/`best_ask`.
+- Gamma slug lookup (`gamma-api.polymarket.com/markets?slug=...`) only serves the ~2 most recent 5m windows;
+  official resolution must come from `clob.polymarket.com/markets/{conditionId}` → `tokens[].winner`
+  (works indefinitely; that is what `resolution_backfill.py` uses).
+- RTDS `wss://ws-live-data.polymarket.com` (topics `crypto_prices_chainlink` + `crypto_prices`) sends ALL 7 assets
+  at identical cadence; the payload has NO twap/roundId/reportId/sequence. We subscribe to BOTH topics → 6 assets
+  are double-stored (two price series per tick: rounded + full-precision Chainlink), HYPE arrives only on the Chainlink topic.
+- Data-API `data-api.polymarket.com/trades` exposes maker+taker legs with `takerOnly=false`, but both legs only
+  for a minority of fills; fills are INDEXED LATE (enrich 30s after window end → poor coverage; self-heals per export).
+- Tightening websockets ping_interval/ping_timeout makes churn WORSE (server answers pings slowly). Defaults plus a
+  150s light recycle (no disconnect episode, no REST resync) is the current design.
+
+**Tooling:** one command `python run_2x5min_test.py` = wipe local data → delete Kaggle dataset → 2×5min live test
+→ Kaggle upload → resolution backfill → final upload → summary. `--keep-data` skips wipes.
+`run_2x5min_test.cmd` is the Windows wrapper. pm2 cron `polymarket-resolution-backfill` runs the backfill every 15 min.
+
+---
+
+## Remaining work (in recommended order)
+
+### 1. markets_summary export (analyst-facing; like kaggle.com/datasets/kachoio/polymarket-5-minute-crypto-updown-markets)
+
+One row per condition_id with: condition_id, slug, asset, window start/end, up/down token ids, resolution outcome +
+settlement price + settlement_source, underlying open/close (chainlink ticks at window start/end), outcome-token
+open/close/hi/lo (clean snapshots), traded volume + fill count (trades incl. api- rows), unique traders, avg spread.
+Ship as a 39th staging file (`markets_summary.parquet`). All ingredients already exist across datasets — this is a
+pure derived export in `storage/export.py` plus the staging lists (currently 38 files = 7×5+3).
+
+### 2. Chainlink cleanup
+
+- Decide the dual-topic question: subscribe ONLY `crypto_prices_chainlink` (drops the rounded duplicate series for
+  6 assets; HYPE unaffected — verify all 7 still arrive via the B-4 counters/raw archive) OR keep both and label
+  `source` per topic so backtests can filter. Current state = two interleaved price series per tick for 6 assets.
+- Compute rolling TWAP from stored ticks (`source='derived'`) OR drop `twap*` columns from CHAINLINK_SCHEMA.
+- Drop `sequence_number`/`round_id` from the chainlink schema if no upstream source appears (they are 100% null).
+- Markets rows: populate `tick_size`/`minimum_order_size` from the CLOB market endpoint at discovery; drop
+  never-populated Gamma columns (`fee_information`, `resolution_rule`, `resolution_source`).
+
+### 3. Trades enrichment round 2
+
+- Second enrichment pass on rows still NULL (idempotent already — run it ~15 min after each export or inside
+  `resolution_backfill`), plus adaptive pagination in `_fetch` (page until older than the oldest needed fill).
+- `sequence_number` on trades is 100% null (CLOB does not send one) — drop the column or fill with a local
+  per-asset sequence marked estimated.
+
+### 4. WebSockets: shared connection + hot standby (the big one)
+
+Run the research prompt below FIRST, then implement: (a) all 7 assets × 2 tokens on ONE shared CLOB connection
+(the channel accepts many asset_ids per subscribe), (b) one hot-standby socket with the same subscription that is
+ALREADY streaming — on primary drop, zero lost ticks / zero stale rows, primary reconnects at leisure and becomes
+standby, (c) keep the 150s light recycle for the primary only, (d) REST resync becomes a periodic cross-check,
+not an outage tool. Acceptance: stale+resyncing rows < 1% of snapshots across a 30-min live run with induced drops.
+
+```text
+<prompt>
+You are researching WebSocket resilience for a Polymarket market-data collector (Python 3.13, asyncio, the
+`websockets` library). Report findings with sources (official docs, GitHub issues/clients, community threads).
+
+Context — what we already know from live measurements (2026-09-05):
+- Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market. Subscribe payload:
+  {"assets_ids": ["<token>", ...], "type": "market"}. Message types: "book" (full book per token, sent on
+  subscribe), "price_change" (batched deltas; each entry has asset_id, price, size, side, best_bid, best_ask),
+  "last_trade_price", "tick_size_change". NO sequence numbers anywhere in the payload.
+- The server terminates connections after roughly 3-5 minutes regardless of activity (observed 1011 closes,
+  "keepalive ping timeout" in both directions). Tightening websockets ping_interval/ping_timeout below defaults
+  INCREASED disconnects (the server answers pings slowly). Defaults are safest today.
+- Sending a second subscribe with additional asset_ids on an ESTABLISHED connection is silently ignored:
+  new tokens never receive any frames. Adding tokens requires a fresh connection.
+- One connection can hold many asset_ids (we hold 14 tokens per asset connection today, 7 assets total).
+- A light reconnect (close, reconnect, resubscribe) restores full books within ~1s; a REST snapshot of
+  clob.polymarket.com/book?token_id=... can heal books without WS.
+- Second data feed: wss://ws-live-data.polymarket.com (RTDS) with {"action":"subscribe","subscriptions":
+  [{"topic":"crypto_prices_chainlink","type":"*"},{"topic":"crypto_prices","type":"*"}]}.
+
+Research questions:
+1. Official Polymarket CLOB WS documentation: documented heartbeat/ping requirements, idle timeouts,
+   max subscriptions per connection, max connections per IP, rate limits on (re)subscribe.
+2. Do Polymarket-operated or community high-availability clients (py-clob-client, Go/Rust bots, market-maker
+   repos) use one shared connection, dual/hot-standby connections, or a proxy? What reconnect pattern do they use?
+3. Is there an official SSE/streaming-REST fallback or a WebSocket v2 endpoint? Any documented roadmap.
+4. Known community issues about silent token-adds, dropped connections, or message gaps — and recommended fixes.
+5. Does RTDS offer a topic variant that includes Chainlink roundId/reportId/TWAP metadata?
+6. Any documented message-ordering/delivery guarantees (at-least-once? gaps?) for the market channel, and how
+   others reconcile gaps against the REST book snapshot.
+
+Deliverables:
+- A findings document with links per question.
+- A recommended architecture for: 1 shared primary connection (14+ tokens) + 1 hot standby already subscribed,
+  role swap on failure with zero data loss, recycle timing, and what (if anything) should change in ping/keepalive.
+- Concrete parameter recommendations (ping_interval/timeout, recycle period, backoff) backed by sources or experiments.
+- Risks/unknowns that require a live probe, with the exact probe to run.
+</prompt>
+```
+
+### 5. Maker-wallet backfill (no hot path)
+
+Probe first (one day): The Graph Polymarket exchange subgraph (OrderFilled has maker+taker; free tier ~100k
+queries/mo) vs Alchemy free `eth_getLogs` on the two CTF Exchange contracts on Polygon vs PolygonScan API.
+Join key to our rows: (transaction_hash, price, size). If the probe confirms coverage, implement a scheduled
+backfill that fills `maker_wallet` NULLs through the existing write-back path (`_writeback_enriched_trades`).
+
+### 6. Small cleanups
+
+- `_analyse_test_data`: count actual rows only for discovered windows (completeness then reads ≤100%; extra
+  next-window rows reported separately as "bonus rows").
+- `book_events.ts_source` null ~1–14%: document "sort by ts_received_ns; ts_source best-effort" in the data card.
+- L2 levels 9–20 structurally empty (book depth ~4–8): document, or drop `l2_levels` 20→10.
+- `book_events.sequence_number` 100% null (CLOB sends none) — drop or mark estimated.
+
+---
+
+# Historical handoff (earlier audit rounds — superseded sections kept for context)
+
+---
+
 # Handoff: Data-Loss & Data-Integrity Fixes
 
 **Audited repo:** https://github.com/Genius740Code/polymarket-data-collector

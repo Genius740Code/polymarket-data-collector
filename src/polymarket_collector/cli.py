@@ -4,9 +4,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
+import sys
 
 from .config import CollectorConfig
 from .collector import Collector
+
+
+def _install_windows_loop_policy() -> None:
+    """R-4: ProactorEventLoop prints a ConnectionResetError [WinError 10054]
+    traceback at process exit when WS sockets still in flight get reset during
+    teardown — after all work has completed, purely cosmetic, but it reads like
+    a crash. The selector loop closes the same sockets quietly and
+    websockets>=12 supports both loops; the collector's socket count (~10) is
+    far below the selector fd limit."""
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def main() -> None:
@@ -71,7 +83,13 @@ def main() -> None:
             await collector.stop()
             print("collector stopped")
 
-    asyncio.run(run())
+    _install_windows_loop_policy()
+    try:
+        asyncio.run(run())
+    except ConnectionResetError:
+        # R-4 belt-and-braces: any reset that still slips through loop teardown
+        # happens after stop() flushed/persisted everything — no data impact.
+        pass
 
 
 if __name__ == "__main__":

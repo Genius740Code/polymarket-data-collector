@@ -15,6 +15,7 @@ import datetime
 import json
 import time
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -117,6 +118,16 @@ class Collector:
         self._coverage_gapped: set = set()
         # books with a background REST heal in flight (prevents snapshot-loop stalls)
         self._heal_inflight: set = set()
+        # R-1 pre-warm gate: when set, the collector tasks run (WS connect,
+        # discovery, subscriptions) but snapshots are only WRITTEN from this
+        # epoch-ms onward — used by test mode to warm up before the window
+        # boundary so the first collected window is warm (600/600), not cold.
+        self._snapshot_start_ms: Optional[int] = None
+        # B-4: RTDS received/parsed counters per asset (upstream-cadence probe).
+        # defaultdict — the RTDS loop must never crash on a counter miss (a plain
+        # dict here killed the chainlink consumer 115 times in one run: KeyError
+        # on the first message → crash → reconnect forever, 0 rows written).
+        self._rtds_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"rx": 0, "parsed": 0})
 
     async def _recover_from_cursor(self) -> None:
         """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap."""
@@ -759,7 +770,15 @@ class Collector:
             initial_backoff_ms = 1_000
             max_backoff_ms = 60_000
             try:
+                # B-3 lesson learned: explicit ping_interval/ping_timeout made the
+                # connection churn WORSE (the server answers pings slowly; a tight
+                # timeout kills healthy sockets from our side). Defaults stay; the
+                # 150s planned recycle below bounds connection age instead.
                 async with websockets.connect(ws_url) as ws:
+                    conn_established_ms = int(time.time() * 1000)
+                    # planned recycle: close is OURS — no disconnect episode, no
+                    # REST resync, no backoff; books relive from the fresh full book
+                    planned_recycle = False
                     # Assign per-asset connection_id for collector_events (§8)
                     try:
                         conn_id = str(uuid.uuid4())
@@ -777,9 +796,24 @@ class Collector:
                     except Exception:
                         pass
                     subscribed_tokens: set[str] = set()
+                    # R-1 (root cause): the CLOB IGNORES subscription updates on an
+                    # established connection — lookahead-subscribed next-window tokens
+                    # never receive a single message (measured live 2026-09-05: no
+                    # full-book for the new tokens until the next reconnect), so the
+                    # book sat stale until the boundary REST heal (+7.5s every window).
+                    # When new tokens appear on a non-fresh connection we drop the
+                    # connection; the reconnect resubscribes everything and gets full
+                    # books immediately — and thanks to the 60s lookahead this lands
+                    # well before the window boundary, keeping the boundary warm.
+                    subscribed_once = False
+                    needs_fresh_connection = False
 
-                    async def _ensure_ws_subscription() -> None:
-                        """Subscribe to all active market tokens for this asset (§1 dual-tracking)."""
+                    async def _ensure_ws_subscription() -> bool:
+                        """Subscribe to all active market tokens for this asset (§1 dual-tracking).
+
+                        Returns True when new tokens were subscribed.
+                        """
+                        nonlocal subscribed_once, needs_fresh_connection
                         try:
                             markets = self.rollover.active_markets(asset)
                             tokens: list[str] = []
@@ -791,22 +825,28 @@ class Collector:
                             # dedup + only new tokens
                             new_tokens = [t for t in tokens if t not in subscribed_tokens]
                             if not new_tokens:
-                                return
+                                return False
                             # Polymarket CLOB expects {"assets_ids": [...], "type": "market"}
                             payload = json.dumps({"assets_ids": tokens, "type": "market"})
                             await ws.send(payload)
+                            added_on_established = subscribed_once
+                            subscribed_once = True
                             subscribed_tokens.update(tokens)
+                            if added_on_established:
+                                needs_fresh_connection = True
                             if self.on_event:
                                 try:
                                     self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
                                 except Exception:
                                     pass
+                            return True
                         except Exception as e:
                             if self.on_event:
                                 try:
                                     self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": str(e)})
                                 except Exception:
                                     pass
+                            return False
 
                     async def _on_market(market: MarketInfo) -> None:
                         # Dedup: skip if already exists (prevents 2x market log rows)
@@ -847,7 +887,15 @@ class Collector:
                             self.books[market.condition_id] = _nb2
                         # subscribe newly discovered market tokens
                         try:
-                            await _ensure_ws_subscription()
+                            added = await _ensure_ws_subscription()
+                            if added and needs_fresh_connection:
+                                # token-add on an established connection is ignored by
+                                # the CLOB — drop it; the reconnect loop resubscribes
+                                # everything on a fresh socket (see note above)
+                                try:
+                                    await ws.close()
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
@@ -872,6 +920,16 @@ class Collector:
                     try:
                         async for message in ws:
                             if not self._running:
+                                break
+                            # B-3 proactive recycle: the CLOB kills long-lived
+                            # connections server-side (observed deaths at ~5min
+                            # connection age). Recycle at 150s on OUR schedule —
+                            # but LIGHTLY: no disconnect episode, no REST resync;
+                            # books relive from the fresh connection's full book
+                            # and are honestly labeled stale during the ~1s swap
+                            # (via the ws_connected downgrade in the snapshot loop).
+                            if int(time.time() * 1000) - conn_established_ms > 150_000:
+                                planned_recycle = True
                                 break
                             # §13 raw archive — persist every raw WS frame for replay/re-derive
                             try:
@@ -1027,6 +1085,15 @@ class Collector:
                 # Connection closed — mark stale, request resync, then reconnect
                 # Real gap tracking: close gap on reconnect so gap_duration_ms is populated per AGENT.md honest gaps
                 if self._running:
+                    self._ws_connected[asset.upper()] = False
+                if planned_recycle:
+                    # B-3 light recycle: the swap is ours and takes ~1s — no
+                    # disconnect episode, no REST resync; the fresh connection's
+                    # full book relives the books. ws_connected=False already
+                    # downgrades snapshots to stale for the swap window (honest).
+                    planned_recycle = False
+                    continue
+                if self._running:
                     _cid = None
                     try:
                         act = self.rollover.active_markets(asset)
@@ -1087,9 +1154,16 @@ class Collector:
                     {"asset": asset, "attempt": attempt, "backoff_s": backoff_s},
                 )
             # K-4: stagger across assets — after a shared disconnect all 7 assets
-            # would otherwise hit CLOB REST within the same second and rate-limit
-            import random as _random
-            await asyncio.sleep(_random.uniform(0.0, 2.0))
+            # would otherwise hit CLOB REST within the same second and rate-limit.
+            # B-3: when OTHER assets are still connected this is a single-socket
+            # flap — the stagger would just add dead air, so skip it.
+            _others = sum(
+                1 for a in self.config.assets
+                if a.upper() != asset.upper() and self._ws_connected.get(a.upper())
+            )
+            if _others < 2:
+                import random as _random
+                await asyncio.sleep(_random.uniform(0.0, 2.0))
             # Attempt REST resync for all stale books before reconnecting WS
             try:
                 stale_books = [b for b in self.books.values() if b.asset.upper() == asset.upper() and b.book_state.value == "stale"]
@@ -1213,6 +1287,18 @@ class Collector:
             try:
                 now_ms = int(time.time() * 1000)
                 cur_bucket = (now_ms // 500) * 500
+                # R-1 pre-warm gate: collector is running and books are already
+                # filling (WS subscribed before the first collected window), but
+                # snapshot rows are only written from the intended collection start.
+                if self._snapshot_start_ms is not None and cur_bucket < self._snapshot_start_ms:
+                    self._last_snapshot_bucket_ms = cur_bucket
+                    try:
+                        _now = time.time()
+                        _nxt = (int(_now * 1000) // 500 + 1) * 500 / 1000
+                        await asyncio.sleep(max(0, _nxt - _now))
+                    except asyncio.CancelledError:
+                        break
+                    continue
                 # Catch-up: emit every 500ms bucket since last tick to avoid gaps (§3 gap fix)
                 if self._last_snapshot_bucket_ms is None:
                     buckets = [cur_bucket]
@@ -1236,7 +1322,12 @@ class Collector:
                             buckets = list(range(start, cur_bucket + 1, 500))
                         if len(buckets) > 1:
                             try:
-                                self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms})
+                                # R-5: this is scheduler catch-up (the 500ms loop briefly
+                                # fell behind), not writer backpressure — the writer's
+                                # dropped_total stayed 0 in every run. Emitted as its own
+                                # event type so `backpressure` keeps meaning "the writer
+                                # refused a row" (and doesn't trip the watchdog alert).
+                                self._collector_event(CollectorEventType.scheduler_lag, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms})
                             except Exception:
                                 pass
                 for bucket in buckets:
@@ -1475,6 +1566,9 @@ class Collector:
         attempt = 0
         while self._running:
             try:
+                # B-4: per-asset received/parsed counters answer "is the HYPE
+                # cadence upstream or are we dropping frames?" — printed with the
+                # raw frames archived so the question is decidable from data.
                 async with websockets.connect(url) as ws:
                     self._collector_event(CollectorEventType.connected, {"asset": "CHAINLINK", "connection_id": "chainlink"})
                     # RTDS subscribe — request both chainlink topic variants defensively
@@ -1490,6 +1584,7 @@ class Collector:
                     parsed_any = False
                     dbg_printed = False
                     rx_count = 0
+                    _last_count_log = time.time()
                     async for message in ws:
                         if not self._running:
                             break
@@ -1498,6 +1593,14 @@ class Collector:
                             msg = _json.loads(message) if isinstance(message, (str, bytes)) else message
                         except Exception:
                             continue
+                        # B-4: archive the raw RTDS frame for upstream-cadence analysis
+                        try:
+                            if isinstance(msg, dict):
+                                self.raw_archive.append("RTDS", msg)
+                            else:
+                                self.raw_archive.append("RTDS", str(msg)[:2000])
+                        except Exception:
+                            pass
                         payloads = msg if isinstance(msg, list) else [msg]
                         for p in payloads:
                             if not isinstance(p, dict):
@@ -1533,6 +1636,7 @@ class Collector:
                                     break
                             if asset is None:
                                 continue
+                            self._rtds_counts[asset]["rx"] += 1
                             # normalize ts_source (ms epoch / s epoch / ISO)
                             ts_raw = body.get("timestamp") or body.get("last_seen") or body.get("reportTimestamp")
                             ts_ms = None
@@ -1562,9 +1666,21 @@ class Collector:
                             # keep asset in the RAM row — _nearest_chainlink filters on it
                             # (to_dict() omits it; without it no market could ever resolve)
                             self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms or int(time.time() * 1000)})
+                            self._rtds_counts[asset]["parsed"] += 1
                             if len(self._chainlink_events) > 20000:
                                 del self._chainlink_events[:len(self._chainlink_events) - 20000]
                     attempt = 0
+                    # B-4: periodic received-vs-parsed report per asset — answers
+                    # whether a thin feed (e.g. HYPE ~0.84s ticks) is upstream
+                    # cadence or our parser dropping frames.
+                    if self._running and time.time() - _last_count_log > 120:
+                        _last_count_log = time.time()
+                        counts = {a: dict(v) for a, v in sorted(self._rtds_counts.items())}
+                        print(f"[chainlink] rtds rx/parsed per asset: {counts}")
+                        try:
+                            self._collector_event(CollectorEventType.snapshot_heartbeat, {"rtds_counts": counts})
+                        except Exception:
+                            pass
                     if self._running and not parsed_any and rx_count > 0:
                         # connected but nothing parsed — surface the real payload shape once
                         try:
@@ -1690,7 +1806,7 @@ class Collector:
 
         Runs real pipeline Gamma slug {asset}-updown-5m-{ts} + CLOB WS + 500ms snapshots for 7 assets
         (BTC/ETH/SOL/HYPE/BNB/XRP/DOGE). Every 10 min (test_upload_interval) it flushes, compacts,
-        prepares Kaggle staging gghgg1/polymarket-5m-crypto (31 files for 7 assets) and uploads as folder
+        prepares Kaggle staging gghgg1/polymarket-5m-crypto (38 files for 7 assets) and uploads as folder
         version (single dataset, not per-asset), gated on full closed markets only. After 4 windows per
         asset (≈20 min wall-clock +60s) it stops, flushes, compacts and writes data/test_analysis.json with
         null/data-loss audit.
@@ -1713,24 +1829,31 @@ class Collector:
         now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
         next_boundary_ms = ((now_ms // window_ms) + 1) * window_ms
         wait_ms = next_boundary_ms - now_ms
+        # R-1 cold-start fix: start the collector BEFORE the boundary so the WS
+        # connections, Gamma discovery and token subscriptions are already warm
+        # when the first collected window opens (the previously observed cold
+        # window lost ~10 ticks to process warm-up: 589-590/600). Snapshots are
+        # gated to the boundary, so the pre-boundary tail is not snapshot-ed;
+        # window 1 now behaves like the warm 600/600 windows.
+        self._snapshot_start_ms = next_boundary_ms
+        await self.start(enable_kaggle_loop=False)
         if wait_ms < 2000:
             dt_next = datetime.datetime.fromtimestamp(next_boundary_ms/1000, tz=datetime.timezone.utc)
             print(f"[test-mode:real] already on boundary (wait {wait_ms/1000:.1f}s, next {dt_next.isoformat()}), starting immediately")
         elif wait_ms <= 300_000:
             wait_s = wait_ms / 1000
             dt_next = datetime.datetime.fromtimestamp(next_boundary_ms/1000, tz=datetime.timezone.utc)
-            print(f"[test-mode:real] aligning to next 5m market boundary {dt_next.isoformat()} — waiting {wait_s:.1f}s for clean start (ensures 98%+ completeness) — 5m-only, 7 assets")
+            print(f"[test-mode:real] aligning to next 5m market boundary {dt_next.isoformat()} — waiting {wait_s:.1f}s (collector PRE-WARMING: WS + discovery + subscriptions live, snapshots gated to boundary) — 5m-only, 7 assets")
             end_wait = time.time() + wait_s
             while time.time() < end_wait and self._running:
                 await asyncio.sleep(min(1, end_wait - time.time()))
                 self._beat()
-            print(f"[test-mode:real] boundary reached, starting collector (fresh market)")
+            print(f"[test-mode:real] boundary reached — collector already warm (pre-subscribed), first window starts now")
         else:
             print(f"[test-mode:real] starting immediately (wait {wait_ms/1000:.1f}s >300s, unexpected) — will capture current + next windows")
 
         # In finite quick-test (4 markets = 2 chunks of 2), disable background kaggle loop — run_test_mode drives chunk uploads itself (every 2 markets =10min)
         # This avoids double-upload race where both loops flush/export concurrently (§10A).
-        await self.start(enable_kaggle_loop=False)
         if getattr(self, "_kaggle_task", None):
             try:
                 self._kaggle_task.cancel()
@@ -1739,12 +1862,15 @@ class Collector:
             print("[test-mode] background kaggle loop disabled (chunk uploads driven by test loop)")
         kaggle_interval = getattr(self.config.kaggle, "test_upload_interval_seconds", 600)
         print(f"[test-mode:real] QUICK TEST — {num_markets}×{ws}s (5m-only) = {num_markets*(ws/60):.0f}min total, {len(self.config.assets)} assets {self.config.assets}")
-        print(f"[test-mode] chunks: every 2 markets → kaggle every {kaggle_interval}s (10min), one-file-per-asset staging (31 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals")
+        print(f"[test-mode] chunks: every 2 markets → kaggle every {kaggle_interval}s (10min), one-file-per-asset staging (38 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals")
 
         timeout_s = num_markets * ws + 90  # 4*300+90=1290s ~21.5 min
-        # FIX: record start after alignment wait and after collector start, so expected doesn't include idle.
-        start_ts = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
-        start_ms = start_ts * 1000
+        # R-1: measure the run from the boundary, not from process start — the
+        # pre-warm wait must not count against the timeout or pull the first
+        # Kaggle chunk forward, and the analysis must expect only the windows
+        # that START at/after this boundary.
+        start_ts = next_boundary_ms // 1000
+        start_ms = next_boundary_ms
         # Will be refined after first market discovery (see below)
         completed_windows: Dict[str, set] = {a: set() for a in self.config.assets}
         last_kaggle_s = start_ts
@@ -1776,12 +1902,18 @@ class Collector:
                 except Exception as e:
                     print(f"[test-kaggle:{tag}] clean_view err {e}")
                 # Prepare staging + upload (dry_run if no creds to avoid crash)
-                # Staging is one-file-per-asset: 7 assets ×4 (book_snapshots, trades, book_events, chainlink) +3 globals =31 files
+                # Staging is one-file-per-asset: 7 assets ×5 (snapshots, clean view, trades, book_events, chainlink) +3 globals =38 files
                 # Single dataset gghgg1/polymarket-5m-crypto — all assets share same slug, cumulative rows.
                 _has_creds = _validate_kaggle_config()
                 try:
                     from .storage.export import cleanup_local_data as _cleanup
-                    res = export_and_upload_all_kaggle(
+                    # B-fix: run the export in a worker thread — it makes
+                    # synchronous HTTP calls (data-api enrichment, Kaggle client)
+                    # that otherwise FREEZE the whole event loop for minutes,
+                    # stalling the 500ms snapshot scheduler (measured: the chunk
+                    # upload at 20:20 blocked the loop past the run's timeout).
+                    res = await asyncio.to_thread(
+                        export_and_upload_all_kaggle,
                         data_dir=self.config.storage.data_dir,
                         assets=self.config.assets,
                         timeframe_labels=["5m"],
@@ -1836,15 +1968,15 @@ class Collector:
                         kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
                     else:
                         print(f"[test-kaggle:{tag}] upload NOT counted as completed chunk (status={_up_status or res.get('error')}) — data retained, retry scheduled")
-                    # one-file-per-asset audit: staging should be 31 files for 7 assets
+                    # one-file-per-asset audit: staging should be 38 files for 7 assets
                     try:
                         st = res.get("staging", {})
                         files = st.get("files", 0)
-                        expected = len(self.config.assets) * 4 + 3
+                        expected = len(self.config.assets) * 5 + 3
                         if files != expected:
                             print(f"[test-kaggle:{tag}] WARN staging files {files} != expected {expected} (one-file-per-asset)")
                         else:
-                            print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: BTC/ETH/..._book_snapshots, trades, book_events, chainlink +3 globals)")
+                            print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: snapshots, clean view, trades, book_events, chainlink +3 globals)")
                     except Exception:
                         pass
                     # also intermediate lightweight analysis
@@ -1894,6 +2026,12 @@ class Collector:
                     for cid, m in list(self.markets.items()):
                         if m.asset.upper() != asset.upper():
                             continue
+                        # R-1: the pre-warm tail window (discovered before the
+                        # boundary, snapshots gated off) is not one of the run's
+                        # num_markets windows — counting it would end the run a
+                        # window short.
+                        if (m.market_start_ts_ms or 0) < start_ms:
+                            continue
                         now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
                         if m.market_end_ts_ms < now_ms:
                             completed_windows[asset].add(m.window_index)
@@ -1901,12 +2039,14 @@ class Collector:
                 # >75s ago with no discovered market is a coverage_gap, not silence
                 now_ms_c = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
                 cur_widx = (now_ms_c // 1000) // ws
+                boundary_widx = start_ms // 1000 // ws
                 for asset in self.config.assets:
                     has_market = any(
                         m.asset.upper() == asset.upper() and m.window_index == cur_widx
                         for m in self.markets.values()
                     )
                     if (not has_market and (asset, cur_widx) not in self._coverage_gapped
+                            and cur_widx >= boundary_widx
                             and now_ms_c >= (cur_widx * ws + 75) * 1000):
                         self._coverage_gapped.add((asset, cur_widx))
                         self._collector_event(CollectorEventType.coverage_gap, {
@@ -1926,6 +2066,10 @@ class Collector:
                     prog = {a: sorted(s) for a, s in completed_windows.items()}
                     print(f"[test-mode:real] {elapsed}s elapsed, windows per asset: {prog}, timeout {timeout_s}s, kaggle {len(kaggle_uploads)} uploads")
                 if all_done:
+                    # B-1: let the final in-window bucket(s) land before stopping —
+                    # an immediate stop raced the last 500ms tick (1 missing bucket
+                    # per asset at 19:14:59.5 in the previous run).
+                    await asyncio.sleep(1.5)
                     print(f"[test-mode:real] all assets have {num_markets} windows (completed={completed_windows}), stopping")
                     break
                 if elapsed >= timeout_s:
@@ -2142,7 +2286,12 @@ class Collector:
         expected_snaps = num_markets * ticks_per_market * len(self.config.assets)
         import time as _time_mod
         _now_ms_a = int(_time_mod.time() * 1000)
-        elapsed_cids = {cid for cid, m in self.markets.items() if m.market_end_ts_ms < _now_ms_a}
+        elapsed_cids = {cid for cid, m in self.markets.items()
+                        if m.market_end_ts_ms < _now_ms_a
+                        # R-1: only windows that STARTED at/after the run start —
+                        # a pre-warm tail window (snapshots gated off) would
+                        # otherwise inflate the expected denominator to ~50%.
+                        and (m.market_start_ts_ms or 0) >= start_ms}
         discovered = len(elapsed_cids)
         expected_discovered = discovered * ticks_per_market
         checks["expected_book_snapshots"] = expected_discovered
@@ -2220,12 +2369,12 @@ class Collector:
         # trades chainlink loss
         checks["trades_rows"] = report["datasets"]["trades"]["rows"]
         checks["chainlink_rows"] = report["datasets"]["chainlink_events"]["rows"]
-        # kaggle staging check (31 files expected for 7 assets)
+        # kaggle staging check (38 files expected for 7 assets)
         try:
             kag_staging = base / "kaggle_staging" / "5m" / "gghgg1/polymarket-5m-crypto"
             if kag_staging.exists():
                 files = [f for f in kag_staging.glob("*.parquet") if not f.name.endswith(".tmp")]
-                report["kaggle_staging"] = {"exists": True, "files": len(files), "expected": len(self.config.assets)*4 + 3, "dataset": "gghgg1/polymarket-5m-crypto", "file_list": sorted([f.name for f in files])[:20]}
+                report["kaggle_staging"] = {"exists": True, "files": len(files), "expected": len(self.config.assets)*5 + 3, "dataset": "gghgg1/polymarket-5m-crypto", "file_list": sorted([f.name for f in files])[:20]}
                 # meta
                 meta = kag_staging / "dataset-metadata.json"
                 if meta.exists():
@@ -2297,7 +2446,8 @@ class Collector:
                                 self.markets_log.compact()
                             except Exception:
                                 pass
-                            res = export_and_upload_all_kaggle(
+                            res = await asyncio.to_thread(
+                                export_and_upload_all_kaggle,
                                 data_dir=self.config.storage.data_dir,
                                 assets=self.config.assets,
                                 timeframe_labels=["5m"],
@@ -2305,7 +2455,8 @@ class Collector:
                                 dry_run=not _has_creds,
                             )
                     else:
-                        res = export_and_upload_all_kaggle(
+                        res = await asyncio.to_thread(
+                            export_and_upload_all_kaggle,
                             data_dir=self.config.storage.data_dir,
                             assets=self.config.assets,
                             timeframe_labels=["5m"],

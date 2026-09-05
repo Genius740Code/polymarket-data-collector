@@ -99,5 +99,23 @@ module.exports = {
       out_file: path.join(cwd, 'logs', 'compact-out.log'),
       error_file: path.join(cwd, 'logs', 'compact-error.log'),
     },
+
+    // --- B-7: resolution backfill — every 15 minutes --------------------------------
+    // Upgrades ended markets (active/closed/unknown) to the OFFICIAL outcome via
+    // the CLOB tokens[].winner flag, append-only + atomic compact. Idempotent:
+    // already-resolved markets are skipped, unsettled ones retry next run.
+    {
+      name: 'polymarket-resolution-backfill',
+      cwd,
+      script: python,
+      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml',
+      interpreter: 'none',
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '*/15 * * * *',   // every 15 minutes
+      time: true,
+      out_file: path.join(cwd, 'logs', 'resolution-backfill-out.log'),
+      error_file: path.join(cwd, 'logs', 'resolution-backfill-error.log'),
+    },
   ],
 };

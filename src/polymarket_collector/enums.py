@@ -70,6 +70,10 @@ class CollectorEventType(StrEnum):
     resolution_stuck = "resolution_stuck"
     write_failed = "write_failed"
     backpressure = "backpressure"
+    # R-5: the 500ms scheduler briefly falling behind emits catch-up snapshots —
+    # that is scheduler lag, NOT writer backpressure (writer dropped_total stayed 0).
+    # Kept as its own event type so backpressure keeps meaning "writer refused a row".
+    scheduler_lag = "scheduler_lag"
     # §1B
     collector_started = "collector_started"
     collector_restarted = "collector_restarted"
