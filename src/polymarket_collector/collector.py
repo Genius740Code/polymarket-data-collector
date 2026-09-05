@@ -879,12 +879,8 @@ class Collector:
                     except Exception:
                         pass
                     resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
-                    # Immediately set reconnect timestamp placeholder will be overwritten on actual reconnect,
-                    # but ensure gap is not left 100% null if collector stops before reconnect
-                    try:
-                        self.resync.handle_reconnect(resync_id)
-                    except Exception:
-                        pass
+                    # Do NOT auto-reconnect here — wait for real WS reconnect; gap will be closed on next connect `handle_reconnect` or on stop `ensure_all_reconnected`
+                    # This ensures resync_rest_fetch_ts_utc is set only via real resync() REST fetch per AGENT.md
             except asyncio.CancelledError:
                 # Clean, expected shutdown — just exit
                 if not self._running:
