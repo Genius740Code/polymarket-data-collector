@@ -23,11 +23,7 @@ class ChainlinkEvent:
     symbol: Optional[str]
     source: Optional[str]
     price: Optional[float]
-    twap: Optional[float]
-    twap_window_seconds: Optional[int]
     report_id: Optional[str]
-    round_id: Optional[str]
-    sequence_number: Optional[int]
     ts_source: Optional[str]
     ts_received_ns: int
 
@@ -40,29 +36,19 @@ class ChainlinkEvent:
             "symbol": self.symbol,
             "source": self.source,
             "price": self.price,
-            "twap": self.twap,
-            "twap_window_seconds": self.twap_window_seconds,
             "report_id": self.report_id,
-            "round_id": self.round_id,
-            "sequence_number": self.sequence_number,
         }
 
 
 def chainlink_event_from_ws(msg: Dict[str, Any], asset: str, schema_version: str = "3.0.0") -> ChainlinkEvent:
-    """Parse a raw Chainlink Data Streams WS message (§6). Preserve both timestamps, full precision."""
-    # ts_source from message, ts_received_ns now
+    """Parse a raw Chainlink RTDS WS message (§6). Preserve both timestamps, full precision.
+
+    The RTDS crypto_prices(_chainlink) payload carries no roundId/reportId/TWAP/sequence
+    (probed live 2026-09-05) — report_id is kept for the §6A settlement join but is
+    expected to stay NULL until an upstream source appears.
+    """
     ts_source = msg.get("timestamp") or msg.get("ts_source") or msg.get("reportTimestamp")
     report_id = msg.get("report_id") or msg.get("reportId") or msg.get("reportIdHex")
-    round_id = str(msg.get("round_id") or msg.get("roundId") or "") or None
-    # If round_id still null but report_id exists, mirror report_id for joinability (Data Streams legacy compat)
-    if round_id is None and report_id:
-        round_id = str(report_id)
-    seq = msg.get("sequence_number") or msg.get("sequence")
-    if seq is not None:
-        try:
-            seq = int(str(seq).strip()) if str(seq).strip().lstrip("-").isdigit() else int(float(str(seq)))
-        except Exception:
-            seq = None
     return ChainlinkEvent(
         event_id=str(uuid.uuid4()),
         schema_version=schema_version,
@@ -70,11 +56,7 @@ def chainlink_event_from_ws(msg: Dict[str, Any], asset: str, schema_version: str
         symbol=msg.get("symbol") or asset.upper(),
         source=msg.get("source") or "chainlink",
         price=msg.get("price"),
-        twap=msg.get("twap"),
-        twap_window_seconds=msg.get("twap_window_seconds"),
         report_id=report_id,
-        round_id=round_id,
-        sequence_number=seq,
         ts_source=str(ts_source) if ts_source else None,
         ts_received_ns=time.time_ns(),
     )

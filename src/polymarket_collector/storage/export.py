@@ -36,12 +36,12 @@ def _os_replace_safe(src, dst):
 from .parquet_io import read_table
 import pyarrow.compute as pc
 
-from .schemas import SCHEMAS, snapshot_schema
+from .schemas import SCHEMAS, snapshot_schema, MARKETS_SUMMARY_SCHEMA
 
 
 # Datasets that are per-asset vs global
 PER_ASSET_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
-NON_ASSET_DATASETS = {"markets_log", "collector_events", "resync_episodes"}
+NON_ASSET_DATASETS = {"markets_log", "collector_events", "resync_episodes", "markets_summary"}
 
 # Prefer these ts columns for sorting (first present wins)
 TS_SORT_CANDIDATES = [
@@ -118,7 +118,7 @@ def _unambiguous_wallet(pool: Optional[list]) -> Optional[str]:
     return next(iter(distinct)) if len(distinct) == 1 else None
 
 
-def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None) -> pa.Table:
+def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None, reconcile: bool = True) -> pa.Table:
     """Fill maker_wallet/taker_wallet/wallet and missing outcome on trades.
 
     The CLOB market channel does not carry wallets, so streamed trade rows have
@@ -136,11 +136,12 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
     import datetime as _dt
     import httpx as _hx
 
-    def _fetch(cid: str, taker_only: bool, oldest_needed_ms: Optional[int], max_pages: int = 12) -> list:
-        """Data-API fills for a market, newest-first, stopping once older than
-        anything we need. The previous fixed 3-4 page cap truncated liquid
-        markets (BTC ~4k fills/window) — fills beyond the cap could never be
-        enriched (part of the BTC ~36% wallet-null tail)."""
+    def _fetch(cid: str, taker_only: bool, oldest_needed_ms: Optional[int], max_pages: int = 60) -> list:
+        """Data-API fills for a market, newest-first, paging until older than
+        anything we need (adaptive pagination — enrichment round 2). The old
+        fixed 12-page cap truncated liquid markets (BTC ~4k fills/window ≈ 8+
+        pages), so fills beyond the cap could never be enriched. max_pages is
+        now only a runaway-safety ceiling, not the stop condition."""
         rows: list = []
         offset = 0
         for _page in range(max_pages):
@@ -288,6 +289,10 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
     # exchange itself reported on this market's streamed rows (uniform across
     # the market, 0 on current 5m markets) and flagged fee_is_estimated=True —
     # derived, not fabricated; NULL when the market's streamed rows disagree.
+    if not reconcile:
+        # wallet/outcome-only mode (enrichment round 2): fill NULLs, skip the
+        # api- row inserts — the second pass must never duplicate reconciliation
+        return combined
     inserted = 0
     fee_derived = 0
     try:
@@ -434,6 +439,324 @@ def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: p
     if rewritten:
         print(f"[export] trades enrichment write-back: {rewritten} hive part files updated (NULLs filled, nothing overwritten)")
     return rewritten
+
+
+def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] = None) -> dict:
+    """Enrichment round 2 — re-run the data-api wallet/outcome fill over hive
+    trades rows that are STILL NULL.
+
+    Data-API fills are indexed late (measured 2026-09-05: enrichment 30s after
+    window end finds only a minority of legs; coverage self-heals over time),
+    so a pass ~15 min after the export recovers rows the first pass could not
+    see. Reuses the enrichment + write-back path: NULLs filled only, atomic per
+    part file, idempotent. api- reconciliation rows are NOT inserted here (the
+    export-time pass owns those); this pass only completes existing rows.
+    Intended to run inside resolution_backfill (pm2 cron, every 15 min).
+    """
+    if assets is None:
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+    base = Path(data_dir)
+    stats = {"assets_scanned": 0, "rows_needed": 0, "files_rewritten": 0}
+    for asset in assets:
+        au = asset.upper()
+        tbl = _read_dataset_per_asset_plain(base, "trades", au)
+        stats["assets_scanned"] += 1
+        if tbl is None or tbl.num_rows == 0 or "wallet" not in tbl.schema.names:
+            continue
+        rows = tbl.to_pylist()
+        needed = 0
+        for r in rows:
+            # rows without a transaction_hash cannot be joined to the data-api — skip
+            if not r.get("transaction_hash"):
+                continue
+            needs = (
+                r.get("wallet") is None
+                or (r.get("maker_wallet") is None and str(r.get("side") or "").upper() in ("BUY", "SELL"))
+                or r.get("outcome") in (None, "", "unknown")
+            )
+            if needs:
+                needed += 1
+        if not needed:
+            continue
+        stats["rows_needed"] += needed
+        print(f"[export] second-pass enrichment: {au} {needed} rows still missing wallet/outcome — querying data-api")
+        enriched = _backfill_trade_wallets(tbl, base, asset=au, reconcile=False)
+        try:
+            rewritten = _writeback_enriched_trades(base, au, enriched)
+            stats["files_rewritten"] += rewritten
+        except Exception as e:
+            print(f"[export] WARN second-pass write-back failed for {au}: {e}")
+    print(f"[export] second-pass enrichment done: {stats}")
+    return stats
+
+
+def _read_dataset_per_asset_plain(data_dir: Path, dataset: str, asset: Optional[str]) -> Optional[pa.Table]:
+    """Read hive rows WITHOUT triggering the export-time enrichment side effects
+    (data-api fetches, reconciliation inserts) — used by the second pass to
+    inspect raw stored rows only."""
+    from .parquet_io import read_table as _rt
+    base = Path(data_dir) / dataset
+    if not base.exists():
+        return None
+    parts = [p for p in base.rglob("*.parquet")
+             if not p.name.endswith(".tmp")
+             and (asset is None or f"asset={asset}" in str(p) or f"asset={asset.upper()}" in str(p))]
+    if not parts:
+        return None
+    tables = []
+    for p in parts:
+        try:
+            t = _rt(p)
+            if asset and "asset" in t.schema.names and f"asset={asset.upper()}" not in str(p):
+                t = t.filter(pc.equal(t.column("asset"), pa.scalar(asset.upper())))
+            if t.num_rows:
+                tables.append(t)
+        except Exception:
+            continue
+    if not tables:
+        return None
+    return tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
+
+
+# ------------------------------------------------------------------ markets_summary — analyst-facing one-row-per-market export
+# Modelled on kaggle.com/datasets/kachoio/polymarket-5-minute-crypto-updown-markets:
+# one row per condition_id combining resolution, underlying (chainlink) boundary
+# prices, outcome-token OHLC, and activity aggregates. Purely derived — every
+# field is computed at export time from the other datasets; nothing new is
+# collected.
+
+def _load_markets_latest_rows(base: Path) -> List[dict]:
+    """Latest markets row per condition_id (markets_latest, falling back to markets_log hive)."""
+    rows: List[dict] = []
+    latest = base / "markets_latest" / "markets_latest.parquet"
+    if latest.exists():
+        try:
+            rows = read_table(latest).to_pylist()
+        except Exception as e:
+            print(f"[export] WARN markets_latest unreadable: {e}")
+    if not rows:
+        log_tbl = _read_dataset_per_asset(base, "markets_log", None)
+        if log_tbl is not None and log_tbl.num_rows:
+            rows = log_tbl.to_pylist()
+    # dedupe by condition_id, last row wins (log is time-ordered upstream)
+    out: Dict[str, dict] = {}
+    for r in rows:
+        cid = r.get("condition_id")
+        if cid:
+            out[str(cid)] = r
+    return [out[c] for c in sorted(out)]
+
+
+def _read_trades_for_summary(base: Path, staging_dir: Optional[Path], assets: List[str]) -> Optional[pa.Table]:
+    """Trades table for the summary — staging files preferred (they carry the
+    api- reconciled fills), hive fallback otherwise."""
+    tables: List[pa.Table] = []
+    if staging_dir is not None:
+        for a in assets:
+            p = Path(staging_dir) / f"{a}_trades.parquet"
+            if p.exists():
+                try:
+                    tables.append(read_table(p))
+                except Exception as e:
+                    print(f"[export] WARN staging trades unreadable {p.name}: {e}")
+    if not tables:
+        hive = _read_dataset_per_asset(base, "trades", None)
+        if hive is not None:
+            tables.append(hive)
+    if not tables:
+        return None
+    return tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
+
+
+def build_markets_summary(
+    data_dir: str | Path,
+    staging_dir: str | Path | None = None,
+    assets: List[str] | None = None,
+) -> pa.Table:
+    """Build the analyst-facing markets summary table (one row per condition_id).
+
+    Sources: markets_latest (identity + resolution), book_snapshots_clean
+    (outcome-token mid OHLC + average spread), trades incl. api- rows (volume,
+    fill count, unique traders), chainlink_events (underlying open/close =
+    nearest tick to the window boundary, ≤5s tolerance). All nullable except
+    condition_id/asset — missing ingredients stay NULL, never zero-filled.
+    """
+    import bisect
+    import datetime as _dt2
+    base = Path(data_dir)
+    if assets is None:
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+
+    def _empty() -> pa.Table:
+        return pa.table({f.name: [] for f in MARKETS_SUMMARY_SCHEMA}, schema=MARKETS_SUMMARY_SCHEMA)
+
+    markets = _load_markets_latest_rows(base)
+    if not markets:
+        return _empty()
+
+    # --- trades: volume / fill count / unique traders per condition_id ---
+    vol_by_cid: Dict[str, float] = {}
+    fills_by_cid: Dict[str, int] = {}
+    traders_by_cid: Dict[str, int] = {}
+    trades = _read_trades_for_summary(base, Path(staging_dir) if staging_dir else None, assets)
+    if trades is not None and trades.num_rows and "condition_id" in trades.schema.names:
+        cols = {"condition_id": trades.column("condition_id")}
+        cols["one"] = pa.array([1] * trades.num_rows, type=pa.int64())
+        for c in ("notional", "wallet"):
+            cols[c] = trades.column(c) if c in trades.schema.names else pa.array([None] * trades.num_rows, type=pa.string() if c == "wallet" else pa.float64())
+        t = pa.table(cols)
+        try:
+            agg = t.group_by("condition_id").aggregate([("one", "sum"), ("notional", "sum")])
+            for r in agg.to_pylist():
+                cid = r["condition_id"]
+                fills_by_cid[cid] = int(r["one_sum"] or 0)
+                vol_by_cid[cid] = float(r["notional_sum"]) if r["notional_sum"] is not None else 0.0
+            valid_w = t.filter(pc.is_valid(t.column("wallet")))
+            if valid_w.num_rows:
+                dist = valid_w.group_by("condition_id").aggregate([("wallet", "count_distinct")])
+                for r in dist.to_pylist():
+                    traders_by_cid[r["condition_id"]] = int(r["wallet_count_distinct"] or 0)
+        except Exception as e:
+            print(f"[export] WARN markets_summary trades aggregation failed: {e}")
+
+    # --- snapshots (clean): outcome-token mid OHLC + average spread per condition_id ---
+    ohlc_by_cid: Dict[str, dict] = {}
+    snaps = _read_dataset_per_asset(base, "book_snapshots_clean", None)
+    if snaps is not None and snaps.num_rows:
+        needed = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
+        if all(c in snaps.schema.names for c in needed):
+            try:
+                s = pa.table({
+                    "condition_id": snaps.column("condition_id"),
+                    "ts": snaps.column("ts_snapshot_ns"),
+                    "mid_up": pc.divide(pc.add(snaps.column("up_bid"), snaps.column("up_ask")), pa.scalar(2.0)),
+                    "mid_dn": pc.divide(pc.add(snaps.column("down_bid"), snaps.column("down_ask")), pa.scalar(2.0)),
+                    "spr_up": pc.subtract(snaps.column("up_ask"), snaps.column("up_bid")),
+                    "spr_dn": pc.subtract(snaps.column("down_ask"), snaps.column("down_bid")),
+                })
+                s = s.sort_by([("ts", "ascending"), ("condition_id", "ascending")])
+                _old_cpu = pa.cpu_count()
+                pa.set_cpu_count(1)  # first/last aggregators are single-threaded only
+                try:
+                    agg = s.group_by("condition_id").aggregate([
+                        ("mid_up", "first"), ("mid_up", "last"), ("mid_up", "min"), ("mid_up", "max"),
+                        ("mid_dn", "first"), ("mid_dn", "last"), ("mid_dn", "min"), ("mid_dn", "max"),
+                        ("spr_up", "mean"), ("spr_dn", "mean"), ("ts", "count"),
+                    ])
+                finally:
+                    pa.set_cpu_count(_old_cpu)
+                for r in agg.to_pylist():
+                    ohlc_by_cid[r["condition_id"]] = {
+                        "up_open": r["mid_up_first"], "up_close": r["mid_up_last"],
+                        "up_low": r["mid_up_min"], "up_high": r["mid_up_max"],
+                        "down_open": r["mid_dn_first"], "down_close": r["mid_dn_last"],
+                        "down_low": r["mid_dn_min"], "down_high": r["mid_dn_max"],
+                        "avg_spread_up": r["spr_up_mean"], "avg_spread_down": r["spr_dn_mean"],
+                        "snapshot_count": int(r["ts_count"] or 0),
+                    }
+            except Exception as e:
+                print(f"[export] WARN markets_summary snapshot aggregation failed: {e}")
+
+    # --- chainlink: underlying open/close = nearest tick to window boundary (≤5s) ---
+    ticks_by_asset: Dict[str, List] = {}
+    cl = _read_dataset_per_asset(base, "chainlink_events", None)
+    if cl is not None and cl.num_rows and {"asset", "ts_source", "price"}.issubset(set(cl.schema.names)):
+        for r in cl.select(["asset", "ts_source", "price"]).to_pylist():
+            a = r.get("asset")
+            p = r.get("price")
+            ts_str = r.get("ts_source")
+            if not a or p is None or not ts_str:
+                continue
+            try:
+                ts_ms = int(_dt2.datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() * 1000)
+            except Exception:
+                continue
+            ticks_by_asset.setdefault(a, []).append((ts_ms, float(p)))
+        for a in ticks_by_asset:
+            ticks_by_asset[a].sort(key=lambda x: x[0])
+
+    def _nearest_tick(asset: str, target_ms: Optional[int], tol_ms: int = 5000):
+        if target_ms is None:
+            return None, None
+        ticks = ticks_by_asset.get(asset or "", [])
+        if not ticks:
+            return None, None
+        ts_list = [t[0] for t in ticks]
+        i = bisect.bisect_left(ts_list, target_ms)
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(ticks):
+                d = abs(ticks[j][0] - target_ms)
+                if best is None or d < best[0]:
+                    best = (d, ticks[j])
+        if best is None or best[0] > tol_ms:
+            return None, None
+        ts_ms, price = best[1]
+        iso = _dt2.datetime.fromtimestamp(ts_ms / 1000, tz=_dt2.timezone.utc).isoformat().replace("+00:00", "Z")
+        return price, iso
+
+    rows = []
+    for m in markets:
+        cid = str(m.get("condition_id"))
+        asset = m.get("asset") or ""
+        start_ms = m.get("market_start_ts_ms")
+        end_ms = m.get("market_end_ts_ms")
+        try:
+            start_ms = int(start_ms) if start_ms is not None else None
+        except Exception:
+            start_ms = None
+        try:
+            end_ms = int(end_ms) if end_ms is not None else None
+        except Exception:
+            end_ms = None
+
+        def _iso_from_ms(ms, fallback):
+            if ms is None:
+                return fallback
+            try:
+                return _dt2.datetime.fromtimestamp(ms / 1000, tz=_dt2.timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                return fallback
+
+        start_iso = _iso_from_ms(start_ms, m.get("market_start_ts"))
+        end_iso = _iso_from_ms(end_ms, m.get("market_end_ts"))
+        o_open, o_open_ts = _nearest_tick(asset, start_ms)
+        o_close, o_close_ts = _nearest_tick(asset, end_ms)
+        ohlc = ohlc_by_cid.get(cid, {})
+        resolution = m.get("resolution_outcome")
+        if resolution in (None, "", "unknown"):
+            resolution = resolution or "unknown"
+        rows.append({
+            "condition_id": cid,
+            "asset": asset,
+            "slug": m.get("slug"),
+            "window_start_ts": start_iso,
+            "window_end_ts": end_iso,
+            "window_start_ts_ms": start_ms,
+            "window_end_ts_ms": end_ms,
+            "window_index": m.get("window_index"),
+            "up_token_id": m.get("up_token_id"),
+            "down_token_id": m.get("down_token_id"),
+            "resolution_outcome": resolution,
+            "settlement_price": m.get("settlement_price"),
+            "settlement_source": m.get("settlement_source"),
+            "underlying_open": o_open,
+            "underlying_open_ts_utc": o_open_ts,
+            "underlying_close": o_close,
+            "underlying_close_ts_utc": o_close_ts,
+            "up_open": ohlc.get("up_open"), "up_high": ohlc.get("up_high"),
+            "up_low": ohlc.get("up_low"), "up_close": ohlc.get("up_close"),
+            "down_open": ohlc.get("down_open"), "down_high": ohlc.get("down_high"),
+            "down_low": ohlc.get("down_low"), "down_close": ohlc.get("down_close"),
+            "traded_volume": vol_by_cid.get(cid),
+            "fill_count": fills_by_cid.get(cid),
+            "unique_traders": traders_by_cid.get(cid),
+            "avg_spread_up": ohlc.get("avg_spread_up"),
+            "avg_spread_down": ohlc.get("avg_spread_down"),
+            "snapshot_count": ohlc.get("snapshot_count"),
+        })
+    rows.sort(key=lambda r: (r.get("window_start_ts_ms") or 0, r.get("asset") or "", r.get("condition_id")))
+    return pa.Table.from_pylist(rows, schema=MARKETS_SUMMARY_SCHEMA)
 
 
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False) -> Optional[pa.Table]:
@@ -678,17 +1001,18 @@ def export_per_asset_single_file(
 
     Returns dict {relative_out_path: rows}
 
-    Note: The 3 global datasets (markets_log, collector_events, resync_episodes)
-    are always exported as single files in the Kaggle staging folder, even if
-    they contain 0 rows. This ensures the staging always has 38 files (7 assets x 5
-    per-asset + 3 globals) for the dataset gghgg1/polymarket-5m-crypto.
+    Note: The global datasets (markets_log, collector_events, resync_episodes)
+    and the derived markets_summary are always exported as single files in the
+    Kaggle staging folder, even if they contain 0 rows. This ensures the staging
+    always has 39 files (7 assets x 5 per-asset + 3 globals + 1 summary) for the
+    dataset gghgg1/polymarket-5m-crypto.
     """
     base = Path(data_dir)
     out = Path(out_dir) if out_dir else base / "export"
     out.mkdir(parents=True, exist_ok=True)
 
     if datasets is None:
-        datasets = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes"]
+        datasets = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes", "markets_summary"]
     if assets is None:
         # Always use the 7 known assets — hardcoded per plan.md §0
         # Do NOT discover dynamically from hive partitions, as this fails
@@ -702,6 +1026,31 @@ def export_per_asset_single_file(
 
     stats: dict = {}
     for ds in datasets:
+        # Derived analyst-facing summary — must run AFTER the per-asset trades
+        # staging files are (re)written so it sees the api- reconciled fills.
+        if ds == "markets_summary":
+            out_path = out / "markets_summary.parquet"
+            rel = str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)
+            table = build_markets_summary(base, staging_dir=out, assets=assets)
+            prior_rows_s = None
+            if out_path.exists():
+                try:
+                    prior_rows_s = read_table(out_path).num_rows
+                except Exception:
+                    prior_rows_s = None
+            new_rows_s = table.num_rows if table is not None else 0
+            if prior_rows_s is not None and prior_rows_s > 0 and (table is None or new_rows_s < prior_rows_s):
+                # markets only accumulate — a shrink means a transient read failure; keep prior
+                stats[rel] = prior_rows_s
+                continue
+            if table is None:
+                table = pa.table({f.name: [] for f in MARKETS_SUMMARY_SCHEMA}, schema=MARKETS_SUMMARY_SCHEMA)
+                new_rows_s = 0
+            tmp_path = out_path.with_suffix(".parquet.tmp")
+            pq.write_table(table, str(tmp_path), compression="zstd")
+            _os_replace_safe(tmp_path, out_path)
+            stats[rel] = new_rows_s
+            continue
         schema = _get_schema(ds, l2_levels)
         if ds in PER_ASSET_DATASETS:
             for asset in assets:
@@ -1090,7 +1439,7 @@ def export_timeframe_aggregates(
 
 
 # ------------------------------------------------------------------ Kaggle upload — 5m-only, single dataset, folder versioning
-# plan.md: single dataset gghgg1/polymarket-5m-crypto contains 7*5+3=38 files (all assets share same slug; per-asset: snapshots, clean view, book_events, trades, chainlink).
+# plan.md: single dataset gghgg1/polymarket-5m-crypto contains 7*5+4=39 files (all assets share same slug; per-asset: snapshots, clean view, book_events, trades, chainlink; global: markets, collector_events, resync_episodes, markets_summary).
 # Test mode uploads every 10 min (600s) gated on full closed markets only, safe delete after ready.
 
 try:
@@ -1196,7 +1545,7 @@ def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[st
             if not prior_files:
                 return
             prior_map = {p.name: p for p in prior_files}
-            for expected_name in [f"{a}_{ds}.parquet" for a in (assets or []) for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]] + ["markets.parquet", "collector_events.parquet", "resync_episodes.parquet"]:
+            for expected_name in [f"{a}_{ds}.parquet" for a in (assets or []) for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]] + ["markets.parquet", "collector_events.parquet", "resync_episodes.parquet", "markets_summary.parquet"]:
                 staging_path = staging / expected_name
                 prior_path = prior_map.get(expected_name)
                 if prior_path is None or not staging_path.exists():
@@ -1372,7 +1721,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         st = api.dataset_status(dataset)
                         s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
                         if s == "ready":
-                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 3
+                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4
                             _rows_ok = _verify_staging_row_counts(staging, expected_assets)
                             # Remote verification: ensure Kaggle actually stores expected files (not just local status)
                             # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
@@ -1410,7 +1759,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                     if not next_token:
                                         break
                                 # Check remote has at least expected parquets
-                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet"}
+                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet", "markets_summary.parquet"}
                                 if not expected_names.issubset(remote_names):
                                     _remote_ok = False
                                 if len(remote_names) < len(expected_names):
@@ -1424,7 +1773,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                             elif not _rows_ok:
                                 print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
                             elif not _files_ok:
-                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 3}; waiting for complete upload")
+                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 4}; waiting for complete upload")
                             elif not _remote_ok:
                                 print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
                         elif s in ("failed", "error"):
@@ -1460,9 +1809,9 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
 def _expected_staging_files(staging: Path) -> int:
     """Count expected parquet files in staging directory for Kaggle version."""
     parquet_files = [p for p in staging.glob("*.parquet") if not p.name.endswith(".tmp")]
-    # 7 assets x 5 per-asset datasets + 3 globals = 38 files
+    # 7 assets x 5 per-asset datasets + 3 globals + 1 summary = 39 files
     # per-asset: book_snapshots_500ms, book_events, trades, chainlink_events
-    # globals: markets_log, collector_events, resync_episodes
+    # globals: markets_log, collector_events, resync_episodes + derived markets_summary
     return len(parquet_files)
 
 
@@ -1485,6 +1834,7 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
         "markets_log": "markets.parquet",
         "collector_events": "collector_events.parquet",
         "resync_episodes": "resync_episodes.parquet",
+        "markets_summary": "markets_summary.parquet",
     }
     for asset in expected_assets:
         au = asset.upper()
@@ -1689,10 +2039,10 @@ def export_and_upload_all_kaggle(
     l2_levels: int = 20,
     dry_run: bool = False,
 ) -> dict:
-    """5m-only pipeline: export 7-asset staging (38 files) → Kaggle single dataset → safe prune.
+    """5m-only pipeline: export 7-asset staging (39 files) → Kaggle single dataset → safe prune.
 
     - Only full closed markets (market_end < now) are uploaded.
-    - Staging is cumulative: same filenames overwritten with larger parquet each version (38 files).
+    - Staging is cumulative: same filenames overwritten with larger parquet each version (39 files).
     - Kaggle upload uses folder versioning with retry 5 + jitter and status poll.
     - Safe delete only after ready, with 2h buffer, never deleting open window.
     Timeframe aggregation for 15m/1h removed (native only; 5m-only assumes 5m validates others).

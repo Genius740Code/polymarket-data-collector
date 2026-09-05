@@ -36,10 +36,11 @@ MARKETS_SCHEMA = pa.schema([
     pa.field("question", pa.string(), nullable=True),
     pa.field("resolution_rule", pa.string(), nullable=True),
     pa.field("resolution_source", pa.string(), nullable=True),
-    pa.field("tick_size", pa.float64(), nullable=True),
-    pa.field("minimum_order_size", pa.float64(), nullable=True),
+    pa.field("tick_size", pa.float64(), nullable=True),  # from Gamma orderPriceMinTickSize at discovery
+    pa.field("minimum_order_size", pa.float64(), nullable=True),  # backfilled from CLOB /markets/{cid} (resolution_backfill)
     pa.field("minimum_notional", pa.float64(), nullable=True),
-    pa.field("fee_information", pa.string(), nullable=True),
+    # fee_information / resolution_rule / resolution_source dropped 2026-09-05:
+    # never populated by Gamma or CLOB for 5m crypto markets (100% null forever)
     pa.field("reported_volume", pa.float64(), nullable=True),
     pa.field("reported_liquidity", pa.float64(), nullable=True),
     # §6A settlement ground truth
@@ -122,6 +123,7 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("old_ask_size", pa.float64(), nullable=True),
     pa.field("new_ask_size", pa.float64(), nullable=True),
     pa.field("threshold_config_id", pa.string(), nullable=True),
+    # sequence_number dropped 2026-09-05: CLOB market channel sends none (100% null)
 ])
 
 # §5 trades — time first, condition_id second, with transaction_hash + wallet fields (no RPC)
@@ -145,7 +147,7 @@ TRADES_SCHEMA = pa.schema([
     pa.field("fee_is_estimated", pa.bool_(), nullable=True),  # true if fee was 0.07% fallback, false if exchange reported
     pa.field("side", pa.string(), nullable=True),
     pa.field("aggressor_side", pa.string(), nullable=True),
-    pa.field("sequence_number", pa.int64(), nullable=True),
+    # sequence_number dropped 2026-09-05: CLOB sends no sequence numbers (100% null)
     # wallet — from CLOB trade payload (maker/taker proxy wallet), no RPC
     pa.field("maker_wallet", pa.string(), nullable=True),   # maker proxy wallet (0x...)
     pa.field("taker_wallet", pa.string(), nullable=True),   # taker proxy wallet (0x...)
@@ -153,6 +155,9 @@ TRADES_SCHEMA = pa.schema([
 ])
 
 # §6 chainlink_events — time first
+# twap/twap_window_seconds/round_id/sequence_number dropped 2026-09-05: the RTDS
+# payload carries none of them (100% null); rolling TWAP is a downstream derived
+# metric, not a stored column. report_id kept as the §6A settlement join key.
 CHAINLINK_SCHEMA = pa.schema([
     pa.field("ts_source", pa.string(), nullable=True),
     pa.field("ts_received_ns", pa.int64(), nullable=False),
@@ -161,11 +166,7 @@ CHAINLINK_SCHEMA = pa.schema([
     pa.field("symbol", pa.string(), nullable=True),
     pa.field("source", pa.string(), nullable=True),
     pa.field("price", pa.float64(), nullable=True),
-    pa.field("twap", pa.float64(), nullable=True),
-    pa.field("twap_window_seconds", pa.int64(), nullable=True),
     pa.field("report_id", pa.string(), nullable=True),
-    pa.field("round_id", pa.string(), nullable=True),
-    pa.field("sequence_number", pa.int64(), nullable=True),
 ])
 
 # §8 collector_events — time first, condition_id second
@@ -219,4 +220,48 @@ SCHEMAS = {
     "collector_events": COLLECTOR_EVENTS_SCHEMA,
     "resync_episodes": RESYNC_EPISODES_SCHEMA,
     "event_thresholds_config": THRESHOLDS_SCHEMA,
+    "markets_summary": None,  # derived export, built by export.build_markets_summary()
 }
+
+
+# Analyst-facing one-row-per-market summary (§Kaggle markets_summary.parquet).
+# Purely derived: every field is computed from the other datasets at export time.
+# Underlying open/close = nearest chainlink tick to the window boundary.
+# Outcome OHLC = mid price ((bid+ask)/2) from clean snapshots, first/last/min/max.
+# avg_spread = mean(ask - bid) across the window's clean snapshots per outcome.
+MARKETS_SUMMARY_SCHEMA = pa.schema([
+    pa.field("condition_id", pa.string(), nullable=False),
+    pa.field("asset", pa.string(), nullable=False),
+    pa.field("slug", pa.string(), nullable=True),
+    pa.field("window_start_ts", pa.string(), nullable=True),   # ISO8601
+    pa.field("window_end_ts", pa.string(), nullable=True),     # ISO8601
+    pa.field("window_start_ts_ms", pa.int64(), nullable=True),
+    pa.field("window_end_ts_ms", pa.int64(), nullable=True),
+    pa.field("window_index", pa.int64(), nullable=True),
+    pa.field("up_token_id", pa.string(), nullable=True),
+    pa.field("down_token_id", pa.string(), nullable=True),
+    pa.field("resolution_outcome", pa.string(), nullable=True),   # up | down | tie | unknown
+    pa.field("settlement_price", pa.float64(), nullable=True),
+    pa.field("settlement_source", pa.string(), nullable=True),
+    # underlying (chainlink) reference at window boundaries
+    pa.field("underlying_open", pa.float64(), nullable=True),
+    pa.field("underlying_open_ts_utc", pa.string(), nullable=True),
+    pa.field("underlying_close", pa.float64(), nullable=True),
+    pa.field("underlying_close_ts_utc", pa.string(), nullable=True),
+    # outcome-token OHLC (mid price from clean snapshots)
+    pa.field("up_open", pa.float64(), nullable=True),
+    pa.field("up_high", pa.float64(), nullable=True),
+    pa.field("up_low", pa.float64(), nullable=True),
+    pa.field("up_close", pa.float64(), nullable=True),
+    pa.field("down_open", pa.float64(), nullable=True),
+    pa.field("down_high", pa.float64(), nullable=True),
+    pa.field("down_low", pa.float64(), nullable=True),
+    pa.field("down_close", pa.float64(), nullable=True),
+    # activity
+    pa.field("traded_volume", pa.float64(), nullable=True),   # sum(price*size), trades incl. api- rows
+    pa.field("fill_count", pa.int64(), nullable=True),        # number of fills
+    pa.field("unique_traders", pa.int64(), nullable=True),    # distinct non-null wallet values
+    pa.field("avg_spread_up", pa.float64(), nullable=True),
+    pa.field("avg_spread_down", pa.float64(), nullable=True),
+    pa.field("snapshot_count", pa.int64(), nullable=True),    # clean snapshots contributing to OHLC
+])

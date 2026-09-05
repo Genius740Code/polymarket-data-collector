@@ -464,7 +464,7 @@ class ParquetWriter:
                 # bucket already aligned to 500ms grid; use it directly
                 return (row.get("asset"), row.get("condition_id"), int(int(bucket) // 500_000_000 * 500_000_000))
         if dataset == "chainlink_events":
-            rid = row.get("report_id") or row.get("round_id")
+            rid = row.get("report_id")
             if rid:
                 return (str(rid),)
         if dataset == "resync_episodes":

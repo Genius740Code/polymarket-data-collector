@@ -770,11 +770,14 @@ class Collector:
             initial_backoff_ms = 1_000
             max_backoff_ms = 60_000
             try:
-                # B-3 lesson learned: explicit ping_interval/ping_timeout made the
-                # connection churn WORSE (the server answers pings slowly; a tight
-                # timeout kills healthy sockets from our side). Defaults stay; the
-                # 150s planned recycle below bounds connection age instead.
-                async with websockets.connect(ws_url) as ws:
+                # WS resilience (docs/WS_RESILIENCE_RESEARCH.md §0): the 3-5min
+                # churn was OUR client closing on protocol-level ping timeouts —
+                # the server answers RFC6455 pings slowly because the documented
+                # heartbeat is an APPLICATION-level text "PING" every 10s instead.
+                # Disable library pings entirely and send the text heartbeat
+                # ourselves (started after the first subscribe: a PING before any
+                # subscribe earns close 1008 "invalid subscription payload").
+                async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
                     conn_established_ms = int(time.time() * 1000)
                     # planned recycle: close is OURS — no disconnect episode, no
                     # REST resync, no backoff; books relive from the fresh full book
@@ -796,24 +799,23 @@ class Collector:
                     except Exception:
                         pass
                     subscribed_tokens: set[str] = set()
-                    # R-1 (root cause): the CLOB IGNORES subscription updates on an
-                    # established connection — lookahead-subscribed next-window tokens
-                    # never receive a single message (measured live 2026-09-05: no
-                    # full-book for the new tokens until the next reconnect), so the
-                    # book sat stale until the boundary REST heal (+7.5s every window).
-                    # When new tokens appear on a non-fresh connection we drop the
-                    # connection; the reconnect resubscribes everything and gets full
-                    # books immediately — and thanks to the 60s lookahead this lands
-                    # well before the window boundary, keeping the boundary warm.
+                    # R-1 (SUPERSEDED, probed live 2026-09-05): the CLOB ignores a
+                    # repeated plain {"assets_ids":[...],"type":"market"} subscribe on
+                    # an established connection — BUT the documented
+                    # {"assets_ids":[...],"operation":"subscribe"} field hot-adds
+                    # tokens on the SAME connection (full book frame arrives
+                    # immediately; verified for same-asset and cross-asset adds).
+                    # New-window tokens are therefore added in place; no forced
+                    # reconnect at rollover anymore. The 150s recycle + boundary
+                    # REST heal remain as backstops.
                     subscribed_once = False
-                    needs_fresh_connection = False
 
                     async def _ensure_ws_subscription() -> bool:
                         """Subscribe to all active market tokens for this asset (§1 dual-tracking).
 
                         Returns True when new tokens were subscribed.
                         """
-                        nonlocal subscribed_once, needs_fresh_connection
+                        nonlocal subscribed_once
                         try:
                             markets = self.rollover.active_markets(asset)
                             tokens: list[str] = []
@@ -826,14 +828,20 @@ class Collector:
                             new_tokens = [t for t in tokens if t not in subscribed_tokens]
                             if not new_tokens:
                                 return False
-                            # Polymarket CLOB expects {"assets_ids": [...], "type": "market"}
-                            payload = json.dumps({"assets_ids": tokens, "type": "market"})
+                            if subscribed_once:
+                                # hot-add on the established connection (see R-1 note above)
+                                payload = json.dumps({
+                                    "assets_ids": new_tokens,
+                                    "operation": "subscribe",
+                                    "type": "market",
+                                    "custom_feature_enabled": True,
+                                })
+                            else:
+                                # Polymarket CLOB initial subscribe shape
+                                payload = json.dumps({"assets_ids": tokens, "type": "market"})
                             await ws.send(payload)
-                            added_on_established = subscribed_once
                             subscribed_once = True
-                            subscribed_tokens.update(tokens)
-                            if added_on_established:
-                                needs_fresh_connection = True
+                            subscribed_tokens.update(new_tokens)
                             if self.on_event:
                                 try:
                                     self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
@@ -885,17 +893,10 @@ class Collector:
                             except Exception:
                                 pass
                             self.books[market.condition_id] = _nb2
-                        # subscribe newly discovered market tokens
+                        # subscribe newly discovered market tokens (hot-add via
+                        # operation:subscribe — no reconnect needed, see R-1 note)
                         try:
-                            added = await _ensure_ws_subscription()
-                            if added and needs_fresh_connection:
-                                # token-add on an established connection is ignored by
-                                # the CLOB — drop it; the reconnect loop resubscribes
-                                # everything on a fresh socket (see note above)
-                                try:
-                                    await ws.close()
-                                except Exception:
-                                    pass
+                            await _ensure_ws_subscription()
                         except Exception:
                             pass
 
@@ -916,6 +917,45 @@ class Collector:
                             await asyncio.sleep(self.config.discovery_poll_interval_seconds)
 
                     disc_task = asyncio.create_task(_discovery_poller(), name=f"discovery-{asset}")
+
+                    # WS resilience (docs/WS_RESILIENCE_RESEARCH.md): app-level
+                    # heartbeat + data-staleness watchdog. The text "PING" proves
+                    # transport liveness; the watchdog proves DATA liveness —
+                    # py-clob-client#292 showed connections can stay
+                    # heartbeat-alive while market data silently dies.
+                    last_data_ns = time.time_ns()
+
+                    async def _heartbeat() -> None:
+                        # documented app-level heartbeat: text "PING" every 10s,
+                        # only AFTER the first subscribe (a PING before any
+                        # subscribe earns close 1008 "invalid subscription payload")
+                        while self._running:
+                            await asyncio.sleep(10)
+                            if subscribed_once:
+                                try:
+                                    await ws.send("PING")
+                                except Exception:
+                                    return
+
+                    hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{asset}")
+
+                    async def _staleness_watchdog() -> None:
+                        # 30s without any market-data frame → close the socket and
+                        # let the reconnect loop resubscribe with full books.
+                        while self._running:
+                            await asyncio.sleep(5)
+                            if time.time_ns() - last_data_ns > 30_000_000_000:
+                                if self.on_event:
+                                    try:
+                                        self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": "data_staleness_30s_forcing_reconnect"})
+                                    except Exception:
+                                        pass
+                                try:
+                                    await ws.close()
+                                except Exception:
+                                    return
+
+                    wd_task = asyncio.create_task(_staleness_watchdog(), name=f"ws-watchdog-{asset}")
 
                     try:
                         async for message in ws:
@@ -963,6 +1003,11 @@ class Collector:
                                         continue
                             except Exception:
                                 continue
+                            # any parsed frame counts as data liveness — the
+                            # app-level "PONG" reply is plain text, fails JSON,
+                            # and never reaches here (so a pong-alive/data-dead
+                            # socket still trips the watchdog)
+                            last_data_ns = time.time_ns()
 
                             # Validate WS message via shared validator
                             try:
@@ -1072,16 +1117,18 @@ class Collector:
                                 except Exception:
                                     pass
                     finally:
-                        try:
-                            disc_task.cancel()
-                        except Exception:
-                            pass
-                        try:
-                            await disc_task
-                        except asyncio.CancelledError:
-                            pass
-                        except Exception:
-                            pass
+                        for _t in (disc_task, hb_task, wd_task):
+                            try:
+                                _t.cancel()
+                            except Exception:
+                                pass
+                        for _t in (disc_task, hb_task, wd_task):
+                            try:
+                                await _t
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
                 # Connection closed — mark stale, request resync, then reconnect
                 # Real gap tracking: close gap on reconnect so gap_duration_ms is populated per AGENT.md honest gaps
                 if self._running:
@@ -1569,13 +1616,26 @@ class Collector:
                 # B-4: per-asset received/parsed counters answer "is the HYPE
                 # cadence upstream or are we dropping frames?" — printed with the
                 # raw frames archived so the question is decidable from data.
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=None, ping_timeout=None) as ws:
                     self._collector_event(CollectorEventType.connected, {"asset": "CHAINLINK", "connection_id": "chainlink"})
-                    # RTDS subscribe — request both chainlink topic variants defensively
+                    # RTDS heartbeat: documented app-level text "PING" every 5s
+                    # (docs/WS_RESILIENCE_RESEARCH.md §0/§1)
+                    async def _rtds_heartbeat() -> None:
+                        while self._running:
+                            await asyncio.sleep(5)
+                            try:
+                                await ws.send("PING")
+                            except Exception:
+                                return
+                    rtds_hb_task = asyncio.create_task(_rtds_heartbeat(), name="ws-heartbeat-RTDS")
+                    # RTDS subscribe — chainlink topic ONLY (cleanup 2026-09-05).
+                    # Both topics delivered identical cadence; `crypto_prices` carried
+                    # a ROUNDED duplicate of 6 assets (HYPE only exists on the
+                    # chainlink topic), which stored two interleaved price series per
+                    # tick. The chainlink topic alone covers all 7 assets.
                     try:
                         sub = _json.dumps({"action": "subscribe", "subscriptions": [
                             {"topic": "crypto_prices_chainlink", "type": "*"},
-                            {"topic": "crypto_prices", "type": "*"},
                         ]})
                         await ws.send(sub)
                     except Exception:
@@ -1658,7 +1718,6 @@ class Collector:
                                 "source": "chainlink_rtds",
                                 "timestamp": ts_source_iso,
                                 "report_id": body.get("hash") or body.get("reportId"),
-                                "round_id": body.get("roundId"),
                             }, asset, schema_version=self.config.schema_version)
                             row = ev.to_dict()
                             self.writer.append("chainlink_events", row, asset=asset)
@@ -1687,6 +1746,10 @@ class Collector:
                             print(f"[chainlink] rx={rx_count} messages, 0 parsed — sample: {str(message)[:300]}")
                         except Exception:
                             pass
+                    try:
+                        rtds_hb_task.cancel()
+                    except Exception:
+                        pass
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -2294,13 +2357,33 @@ class Collector:
                         and (m.market_start_ts_ms or 0) >= start_ms}
         discovered = len(elapsed_cids)
         expected_discovered = discovered * ticks_per_market
+        # Small cleanup: actual rows counted ONLY for discovered windows, so
+        # completeness reads ≤100% honestly. Rows belonging to other windows
+        # (the pre-discovered next window, pre-warm tails) are reported
+        # separately as "bonus rows" instead of inflating completeness.
+        def _rows_for_discovered(tbl):
+            if tbl is None or tbl.num_rows == 0 or not elapsed_cids or "condition_id" not in tbl.schema.names:
+                return 0
+            try:
+                _pa = __import__("pyarrow")
+                mask = _pa.compute.is_in(tbl.column("condition_id"),
+                                         value_set=_pa.array(sorted(elapsed_cids), type=_pa.string()))
+                return tbl.filter(mask).num_rows
+            except Exception:
+                return 0
+        actual_snaps_disc = _rows_for_discovered(snap_info.get("table"))
+        actual_clean_disc = _rows_for_discovered(report["datasets"]["book_snapshots_clean"].get("table"))
         checks["expected_book_snapshots"] = expected_discovered
         checks["expected_book_snapshots_if_all_windows"] = expected_snaps
         checks["discovered_windows_total"] = discovered
-        checks["actual_book_snapshots"] = snap_info["rows"]
-        checks["actual_clean_snapshots"] = report["datasets"]["book_snapshots_clean"]["rows"]
-        checks["snapshot_completeness_pct"] = round(100*snap_info["rows"]/expected_discovered,2) if expected_discovered else 0
-        checks["clean_completeness_pct"] = round(100*report["datasets"]["book_snapshots_clean"]["rows"]/expected_discovered,2) if expected_discovered else 0
+        checks["actual_book_snapshots"] = actual_snaps_disc if actual_snaps_disc else snap_info["rows"]
+        checks["actual_book_snapshots_total"] = snap_info["rows"]
+        checks["bonus_book_snapshots"] = max(0, snap_info["rows"] - checks["actual_book_snapshots"])
+        checks["actual_clean_snapshots"] = actual_clean_disc if actual_clean_disc else report["datasets"]["book_snapshots_clean"]["rows"]
+        checks["actual_clean_snapshots_total"] = report["datasets"]["book_snapshots_clean"]["rows"]
+        checks["bonus_clean_snapshots"] = max(0, report["datasets"]["book_snapshots_clean"]["rows"] - checks["actual_clean_snapshots"])
+        checks["snapshot_completeness_pct"] = round(100*checks["actual_book_snapshots"]/expected_discovered,2) if expected_discovered else 0
+        checks["clean_completeness_pct"] = round(100*checks["actual_clean_snapshots"]/expected_discovered,2) if expected_discovered else 0
         # completeness.py style report per asset if date partitions exist
         try:
             from .completeness import compute_daily_completeness
@@ -2312,7 +2395,6 @@ class Collector:
             s = snap_info["sample"]
             checks["sample_up_bid"] = s.get("up_bid")
             checks["sample_chainlink_price"] = report["datasets"]["chainlink_events"]["sample"].get("price") if report["datasets"]["chainlink_events"]["sample"] else None
-            checks["sample_chainlink_twap"] = report["datasets"]["chainlink_events"]["sample"].get("twap") if report["datasets"]["chainlink_events"]["sample"] else None
             depth_cols = [k for k in s.keys() if "depth" in k]
             checks["depth_columns_present"] = len(depth_cols)
             checks["book_state_sample"] = s.get("book_state")
@@ -2327,9 +2409,7 @@ class Collector:
         # chainlink checks
         cl = report["datasets"]["chainlink_events"]
         if cl["sample"]:
-            checks["chainlink_has_twap"] = cl["sample"].get("twap") is not None
             checks["chainlink_has_price"] = cl["sample"].get("price") is not None
-            checks["chainlink_twap_window"] = cl["sample"].get("twap_window_seconds")
         # collector_events gaps
         ce = report["datasets"]["collector_events"]
         if ce["rows"]:
@@ -2354,9 +2434,12 @@ class Collector:
                 tbl = report["null_analysis"]["resync_episodes"]["rows"]
             except Exception:
                 pass
-        # data loss summary: expected vs missing intervals
-        checks["missing_intervals"] = max(0, expected_snaps - checks["actual_clean_snapshots"])
-        checks["data_loss_pct"] = round(100*checks["missing_intervals"]/expected_snaps,2) if expected_snaps else 0
+        # data loss summary: expected vs missing intervals — expected uses the
+        # discovered windows (honest denominator; all-window count would count
+        # markets that were never discovered as "loss")
+        _eff_expected = expected_discovered if expected_discovered else expected_snaps
+        checks["missing_intervals"] = max(0, _eff_expected - checks["actual_clean_snapshots"])
+        checks["data_loss_pct"] = round(100*checks["missing_intervals"]/_eff_expected,2) if _eff_expected else 0
         # null loss for critical fields: top-of-book null % should be low if books have liquidity; high null => empty book side
         try:
             snap_null = report["null_analysis"].get("book_snapshots_500ms",{}).get("cols",{})
@@ -2374,7 +2457,7 @@ class Collector:
             kag_staging = base / "kaggle_staging" / "5m" / "gghgg1/polymarket-5m-crypto"
             if kag_staging.exists():
                 files = [f for f in kag_staging.glob("*.parquet") if not f.name.endswith(".tmp")]
-                report["kaggle_staging"] = {"exists": True, "files": len(files), "expected": len(self.config.assets)*5 + 3, "dataset": "gghgg1/polymarket-5m-crypto", "file_list": sorted([f.name for f in files])[:20]}
+                report["kaggle_staging"] = {"exists": True, "files": len(files), "expected": len(self.config.assets)*5 + 4, "dataset": "gghgg1/polymarket-5m-crypto", "file_list": sorted([f.name for f in files])[:20]}
                 # meta
                 meta = kag_staging / "dataset-metadata.json"
                 if meta.exists():

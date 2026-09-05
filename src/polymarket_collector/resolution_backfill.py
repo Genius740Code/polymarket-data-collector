@@ -37,8 +37,14 @@ def _now_iso() -> str:
 def fetch_official_outcome(condition_id: str) -> Optional[Dict]:
     """Official outcome from the CLOB: the token flagged ``winner`` post-settlement.
 
-    Returns {"outcome": "up"|"down", "price": float} or None when the market is
-    not yet settled (or the fetch fails) — the caller simply retries next run.
+    Also carries the market's CLOB trading parameters (minimum_tick_size,
+    minimum_order_size) — Chainlink cleanup: these were never populated (Gamma
+    does not expose minimum_order_size), and this is the one fetch per market
+    that already happens without touching the hot discovery path.
+
+    Returns {"outcome": "up"|"down", "price": float, "minimum_order_size": float|None,
+    "minimum_tick_size": float|None} or None when the market is not yet settled
+    (or the fetch fails) — the caller simply retries next run.
     """
     try:
         resp = httpx.get(CLOB_MARKET_URL.format(cid=condition_id), timeout=10,
@@ -51,6 +57,18 @@ def fetch_official_outcome(condition_id: str) -> Optional[Dict]:
     j = resp.json()
     if not j.get("closed"):
         return None
+
+    def _f(key: str) -> Optional[float]:
+        try:
+            v = j.get(key)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    params = {
+        "minimum_order_size": _f("minimum_order_size"),
+        "minimum_tick_size": _f("minimum_tick_size"),
+    }
     for tok in j.get("tokens") or []:
         if tok.get("winner"):
             outcome = str(tok.get("outcome") or "").strip().lower()
@@ -59,7 +77,7 @@ def fetch_official_outcome(condition_id: str) -> Optional[Dict]:
                     price = float(tok.get("price")) if tok.get("price") is not None else None
                 except Exception:
                     price = None
-                return {"outcome": outcome, "price": price}
+                return {"outcome": outcome, "price": price, **params}
     return None
 
 
@@ -111,6 +129,13 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
             "resolution_confirmed_at": _now_iso(),
             "resolution_ts": _now_iso(),
         })
+        # Chainlink cleanup: backfill the CLOB trading params on the same row
+        # update (tick_size only if Gamma left it null; minimum_order_size has
+        # no Gamma source at all)
+        if official.get("minimum_tick_size") is not None and not r.get("tick_size"):
+            new_row["tick_size"] = official["minimum_tick_size"]
+        if official.get("minimum_order_size") is not None:
+            new_row["minimum_order_size"] = official["minimum_order_size"]
         log.append(new_row)
         stats["resolved"] += 1
         print(f"[resolution-backfill] {r.get('asset')} w{r.get('window_index')} resolved {official['outcome']} (official)")
@@ -120,6 +145,18 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
         log.compact()
     print(f"[resolution-backfill] done: {stats}")
     return stats
+
+
+def run_trades_enrichment_second_pass(data_dir: str | Path, assets: List[str]) -> Dict:
+    """Enrichment round 2 (trades): fills indexed late → a pass ~15 min after
+    each export recovers wallet/outcome NULLs the first pass could not see.
+    Runs on this 15-min cron so no extra scheduler is needed. Best-effort."""
+    try:
+        from .storage.export import second_pass_enrich_trades
+        return second_pass_enrich_trades(data_dir, assets=assets)
+    except Exception as e:
+        print(f"[resolution-backfill] WARN trades enrichment second pass failed: {e}")
+        return {}
 
 
 def reupload_kaggle(data_dir: str | Path, assets: List[str], l2_levels: int = 20) -> bool:
@@ -144,10 +181,13 @@ def main() -> None:
     ap.add_argument("--data-dir", default=None, help="override storage.data_dir")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reupload", action="store_true", help="re-export staging + push a new Kaggle version after backfilling")
+    ap.add_argument("--skip-enrich", action="store_true", help="skip the trades enrichment second pass")
     args = ap.parse_args()
     cfg = CollectorConfig.load(args.config)
     data_dir = args.data_dir or cfg.storage.data_dir
     stats = backfill_resolutions(data_dir, dry_run=args.dry_run)
+    if not args.skip_enrich and not args.dry_run:
+        run_trades_enrichment_second_pass(data_dir, cfg.assets)
     if args.reupload and stats.get("resolved"):
         reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels)
 
