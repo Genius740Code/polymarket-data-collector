@@ -3,7 +3,7 @@
 ```text
 Start by syncing the repo and reading the mission:
 
-1. cd into the polymarket-data-collector repo and run `git pull` (fast-forward to the latest commit; if there are local changes, stash them first and re-apply after pull).
+1. cd into the polymarket-data-collector repo and run `git pull origin master` (fast-forward to the latest commit; if there are local changes, stash them first and re-apply after pull; if the remote is unreachable, continue from the latest local commit `87abbda`).
 2. Read `handoff.md` from the top — it is the authoritative mission brief. Also read `docs/WS_RESILIENCE_RESEARCH.md` and `DATA_CARD.md` when the checklist references them. Do NOT re-derive the "Verified live facts" listed there; they were measured against the production endpoints.
 
 Then execute the three phases described in handoff.md, in order:
