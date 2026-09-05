@@ -163,12 +163,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                         changed = True
                     except Exception:
                         pass
-                if r.get("fee") is None and r.get("notional") is not None:
-                    try:
-                        r["fee"] = float(r["notional"]) * 0.0007  # 0.07% crypto fee per user
-                        changed = True
-                    except Exception:
-                        pass
+                # fee stays NULL if not observed — real data only
                 if r.get("aggressor_side") is None and r.get("side"):
                     try:
                         r["aggressor_side"] = str(r["side"]).upper()
@@ -182,15 +177,8 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                     if len(tid) >= 32 and all(c in "0123456789abcdef" for c in tid.lower()[:8]):
                         r["transaction_hash"] = tid
                         changed = True
-                if r.get("sequence_number") is None and r.get("ts_source"):
-                    try:
-                        # ts_source like 1788000650548 as ms string
-                        ts = r["ts_source"]
-                        if isinstance(ts, str) and ts.isdigit():
-                            r["sequence_number"] = int(ts)
-                            changed = True
-                    except Exception:
-                        pass
+                # sequence_number stays NULL if not observed — real data only (no synthetic ts_source -> seq backfill per AGENT.md)
+                # previously fabricated seq from ts_source here; removed to preserve null honesty
                 # wallet backfill — no RPC, just normalize existing CLOB fields
                 # old data may have proxyWallet/wallet under different keys already flattened
                 if r.get("wallet") is None:
@@ -774,26 +762,9 @@ def prepare_kaggle_staging_5m(
     stats = export_per_asset_single_file(
         data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels, include_binance=False
     )
-    # --- download-merge: if local hive is empty (new machine) but Kaggle has prior version,
-    # merge prior rows to ensure cumulative history not lost. Best-effort, no crash if offline.
-    try:
-        _try_merge_prior_kaggle_staging(staging, dataset_prefix, assets, l2_levels)
-        # Re-count after merge (merge may have increased rows)
-        # Re-read stats from staging dir
-        _merged_stats = {}
-        for _p in staging.glob("*.parquet"):
-            if _p.name.endswith(".tmp"):
-                continue
-            try:
-                _t = pq.read_table(str(_p))
-                _key = str(_p.relative_to(base) if _p.is_relative_to(base) else _p)
-                _merged_stats[_key] = _t.num_rows
-            except Exception:
-                continue
-        if _merged_stats:
-            stats = _merged_stats
-    except Exception:
-        pass
+    # Real data only: never merge synthetic prior Kaggle data. If local hive is empty after
+    # clean delete, staging stays empty/minimal (3 globals). Merge disabled per AGENT.md.
+    # _try_merge_prior_kaggle_staging disabled — would resurrect old synthetic cl-*/synth-* rows.
     # Ensure markets_latest also available as markets_latest.parquet alias if needed for reference
     # but primary markets file is markets.parquet (from markets_log)
     row_counts = stats

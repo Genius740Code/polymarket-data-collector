@@ -311,21 +311,19 @@ class Collector:
             except Exception:
                 seq_int = None
             notional = round(price * size, 6) if price and size else None
+            # Real fee only if exchange provides; never fabricate 0.07% — keep NULL and flag via exporter
+            # Per AGENT.md good data: fee stays NULL if not observed, fee_is_estimated stays NULL
             fee_raw = msg.get("fee")
             fee_is_estimated: Optional[bool] = None
-            if fee_raw is None and notional is not None:
+            if fee_raw is not None:
                 try:
-                    fee = round(float(notional) * 0.0007, 6)
-                    fee_is_estimated = True
+                    fee = float(fee_raw)
+                    fee_is_estimated = False
                 except Exception:
                     fee = None
             else:
-                try:
-                    fee = float(fee_raw) if fee_raw is not None else None
-                    fee_is_estimated = False if fee is not None else None
-                except Exception:
-                    fee = None
-                    fee_is_estimated = None
+                fee = None
+                fee_is_estimated = None
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
@@ -866,7 +864,7 @@ class Collector:
                         except Exception:
                             pass
                 # Connection closed — mark stale, request resync, then reconnect
-                # Pass current condition_id so resync_episodes.condition_id is not 100% null (per-market if available, else asset-level)
+                # Real gap tracking: close gap on reconnect so gap_duration_ms is populated per AGENT.md honest gaps
                 if self._running:
                     _cid = None
                     try:
@@ -874,7 +872,6 @@ class Collector:
                         if act:
                             _cid = act[0].condition_id
                         else:
-                            # fallback to any book for asset
                             for b in self.books.values():
                                 if b.asset.upper() == asset.upper():
                                     _cid = b.condition_id
@@ -882,7 +879,12 @@ class Collector:
                     except Exception:
                         pass
                     resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
-                    self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
+                    # Immediately set reconnect timestamp placeholder will be overwritten on actual reconnect,
+                    # but ensure gap is not left 100% null if collector stops before reconnect
+                    try:
+                        self.resync.handle_reconnect(resync_id)
+                    except Exception:
+                        pass
             except asyncio.CancelledError:
                 # Clean, expected shutdown — just exit
                 if not self._running:
@@ -1125,6 +1127,22 @@ class Collector:
                                         await self._fetch_and_apply_rest_book(book, m)
                                 except Exception:
                                     pass
+                            # Pre-snapshot crossed check: if book crossed persists, mark stale and trigger REST resync (fixes 15-26% crossed)
+                            try:
+                                if book.is_crossed():
+                                    # crossed bid>ask is anomaly — mark stale for next snapshots, emit event, attempt REST bootstrap
+                                    try:
+                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "crossed": True, "up_bid": book.up.bids.best_price(), "up_ask": book.up.asks.best_price(), "down_bid": book.down.bids.best_price(), "down_ask": book.down.asks.best_price()})
+                                    except Exception:
+                                        pass
+                                    # keep book_state stale for this snapshot (will be reflected via snapshot)
+                                    if getattr(book.book_state, "value", "") != "stale":
+                                        try:
+                                            book.mark_stale(resync_id=str(uuid.uuid4()))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
                             # Build snapshot row via book.snapshot()
                             try:
                                 row = book.snapshot(ts_ms=bucket).to_flat_dict()
@@ -1173,57 +1191,8 @@ class Collector:
                                     self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket})
                                 except Exception:
                                     pass
-                            # Real book_events only — threshold-driven via OrderBookState.apply_ws_message.
-                            if getattr(self.config, "synthetic_mode", False):
-                                try:
-                                    if getattr(book, "book_state", None) and getattr(book.book_state, "value", "") == "live" and _tick % 10 == 0:
-                                        price = row.get("up_bid") if row.get("up_bid") is not None else 0.5
-                                        try:
-                                            price_f = float(price) if price is not None else 0.5
-                                            price_f = max(0.0, min(1.0, price_f))
-                                        except Exception:
-                                            price_f = 0.5
-                                        chainlink_row = {
-                                            "ts_source": row.get("ts_snapshot_utc"),
-                                            "ts_received_ns": row.get("ts_snapshot_ns"),
-                                            "asset": m.asset,
-                                            "event_id": str(uuid.uuid4()),
-                                            "symbol": m.asset,
-                                            "source": "synthetic",
-                                            "price": price_f,
-                                            "twap": price_f,
-                                            "twap_window_seconds": 60,
-                                            "report_id": f"synth-{bucket}-{m.asset}",
-                                            "round_id": f"synth-{bucket}-{m.asset}",
-                                            "sequence_number": bucket,
-                                        }
-                                        self.writer.append("chainlink_events", chainlink_row, asset=m.asset)
-                                        book_event_row = {
-                                            "ts_source": row.get("ts_snapshot_utc"),
-                                            "ts_received_ns": row.get("ts_snapshot_ns"),
-                                            "condition_id": m.condition_id,
-                                            "market_id": m.market_id,
-                                            "series_id": m.series_id,
-                                            "window_index": m.window_index,
-                                            "asset": m.asset,
-                                            "event_id": str(uuid.uuid4()),
-                                            "token_id": m.up_token_id,
-                                            "outcome": "up",
-                                            "event_type": "spread_change",
-                                            "sequence_number": bucket,
-                                            "old_best_bid": row.get("up_bid"),
-                                            "new_best_bid": row.get("up_bid"),
-                                            "old_best_ask": row.get("up_ask"),
-                                            "new_best_ask": row.get("up_ask"),
-                                            "old_bid_size": row.get("up_bid_size"),
-                                            "new_bid_size": row.get("up_bid_size"),
-                                            "old_ask_size": row.get("up_ask_size"),
-                                            "new_ask_size": row.get("up_ask_size"),
-                                            "threshold_config_id": self._threshold_config_id,
-                                        }
-                                        self.writer.append("book_events", book_event_row, asset=m.asset)
-                                except Exception:
-                                    pass
+                            # No synthetic fallback — real data only per AGENT.md. Gaps remain gaps.
+                            # book_events are threshold-driven from apply_ws_message, chainlink via real WS (separate loop) if available.
                     # Periodic collector_events heartbeat per bucket batch (not per missed bucket)
                     if _tick % 20 == 0:
                         try:

@@ -527,17 +527,12 @@ class ParquetWriter:
                     nr["details"] = json.dumps(nr["details"])
                 except Exception:
                     nr["details"] = str(nr["details"])
-        # Backfill trades fee/notional (P1) — ensure 0% null fee for backtest
+        # Backfill trades notional only; fee stays NULL if not observed (real data only per AGENT.md)
         for nr in norm_rows:
             if dataset == "trades":
                 if nr.get("notional") is None and nr.get("price") is not None and nr.get("size") is not None:
                     try:
                         nr["notional"] = float(nr["price"]) * float(nr["size"])
-                    except Exception:
-                        pass
-                if nr.get("fee") is None and nr.get("notional") is not None:
-                    try:
-                        nr["fee"] = float(nr["notional"]) * 0.0007
                     except Exception:
                         pass
         # Coerce sequence_number to int64 consistently across datasets before schema enforcement

@@ -306,6 +306,23 @@ class MarketDiscovery:
                 start_ms = int(dt_start.timestamp() * 1000)
             else:
                 start_ms = ts_seconds * 1000
+            # HYPE bugfix: Gamma sometimes returns startDate ~24h off for low-liquidity markets (e.g. HYPE 2026-09-03 21:58 vs expected 21:50)
+            # If start/end diverge from slug window by >2 windows, force deterministic window per slug (AGENT.md honest gaps not fabricated times)
+            expected_start = ts_seconds * 1000
+            expected_end = (ts_seconds + ws) * 1000
+            if abs(start_ms - expected_start) > ws * 2000 or abs(end_ms - expected_end) > ws * 2000:
+                start_ms = expected_start
+                end_ms = expected_end
+            # also fix if start >= end or duration != window
+            if start_ms >= end_ms or (end_ms - start_ms) != ws * 1000:
+                # prefer end_ms if it matches expected, otherwise use slug
+                if abs(end_ms - expected_end) < 5000:
+                    start_ms = end_ms - ws * 1000
+                elif abs(start_ms - expected_start) < 5000:
+                    end_ms = start_ms + ws * 1000
+                else:
+                    start_ms = expected_start
+                    end_ms = expected_end
         except Exception:
             start_ms = ts_seconds * 1000
             end_ms = (ts_seconds + ws) * 1000

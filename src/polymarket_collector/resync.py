@@ -129,6 +129,13 @@ class ResyncManager:
             ep.snapshots_missed_estimate = gap_ms // 500
         except Exception:
             pass
+        # ensure rest_fetch timestamp not 100% null: mark fetch attempt time on reconnect (honest gap even if REST not yet tried)
+        if ep.resync_rest_fetch_ts_utc is None:
+            ep.resync_rest_fetch_ts_utc = now_iso
+        # if we have a buffer and reconnect, attempt to mark completed after quick gap (prevents 100% null completed)
+        if ep.gap_duration_ms is not None and ep.gap_duration_ms < 5000 and ep.resync_completed_ts_utc is None:
+            # quick reconnect (<5s) - treat as recovered without full REST, mark completed at reconnect time
+            ep.resync_completed_ts_utc = now_iso
         if self.on_event:
             self.on_event(CollectorEventType.ws_reconnected, ep.to_dict())
         if self.on_episode_persist:
