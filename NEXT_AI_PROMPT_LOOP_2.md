@@ -83,11 +83,22 @@ KNOWN OPEN ITEMS (highest value first):
      are resolved or ~12 min elapse, THEN run the backfill + final re-upload. (Operator-side stopgap:
      run `python -m polymarket_collector.resolution_backfill --config config/collector.yaml
      --reupload` ~15 min after each test run — there is no pm2 cron on this box.)
-  3. **C2 maker-wallet backfill — BLOCKED ON OPERATOR CREDENTIALS.** No Alchemy/Graph/PolygonScan key
-     exists on this box. Once a key exists: Polymarket exchange subgraph (OrderFilled has maker+taker)
-     or Alchemy eth_getLogs on the two CTF Exchange contracts on Polygon; join key
-     (transaction_hash, price, size); fill through the existing `_writeback_enriched_trades` path.
-     Current fills: taker 80–99%, maker 14–78% (asset-dependent).
+  3. **C2 maker-wallet on-chain backfill — UNBLOCKED, key is in env.** `.env` (gitignored) holds
+     `ALCHEMY_POLYGON_URL=https://polygon-mainnet.g.alchemy.com/v2/...` — verified live 2026-09-06
+     (`eth_blockNumber` + `eth_getLogs` both work). NEVER commit the key or hardcode it in src; load
+     it from the env var only (python-dotenv or os.environ; `.env` is already in .gitignore).
+     Implementation: `eth_getLogs` on the Polymarket CTF Exchange contracts on Polygon — candidates
+     CTF Exchange `0x4bFb41d5B3570DeFd05fa795c73e2dE17C7073D0`, Neg Risk CTF Exchange
+     `0xC5d563A36AE78145C45a50134d48A1215220f80A` (verify addresses + the OrderFilled event topic0
+     from the official Polymarket docs/ABI before coding; the Neg Risk Adapter
+     `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` confirmed emitting logs on this key).
+     **Free-tier constraint (verified live): `eth_getLogs` accepts max a 10-block range per call**
+     (~20s of Polygon blocks) — page in ≤10-block chunks backwards from the fill's block timestamp,
+     and mind the free-tier CU budget (10-block pages of a busy exchange add up; probe a page first).
+     OrderFilled exposes maker+taker; join key to existing rows: (transaction_hash, price, size);
+     fill maker_wallet NULLs through the existing `_writeback_enriched_trades` path (NULLs only,
+     atomic per file, idempotent). Current fills: taker 80–99%, maker 14–78% (asset-dependent).
+     Start with a one-market probe before wiring it into second_pass_enrich_trades.
   4. **Crossed rows leaking into book_snapshots_clean** (4 rows SOL, 0.09%, in the final artifact):
      race between the pre-snapshot `is_crossed()` check and frames applied after it. Cheap fix:
      clean_view build (storage/clean_view.py) could exclude rows where bid >= ask, or the snapshot
