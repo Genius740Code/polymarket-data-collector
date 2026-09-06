@@ -142,49 +142,56 @@ class Collector:
         self._rtds_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"rx": 0, "parsed": 0})
 
     async def _recover_from_cursor(self) -> None:
-        """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap."""
+        """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap.
+
+        Multi-timeframe: one cursor row per (asset, tf) lane; each lane's book is
+        recreated with its own window width and series label.
+        """
         import datetime
-        print(f"[startup] recovering cursor state for assets: {self.config.assets}")
+        lanes = self.rollover.enabled_lane_labels()
+        print(f"[startup] recovering cursor state for assets: {self.config.assets} lanes: {lanes}")
         now_ms = int(time.time() * 1000)
         for asset in self.config.assets:
-            try:
-                store = CursorStore.for_asset(self.config, asset)
-                state = store.load(asset)
-                if state is None:
-                    print(f"[startup] no cursor for {asset}")
-                    continue
-                print(f"[startup] recovered cursor for {asset}: window={state.current_window_index} cid={state.current_condition_id} last_snap={state.last_snapshot_written_ts}")
-                if state.current_condition_id:
-                    age_ms = now_ms - (state.last_snapshot_written_ts or 0)
-                    # Heuristic: if last snapshot <10 min ago, market still active → recreate stale book for resync
-                    if age_ms < 600_000 and state.current_condition_id not in self.books:
-                        # Create minimal OrderBookState for the recovered market (will be resynced)
-                        try:
-                            book = OrderBookState(
-                                asset=asset,
-                                condition_id=state.current_condition_id,
-                                market_id=state.current_condition_id,
-                                series_id=f"{asset}-5m",
-                                window_index=state.current_window_index or 0,
-                                up_token_id=f"{state.current_condition_id}-UP",
-                                down_token_id=f"{state.current_condition_id}-DOWN",
-                                market_end_ts_ms=now_ms + 300_000,
-                                schema_version=self.config.schema_version,
-                                l2_levels=self.config.l2_levels,
-                            )
-                            book.mark_stale(resync_id=str(uuid.uuid4()))
-                            self.books[state.current_condition_id] = book
-                            self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "age_ms": age_ms, "recovered": True})
-                            print(f"[startup] recreated stale book for {asset} {state.current_condition_id}")
-                        except Exception as e:
-                            print(f"[startup] recreate book err {e}")
-                    elif age_ms >= 600_000:
-                        # Market ended while down → coverage_gap
-                        self._collector_event(CollectorEventType.coverage_gap, {"asset": asset, "condition_id": state.current_condition_id, "downtime_ms": age_ms})
-                        self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "downtime_ms": age_ms, "market_ended": True})
-                        print(f"[startup] coverage_gap for {asset} {state.current_condition_id} age {age_ms}ms")
-            except Exception as e:
-                print(f"[startup] no cursor state for {asset}: {e}")
+            for tf in lanes:
+                ws_lane = self.rollover.lane_ws.get(tf, self.config.window_size_seconds)
+                try:
+                    store = CursorStore.for_asset(self.config, asset)
+                    state = store.load(asset, window_label=tf)
+                    if state is None:
+                        print(f"[startup] no cursor for {asset} [{tf}]")
+                        continue
+                    print(f"[startup] recovered cursor for {asset} [{tf}]: window={state.current_window_index} cid={state.current_condition_id} last_snap={state.last_snapshot_written_ts}")
+                    if state.current_condition_id:
+                        age_ms = now_ms - (state.last_snapshot_written_ts or 0)
+                        # Heuristic: if last snapshot <10 min ago, market still active → recreate stale book for resync
+                        if age_ms < 600_000 and state.current_condition_id not in self.books:
+                            # Create minimal OrderBookState for the recovered market (will be resynced)
+                            try:
+                                book = OrderBookState(
+                                    asset=asset,
+                                    condition_id=state.current_condition_id,
+                                    market_id=state.current_condition_id,
+                                    series_id=f"{asset}-{tf}",
+                                    window_index=state.current_window_index or 0,
+                                    up_token_id=f"{state.current_condition_id}-UP",
+                                    down_token_id=f"{state.current_condition_id}-DOWN",
+                                    market_end_ts_ms=now_ms + ws_lane * 1000,
+                                    schema_version=self.config.schema_version,
+                                    l2_levels=self.config.l2_levels,
+                                )
+                                book.mark_stale(resync_id=str(uuid.uuid4()))
+                                self.books[state.current_condition_id] = book
+                                self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "age_ms": age_ms, "recovered": True})
+                                print(f"[startup] recreated stale book for {asset} [{tf}] {state.current_condition_id}")
+                            except Exception as e:
+                                print(f"[startup] recreate book err {e}")
+                        elif age_ms >= 600_000:
+                            # Market ended while down → coverage_gap
+                            self._collector_event(CollectorEventType.coverage_gap, {"asset": asset, "condition_id": state.current_condition_id, "downtime_ms": age_ms})
+                            self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "downtime_ms": age_ms, "market_ended": True})
+                            print(f"[startup] coverage_gap for {asset} [{tf}] {state.current_condition_id} age {age_ms}ms")
+                except Exception as e:
+                    print(f"[startup] no cursor state for {asset} [{tf}]: {e}")
 
     def _collector_event(self, event_type: CollectorEventType, details: dict) -> None:
         """Fire a collector_events row for data-quality tracking."""
@@ -587,59 +594,67 @@ class Collector:
             pass
 
     def _persist_cursor_sync(self) -> None:
-        """Persist cursor state to durable storage (§1B).
+        """Persist cursor state to durable storage (§1B) — one row per (asset, tf) lane.
 
-        Builds CursorState per asset from current rollover state + book
-        sequence numbers and saves via CursorStore. Previously was a no-op
-        (called non-existent sync), so crash recovery never worked.
+        Builds CursorState per lane from current rollover state + book
+        sequence numbers and saves via CursorStore.
         """
         import time as _time
         now_ms = int(_time.time() * 1000)
+        lanes = self.rollover.enabled_lane_labels()
         for asset, store in self.cursor_stores.items():
             try:
                 au = asset.upper()
-                state_obj = self.rollover.states.get(au)
-                cur = state_obj.current if state_obj else None
-                nxt = state_obj.next if state_obj else None
-                # Aggregate last sequence numbers from books for this asset
-                seqs: dict = {}
-                last_snap = None
-                for cid, book in self.books.items():
-                    if getattr(book, "asset", "").upper() == au:
-                        # merge book sequence_numbers
-                        for tok, seq in getattr(book, "sequence_numbers", {}).items():
-                            try:
-                                seqs[str(tok)] = int(seq)
-                            except Exception:
-                                pass
-                # Determine current_condition_id / window_index
-                if cur:
-                    cid = cur.condition_id
-                    widx = cur.window_index
-                    next_cid = nxt.condition_id if nxt else None
-                elif seqs or self.books:
-                    # fallback: pick any book for this asset
-                    fallback_cid = next((b.condition_id for b in self.books.values() if getattr(b, "asset", "").upper() == au), None)
-                    cid = fallback_cid
-                    widx = 0
-                    next_cid = None
-                else:
-                    # no market yet — still persist empty cursor with last_snap
-                    cid = None
-                    widx = 0
-                    next_cid = None
-                # last snapshot ts: use most recent book update or now
-                # Prefer rollover state's last_discovery or now
-                last_snap = now_ms
-                cs = CursorState(
-                    asset=au,
-                    current_window_index=int(widx),
-                    current_condition_id=cid,
-                    next_condition_id=next_cid,
-                    last_sequence_number_per_token=seqs,
-                    last_snapshot_written_ts=last_snap,
-                )
-                store.save(cs)
+                for tf in lanes:
+                    state_obj = self.rollover.state_for(au, tf)
+                    cur = state_obj.current if state_obj else None
+                    nxt = state_obj.next if state_obj else None
+                    # Aggregate last sequence numbers from books for this asset+lane
+                    # (books carry series_id "{ASSET}-{tf}" — the lane disambiguator)
+                    seqs: dict = {}
+                    last_snap = None
+                    lane_series = f"{au}-{tf}"
+                    for cid, book in self.books.items():
+                        if getattr(book, "asset", "").upper() == au and str(getattr(book, "series_id", "")) == lane_series:
+                            # merge book sequence_numbers
+                            for tok, seq in getattr(book, "sequence_numbers", {}).items():
+                                try:
+                                    seqs[str(tok)] = int(seq)
+                                except Exception:
+                                    pass
+                    # Determine current_condition_id / window_index
+                    if cur:
+                        cid = cur.condition_id
+                        widx = cur.window_index
+                        next_cid = nxt.condition_id if nxt else None
+                    elif seqs or self.books:
+                        # fallback: pick any book for this asset+lane
+                        fallback_cid = next(
+                            (b.condition_id for b in self.books.values()
+                             if getattr(b, "asset", "").upper() == au and str(getattr(b, "series_id", "")) == lane_series),
+                            None,
+                        )
+                        cid = fallback_cid
+                        widx = 0
+                        next_cid = None
+                    else:
+                        # no market yet — still persist empty cursor with last_snap
+                        cid = None
+                        widx = 0
+                        next_cid = None
+                    # last snapshot ts: use most recent book update or now
+                    # Prefer rollover state's last_discovery or now
+                    last_snap = now_ms
+                    cs = CursorState(
+                        asset=au,
+                        current_window_index=int(widx),
+                        current_condition_id=cid,
+                        next_condition_id=next_cid,
+                        last_sequence_number_per_token=seqs,
+                        last_snapshot_written_ts=last_snap,
+                        window_label=tf,
+                    )
+                    store.save(cs)
                 # ensure WAL checkpoint if shared_wal mode
                 try:
                     store.sync()
@@ -767,7 +782,7 @@ class Collector:
                             except Exception:
                                 pass
                             self.books[market.condition_id] = _nb
-                    await self.rollover.check_and_roll(asset, _sub)
+                    await self.rollover.check_and_roll_all(asset, _sub)
                 except Exception:
                     pass
                 await asyncio.sleep(self.config.discovery_poll_interval_seconds)
@@ -912,7 +927,7 @@ class Collector:
 
                     # Initial discovery before reading (ensure at least current market)
                     try:
-                        await self.rollover.check_and_roll(asset, _on_market)
+                        await self.rollover.check_and_roll_all(asset, _on_market)
                         await _ensure_ws_subscription()
                     except Exception:
                         pass
@@ -921,7 +936,7 @@ class Collector:
                     async def _discovery_poller() -> None:
                         while self._running:
                             try:
-                                await self.rollover.check_and_roll(asset, _on_market)
+                                await self.rollover.check_and_roll_all(asset, _on_market)
                             except Exception:
                                 pass
                             await asyncio.sleep(self.config.discovery_poll_interval_seconds)
@@ -1526,7 +1541,7 @@ class Collector:
                             try:
                                 row = book.snapshot(ts_ms=bucket).to_flat_dict()
                                 # Ensure is_rollover_window reflects current rollover state
-                                row["is_rollover_window"] = self.rollover.states[m.asset].is_rollover_window
+                                row["is_rollover_window"] = getattr(self.rollover.state_for_market(m), "is_rollover_window", False)
                             except Exception as e:
                                 # Preserve actual book_state (fixes 5a hard-coded live) and emit full schema row
                                 _bs = getattr(book, "book_state", None)
@@ -1549,7 +1564,7 @@ class Collector:
                                     "up_bid": None, "up_ask": None, "up_bid_size": None, "up_ask_size": None,
                                     "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
                                     "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
-                                    "is_rollover_window": self.rollover.states[m.asset].is_rollover_window,
+                                    "is_rollover_window": getattr(self.rollover.state_for_market(m), "is_rollover_window", False),
                                     "book_state": _bs_val,
                                     "resync_id": getattr(book, "resync_id", None),
                                     "book_crossed": False,
@@ -1901,6 +1916,22 @@ class Collector:
                             "reason": "no chainlink settlement data within max_resolution_wait_seconds",
                             "chainlink_events_seen": len(self._chainlink_events),
                         })
+                # 24/7 memory hygiene: evict in-RAM state for markets that ended
+                # >6h ago (resolution wait is 120s, snapshots already flushed;
+                # markets_log/export read the parquet, not these dicts). Without
+                # this, self.books/self.markets grow ~14k entries/day on the 5m
+                # lane alone and leak unboundedly.
+                evict_cutoff = now_ms - 6 * 3600 * 1000
+                evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
+                for cid in evict_cids:
+                    self.books.pop(cid, None)
+                    self.markets.pop(cid, None)
+                    self._closed_cids.discard(cid)
+                    self._resolved_cids.discard(cid)
+                    self._resolution_stuck_emitted.discard(cid)
+                    self._heal_inflight.discard(cid)
+                if evict_cids:
+                    print(f"[memory] evicted {len(evict_cids)} ended markets from RAM (books={len(self.books)}, markets={len(self.markets)})")
             except Exception:
                 pass
 
@@ -1962,6 +1993,12 @@ class Collector:
         # --- Align to next 5m boundary so we start on a fresh market, not halfway ---
         # Always align to ensure clean completeness (98%+). Waiting up to 5m is worth it for 2-market test.
         ws = self.config.test_mode.window_size_seconds  # 300
+        # Test mode collects exactly ONE timeframe lane (the test lane) so the
+        # completed-window counter isn't polluted by other lanes' markets.
+        from .config import CollectorConfig as _CC
+        test_tf = _CC.window_label_for(int(ws))
+        self.rollover.set_enabled_lanes([test_tf])
+        print(f"[test-mode:real] lane restricted to {test_tf} (window {ws}s)")
         window_ms = ws * 1000
         now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
         next_boundary_ms = ((now_ms // window_ms) + 1) * window_ms
@@ -2053,8 +2090,9 @@ class Collector:
                         export_and_upload_all_kaggle,
                         data_dir=self.config.storage.data_dir,
                         assets=self.config.assets,
-                        timeframe_labels=["5m"],
+                        timeframe_labels=[test_tf],
                         l2_levels=self.config.l2_levels,
+                        dataset_prefix=self.config.kaggle_dataset_for(test_tf),
                         dry_run=not _has_creds,
                     )
                     # Quick-test prune: after verified Kaggle ready, delete only closed markets.
@@ -2074,7 +2112,7 @@ class Collector:
                         if built_pruned == 0:
                             # built-in 2h prune kept everything (expected in 20min test); do test-buffer prune to demo delete
                             try:
-                                extra = _cleanup(self.config.storage.data_dir, assets=self.config.assets, timeframe_labels=["5m"], keep_seconds=120, checkpoint_ms=None)
+                                extra = _cleanup(self.config.storage.data_dir, assets=self.config.assets, timeframe_labels=[test_tf], keep_seconds=120, checkpoint_ms=None, rolling_window=True, retention_hours=0)
                                 if extra:
                                     print(f"[test-kaggle:{tag}] test-buffer prune (120s) extra: {extra} — closed markets only, open window kept")
                                     for k, v in extra.items():
@@ -2157,21 +2195,24 @@ class Collector:
                         last_kaggle_s += 60  # retry in 1 min
                 # update completed windows
                 for asset in self.config.assets:
-                    state = self.rollover.states.get(asset.upper())
-                    if not state:
-                        continue
-                    for cid, m in list(self.markets.items()):
-                        if m.asset.upper() != asset.upper():
+                    # test mode runs a single enabled lane; use its state
+                    _lane_tfs = self.rollover.enabled_lane_labels() or [self.rollover.primary_tf]
+                    for _tf in _lane_tfs:
+                        state = self.rollover.state_for(asset, _tf)
+                        if not state:
                             continue
-                        # R-1: the pre-warm tail window (discovered before the
-                        # boundary, snapshots gated off) is not one of the run's
-                        # num_markets windows — counting it would end the run a
-                        # window short.
-                        if (m.market_start_ts_ms or 0) < start_ms:
-                            continue
-                        now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
-                        if m.market_end_ts_ms < now_ms:
-                            completed_windows[asset].add(m.window_index)
+                        for cid, m in list(self.markets.items()):
+                            if m.asset.upper() != asset.upper():
+                                continue
+                            # R-1: the pre-warm tail window (discovered before the
+                            # boundary, snapshots gated off) is not one of the run's
+                            # num_markets windows — counting it would end the run a
+                            # window short.
+                            if (m.market_start_ts_ms or 0) < start_ms:
+                                continue
+                            now_ms = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
+                            if m.market_end_ts_ms < now_ms:
+                                completed_windows[asset].add(m.window_index)
                 # I-5: attribute missing markets in real time — a window that started
                 # >75s ago with no discovered market is a coverage_gap, not silence
                 now_ms_c = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
@@ -2571,10 +2612,13 @@ class Collector:
         return report
 
     async def _kaggle_upload_loop(self) -> None:
-        """5m-only Kaggle loop: single dataset gghgg1/polymarket-5m-crypto.
+        """Multi-timeframe Kaggle loop: one dataset per enabled timeframe lane.
 
         Prod: hourly (3600s). Test: every 10 min (600s) via config.kaggle.test_upload_interval_seconds.
-        Uses staging folder upload with retry 5 + status poll, only after Kaggle ready does safe prune.
+        Each tick iterates the enabled lanes and uploads that lane's dataset
+        (staging kaggle_staging/{tf}/, dataset from config.kaggle.datasets).
+        Uses staging folder upload with retry 5 + status poll; prune runs only
+        after verified ready (rolling-window mode, see cleanup_local_data).
         Starts with delay = interval (not immediate) to avoid empty first upload.
         """
         # Determine interval: prod hourly unless test_mode enabled
@@ -2587,7 +2631,8 @@ class Collector:
         # In run_test_mode, this loop is also started but we coordinate via _running flag
         # Validate creds once
         _has_creds = _validate_kaggle_config()
-        print(f"[kaggle] 5m-only dataset gghgg1/polymarket-5m-crypto interval {interval}s ({interval//60} min), creds={'ok' if _has_creds else 'missing (dry-run only)'}")
+        _tfs = self.rollover.enabled_lane_labels()
+        print(f"[kaggle] datasets for lanes {_tfs}: {[self.config.kaggle_dataset_for(t) for t in _tfs]} interval {interval}s ({interval//60} min), creds={'ok' if _has_creds else 'missing (dry-run only)'}")
         # Initial delay before first upload (so collector can discover markets)
         slept = 0
         while self._running and slept < interval:
@@ -2606,47 +2651,57 @@ class Collector:
                 if not has_data:
                     print("[kaggle] no hive data yet, skipping")
                 else:
-                    # Flush buffer under kaggle lock so staging includes in-memory rows (fixes 2b unflushed buffer)
-                    # Uses same lock as test mode and flush loop to avoid races with snapshot append
-                    if hasattr(self, "_kaggle_lock"):
-                        async with self._kaggle_lock:
-                            try:
-                                n = self.writer.flush()
-                                if n:
-                                    print(f"[kaggle loop] flushed {n} rows before staging (lock held)")
-                            except Exception as e:
-                                print(f"[kaggle loop] flush err {e}")
-                            try:
-                                self.markets_log.flush_staging()
-                            except Exception:
-                                pass
-                            try:
-                                self.markets_log.compact()
-                            except Exception:
-                                pass
+                    async def _upload_one(tf: str) -> None:
+                        # Flush buffer under kaggle lock so staging includes in-memory rows (fixes 2b unflushed buffer)
+                        # Uses same lock as test mode and flush loop to avoid races with snapshot append
+                        if hasattr(self, "_kaggle_lock"):
+                            async with self._kaggle_lock:
+                                try:
+                                    n = self.writer.flush()
+                                    if n:
+                                        print(f"[kaggle loop] flushed {n} rows before staging (lock held)")
+                                except Exception as e:
+                                    print(f"[kaggle loop] flush err {e}")
+                                try:
+                                    self.markets_log.flush_staging()
+                                except Exception:
+                                    pass
+                                try:
+                                    self.markets_log.compact()
+                                except Exception:
+                                    pass
+                                res = await asyncio.to_thread(
+                                    export_and_upload_all_kaggle,
+                                    data_dir=self.config.storage.data_dir,
+                                    assets=self.config.assets,
+                                    timeframe_labels=[tf],
+                                    l2_levels=self.config.l2_levels,
+                                    dataset_prefix=self.config.kaggle_dataset_for(tf),
+                                    dry_run=not _has_creds,
+                                )
+                        else:
                             res = await asyncio.to_thread(
                                 export_and_upload_all_kaggle,
                                 data_dir=self.config.storage.data_dir,
                                 assets=self.config.assets,
-                                timeframe_labels=["5m"],
+                                timeframe_labels=[tf],
                                 l2_levels=self.config.l2_levels,
+                                dataset_prefix=self.config.kaggle_dataset_for(tf),
                                 dry_run=not _has_creds,
                             )
-                    else:
-                        res = await asyncio.to_thread(
-                            export_and_upload_all_kaggle,
-                            data_dir=self.config.storage.data_dir,
-                            assets=self.config.assets,
-                            timeframe_labels=["5m"],
-                            l2_levels=self.config.l2_levels,
-                            dry_run=not _has_creds,
-                        )
-                    export_n = len(res.get("export", {}))
-                    kag = res.get("kaggle_uploads", {})
-                    succ = sum(1 for v in kag.values() if v.get("status")=="success")
-                    dry = sum(1 for v in kag.values() if v.get("status")=="dry_run")
-                    print(f"[kaggle] staging {export_n} files -> {kag} succ {succ} dry {dry} prune {res.get('cleanup',{})}")
-                    self._kaggle_uploads.append({"ts": int(time.time()), "interval": interval, "result": res})
+                        export_n = len(res.get("export", {}))
+                        kag = res.get("kaggle_uploads", {})
+                        succ = sum(1 for v in kag.values() if v.get("status")=="success")
+                        dry = sum(1 for v in kag.values() if v.get("status")=="dry_run")
+                        print(f"[kaggle:{tf}] staging {export_n} files -> {kag} succ {succ} dry {dry} prune {res.get('cleanup',{})}")
+                        self._kaggle_uploads.append({"ts": int(time.time()), "interval": interval, "tf": tf, "result": res})
+                        # Bounded: result dicts are nontrivial; keep only recent history
+                        if len(self._kaggle_uploads) > 200:
+                            del self._kaggle_uploads[:len(self._kaggle_uploads) - 200]
+                    for tf in self.rollover.enabled_lane_labels():
+                        if not self._running:
+                            break
+                        await _upload_one(tf)
                 # Sleep interval with early-exit check every 5s
                 slept2 = 0
                 while self._running and slept2 < interval:

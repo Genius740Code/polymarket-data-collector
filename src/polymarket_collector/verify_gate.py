@@ -209,6 +209,68 @@ async def run_gate(config_path: Optional[str] = None, ws_url: Optional[str] = No
     return result
 
 
+def probe_timeframes(assets: List[str], timeframes: List[str], timeout_s: float = 10.0) -> Dict[str, Any]:
+    """§7 gate — confirm each timeframe's up/down series actually exists on Gamma.
+
+    plan.md requires live confirmation BEFORE enabling a native timeframe lane:
+    "promote to 5 windows after §18 gate confirms 1h/4h/1d Gamma liquidity".
+    Queries the deterministic slug {asset}-updown-{label}-{current_window_ts} for
+    the CURRENT window of each (asset, timeframe) and reports existence +
+    reported volume/liquidity. A timeframe is probe-OK when at least half the
+    assets resolve a live market.
+
+    Returns dict {timeframe: {asset: {found, volume, liquidity, slug, end}}}
+    plus a per-TF "enabled_recommendation". Never fabricates: a missing slug
+    means the lane stays off.
+    """
+    import httpx
+
+    from .config import CollectorConfig as _CC
+
+    GAMMA = "https://gamma-api.polymarket.com/markets"
+    now_ms = int(time.time() * 1000)
+    results: Dict[str, Any] = {}
+    for tf in timeframes:
+        tf = str(tf).lower()
+        try:
+            ws = _CC.window_size_for(tf)
+        except ValueError:
+            results[tf] = {"error": "unknown timeframe"}
+            continue
+        ts = now_ms // 1000 // ws * ws
+        per_asset: Dict[str, Any] = {}
+        found_count = 0
+        for asset in assets:
+            slug = f"{asset.lower()}-updown-{tf}-{ts}"
+            entry: Dict[str, Any] = {"slug": slug, "found": False}
+            try:
+                resp = httpx.get(GAMMA, params={"slug": slug}, timeout=timeout_s)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    m = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+                    if isinstance(m, dict) and m.get("conditionId"):
+                        entry["found"] = True
+                        entry["condition_id"] = m.get("conditionId")
+                        entry["end"] = m.get("endDate")
+                        entry["active"] = bool(m.get("active"))
+                        entry["volume"] = m.get("volumeNum") or m.get("volume")
+                        entry["liquidity"] = m.get("liquidityNum") or m.get("liquidity")
+            except Exception as e:
+                entry["error"] = repr(e)
+            if entry.get("found"):
+                found_count += 1
+            per_asset[asset.upper()] = entry
+        results[tf] = {
+            "assets": per_asset,
+            "found_count": found_count,
+            "assets_total": len(assets),
+            "enabled_recommendation": found_count * 2 >= len(assets),
+        }
+        rec = "ENABLE" if results[tf]["enabled_recommendation"] else "KEEP OFF"
+        print(f"[probe:{tf}] {found_count}/{len(assets)} assets have a live {tf} market at ts={ts} -> {rec}")
+    return results
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Verification gate — §18 (answer BEFORE building §1A)")
     ap.add_argument("--config", default=None, help="path to collector.yaml")
@@ -216,7 +278,28 @@ def main() -> None:
     ap.add_argument("--rest-book-url", default=None)
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--live", action="store_true", help="run live WS/REST probes (requires network)")
+    ap.add_argument("--probe-timeframes", action="store_true",
+                    help="§7 gate: probe Gamma for 5m/15m/1h/4h/1d up/down series existence + liquidity")
+    ap.add_argument("--assets", nargs="*", default=None, help="assets for --probe-timeframes (default config assets)")
+    ap.add_argument("--timeframes", nargs="*", default=["5m", "15m", "1h", "4h", "1d"],
+                    help="timeframes for --probe-timeframes")
     args = ap.parse_args()
+
+    if args.probe_timeframes:
+        from .config import CollectorConfig as _CC
+        cfg = _CC.load(args.config) if args.config else _CC.load()
+        assets = args.assets or cfg.assets
+        res = probe_timeframes(assets, args.timeframes)
+        enabled = [tf for tf, v in res.items() if isinstance(v, dict) and v.get("enabled_recommendation")]
+        print("\n=== TIMEFRAME PROBE RESULT ===")
+        print(f"enabled (probe-OK): {enabled}")
+        print(f"keep OFF: {[t for t in res if t not in enabled]}")
+        print(f"Configure timeframes: {enabled} and matching kaggle.datasets entries.")
+        if args.json_out:
+            with open(args.json_out, "w") as f:
+                json.dump(res, f, indent=2)
+            print(f"Wrote {args.json_out}")
+        return
 
     async def run():
         if args.live:

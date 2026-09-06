@@ -35,6 +35,10 @@ event_thresholds:
   spread_change_threshold: 0.002
 kaggle:
   dataset_prefix: gghgg1/polymarket-5m-crypto
+  # one dataset per timeframe lane (plan.md §1.1 confirmed slugs)
+  rolling_window: true
+  # leeway kept locally after a VERIFIED upload before deletion
+  local_retention_hours: 48
   test_upload_interval_seconds: 600
   upload_interval_seconds: 3600
 l2_levels: 10
@@ -92,6 +96,14 @@ watchdog:
   heartbeat_interval_seconds: 5
   heartbeat_stale_seconds: 15
 window_size_seconds: 300
+# Multi-timeframe lanes. ONLY enable after verify-gate --probe-timeframes
+# reports ENABLE for a lane (probed 2026-09-06: 5m/15m/4h live on all 7 assets;
+# 1h/1d up/down series do not exist on Gamma yet — keep OFF).
+timeframes:
+  - 5m
+  - 15m
+  - 4h
+
 ws:
   full_book_diff_interval_seconds: 300
   full_book_diff_tolerance: 0.01

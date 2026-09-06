@@ -591,6 +591,7 @@ def build_markets_summary(
     data_dir: str | Path,
     staging_dir: str | Path | None = None,
     assets: List[str] | None = None,
+    timeframe_label: Optional[str] = None,
 ) -> pa.Table:
     """Build the analyst-facing markets summary table (one row per condition_id).
 
@@ -602,6 +603,10 @@ def build_markets_summary(
     condition_id/asset — missing ingredients stay NULL, never zero-filled.
     The tolerance actually applied is recorded per row in
     underlying_open_tolerance_s / underlying_close_tolerance_s.
+
+    timeframe_label: when set, only markets of that window size are emitted
+    (multi-timeframe hive is shared; lane identity comes from the
+    window_size_seconds column in markets_latest).
     """
     UNDERLYING_OPEN_TOL_MS = 10_000  # match resolution loop K-2 open tolerance
     UNDERLYING_CLOSE_TOL_MS = 5_000
@@ -617,6 +622,24 @@ def build_markets_summary(
     markets = _load_markets_latest_rows(base)
     if not markets:
         return _empty()
+
+    # multi-timeframe: keep only this lane's markets (markets_latest carries
+    # window_size_seconds; the hive is shared across lanes). Legacy rows with a
+    # NULL window_size_seconds are all 5m-era, so they belong to the 5m lane.
+    if timeframe_label is not None:
+        try:
+            from ..config import CollectorConfig as _CC
+            want_ws = _CC.window_size_for(timeframe_label)
+        except Exception:
+            want_ws = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(timeframe_label)
+        if want_ws is not None:
+            markets = [
+                m for m in markets
+                if m.get("window_size_seconds") == want_ws
+                or (m.get("window_size_seconds") is None and timeframe_label == "5m")
+            ]
+        if not markets:
+            return _empty()
 
     # --- trades: volume / fill count / unique traders per condition_id ---
     vol_by_cid: Dict[str, float] = {}
@@ -786,8 +809,14 @@ def build_markets_summary(
     return pa.Table.from_pylist(rows, schema=MARKETS_SUMMARY_SCHEMA)
 
 
-def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False) -> Optional[pa.Table]:
-    """Read all parquet files for dataset (+ optional asset filter)."""
+def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None) -> Optional[pa.Table]:
+    """Read all parquet files for dataset (+ optional asset filter).
+
+    timeframe_label: when set, keep only rows whose series_id matches
+    "{ASSET}-{label}" — the multi-timeframe lane filter. Datasets without a
+    series_id column (chainlink_events, globals) are returned unfiltered so the
+    shared per-asset feed ships to every TF dataset (plan.md §2.2).
+    """
     base = data_dir / dataset
     if not base.exists():
         return None
@@ -859,6 +888,14 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             print(f"[export] ERROR all {len(patterns)} files failed for {dataset} asset={asset} — aborting read")
         return None
     combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
+    # multi-timeframe lane filter — applied once on the combined table
+    if timeframe_label is not None and asset and "series_id" in combined.schema.names:
+        try:
+            want = f"{asset.upper()}-{timeframe_label}"
+            mask = pc.equal(combined.column("series_id"), pa.scalar(want))
+            combined = combined.filter(mask)
+        except Exception as e:
+            print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
     if dataset == "chainlink_events" and not include_binance and "source" in combined.schema.names:
         try:
@@ -1045,10 +1082,18 @@ def export_per_asset_single_file(
     assets: List[str] | None = None,
     l2_levels: int = 10,
     include_binance: bool = False,
+    timeframe_label: Optional[str] = None,
+    rolling_window: bool = False,
 ) -> dict:
     """Export one flat parquet per asset per dataset (Kaggle style).
 
     Returns dict {relative_out_path: rows}
+
+    timeframe_label: filter per-asset datasets (and markets_log) to this
+    timeframe lane via series_id / window_size_seconds; None = no filter
+    (legacy single-TF behavior).
+    rolling_window: when True the prior-staging monotonic guard is skipped —
+    with a retention pruned hive the staging legitimately shrinks over time.
 
     Note: The global datasets (markets_log, collector_events, resync_episodes)
     and the derived markets_summary are always exported as single files in the
@@ -1080,7 +1125,7 @@ def export_per_asset_single_file(
         if ds == "markets_summary":
             out_path = out / "markets_summary.parquet"
             rel = str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)
-            table = build_markets_summary(base, staging_dir=out, assets=assets)
+            table = build_markets_summary(base, staging_dir=out, assets=assets, timeframe_label=timeframe_label)
             prior_rows_s = None
             if out_path.exists():
                 try:
@@ -1088,7 +1133,7 @@ def export_per_asset_single_file(
                 except Exception:
                     prior_rows_s = None
             new_rows_s = table.num_rows if table is not None else 0
-            if prior_rows_s is not None and prior_rows_s > 0 and (table is None or new_rows_s < prior_rows_s):
+            if not rolling_window and prior_rows_s is not None and prior_rows_s > 0 and (table is None or new_rows_s < prior_rows_s):
                 # markets only accumulate — a shrink means a transient read failure; keep prior
                 stats[rel] = prior_rows_s
                 continue
@@ -1104,10 +1149,12 @@ def export_per_asset_single_file(
         if ds in PER_ASSET_DATASETS:
             for asset in assets:
                 au = asset.upper()
-                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance)
+                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance, timeframe_label=timeframe_label)
                 out_path = out / f"{au}_{ds}.parquet"
                 # --- never overwrite non-empty staging with empty/smaller data (cumulative history guard) ---
-                # Load prior staging first to enforce monotonic row-count (never shrink)
+                # Load prior staging first to enforce monotonic row-count (never shrink).
+                # Skipped in rolling_window mode: after a retention prune the staging
+                # legitimately shrinks — freezing prior rows would ship deleted data forever.
                 prior_rows = None
                 prior_exists = out_path.exists()
                 if prior_exists:
@@ -1119,7 +1166,7 @@ def export_per_asset_single_file(
                 new_rows = table.num_rows if (table is not None) else 0
                 # If prior has data, never replace it with fewer rows (empty read, transient error, or legitimate 0)
                 # This prevents 1a empty-file overwrite and guarantees cumulative history
-                if prior_rows is not None and prior_rows > 0:
+                if not rolling_window and prior_rows is not None and prior_rows > 0:
                     if table is None or new_rows < prior_rows:
                         # Transient read error or incomplete export would shrink history — preserve prior
                         stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows
@@ -1177,11 +1224,23 @@ def export_per_asset_single_file(
             table = _read_dataset_per_asset(base, ds, None, include_binance=include_binance)
             if ds == "markets_log":
                 out_path = out / "markets.parquet"
+                # markets_log rows carry window_size_seconds — keep only this lane's
+                # markets (NULL window_size_seconds rows are legacy 5m-era data)
+                if timeframe_label is not None and table is not None and table.num_rows > 0 and "window_size_seconds" in table.schema.names:
+                    try:
+                        from ..config import CollectorConfig as _CC
+                        want_ws = _CC.window_size_for(timeframe_label)
+                        col = table.column("window_size_seconds")
+                        keep = pc.or_(pc.equal(col, pa.scalar(want_ws)),
+                                      pc.and_(pc.is_null(col), pa.scalar(timeframe_label == "5m")))
+                        table = table.filter(pc.fill_null(keep, False))
+                    except Exception as e:
+                        print(f"[export] WARN markets_log timeframe filter failed (tf={timeframe_label}): {e}")
             elif ds == "collector_events":
                 out_path = out / "collector_events.parquet"
             else:  # resync_episodes
                 out_path = out / "resync_episodes.parquet"
-            # Monotonic guard for globals too: never shrink
+            # Monotonic guard for globals too: never shrink (skipped in rolling mode)
             prior_rows_g = None
             if out_path.exists():
                 try:
@@ -1190,7 +1249,7 @@ def export_per_asset_single_file(
                 except Exception:
                     prior_rows_g = None
             new_rows_g = table.num_rows if (table is not None and hasattr(table, "num_rows")) else 0
-            if prior_rows_g is not None and prior_rows_g > 0 and (table is None or new_rows_g < prior_rows_g):
+            if not rolling_window and prior_rows_g is not None and prior_rows_g > 0 and (table is None or new_rows_g < prior_rows_g):
                 stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = prior_rows_g
                 continue
             if table is not None and table.num_rows > 0:
@@ -1526,23 +1585,33 @@ def prepare_kaggle_staging_5m(
     assets: List[str] | None = None,
     l2_levels: int = 10,
     dataset_prefix: str = "gghgg1/polymarket-5m-crypto",
+    timeframe_label: str = "5m",
+    rolling_window: bool = False,
 ) -> dict:
     """Prepare Kaggle staging folder for 5m-only upload.
 
     Exports per-asset single files (time-first, zstd, no binance) into a flat staging
     folder with dataset-metadata.json (CC BY-NC-SA 4.0) ready for folder upload.
 
-    Returns dict with staging_path, files (31 for 7 assets), row_counts.
+    timeframe_label: which timeframe lane to export (filters rows by series_id;
+    the shared hive carries all lanes). Also names the default staging path
+    kaggle_staging/{label}/<dataset_prefix>.
+    rolling_window: allow staging to shrink when data exited the retention
+    window (the legacy cumulative monotonic guard would otherwise freeze stale
+    rows in staging forever).
+
+    Returns dict with staging_path, files (39 for 7 assets), row_counts.
     """
     base = Path(data_dir)
     if assets is None:
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
-    staging = Path(staging_dir) if staging_dir else base / "kaggle_staging" / "5m" / dataset_prefix
+    staging = Path(staging_dir) if staging_dir else base / "kaggle_staging" / timeframe_label / dataset_prefix
     staging.mkdir(parents=True, exist_ok=True)
 
-    # Export per-asset 5m files directly into staging (not intermediate export/)
+    # Export per-asset TF-lane files directly into staging (not intermediate export/)
     stats = export_per_asset_single_file(
-        data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels, include_binance=False
+        data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels,
+        include_binance=False, timeframe_label=timeframe_label, rolling_window=rolling_window,
     )
     # Real data only: never merge synthetic prior Kaggle data. If local hive is empty after
     # clean delete, staging stays empty/minimal (3 globals). Merge disabled per AGENT.md.
@@ -1551,10 +1620,10 @@ def prepare_kaggle_staging_5m(
     # but primary markets file is markets.parquet (from markets_log)
     row_counts = stats
     # Write dataset-metadata.json
-    resources = [{"path": Path(k).name, "description": f"{Path(k).name} 5m crypto — {dataset_prefix}"} for k in stats.keys()]
+    resources = [{"path": Path(k).name, "description": f"{Path(k).name} {timeframe_label} crypto — {dataset_prefix}"} for k in stats.keys()]
     # Ensure markets.parquet + per-asset files are all listed; add if missing due to empty
     meta = {
-        "title": "Polymarket 5m Crypto",
+        "title": f"Polymarket {timeframe_label} Crypto",
         "id": dataset_prefix,
         "licenses": [{"name": "CC BY-NC-SA 4.0"}],
         "resources": resources,
@@ -1710,7 +1779,7 @@ def upload_to_kaggle(
     return False
 
 
-def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, expected_assets: List[str] | None = None) -> bool:
+def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, expected_assets: List[str] | None = None, check_monotonic: bool = True) -> bool:
     """Folder upload with retry 5× jitter and dataset_status polling (plan.md §5).
 
     If expected_assets is provided, verify staging row counts after status=ready
@@ -1803,7 +1872,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         s = ""
                     if s == "ready":
                         _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4
-                        _rows_ok = _verify_staging_row_counts(staging, expected_assets)
+                        _rows_ok = _verify_staging_row_counts(staging, expected_assets, check_monotonic=check_monotonic)
                         # Remote verification: ensure Kaggle actually stores expected files (not just local status)
                         # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
                         _remote_ok = True
@@ -1893,7 +1962,7 @@ def _expected_staging_files(staging: Path) -> int:
     return len(parquet_files)
 
 
-def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> bool:
+def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_monotonic: bool = True) -> bool:
     """Verify staging file existence and row-count policy.
 
     - book_snapshots_500ms must have >0 rows per active asset (critical null vs zero check;
@@ -1901,8 +1970,10 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
     - trades/book_events/chainlink_events may legitimately be 0 rows early (no trades yet)
       so only existence + readable parquet required; we do NOT block upload if 0
     - globals existence only
-    - Also enforces monotonic: if _kaggle_state.json records prior staging row counts,
-      current must be >= prior (never shrink). This catches empty-file overwrite (1a).
+    - Also enforces monotonic (check_monotonic=True): if _kaggle_state.json records prior
+      staging row counts, current must be >= prior (never shrink). This catches
+      empty-file overwrite (1a). DISABLED in rolling_window mode — after a retention
+      prune the staging legitimately shrinks; history lives in old Kaggle versions.
     Returns True if all expected files exist, False otherwise.
     """
     # Only snapshots are required >0; other per-asset datasets allow 0 (null vs zero fix 4b)
@@ -1943,6 +2014,8 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str]) -> boo
         except Exception:
             return False
     # Monotonic check vs prior staging (download-merge fallback when no local hive yet)
+    if not check_monotonic:
+        return True
     try:
         state_path = staging.parent.parent / "_kaggle_state.json"
         if not state_path.exists():
@@ -2012,15 +2085,31 @@ def cleanup_local_data(
     keep_seconds: int = 3600,
     checkpoint_ms: int | None = None,
     buffer_seconds: int | None = None,
+    rolling_window: bool | None = None,
+    retention_hours: int | None = None,
+    dry_run: bool = False,
 ) -> dict:
-    """Safe post-upload cleanup — only delete data older than buffer, fail closed.
+    """Post-upload local prune — rolling-window mode (market-end aware, fail closed).
 
-    **CRITICAL CHANGE**: Never automatically delete local hive partitions after Kaggle upload.
-    Previously, data older than the 2h buffer was deleted, causing permanent data loss
-    from future Kaggle versions. Now: data is retained indefinitely; only files with
-    market_end_ts_ms in the far future are protected, and all other files are kept.
+    Called ONLY after a verified Kaggle upload. Deletes local parquet files whose
+    every row is (a) from a market that ENDED before the cutoff and (b) therefore
+    already included in at least one uploaded version. The cutoff is
+    ``min(now, upload_checkpoint) - retention_hours`` — the retention is the
+    "leeway" window kept locally just in case.
 
-    The buffer parameter is retained for config compatibility but has no deleting effect.
+    Semantics per file (never per row — files are the delete unit after compaction):
+    - condition-bearing datasets (snapshots, clean view, book_events, trades):
+      delete only if EVERY condition_id in the file maps to a market that ended
+      before the cutoff; any unknown condition → keep (conservative).
+    - timestamp-only datasets (chainlink_events, collector_events): delete only if
+      the max timestamp is before the cutoff.
+    - markets_log / markets_latest: never deleted (the resolution map depends on them).
+
+    In cumulative mode (rolling_window=False, the legacy default) NOTHING is
+    deleted — the staging is cumulative and rebuilt from the full local hive, so
+    deleting local data would shrink future Kaggle versions.
+
+    Returns stats {relative_path: rows_deleted} (empty when nothing was deleted).
     """
     import datetime as _dt2
     if timeframe_labels is None:
@@ -2028,14 +2117,35 @@ def cleanup_local_data(
     if assets is None:
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
-    # Resolve checkpoint
+    tf_label = str(timeframe_labels[0]).lower()
+
+    # Resolve rolling-window policy: explicit arg > config > legacy no-op
+    if rolling_window is None:
+        try:
+            from ..config import CollectorConfig as _CC
+            rolling_window = bool(getattr(_CC.load().kaggle, "rolling_window", False))
+        except Exception:
+            rolling_window = False
+    if not rolling_window:
+        # Cumulative mode: staging is rebuilt from the FULL local hive each time,
+        # so deleting local data would shrink future Kaggle versions. Retain all.
+        return {}
+
+    if retention_hours is None:
+        try:
+            from ..config import CollectorConfig as _CC
+            retention_hours = int(getattr(_CC.load().kaggle, "local_retention_hours", 48))
+        except Exception:
+            retention_hours = 48
+
+    # Resolve checkpoint (per-TF staging dir first, then any staging state)
     if checkpoint_ms is None:
-        # try read _kaggle_state
-        for cand in [base / "kaggle_staging" / "_kaggle_state.json", base / "kaggle_staging" / "5m" / "_kaggle_state.json"]:
+        candidates = [base / "kaggle_staging" / tf_label / "_kaggle_state.json",
+                      base / "kaggle_staging" / "_kaggle_state.json"]
+        for cand in candidates:
             if cand.exists():
                 try:
                     j = _json.loads(cand.read_text())
-                    # take latest last_upload_unix_ms
                     vals = [v.get("last_upload_unix_ms") for v in j.values() if isinstance(v, dict) and v.get("last_upload_unix_ms")]
                     if vals:
                         checkpoint_ms = max(vals)
@@ -2043,63 +2153,104 @@ def cleanup_local_data(
                 except Exception:
                     pass
         if checkpoint_ms is None:
+            # legacy keep_seconds param doubles as the fallback window
             checkpoint_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000) - keep_seconds * 1000
-    # buffer: previously used 2h (7200s) to delete old data — THIS IS NOW DISABLED
-    # to prevent permanent Kaggle cumulative data loss. All hive data is retained.
-    # The buffer_ms is calculated but not used for deletion guard.
-    if buffer_seconds is None:
-        buffer_seconds = 7200  # kept for config compatibility, no-op
-    buffer_ms = buffer_seconds * 1000
-    cutoff_ms = checkpoint_ms - buffer_ms
     now_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000)
+    cutoff_ms = min(now_ms, checkpoint_ms) - int(retention_hours) * 3600 * 1000
+
+    # condition_id -> market_end map (never pruned source of truth)
+    end_by_cid: dict = {}
+    latest = base / "markets_latest" / "markets_latest.parquet"
+    try:
+        if latest.exists():
+            tbl = read_table(latest)
+            if "condition_id" in tbl.schema.names and "market_end_ts_ms" in tbl.schema.names:
+                for cid, me in zip(tbl.column("condition_id").to_pylist(),
+                                   tbl.column("market_end_ts_ms").to_pylist()):
+                    if cid and me is not None:
+                        try:
+                            end_by_cid[str(cid)] = int(me)
+                        except Exception:
+                            pass
+    except Exception as e:
+        print(f"[prune] WARN could not read markets_latest — pruning skipped this cycle: {e}")
+        return {}
+
+    CID_DATASETS = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades"]
+    TS_DATASETS = ["chainlink_events", "collector_events"]
     stats: dict = {}
-    # Hive safe prune: inspect markets_latest for market_end per condition, then walk hive partitions
-    # Simpler for 5m-only: scan hive partitions, read one file's max(market_end_ts_ms) if present
-    # CRITICAL: Do NOT delete files — retain all data to prevent Kaggle cumulative data loss
-    # (Only perform the "never delete open window" guard without actual deletion)
-    for dataset in ["book_snapshots_500ms", "book_events", "trades", "chainlink_events", "collector_events", "markets_log"]:
+    pruned_rows = 0
+
+    def _delete_file(p: Path, rows: int, reason: str) -> None:
+        nonlocal pruned_rows
+        rel = str(p.relative_to(base))
+        if dry_run:
+            print(f"[prune] dry-run would delete {rel} ({rows} rows, {reason})")
+            return
+        try:
+            p.unlink()
+            stats[rel] = rows
+            pruned_rows += rows
+        except Exception as e:
+            print(f"[prune] WARN could not delete {rel}: {e}")
+
+    for dataset in CID_DATASETS + TS_DATASETS:
         ds_root = base / dataset
         if not ds_root.exists():
             continue
-        for leaf in ds_root.rglob("*.parquet"):
-            if leaf.name.endswith(".tmp"):
+        for p in sorted(ds_root.rglob("*.parquet")):
+            if p.name.endswith(".tmp"):
                 continue
             try:
-                # never delete open window (market_end > now) — just verify, don't delete
-                # Read max market_end from file if column exists
-                try:
-                    t = read_table(leaf)
-                    # check hive file's market_end if present
-                    for col in ["market_end_ts_ms", "market_end_ts"]:
+                t = read_table(p)
+                if t is None or t.num_rows == 0:
+                    continue
+                if dataset in CID_DATASETS and "condition_id" in t.schema.names:
+                    cids = {str(c) for c in t.column("condition_id").to_pylist() if c}
+                    if not cids:
+                        continue
+                    ends = [end_by_cid.get(c) for c in cids]
+                    if any(e is None for e in ends):
+                        continue  # unknown condition — conservative keep
+                    if max(ends) >= cutoff_ms:
+                        continue  # some market inside the retention leeway — keep
+                    _delete_file(p, t.num_rows, f"all markets ended < cutoff {cutoff_ms}")
+                elif dataset in TS_DATASETS:
+                    # timestamp-only datasets: age the FILE by its newest row
+                    max_ts_ns = None
+                    for col in ("ts_received_ns", "ts_utc"):
                         if col in t.schema.names:
                             vals = t.column(col).to_pylist()
-                            # filter none
                             vals = [v for v in vals if v is not None]
                             if vals:
-                                # if string ISO, parse
                                 if isinstance(vals[0], str):
-                                    max_end = max(int(_dt2.datetime.fromisoformat(v.replace("Z","+00:00")).timestamp()*1000) for v in vals)
+                                    ms_vals = [int(_dt2.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp() * 1000) for v in vals]
+                                    max_ts_ns = max(max_ts_ns or 0, max(ms_vals) * 1_000_000)
                                 else:
-                                    max_end = max(int(v) for v in vals)
-                                if max_end < now_ms:
-                                    # market is closed, but we NO LONGER delete it
-                                    # previously: can_delete = True would lead to leaf.unlink()
-                                    # now: explicitly do NOT delete
-                                    pass  # data retained, no-op
-                                else:
-                                    # market still open, also retain
-                                    pass
+                                    max_ts_ns = max(max_ts_ns or 0, int(max(vals)))
                             break
-                    else:
-                        # no market_end column — retain file (cannot verify age)
-                        pass
+                    if max_ts_ns is None:
+                        continue
+                    if max_ts_ns // 1_000_000 < cutoff_ms:
+                        _delete_file(p, t.num_rows, "newest row older than cutoff")
+            except Exception as e:
+                print(f"[prune] WARN skipping unreadable {p}: {e}")
+
+    # remove empty leaf dirs left behind (hive hygiene, safe: only empties)
+    if not dry_run:
+        for dataset in CID_DATASETS + TS_DATASETS:
+            ds_root = base / dataset
+            if not ds_root.exists():
+                continue
+            for d in sorted((p for p in ds_root.rglob("*") if p.is_dir()), reverse=True):
+                try:
+                    if next(d.iterdir(), None) is None:
+                        d.rmdir()
                 except Exception:
-                    # error reading file — retain it
                     pass
-                # NOTE: NO leaf.unlink() call — all data retained
-            except Exception:
-                pass
-    # Return empty stats — no deletion occurred
+
+    if stats or pruned_rows:
+        print(f"[prune:{tf_label}] deleted {len(stats)} files / {pruned_rows} rows older than {retention_hours}h leeway (cutoff {cutoff_ms})")
     return stats
 
 
@@ -2116,29 +2267,45 @@ def export_and_upload_all_kaggle(
     timeframe_labels: List[str] | None = None,
     l2_levels: int = 10,
     dry_run: bool = False,
+    dataset_prefix: str | None = None,
 ) -> dict:
-    """5m-only pipeline: export 7-asset staging (39 files) → Kaggle single dataset → safe prune.
+    """Per-timeframe pipeline: export 7-asset staging (39 files) → Kaggle dataset → safe prune.
+
+    Handles ONE timeframe per call (the label is timeframe_labels[0]); the caller
+    (collector kaggle loop) invokes it once per enabled lane. Each lane has its
+    own staging dir (kaggle_staging/{label}/) and its own Kaggle dataset
+    (config.kaggle.datasets[label], fallback dataset_prefix).
 
     - Only full closed markets (market_end < now) are uploaded.
-    - Staging is cumulative: same filenames overwritten with larger parquet each version (39 files).
-    - Kaggle upload uses folder versioning with retry 5 + jitter and status poll.
-    - Safe delete only after ready, with 2h buffer, never deleting open window.
-    Timeframe aggregation for 15m/1h removed (native only; 5m-only assumes 5m validates others).
+    - Cumulative mode (rolling_window=False): staging is cumulative, monotonic
+      row-count checks apply, local data is NEVER deleted.
+    - Rolling-window mode (rolling_window=True): the staging contains the
+      trailing local_retention_hours; local data is pruned after VERIFIED
+      upload (market-end aware, retention leeway). History lives in old
+      Kaggle versions (delete_old_versions=False).
     """
     if timeframe_labels is None:
         timeframe_labels = ["5m"]
+    tf_label = str(timeframe_labels[0]).lower()
     if assets is None:
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
-    # Resolve dataset prefix from env/config if available
-    dataset_prefix = "gghgg1/polymarket-5m-crypto"
+    # Resolve rolling-window policy + dataset prefix from explicit args, then config
+    rolling_window = False
     try:
         from ..config import CollectorConfig as _CC
         _cfg = _CC.load()
-        dataset_prefix = getattr(_cfg.kaggle, "dataset_prefix", dataset_prefix)
+        rolling_window = bool(getattr(_cfg.kaggle, "rolling_window", False))
+        if dataset_prefix is None:
+            try:
+                dataset_prefix = _cfg.kaggle.datasets[tf_label]
+            except (KeyError, AttributeError, TypeError):
+                dataset_prefix = getattr(_cfg.kaggle, "dataset_prefix", None)
     except Exception:
         pass
-    staging = base / "kaggle_staging" / "5m" / dataset_prefix
+    if dataset_prefix is None:
+        dataset_prefix = "gghgg1/polymarket-5m-crypto"
+    staging = base / "kaggle_staging" / tf_label / dataset_prefix
 
     result: dict = {
         "export": {},
@@ -2195,7 +2362,7 @@ def export_and_upload_all_kaggle(
         pass
 
     # Step 1: Prepare staging (export per-asset single files into staging folder)
-    print(f"=== Step 1: Preparing Kaggle staging 5m for {assets} -> {staging} ===")
+    print(f"=== Step 1: Preparing Kaggle staging {tf_label} for {assets} -> {staging} ===")
     # Snapshot the wall clock BEFORE the staging build: the pre-upload validation
     # must compare staging against the hive AS OF the read, not as of validation
     # time — while the collector is live, new part files land between the staging
@@ -2205,7 +2372,9 @@ def export_and_upload_all_kaggle(
     # files are immutable once written, so files with mtime <= build_start hold
     # exactly the rows the export read; later files belong to the NEXT export.
     build_start_ts = _time.time()
-    prep = prepare_kaggle_staging_5m(data_dir, staging_dir=staging, assets=assets, l2_levels=l2_levels, dataset_prefix=dataset_prefix)
+    prep = prepare_kaggle_staging_5m(data_dir, staging_dir=staging, assets=assets, l2_levels=l2_levels,
+                                     dataset_prefix=dataset_prefix, timeframe_label=tf_label,
+                                     rolling_window=rolling_window)
     result["export"] = prep["row_counts"]
     result["staging"] = {"path": prep["staging_path"], "files": prep["files"], "dataset": prep["dataset"]}
     print(f"staging prepared: {prep['files']} files, dataset {prep['dataset']}")
@@ -2241,7 +2410,18 @@ def export_and_upload_all_kaggle(
                 except OSError:
                     continue
                 t_h = read_table(hf)
-                hive_rows += t_h.num_rows if t_h is not None else 0
+                if t_h is not None:
+                    # lane-aware count: the shared hive holds all timeframes, the
+                    # staging only this lane's rows (chainlink_events is shared
+                    # across lanes and ships unfiltered)
+                    if tf_label and ds_name != "chainlink_events" and "series_id" in t_h.schema.names:
+                        try:
+                            import pyarrow.compute as _pc2
+                            import pyarrow as _pa2
+                            t_h = t_h.filter(_pc2.equal(t_h.column("series_id"), _pa2.scalar(f"{a}-{tf_label}")))
+                        except Exception:
+                            pass
+                    hive_rows += t_h.num_rows if t_h is not None else 0
             if hive_rows > staging_rows:
                 lost.append(f"{a}_{ds_name}: staging {staging_rows} < hive {hive_rows}")
     if lost:
@@ -2257,8 +2437,8 @@ def export_and_upload_all_kaggle(
         return result
 
     # Step 2: Upload to Kaggle (single dataset)
-    print(f"=== Step 2: Uploading 5m staging to Kaggle {dataset_prefix} ===")
-    ok = _upload_kaggle_folder(staging, dataset_prefix, expected_assets=assets)
+    print(f"=== Step 2: Uploading {tf_label} staging to Kaggle {dataset_prefix} ===")
+    ok = _upload_kaggle_folder(staging, dataset_prefix, expected_assets=assets, check_monotonic=not rolling_window)
     result["kaggle_uploads"][dataset_prefix] = {
         "status": "success" if ok else "failed",
         "staging": str(staging),
@@ -2266,7 +2446,8 @@ def export_and_upload_all_kaggle(
     }
     if ok:
         print(f"✓ Upload success {dataset_prefix}, pruning hive after verified ready...")
-        cleanup_stats = cleanup_local_data(data_dir, assets=assets, timeframe_labels=timeframe_labels)
+        cleanup_stats = cleanup_local_data(data_dir, assets=assets, timeframe_labels=[tf_label],
+                                           rolling_window=rolling_window)
         result["cleanup"] = cleanup_stats
     else:
         print(f"✗ Upload failed {dataset_prefix}, NOT pruning (data retained for retry)")

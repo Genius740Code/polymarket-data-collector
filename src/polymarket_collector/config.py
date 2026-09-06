@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -120,6 +120,22 @@ class KaggleConfig(BaseModel):
     dataset_prefix: str = "gghgg1/polymarket-5m-crypto"
     # per-plan.md §1.1 single 5m dataset (all assets share same slug, not per-asset suffix)
     # test_mode uploads every 10 min to same dataset, gated on closed markets only
+    # Multi-timeframe: one dataset per TF, keyed by window label. Missing entries
+    # fall back to dataset_prefix (5m) — the slugs per plan.md §1.1 are
+    # gghgg1/polymarket-{5m,15m,1h,4h,1d}-crypto.
+    datasets: Dict[str, str] = Field(default_factory=lambda: {
+        "5m": "gghgg1/polymarket-5m-crypto",
+        "15m": "gghgg1/polymarket-15m-crypto",
+        "1h": "gghgg1/polymarket-1h-crypto",
+        "4h": "gghgg1/polymarket-4h-crypto",
+        "1d": "gghgg1/polymarket-1d-crypto",
+    })
+    # Rolling-window uploads: each hourly upload contains the trailing
+    # local_retention_hours of data (staging is rebuilt from the local hive, so
+    # it can only contain what is still local). When False (legacy cumulative
+    # mode) local data is never pruned and the monotonic row-count check applies.
+    rolling_window: bool = False
+    local_retention_hours: int = 48  # leeway before local prune after verified upload
 
 
 # ------------------------------------------------------------------ top-level
@@ -132,7 +148,13 @@ class CollectorConfig(BaseSettings):
     series_ids: Dict[str, str] = Field(default_factory=lambda: {
         "BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "HYPE": "HYPE", "BNB": "BNB", "XRP": "XRP", "DOGE": "DOGE",
     })
-    window_size_seconds: int = 300  # default 5-min; 5m-only for test (1d too long, assume 5m validates others)
+    window_size_seconds: int = 300  # default 5-min; primary lane (see timeframes)
+    # Multi-timeframe lanes collected by this process. Each label maps to a
+    # window size via WINDOW_SIZES_SECONDS and gets its own rollover lane,
+    # discovery cadence and Kaggle dataset. Keep ["5m"] for the proven 5m-only
+    # behavior; enable more ONLY after verify-gate --probe-timeframes confirms
+    # the Gamma series actually exists (plan.md §7 gate).
+    timeframes: List[str] = Field(default_factory=lambda: ["5m"])
     schema_version: str = "3.2.0"
 
     rollover_lead_seconds: int = 30
@@ -198,19 +220,79 @@ class CollectorConfig(BaseSettings):
                 return cls.from_yaml(c)
         return cls()
 
-    def series_id_for(self, asset: str) -> str:
-        ws = self.window_size_seconds
-        if ws >= 86400:
-            window_label = "1d"
-        elif ws >= 14400:
-            window_label = "4h"
-        elif ws >= 3600:
-            window_label = "1h"
-        elif ws >= 900:
-            window_label = "15m"
-        else:
-            window_label = "5m"
+    def series_id_for(self, asset: str, window_label: str | None = None) -> str:
+        if window_label is None:
+            ws = self.window_size_seconds
+            window_label = self.window_label_for(ws)
         return f"{asset.upper()}-{window_label}"
+
+    # -- multi-timeframe helpers --------------------------------------------
+    WINDOW_SIZES_SECONDS: ClassVar[Dict[str, int]] = {
+        "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+    }
+
+    @classmethod
+    def window_label_for(cls, window_size_seconds: int) -> str:
+        if window_size_seconds >= 86400:
+            return "1d"
+        if window_size_seconds >= 14400:
+            return "4h"
+        if window_size_seconds >= 3600:
+            return "1h"
+        if window_size_seconds >= 900:
+            return "15m"
+        return "5m"
+
+    @classmethod
+    def window_size_for(cls, window_label: str) -> int:
+        try:
+            return cls.WINDOW_SIZES_SECONDS[str(window_label).lower()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown timeframe '{window_label}' — expected one of {sorted(cls.WINDOW_SIZES_SECONDS)}"
+            )
+
+    @field_validator("timeframes")
+    @classmethod
+    def timeframes_valid(cls, v: List[str]) -> List[str]:
+        labels = []
+        for tf in v:
+            tf_l = str(tf).lower()
+            if tf_l not in cls.WINDOW_SIZES_SECONDS:
+                raise ValueError(f"Unknown timeframe '{tf}' — expected one of {sorted(cls.WINDOW_SIZES_SECONDS)}")
+            if tf_l not in labels:
+                labels.append(tf_l)
+        if not labels:
+            labels = ["5m"]
+        return labels
+
+    def timeframe_window_sizes(self) -> Dict[str, int]:
+        """Enabled lanes: label -> window size seconds (ordered, deduped)."""
+        return {tf: self.window_size_for(tf) for tf in self.timeframes}
+
+    def discovery_poll_interval_for(self, window_size_seconds: int) -> int:
+        """Scaled discovery cadence — longer windows don't need 2s polling.
+
+        Keeps total Gamma load flat as timeframes are added: 7 assets ×
+        (2s + 5s + 15s + 30s + 60s cadences) ≈ 6 req/s, well under plan.md's
+        429 threshold, vs 17.5 req/s if every lane polled at 2s.
+        """
+        base = self.discovery_poll_interval_seconds
+        return {300: base, 900: max(5, base), 3600: max(15, base),
+                14400: max(30, base), 86400: max(60, base)}.get(int(window_size_seconds), base)
+
+    def rollover_lead_for(self, window_size_seconds: int) -> int:
+        """Lookahead lead per lane: never below the configured base, scaled with
+        window width (Gamma can index a fresh slug late; for a 1d window a 120s
+        lead is disproportionate — allow generous lead without tight-looping)."""
+        return max(self.rollover_lead_seconds, int(window_size_seconds) // 10)
+
+    def kaggle_dataset_for(self, window_label: str) -> str:
+        """Dataset slug for a timeframe; falls back to the 5m prefix."""
+        try:
+            return self.kaggle.datasets[window_label]
+        except (KeyError, AttributeError):
+            return self.kaggle.dataset_prefix
 
     def validate_assets_have_series(self) -> None:
         missing = [a for a in self.assets if a not in self.series_ids]

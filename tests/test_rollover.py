@@ -48,10 +48,10 @@ async def test_rollover_lookahead_discovers_next():
     now_ms = int(time.time() * 1000)
     # should discover
     await mgr.check_and_roll("BTC", subscribe, now_ms=now_ms)
-    assert mgr.states["BTC"].next is not None
-    assert mgr.states["BTC"].next.condition_id == "next"
+    assert mgr.states[("BTC", "5m")].next is not None
+    assert mgr.states[("BTC", "5m")].next.condition_id == "next"
     assert "next" in subscribed
-    assert mgr.states["BTC"].is_rollover_window is True
+    assert mgr.states[("BTC", "5m")].is_rollover_window is True
     # active markets should be 2 during overlap
     assert len(mgr.active_markets("BTC")) == 2
 
@@ -62,8 +62,8 @@ async def test_rollover_promotion():
     mgr = RolloverManager(cfg)
     cur = make_market(cid="cur", end_offset_ms=-1000, window_index=1)  # already ended
     nxt = make_market(cid="next", end_offset_ms=300_000, window_index=2)
-    mgr.states["BTC"].current = cur
-    mgr.states["BTC"].next = nxt
+    mgr.states[("BTC", "5m")].current = cur
+    mgr.states[("BTC", "5m")].next = nxt
 
     now_ms = int(time.time() * 1000)
     subscribed = []
@@ -71,8 +71,8 @@ async def test_rollover_promotion():
 
     result = await mgr.check_and_roll("BTC", sub, now_ms=now_ms)
     assert result == "rollover_completed"
-    assert mgr.states["BTC"].current.condition_id == "next"
-    assert mgr.states["BTC"].next is None
+    assert mgr.states[("BTC", "5m")].current.condition_id == "next"
+    assert mgr.states[("BTC", "5m")].next is None
 
 
 @pytest.mark.asyncio
@@ -82,7 +82,7 @@ async def test_coverage_gap_vs_rollover_miss():
     events = []
     mgr = RolloverManager(cfg, on_event=lambda t, d: events.append(t))
     cur = make_market(cid="cur", end_offset_ms=-6000, window_index=1)  # ended 6s ago
-    mgr.states["BTC"].current = cur
+    mgr.states[("BTC", "5m")].current = cur
     # discovery returns None (no market)
     async def fake_fetch(asset, after, strict_adjacent=False):
         return None
@@ -93,7 +93,7 @@ async def test_coverage_gap_vs_rollover_miss():
     # 6s past end → beyond max_coverage_gap (5s) → coverage_gap, not just rollover_miss
     now_ms = cur.market_end_ts_ms + 6000
     # need to ensure lookahead needed
-    mgr.states["BTC"].next = None
+    mgr.states[("BTC", "5m")].next = None
     await mgr.check_and_roll("BTC", sub, now_ms=now_ms)
     assert "coverage_gap" in events
 
@@ -103,14 +103,14 @@ async def test_coverage_gap_vs_rollover_miss():
     # The rollover_miss branch is only reachable before promotion (end - lead window).
     # So for now >= end we expect coverage_gap, not miss.
     events.clear()
-    mgr.states["BTC"].rollover_miss_logged = False
+    mgr.states[("BTC", "5m")].rollover_miss_logged = False
     # Use a time still within lead window but before end to exercise miss path:
     # create a fresh current ending in 1s, check 500ms after end would trigger promote,
     # so to test miss we place now at end + 2000 but with a fresh manager that hasn't promoted yet.
     # With current promote logic the result is coverage_gap, which is the correct signal.
     events2 = []
     mgr2 = RolloverManager(cfg, on_event=lambda t, d: events2.append(t))
-    mgr2.states["BTC"].current = cur
+    mgr2.states[("BTC", "5m")].current = cur
     mgr2.discovery.fetch_next_market = fake_fetch  # type: ignore
     now_ms2 = cur.market_end_ts_ms + 2000
     await mgr2.check_and_roll("BTC", sub, now_ms=now_ms2)

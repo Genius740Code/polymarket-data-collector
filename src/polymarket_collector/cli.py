@@ -29,6 +29,8 @@ def main() -> None:
     ap.add_argument("--no-accelerate", action="store_true", help="(deprecated) kept for compat")
     ap.add_argument("--window-size", type=int, default=None, help="window size in seconds (300=5min, 900=15min, 3600=1h, 14400=4h, 86400=1d)")
     ap.add_argument("--series-id", type=str, default=None, help="override series ID per asset (format: ASSET-WINDOW, e.g. BTC-1H)")
+    ap.add_argument("--test-timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
+                    help="test mode: which timeframe lane to validate (sets the test window size; the run collects 2 windows of that lane)")
     args = ap.parse_args()
 
     cfg = CollectorConfig.load(args.config)
@@ -39,6 +41,8 @@ def main() -> None:
         cfg.test_mode.num_markets = args.test_markets
     if args.no_accelerate:
         cfg.test_mode.accelerate = False
+    if args.test_timeframe is not None:
+        cfg.test_mode.window_size_seconds = cfg.window_size_for(args.test_timeframe)
     # if test_mode is via config YAML but CLI flag not given, honour it
     is_test = cfg.test_mode.enabled or args.test_mode
     # CLI window-size override

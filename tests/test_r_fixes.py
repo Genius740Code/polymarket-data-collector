@@ -63,7 +63,8 @@ async def test_r1_prewarm_gate_blocks_then_releases_snapshots(tmp_path, monkeypa
     m = _market(now_ms)
     c.rollover = SimpleNamespace(
         active_markets=lambda a: [m],
-        states={"BTC": SimpleNamespace(is_rollover_window=False)},
+        states={("BTC", "5m"): SimpleNamespace(is_rollover_window=False)},
+        state_for_market=lambda mk: SimpleNamespace(is_rollover_window=False),
     )
     # avoid real REST heal calls from the test
     async def _no_heal(book, market):
@@ -219,7 +220,8 @@ async def test_r5_missed_buckets_emit_scheduler_lag_not_backpressure(tmp_path):
     c = Collector(cfg)
     events: list = []
     c._collector_event = lambda t, d: events.append(t)
-    c.rollover = SimpleNamespace(active_markets=lambda a: [], states={})
+    c.rollover = SimpleNamespace(active_markets=lambda a: [], states={},
+                                 state_for_market=lambda mk: None)
     now_ms = int(time.time() * 1000)
     c._running = True
     c._snapshot_start_ms = None

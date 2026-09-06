@@ -175,14 +175,22 @@ def run_trades_enrichment_second_pass(data_dir: str | Path, assets: List[str]) -
         return {}
 
 
-def reupload_kaggle(data_dir: str | Path, assets: List[str], l2_levels: int = 10) -> bool:
+def reupload_kaggle(data_dir: str | Path, assets: List[str], l2_levels: int = 10,
+                    timeframe: str = "5m", dataset_prefix: str | None = None) -> bool:
     """Re-export staging and push a new Kaggle version carrying the resolutions."""
     from .storage.export import export_and_upload_all_kaggle, _validate_kaggle_config
+    if dataset_prefix is None:
+        try:
+            from .config import CollectorConfig
+            dataset_prefix = CollectorConfig.load("config/collector.yaml").kaggle_dataset_for(timeframe)
+        except Exception:
+            dataset_prefix = None
     res = export_and_upload_all_kaggle(
         data_dir=str(data_dir),
         assets=assets,
-        timeframe_labels=["5m"],
+        timeframe_labels=[timeframe],
         l2_levels=l2_levels,
+        dataset_prefix=dataset_prefix,
         dry_run=not _validate_kaggle_config(),
     )
     status = {k: v.get("status") for k, v in (res.get("kaggle_uploads") or {}).items()}
@@ -198,6 +206,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reupload", action="store_true", help="re-export staging + push a new Kaggle version after backfilling")
     ap.add_argument("--skip-enrich", action="store_true", help="skip the trades enrichment second pass")
+    ap.add_argument("--timeframe", default="5m", help="timeframe lane for the re-upload staging/dataset (5m/15m/1h/4h/1d)")
+    ap.add_argument("--dataset-prefix", default=None, help="override the Kaggle dataset slug for this re-upload")
     args = ap.parse_args()
     cfg = CollectorConfig.load(args.config)
     data_dir = args.data_dir or cfg.storage.data_dir
@@ -205,7 +215,8 @@ def main() -> None:
     if not args.skip_enrich and not args.dry_run:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
     if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
-        reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels)
+        reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels,
+                        timeframe=args.timeframe, dataset_prefix=args.dataset_prefix)
 
 
 if __name__ == "__main__":

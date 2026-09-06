@@ -28,10 +28,13 @@ class CursorState:
     last_sequence_number_per_token: Dict[str, int] = field(default_factory=dict)
     last_snapshot_written_ts: Optional[int] = None  # unix ms
     updated_at: Optional[str] = None
+    window_label: str = "5m"  # timeframe lane (5m/15m/1h/4h/1d) — multi-TF keying
 
     def to_row(self) -> tuple:
+        # column order matches the INSERT in save(): window_label second
         return (
             self.asset,
+            self.window_label,
             self.current_window_index,
             self.current_condition_id,
             self.next_condition_id,
@@ -42,7 +45,8 @@ class CursorState:
 
     @classmethod
     def from_row(cls, row: tuple) -> "CursorState":
-        asset, widx, cur_cid, nxt_cid, seq_json, last_ts, updated = row
+        # column order matches SELECT in load()/load_all(): window_label second
+        asset, window_label, widx, cur_cid, nxt_cid, seq_json, last_ts, updated = row
         try:
             seqs = json.loads(seq_json) if seq_json else {}
         except Exception:
@@ -57,18 +61,21 @@ class CursorState:
             last_sequence_number_per_token=seqs,
             last_snapshot_written_ts=last_ts,
             updated_at=updated,
+            window_label=window_label or "5m",
         )
 
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS cursor_state (
-    asset TEXT PRIMARY KEY,
+    asset TEXT NOT NULL,
+    window_label TEXT NOT NULL DEFAULT '5m',
     current_window_index INTEGER NOT NULL,
     current_condition_id TEXT,
     next_condition_id TEXT,
     last_sequence_number_per_token TEXT NOT NULL DEFAULT '{}',
     last_snapshot_written_ts INTEGER,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (asset, window_label)
 );
 """
 
@@ -102,6 +109,36 @@ class CursorStore:
     def _init_db(self) -> None:
         conn = self._connect()
         try:
+            # Legacy migration: pre-multi-TF databases have cursor_state keyed by
+            # asset alone. Preserve those rows as the 5m lane, then adopt the new
+            # (asset, window_label) schema.
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cursor_state'")
+            if cur.fetchone() is not None:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(cursor_state)").fetchall()]
+                if "window_label" not in cols:
+                    conn.executescript(
+                        """
+                        ALTER TABLE cursor_state RENAME TO cursor_state_legacy;
+                        CREATE TABLE cursor_state (
+                            asset TEXT NOT NULL,
+                            window_label TEXT NOT NULL DEFAULT '5m',
+                            current_window_index INTEGER NOT NULL,
+                            current_condition_id TEXT,
+                            next_condition_id TEXT,
+                            last_sequence_number_per_token TEXT NOT NULL DEFAULT '{}',
+                            last_snapshot_written_ts INTEGER,
+                            updated_at TEXT NOT NULL,
+                            PRIMARY KEY (asset, window_label)
+                        );
+                        INSERT INTO cursor_state
+                          (asset, window_label, current_window_index, current_condition_id,
+                           next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+                        SELECT asset, '5m', current_window_index, current_condition_id,
+                           next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at
+                        FROM cursor_state_legacy;
+                        DROP TABLE cursor_state_legacy;
+                        """
+                    )
             conn.executescript(_DDL)
             conn.commit()
         finally:
@@ -113,10 +150,10 @@ class CursorStore:
             conn.execute(
                 """
                 INSERT INTO cursor_state
-                  (asset, current_window_index, current_condition_id, next_condition_id,
+                  (asset, window_label, current_window_index, current_condition_id, next_condition_id,
                    last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(asset) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset, window_label) DO UPDATE SET
                   current_window_index=excluded.current_window_index,
                   current_condition_id=excluded.current_condition_id,
                   next_condition_id=excluded.next_condition_id,
@@ -130,10 +167,13 @@ class CursorStore:
         finally:
             conn.close()
 
-    def load(self, asset: str) -> Optional[CursorState]:
+    def load(self, asset: str, window_label: str = "5m") -> Optional[CursorState]:
         conn = self._connect()
         try:
-            cur = conn.execute("SELECT asset, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state WHERE asset=?", (asset.upper(),))
+            cur = conn.execute(
+                "SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state WHERE asset=? AND window_label=?",
+                (asset.upper(), str(window_label).lower()),
+            )
             row = cur.fetchone()
             if row is None:
                 return None
@@ -141,11 +181,11 @@ class CursorStore:
         finally:
             conn.close()
 
-    def load_all(self) -> Dict[str, CursorState]:
+    def load_all(self) -> Dict[tuple, CursorState]:
         conn = self._connect()
         try:
-            cur = conn.execute("SELECT asset, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state")
-            return {r[0]: CursorState.from_row(r) for r in cur.fetchall()}
+            cur = conn.execute("SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state")
+            return {(r[0], r[1] or "5m"): CursorState.from_row(r) for r in cur.fetchall()}
         finally:
             conn.close()
 
