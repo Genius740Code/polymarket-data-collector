@@ -121,7 +121,6 @@ class MarketsLog:
         connection_id: Optional[str] = None,
         condition_id: Optional[str] = None,
         market_id: Optional[str] = None,
-        token_id: Optional[str] = None,
         asset: Optional[str] = None,
         details: Optional[dict] = None,
     ) -> None:
@@ -140,7 +139,6 @@ class MarketsLog:
             "connection_id": connection_id,
             "condition_id": condition_id,
             "market_id": market_id,
-            "token_id": token_id,
             "asset": asset,
             "details": details,
             "schema_version": "3.2.0",

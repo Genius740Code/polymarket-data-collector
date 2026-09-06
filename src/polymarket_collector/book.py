@@ -142,6 +142,9 @@ class BookSnapshot:
     book_state: str
     resync_id: Optional[str]
     book_crossed: bool
+    # A4 integrity attestation from the last accepted frame per outcome (None = not yet seen)
+    up_book_hash: Optional[str] = None
+    down_book_hash: Optional[str] = None
 
     def to_flat_dict(self) -> Dict[str, object]:
         d: Dict[str, object] = {
@@ -170,6 +173,8 @@ class BookSnapshot:
             "book_state": self.book_state,
             "resync_id": self.resync_id,
             "book_crossed": self.book_crossed,
+            "up_book_hash": self.up_book_hash,
+            "down_book_hash": self.down_book_hash,
         }
         d.update(self.l2)
         d.update(self.depths)
@@ -765,6 +770,8 @@ class OrderBookState:
             book_state=self.book_state.value,
             resync_id=self.resync_id,
             book_crossed=crossed,
+            up_book_hash=self.book_hash.get("up"),
+            down_book_hash=self.book_hash.get("down"),
         )
 
     def diff_against_rest(self, rest_snapshot: dict, tolerance: float = 0.0) -> Optional[dict]:

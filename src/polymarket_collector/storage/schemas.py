@@ -96,6 +96,10 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
         pa.field("book_state", pa.string(), nullable=False),
         pa.field("resync_id", pa.string(), nullable=True),
         pa.field("book_crossed", pa.bool_(), nullable=False),
+        # A4: exchange book-integrity hashes from the last accepted book/price_change
+        # frame per outcome (nullable until first frame; None = not yet attested)
+        pa.field("up_book_hash", pa.string(), nullable=True),
+        pa.field("down_book_hash", pa.string(), nullable=True),
     ])
     return pa.schema(fields)
 
@@ -113,7 +117,8 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("token_id", pa.string(), nullable=False),
     pa.field("outcome", pa.string(), nullable=False),
     pa.field("event_type", pa.string(), nullable=False),
-    pa.field("sequence_number", pa.int64(), nullable=True),
+    # sequence_number dropped 2026-09-06: CLOB market channel sends none; the old
+    # local tick counter value was NOT a wire sequence (audit 2026-09-06, issue #3)
     pa.field("old_best_bid", pa.float64(), nullable=True),
     pa.field("new_best_bid", pa.float64(), nullable=True),
     pa.field("old_best_ask", pa.float64(), nullable=True),
@@ -179,7 +184,8 @@ COLLECTOR_EVENTS_SCHEMA = pa.schema([
     pa.field("event_type", pa.string(), nullable=False),
     pa.field("connection_id", pa.string(), nullable=True),
     pa.field("market_id", pa.string(), nullable=True),
-    pa.field("token_id", pa.string(), nullable=True),
+    # token_id dropped 2026-09-06: never populated by any emitter (100% null across
+    # all runs — audit 2026-09-06, issue #5); asset-level events carry no token
     pa.field("details", pa.string(), nullable=True),
 ])
 
