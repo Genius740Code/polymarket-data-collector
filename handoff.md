@@ -1,5 +1,24 @@
 # 📌 CURRENT HANDOFF (2026-09-05 night) — MISSION: fix issues → test-loop → git commit
 
+> ## 🔁 LOOP STATUS (2026-09-06, after 5 test-loop iterations)
+> Commits: `4ea47d0` (iter1), `8dbe881` (iter2), `8283c4e` (iter3+4). Final artifact: kaggle `gghgg1/polymarket-5m-crypto` ready, 39 files, remote-verified uploads.
+>
+> **Fixed during the loop:**
+> 1. Staging pre-validation self-race — validation compared staging against hive rows read AFTER the build; live collector growth aborted every in-run upload. Now compares only files with mtime ≤ build start.
+> 2. **Kaggle `dataset_status()` returns a plain STRING** in kaggle 2.x — the old `st.get("status")` threw AttributeError that a bare except swallowed every cycle, so the status poll NEVER matched and uploads "timed out". Fixed + observable (logs every poll; the 403 Forbidden right after `dataset_create_version` is normal and clears in ~10s).
+> 3. Upload verify is fail-closed with a 10-min poll budget (audit fixes #10/#20 restored; the old "optimistic success at 60s" skipped all verification on nearly every upload).
+> 4. `scheduler_lag` no longer fabricates per-asset `ws_disconnected`/`ws_reconnected`/`resync_completed` events or resync_episodes rows (155 catch-ups × 7 assets faked 1085 "disconnects" and drowned the real churn signal — the old B1/C1 churn evidence was bogus; real churn is ~1-2 reconnects/min/asset at the 150s recycles).
+> 5. `date_str fallback` WARN fixed (writer derives partition date from `disconnect_ts_utc`).
+> 6. WS watchdog: fires on >30s data silence, force-aborts via `fail_connection`-equivalent, logs to console, and **skips firing when the event loop itself is stalled** (checks `_last_snapshot_bucket_ms` lag — during a Kaggle export block all 7 connections look "stale" but frames are merely buffered). Task-await at recycle is bounded (3s) so a zombie task can't hang the reconnect.
+> 7. Dropped `settlement_report_id`/`settlement_tx_hash` from markets (no wire source, 100% NULL forever); added `rollover_pairing` invariant to the analysis JSON (started_initial/started/completed/unpaired).
+>
+> **Remaining / operator decisions:**
+> - **C2 maker-wallet backfill is BLOCKED on credentials**: no Alchemy/Graph/PolygonScan key on this box. taker_wallet fills 80-99%; maker_wallet 14-78% (asset-dependent). Implement per the checklist below once a key exists.
+> - **Stale producer on the other box** (audit #1): still unresolved — if the old collector elsewhere runs a Kaggle upload cron, it can clobber the dataset with a 30-file old-schema version. pm2 here is empty.
+> - **No resolution-backfill cron on this box**: the test tool's finalize backfill runs ~5 min after the last window, before the ~10-min official-winner lag, so the last windows stay `inferred_nearest`/`unknown` in the published version until a LATER backfill. Run `python -m polymarket_collector.resolution_backfill --config config/collector.yaml --reupload` ~15 min after each test run (or restore the pm2 cron here).
+> - **Gamma discovery flakiness** (iter 5): 15 coverage_gaps + 19 subscription_failed in one run — discovery sometimes misses windows or serves gaps in sequence (windows 5962367/5962369 discovered with 5962368 skipped); uncollected windows are honestly counted in the completeness denominator (43.69% that run) and left NULL. Needs a discovery-retry/backoff design (next loop).
+> - 4 crossed rows slipped into SOL book_snapshots_clean in the final artifact (0.09%) — crossing race between the pre-snapshot check and frame apply; existing DATA_CARD crossing documentation covers the mechanism.
+
 **Read this first. You (the next AI) have one job, in three phases:**
 
 1. **FIX** — work through the ISSUE CHECKLIST below. Keep `pytest tests/ --ignore=tests/test_verify_gate.py` green before and after every fix (94 tests as of this writing).
