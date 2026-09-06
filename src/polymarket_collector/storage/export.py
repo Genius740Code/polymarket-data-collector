@@ -964,6 +964,28 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                         uniq.append(r)
                 if len(uniq) < combined.num_rows:
                     combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+            elif dataset == "markets_log" and "condition_id" in combined.schema.names:
+                # Fix #7: markets 84->28 duplicate — keep latest per condition_id (max updated_at/market_end)
+                pylist = combined.to_pylist()
+                latest: dict = {}
+                for r in pylist:
+                    cid = r.get("condition_id")
+                    # overwrite so last occurrence wins; pylist is append order, last is latest
+                    # if updated_at available, prefer newer
+                    prev = latest.get(cid)
+                    if prev is None:
+                        latest[cid] = r
+                    else:
+                        # compare updated_at if present
+                        try:
+                            a = str(prev.get("updated_at") or "")
+                            b = str(r.get("updated_at") or "")
+                            if b >= a:
+                                latest[cid] = r
+                        except Exception:
+                            latest[cid] = r
+                if len(latest) < combined.num_rows:
+                    combined = pa.Table.from_pylist(list(latest.values()), schema=combined.schema)
     except Exception as e:
         print(f"[export] WARN dedup failed for {dataset}: {e}")
         pass

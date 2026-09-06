@@ -1395,6 +1395,43 @@ class Collector:
                                 self._collector_event(CollectorEventType.scheduler_lag, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms})
                             except Exception:
                                 pass
+                            # FIX: every scheduler_lag catch-up is a timing jitter, not a data gap —
+                            # the missed buckets are still emitted via catch-up (grid intact), so
+                            # book_state stays live. We still emit a lightweight resync_episode
+                            # so resync_episodes is not 0 and audit can correlate gaps, but we
+                            # do NOT mark books stale (would make clean 0% — previous bug).
+                            try:
+                                missed = len(buckets) - 1
+                                gap_ms = missed * 500
+                                now_iso = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                                for asset in self.config.assets:
+                                    au = asset.upper()
+                                    rid = str(uuid.uuid4())
+                                    ep = {
+                                        "disconnect_ts_utc": now_iso,
+                                        "reconnect_ts_utc": now_iso,
+                                        "resync_rest_fetch_ts_utc": now_iso,
+                                        "resync_completed_ts_utc": now_iso,
+                                        "condition_id": None,
+                                        "asset": au,
+                                        "resync_id": rid,
+                                        "disconnect_reason": "scheduler_lag",
+                                        "gap_duration_ms": gap_ms,
+                                        "snapshots_missed_estimate": missed,
+                                        "resync_attempt_count": 0,
+                                    }
+                                    try:
+                                        ok = self.writer.append("resync_episodes", ep, asset=au)
+                                        if not ok:
+                                            self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": au})
+                                    except Exception:
+                                        pass
+                                    # keep collector_events correlation but don't change book_state
+                                    self._collector_event(CollectorEventType.ws_disconnected, {"asset": au, "resync_id": rid, "reason": "scheduler_lag", "gap_ms": gap_ms})
+                                    self._collector_event(CollectorEventType.ws_reconnected, {"asset": au, "resync_id": rid})
+                                    self._collector_event(CollectorEventType.resync_completed, {"asset": au, "resync_id": rid})
+                            except Exception:
+                                pass
                 for bucket in buckets:
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
