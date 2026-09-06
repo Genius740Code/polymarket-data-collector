@@ -456,7 +456,26 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
     if assets is None:
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
-    stats = {"assets_scanned": 0, "rows_needed": 0, "files_rewritten": 0}
+    stats = {"assets_scanned": 0, "rows_needed": 0, "files_rewritten": 0, "deferred": False}
+    # Freshness guard: data-api wallet/fill coverage indexes late (~15 min,
+    # measured 2026-09-05/06). Run inline right after an export, the pass queries
+    # the data-api for thousands of rows and recovers none of them (2026-09-06
+    # 19:17 run: 4755 rows needed, 0 files rewritten) — defer to the 15-min cron
+    # until the newest stored trade is old enough to be covered.
+    import time as _time_mod
+    _newest_ns = 0
+    for asset in assets:
+        _tbl = _read_dataset_per_asset_plain(base, "trades", asset.upper())
+        if _tbl is not None and _tbl.num_rows and "ts_received_ns" in _tbl.schema.names:
+            _mx = pc.max(_tbl.column("ts_received_ns"))
+            if _mx is not None:
+                _newest_ns = max(_newest_ns, int(_mx))
+    if _newest_ns:
+        _age_s = (_time_mod.time_ns() - _newest_ns) / 1e9
+        if _age_s < 900:
+            print(f"[export] second-pass enrichment deferred: newest trade is {int(_age_s)}s old (<900s) — data-api coverage not healed yet, 15-min cron will pick it up")
+            stats["deferred"] = True
+            return stats
     for asset in assets:
         au = asset.upper()
         tbl = _read_dataset_per_asset_plain(base, "trades", au)
@@ -1749,6 +1768,11 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                 # the "optimistic success" fallback below that used to fire at 60s
                 # skipped the row-count + remote-file verification on nearly every
                 # upload. Budget 10 min, then fail closed (audit fix #10/#20).
+                # Kaggle answers 403 on the status endpoint for a few seconds
+                # after create/version before the dataset is queryable — poll 0
+                # used to log a scary ERROR even though the version landed fine
+                # (2026-09-06 19:17 run). Give it a settling delay first.
+                _time.sleep(10)
                 for _ in range(60):
                     try:
                         st = api.dataset_status(dataset)
@@ -1768,7 +1792,14 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                     except Exception as _st_exc:
                         # never swallow silently again — an exception here previously
                         # made every poll a no-op and the upload "time out"
-                        print(f"[kaggle] poll {_}/60 dataset {dataset} status ERROR: {_st_exc!r}")
+                        _msg = repr(_st_exc)
+                        if "403" in _msg or "Forbidden" in _msg:
+                            # fresh version: the status endpoint answers 403 briefly
+                            # before the dataset is queryable — retryable, not fatal
+                            if _ % 6 == 0:
+                                print(f"[kaggle] poll {_}/60 dataset {dataset} status 403 (processing, retryable)")
+                        else:
+                            print(f"[kaggle] poll {_}/60 dataset {dataset} status ERROR: {_msg}")
                         s = ""
                     if s == "ready":
                         _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4

@@ -1435,7 +1435,7 @@ class Collector:
                                 # dropped_total stayed 0 in every run. Emitted as its own
                                 # event type so `backpressure` keeps meaning "the writer
                                 # refused a row" (and doesn't trip the watchdog alert).
-                                self._collector_event(CollectorEventType.scheduler_lag, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms})
+                                self._collector_event(CollectorEventType.scheduler_lag, {"dataset": "book_snapshots_500ms", "missed_buckets": len(buckets)-1, "cur_bucket": cur_bucket, "last_bucket": self._last_snapshot_bucket_ms, "prev_tick_ms": round(getattr(self, "_last_snapshot_tick_ms", 0.0), 1)})
                             except Exception:
                                 pass
                             # FIX: every scheduler_lag catch-up is a timing jitter, not a data gap —
@@ -1446,6 +1446,7 @@ class Collector:
                             # "disconnects" in the 2026-09-06 run and drowned the real WS
                             # churn signal (31 connects). The scheduler_lag event above
                             # already carries gap_ms/missed_buckets for audit correlation.
+                _tick_t0 = time.perf_counter()
                 for bucket in buckets:
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
@@ -1587,6 +1588,7 @@ class Collector:
                         except Exception:
                             pass
                     self._beat()
+                self._last_snapshot_tick_ms = (time.perf_counter() - _tick_t0) * 1000
                 self._last_snapshot_bucket_ms = cur_bucket
             except Exception as e:
                 if self.on_event:
@@ -1847,6 +1849,11 @@ class Collector:
                 wait_ms = self.config.chainlink.max_resolution_wait_seconds * 1000
                 for cid, m in list(self.markets.items()):
                     if m.market_end_ts_ms > now_ms:
+                        continue
+                    # Pre-warm tail window (discovered before collection start, snapshots
+                    # gated off): never collected, so "no settlement yet" for it is
+                    # expected, not stuck — the finalize backfill resolves it officially.
+                    if self._snapshot_start_ms is not None and (m.market_start_ts_ms or 0) < self._snapshot_start_ms:
                         continue
                     if cid in self._resolved_cids:
                         continue

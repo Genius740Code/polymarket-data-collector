@@ -114,7 +114,10 @@ class RolloverState:
     is_rollover_window: bool = False
     last_discovery_attempt_ms: Optional[int] = None
     rollover_miss_logged: bool = False
-    rollover_started_emitted: bool = False  # throttle spam — emit once per window
+    # emit rollover_started once per TARGET WINDOW (keyed on after_ts), not once
+    # per lookahead phase — a transport-aborted cycle re-enters this path with the
+    # same target and must not re-emit (19:58 run: 28 started vs 21 completed)
+    rollover_started_for_ts: Optional[int] = None
     initial_discovery_attempts: int = 0  # for initial current=None phase
 
     def needs_rollover_lookahead(self, now_ms: int, lead_ms: int) -> bool:
@@ -127,6 +130,26 @@ class RolloverState:
             return False
         # Allow promotion even if next is None so we don't stall on missing market (gap)
         return now_ms >= self.current.market_end_ts_ms
+
+
+_shared_http_client: Optional["httpx.AsyncClient"] = None
+
+
+def _get_http_client() -> "httpx.AsyncClient":
+    """Shared pooled HTTP client for discovery polls.
+
+    A fresh AsyncClient (new TCP+TLS handshake) per candidate slug per poll was
+    the main source of discovery ConnectTimeouts; pooling keeps one warm
+    connection to gamma-api per process instead of 3 handshakes per cycle.
+    """
+    global _shared_http_client
+    import httpx
+    if _shared_http_client is None or _shared_http_client.is_closed:
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _shared_http_client
 
 
 class MarketDiscovery:
@@ -160,6 +183,10 @@ class MarketDiscovery:
         self.window_size_seconds = window_size_seconds
         self.window_multiplier = window_size_seconds // 300
         self.liquidity_filter = liquidity_filter  # LiquidityFilterConfig or None
+        # discovery_timeout events are diagnostics, not signals — the fast retry
+        # itself is unchanged. Throttle to one per asset per 10s (the 19:58 run
+        # emitted 69 timeouts, all harmless, all retried within ~1s).
+        self._last_timeout_emit_ms: Dict[str, int] = {}
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
@@ -197,63 +224,84 @@ class MarketDiscovery:
             candidates = [ts]
         else:
             candidates = [ts, ts + self.window_size_seconds, ts + 2 * self.window_size_seconds]
+        transport_error = False
         for cand_ts in candidates:
             cand_slug = self._slug_for(asset, cand_ts)
             cand_params = {"slug": cand_slug}
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(gamma_url, params=cand_params)
-                    if resp.status_code == 429:
-                        if self.on_event:
-                            self.on_event("rate_limited", {"asset": asset, "status": 429, "url": gamma_url})
-                        self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
-                        return None
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if isinstance(data, list) and not data:
+                client = _get_http_client()
+                resp = await client.get(gamma_url, params=cand_params)
+                if resp.status_code == 429:
+                    if self.on_event:
+                        self.on_event("rate_limited", {"asset": asset, "status": 429, "url": gamma_url})
+                    self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
+                    return None
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list) and not data:
+                    continue
+                m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+                if isinstance(m0, dict):
+                    end_iso = m0.get("endDate")
+                    try:
+                        if end_iso:
+                            dt_end = _dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                            end_ms = int(dt_end.timestamp()*1000)
+                            now_ms_check = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000)
+                            # Only skip if this is the first candidate and market already ended long ago (>window)
+                            if end_ms + self.window_size_seconds*1000 <= now_ms_check and cand_ts == ts:
+                                continue
+                    except Exception:
+                        pass
+                    self._backoff_s = self.poll_interval
+                    parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                    # liquidity filtering — no RPC, uses reported_liquidity/reported_volume only
+                    if parsed is not None and not self._passes_liquidity_filter(parsed):
+                        # try next candidate window instead of returning low-liq market
                         continue
-                    m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
-                    if isinstance(m0, dict):
-                        end_iso = m0.get("endDate")
-                        try:
-                            if end_iso:
-                                dt_end = _dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                                end_ms = int(dt_end.timestamp()*1000)
-                                now_ms_check = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000)
-                                # Only skip if this is the first candidate and market already ended long ago (>window)
-                                if end_ms + self.window_size_seconds*1000 <= now_ms_check and cand_ts == ts:
-                                    continue
-                        except Exception:
-                            pass
-                        self._backoff_s = self.poll_interval
-                        parsed = self._parse_gamma_market(asset, m0, cand_ts)
-                        # liquidity filtering — no RPC, uses reported_liquidity/reported_volume only
-                        if parsed is not None and not self._passes_liquidity_filter(parsed):
-                            # try next candidate window instead of returning low-liq market
-                            continue
-                        if parsed is not None:
-                            return parsed
+                    if parsed is not None:
+                        return parsed
             except Exception as e:
+                # Transport errors (timeout/DNS/refused) previously fell through to
+                # the remaining candidates AND the legacy fallback — one dead network
+                # phase burned 15-20s of the rollover lead window and the next market
+                # was discovered only AFTER the boundary (2026-09-06 19:17 run:
+                # coverage gaps at 18:20 and 18:30 on all 7 assets). Abort the cycle
+                # and retry fast instead.
+                import httpx as _hx
+                if isinstance(e, (_hx.TimeoutException, _hx.TransportError)):
+                    transport_error = True
+                    _now_ms = int(time.time() * 1000)
+                    if _now_ms - self._last_timeout_emit_ms.get(asset, 0) > 10_000:
+                        self._last_timeout_emit_ms[asset] = _now_ms
+                        if self.on_event:
+                            self.on_event("discovery_timeout", {"asset": asset, "error": repr(e), "phase": "gamma_poll"})
+                    break
                 continue
+        if transport_error:
+            # a timeout is transient transport, NOT "market not indexed yet" —
+            # retry in ~1s instead of waiting out the caller's backoff
+            self._backoff_s = 1.0
+            return None
         # No market found for either candidate — let poll retry / fallback
 
         # Legacy fallback: use configured rest_market_url with old param shape (for tests / mock injectors)
         if self.rest_market_url and self.rest_market_url != gamma_url:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(self.rest_market_url, params={"asset": asset, "after": after_ts_ms})
-                    if resp.status_code == 429:
-                        if self.on_event:
-                            self.on_event("rate_limited", {"asset": asset, "status": 429})
-                        self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
-                        return None
-                    resp.raise_for_status()
-                    data = resp.json()
-                    self._backoff_s = self.poll_interval
-                    parsed2 = self._parse_market_response(asset, data, after_ts_ms)
-                    if parsed2 is not None and not self._passes_liquidity_filter(parsed2):
-                        return None
-                    return parsed2
+                client = _get_http_client()
+                resp = await client.get(self.rest_market_url, params={"asset": asset, "after": after_ts_ms})
+                if resp.status_code == 429:
+                    if self.on_event:
+                        self.on_event("rate_limited", {"asset": asset, "status": 429})
+                    self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
+                    return None
+                resp.raise_for_status()
+                data = resp.json()
+                self._backoff_s = self.poll_interval
+                parsed2 = self._parse_market_response(asset, data, after_ts_ms)
+                if parsed2 is not None and not self._passes_liquidity_filter(parsed2):
+                    return None
+                return parsed2
             except Exception as e:
                 if self.on_event:
                     self.on_event("subscription_failed", {"asset": asset, "error": repr(e), "phase": "discovery_poll"})
@@ -593,7 +641,7 @@ class RolloverManager:
             state.next = None
             state.is_rollover_window = False
             state.rollover_miss_logged = False
-            state.rollover_started_emitted = False
+            state.rollover_started_for_ts = None
             if self.on_event:
                 if was_next_none and prev_cid:
                     self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
@@ -614,21 +662,22 @@ class RolloverManager:
             state.last_discovery_attempt_ms = now_ms
             # throttle rollover_started — emit once per window, not every poll (fixes 65k spam)
             # initial discovery phase does NOT emit rollover_started (would spam until first market found)
-            should_emit_rollover = (not is_initial) and (not state.rollover_started_emitted)
+            should_emit_rollover = (not is_initial) and (state.rollover_started_for_ts != after)
             if should_emit_rollover:
                 if self.on_event:
                     self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after})
-                state.rollover_started_emitted = True
+                state.rollover_started_for_ts = after
             elif is_initial:
                 state.initial_discovery_attempts += 1
                 # throttle initial discovery logging: only first attempt or every 10th to avoid spam
                 if state.initial_discovery_attempts == 1 and self.on_event:
-                    # lightweight trace, not the heavy rollover_started event
-                    self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after, "initial": True})
+                    # distinct event type: rollover_started must mean "real rollover
+                    # lookahead", otherwise audits miscount 43 started vs 21 completed
+                    self.on_event("initial_discovery", {"asset": asset, "after_ts_ms": after})
             next_market = await self.discovery.fetch_next_market(asset, after, strict_adjacent=not is_initial)
             if next_market:
-                # reset emission flags on success
-                state.rollover_started_emitted = False  # allow next window to emit again
+                # target discovered — stop tracking it for emission dedup
+                state.rollover_started_for_ts = None
                 state.initial_discovery_attempts = 0
                 # for initial discovery, set current directly; for rollover, set next
                 if state.current is None:

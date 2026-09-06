@@ -61,6 +61,13 @@ class CollectorEventType(StrEnum):
     rollover_completed = "rollover_completed"
     coverage_gap = "coverage_gap"
     rate_limited = "rate_limited"
+    # discovery-poll transport failure (timeout/DNS/refused) — distinct from
+    # subscription_failed so boundary coverage gaps are attributable to the
+    # discovery transport, not the WS subscription
+    discovery_timeout = "discovery_timeout"
+    # first successful discovery attempt when no market is current yet — kept
+    # out of rollover_started so that event means "real rollover lookahead"
+    initial_discovery = "initial_discovery"
     # data quality
     snapshot_gap = "snapshot_gap"
     event_gap = "event_gap"

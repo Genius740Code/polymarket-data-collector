@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from collections import defaultdict, deque
@@ -254,6 +255,14 @@ class ParquetWriter:
         # truncate WAL after successful flush — fsync directory to ensure durability (fixes 3 duplicate window)
         if self.wal_enabled and flushed:
             try:
+                # Batched WAL durability: fsync once per flush (not per row) so
+                # every buffered row's WAL entry is on disk before the truncate
+                try:
+                    with open(self._wal_path, "a", encoding="utf-8") as f:
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
                 # Ensure all parquet renames are durable before truncating WAL
                 self._wal_path.write_text("")
                 try:
@@ -480,14 +489,14 @@ class ParquetWriter:
 
     def _wal_append(self, dataset: str, row: Dict[str, Any], asset: Optional[str], date_str: Optional[str]) -> None:
         entry = json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": row, "ts": time.time()})
-        with open(self._wal_path, "a") as f:
+        # open/write/flush/close per row, but NO per-row fsync: fsync cost 10-20ms
+        # each on Windows/OneDrive and consumed the whole 500ms tick budget at 14
+        # snapshot rows per tick (scheduler_lag p95 556ms, 2026-09-06 19:58 run).
+        # write+flush still survives a process crash; power-loss durability is
+        # guaranteed once per flush() where the WAL is fsynced before truncation.
+        with open(self._wal_path, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
             f.flush()
-            try:
-                import os
-                os.fsync(f.fileno())
-            except Exception:
-                pass
 
     def _write_group(self, dataset: str, date_str: str, asset: Optional[str], rows: List[Dict[str, Any]]) -> None:
         # Determine output path §11 partitioning — §11 explicitly lists which
