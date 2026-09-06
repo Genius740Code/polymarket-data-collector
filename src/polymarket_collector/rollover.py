@@ -116,6 +116,9 @@ class RolloverState:
     rollover_miss_logged: bool = False
     rollover_started_emitted: bool = False  # throttle spam — emit once per window
     initial_discovery_attempts: int = 0  # for initial current=None phase
+    # loop2-iter1: mid-window recovery probe bookkeeping
+    consecutive_failures: int = 0  # polls with no market while current is None
+    last_probe_ms: Optional[int] = None
 
     def needs_rollover_lookahead(self, now_ms: int, lead_ms: int) -> bool:
         if not self.current:
@@ -155,16 +158,49 @@ class MarketDiscovery:
         self.rest_market_url = rest_market_url
         self.poll_interval = poll_interval_s
         self.backoff_max = backoff_max_s
+        # loop2-iter1: effective discovery backoff is capped at 5s — a missed
+        # 5-minute window is permanent, so retry aggressively rather than
+        # backing off into the next window.
+        self.max_effective_backoff_s = 5.0
         self.on_event = on_event
         self._backoff_s = poll_interval_s
         self.window_size_seconds = window_size_seconds
         self.window_multiplier = window_size_seconds // 300
         self.liquidity_filter = liquidity_filter  # LiquidityFilterConfig or None
+        # loop2-iter1: throttle for failure observability events (per asset)
+        self._last_fail_event_ms: Dict[str, int] = {}
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
         # asset prefix is lower-case, e.g. btc-updown-5m-1787994000
         return f"{asset.lower()}-updown-{window_label}-{ts_seconds}"
+
+    def _clamp_backoff(self) -> None:
+        """Cap effective backoff at 5s (loop2-iter1: aggressive discovery retry)."""
+        try:
+            self._backoff_s = min(self._backoff_s, self.backoff_max, self.max_effective_backoff_s)
+        except Exception:
+            pass
+
+    def _note_failure(self, asset: str, detail: dict) -> None:
+        """Emit a throttled discovery_poll failure event (≤1 per 60s per asset).
+
+        Routine polls fail silently at the call site (the 2s poll loop IS the
+        retry); this keeps failures observable without spamming collector_events.
+        """
+        if not self.on_event:
+            return
+        try:
+            now_ms = int(time.time() * 1000)
+            last = self._last_fail_event_ms.get(asset.upper(), 0)
+            if now_ms - last < 60_000:
+                return
+            self._last_fail_event_ms[asset.upper()] = now_ms
+            payload = {"asset": asset.upper()}
+            payload.update(detail)
+            self.on_event("discovery_poll", payload)
+        except Exception:
+            pass
 
     def _ts_for_after(self, after_ts_ms: int) -> int:
         # floor to configurable window boundary
@@ -189,53 +225,102 @@ class MarketDiscovery:
         gamma_url = f"{self.GAMMA_BASE}/markets"
         params = {"slug": slug}
 
+        # loop2-iter1 no-skip rule: Gamma serves only the ~2 most recent 5m
+        # windows, and far-future windows are sometimes indexed BEFORE the
+        # adjacent one. Adopting a later window while the adjacent/current one
+        # is still live SKIPS a whole window permanently (iter-5: 5962367 →
+        # 5962369 with 5962368 skipped). So while the requested window is live,
+        # only the adjacent slug is eligible. Skip-ahead is allowed ONLY when
+        # the requested window already ended (stale `after`, e.g. cursor
+        # recovery) — and then candidates jump to the CURRENT window, never
+        # blindly to ts+1/ts+2.
+        ws = self.window_size_seconds
+        now_ts = int(time.time()) // ws * ws  # current window boundary (seconds)
+        failures: List[dict] = []
         # Try Gamma first — slug is deterministic but may be indexed ~30-60s late.
         import datetime as _dt
         # Skip-ahead candidates only for initial discovery (no current market);
         # lookahead discovery must adopt the adjacent window or wait for it.
         if strict_adjacent:
             candidates = [ts]
+        elif ts + ws <= now_ts:
+            # requested window already ended → recover to the current window
+            candidates = [now_ts]
+            if self.on_event:
+                try:
+                    self.on_event("discovery_jump", {
+                        "asset": asset,
+                        "from_ts": ts,
+                        "to_ts": now_ts,
+                        "reason": "requested window ended; jumping to current window",
+                    })
+                except Exception:
+                    pass
         else:
-            candidates = [ts, ts + self.window_size_seconds, ts + 2 * self.window_size_seconds]
-        for cand_ts in candidates:
-            cand_slug = self._slug_for(asset, cand_ts)
-            cand_params = {"slug": cand_slug}
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(gamma_url, params=cand_params)
-                    if resp.status_code == 429:
-                        if self.on_event:
-                            self.on_event("rate_limited", {"asset": asset, "status": 429, "url": gamma_url})
-                        self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
-                        return None
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if isinstance(data, list) and not data:
-                        continue
-                    m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
-                    if isinstance(m0, dict):
-                        end_iso = m0.get("endDate")
-                        try:
-                            if end_iso:
-                                dt_end = _dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-                                end_ms = int(dt_end.timestamp()*1000)
-                                now_ms_check = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000)
-                                # Only skip if this is the first candidate and market already ended long ago (>window)
-                                if end_ms + self.window_size_seconds*1000 <= now_ms_check and cand_ts == ts:
-                                    continue
-                        except Exception:
-                            pass
-                        self._backoff_s = self.poll_interval
-                        parsed = self._parse_gamma_market(asset, m0, cand_ts)
-                        # liquidity filtering — no RPC, uses reported_liquidity/reported_volume only
-                        if parsed is not None and not self._passes_liquidity_filter(parsed):
-                            # try next candidate window instead of returning low-liq market
+            candidates = [ts]
+        found: Optional[MarketInfo] = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for cand_ts in candidates:
+                    cand_slug = self._slug_for(asset, cand_ts)
+                    cand_params = {"slug": cand_slug}
+                    try:
+                        resp = await client.get(gamma_url, params=cand_params)
+                        if resp.status_code == 429:
+                            if self.on_event:
+                                self.on_event("rate_limited", {"asset": asset, "status": 429, "url": gamma_url})
+                            self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
+                            self._clamp_backoff()
+                            failures.append({"slug": cand_slug, "status": 429})
+                            self._note_failure(asset, {"slugs": [cand_slug], "errors": ["429"], "phase": "gamma"})
+                            return None
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if isinstance(data, list) and not data:
+                            failures.append({"slug": cand_slug, "status": resp.status_code, "empty": True})
                             continue
-                        if parsed is not None:
-                            return parsed
-            except Exception as e:
-                continue
-        # No market found for either candidate — let poll retry / fallback
+                        m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+                        if isinstance(m0, dict):
+                            end_iso = m0.get("endDate")
+                            try:
+                                if end_iso:
+                                    dt_end = _dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                                    end_ms = int(dt_end.timestamp()*1000)
+                                    now_ms_check = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp()*1000)
+                                    # Only skip if this is the first candidate and market already ended long ago (>window)
+                                    if end_ms + self.window_size_seconds*1000 <= now_ms_check and cand_ts == ts:
+                                        failures.append({"slug": cand_slug, "stale": True})
+                                        continue
+                            except Exception:
+                                pass
+                            self._backoff_s = self.poll_interval
+                            parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                            # liquidity filtering — no RPC, uses reported_liquidity/reported_volume only
+                            if parsed is not None and not self._passes_liquidity_filter(parsed):
+                                # try next candidate window instead of returning low-liq market
+                                failures.append({"slug": cand_slug, "low_liquidity": True})
+                                continue
+                            if parsed is not None:
+                                found = parsed
+                                break
+                        else:
+                            failures.append({"slug": cand_slug, "status": resp.status_code, "unparseable": True})
+                    except Exception as e:
+                        failures.append({"slug": cand_slug, "error": repr(e)})
+                        continue
+        except Exception as e:
+            failures.append({"transport": repr(e)})
+        if found is not None:
+            return found
+        # No market found for the candidate(s) — the 2s poll loop IS the retry;
+        # record the failure observably (throttled) instead of swallowing it.
+        if failures:
+            self._note_failure(asset, {
+                "slugs": [f.get("slug") for f in failures if f.get("slug")],
+                "errors": [f.get("error", f.get("status", "?")) for f in failures],
+                "phase": "gamma",
+            })
+        # No market found — let poll retry / fallback
 
         # Legacy fallback: use configured rest_market_url with old param shape (for tests / mock injectors)
         if self.rest_market_url and self.rest_market_url != gamma_url:
@@ -246,6 +331,7 @@ class MarketDiscovery:
                         if self.on_event:
                             self.on_event("rate_limited", {"asset": asset, "status": 429})
                         self._backoff_s = min(self._backoff_s * 2, self.backoff_max)
+                        self._clamp_backoff()
                         return None
                     resp.raise_for_status()
                     data = resp.json()
@@ -259,6 +345,55 @@ class MarketDiscovery:
                     self.on_event("subscription_failed", {"asset": asset, "error": repr(e), "phase": "discovery_poll"})
                 return None
         return None
+
+    async def probe_window(self, asset: str, window_ts_seconds: int) -> tuple[Optional[MarketInfo], dict]:
+        """Mid-window recovery probe (loop2-iter1).
+
+        Re-polls Gamma for the exact window slug plus the next-window slug and
+        returns (parsed_market_or_None, debug). The debug dict carries the raw
+        per-slug status/body-snippet so a failure is logged with evidence
+        instead of vanishing into the poll loop. Never raises.
+        """
+        import httpx
+
+        asset = asset.upper()
+        ws = self.window_size_seconds
+        gamma_url = f"{self.GAMMA_BASE}/markets"
+        debug: dict = {"asset": asset, "window_ts": window_ts_seconds, "slugs": []}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for cand_ts in (window_ts_seconds, window_ts_seconds + ws):
+                    slug = self._slug_for(asset, cand_ts)
+                    entry: dict = {"slug": slug, "ts": cand_ts}
+                    try:
+                        resp = await client.get(gamma_url, params={"slug": slug})
+                        entry["status"] = resp.status_code
+                        try:
+                            body = resp.text or ""
+                        except Exception:
+                            body = ""
+                        entry["body_snippet"] = body[:500]
+                        if resp.status_code != 429:
+                            resp.raise_for_status()
+                            data = resp.json()
+                            m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+                            if isinstance(m0, dict):
+                                parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                                if parsed is not None and self._passes_liquidity_filter(parsed):
+                                    # only adopt the EXACT window (adjacent); the
+                                    # next slug is diagnostic only (no-skip rule)
+                                    entry["parsed_condition_id"] = parsed.condition_id
+                                    if cand_ts == window_ts_seconds:
+                                        debug["slugs"].append(entry)
+                                        return parsed, debug
+                    except Exception as e:
+                        entry["error"] = repr(e)
+                        if "status" not in entry:
+                            entry["status"] = None
+                    debug["slugs"].append(entry)
+        except Exception as e:
+            debug["transport_error"] = repr(e)
+        return None, debug
 
     def _parse_gamma_market(self, asset: str, data: dict, ts_seconds: int) -> Optional[MarketInfo]:
         import json
@@ -628,6 +763,7 @@ class RolloverManager:
             next_market = await self.discovery.fetch_next_market(asset, after, strict_adjacent=not is_initial)
             if next_market:
                 # reset emission flags on success
+                state.consecutive_failures = 0
                 state.rollover_started_emitted = False  # allow next window to emit again
                 state.initial_discovery_attempts = 0
                 # for initial discovery, set current directly; for rollover, set next
@@ -655,6 +791,52 @@ class RolloverManager:
                     return "rollover_started" if should_emit_rollover else "market_added"
             else:
                 # No synthetic fallback - distinguish discovered late vs no market existed (§1 #6)
+                # loop2-iter1: mid-window recovery probe — if an asset has no
+                # market ~10s into a window (>=5 failed polls at 2s cadence),
+                # re-poll Gamma with the exact + next slug and log the raw
+                # response as evidence (throttled to 1 probe per 30s).
+                if is_initial:
+                    state.consecutive_failures += 1
+                    ws_ms = self.discovery.window_size_seconds * 1000
+                    win_start_ms = (now_ms // ws_ms) * ws_ms
+                    due = (
+                        state.consecutive_failures >= 5
+                        and now_ms - win_start_ms >= 10_000
+                        and (state.last_probe_ms is None or now_ms - state.last_probe_ms > 30_000)
+                    )
+                    if due:
+                        state.last_probe_ms = now_ms
+                        try:
+                            probed, debug = await self.discovery.probe_window(
+                                asset, win_start_ms // 1000
+                            )
+                        except Exception as e:
+                            probed, debug = None, {"probe_error": repr(e)}
+                        if self.on_event:
+                            try:
+                                self.on_event("discovery_recovery", {
+                                    "asset": asset,
+                                    "window_index": win_start_ms // ws_ms,
+                                    "consecutive_failures": state.consecutive_failures,
+                                    "slugs": debug.get("slugs", []),
+                                    "transport_error": debug.get("transport_error"),
+                                    "recovered": probed is not None,
+                                })
+                            except Exception:
+                                pass
+                        if probed is not None:
+                            state.consecutive_failures = 0
+                            state.initial_discovery_attempts = 0
+                            state.current = probed
+                            state.is_rollover_window = False
+                            try:
+                                await subscribe_fn(probed)
+                            except Exception as e:
+                                if self.on_event:
+                                    self.on_event("subscription_failed", {"asset": asset, "condition_id": probed.condition_id, "error": repr(e)})
+                            if self.on_event:
+                                self.on_event("market_added", {"asset": asset, "condition_id": probed.condition_id, "via": "recovery_probe"})
+                            return "market_added"
                 # If we're past market_end_ts + max_gap and still no next, it's a coverage_gap
                 if state.current and now_ms > state.current.market_end_ts_ms + self.max_gap_ms:
                     if not state.rollover_miss_logged:

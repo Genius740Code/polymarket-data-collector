@@ -1,5 +1,12 @@
 # 📌 CURRENT HANDOFF (2026-09-05 night) — MISSION: fix issues → test-loop → git commit
 
+> ## 🔁 LOOP STATUS (2026-09-06, loop2 iter1 — run 16:50–17:01 UTC + finalize)
+> Log: `test_run_20260906T164819Z.log`. Code: discovery no-skip + recovery probe (`rollover.py`), finalize-wait ~12 min + hermetic subprocess env (`run_2x5min_test.py`), 3 new enum members, 5 new rollover tests, DATA_CARD locked-book note.
+> Result: pytest 110/110; staging 39/39; completeness 100% / clean 99.89%; coverage_gaps 0 (vs 15 in iter-5); subscription_failed 0 (vs 19); windows consecutive 5962377–5962380 all 7 assets; data_loss 0.11%; critical_null false; live 9538 / stale 10; unpaired 0; log: 1 ERROR (known-normal 403 poll-0), 0 WARN, 0 watchdog fires (35 [ws:] lines all planned recycles); RTDS all 7 assets ~665 rows each.
+> Kaggle v3 (17:21 UTC, remote-verified, fresh-download audited): 39 files, schemas PASS, 28/28 markets polymarket_official (finalize-wait caught run windows; follow-up backfill closed the last 9), clean 9538 rows: 0 strict-crossed, 0 complementarity violations, 2 locked (ETH zero-spread, ACCEPTED), monotonic PASS, taker fills 91–99%.
+> Notes: (a) env footgun — this box has a second checkout (`polymarket-data-collector`) installed as editable that SHADOWS this repo's package; the runner now pins ROOT/src via sys.path + PYTHONPATH for children — always launch with the repo's own python env. (b) New discovery failure events (`discovery_poll/jump/recovery`) did NOT fire this run — Gamma behaved; covered by unit tests only. (c) Iter-5's "4 crossed SOL rows" do NOT reproduce locally (0/8659 staging) or remotely (0/9538 v3) — likely version skew in that audit; the snapshot path is structurally race-free (check→snapshot is one synchronous block). No clean_view exclusion applied (would hide honest data). (d) Kaggle `list --mine` timestamps lag the API — trust `dataset_list`/download bytes for version recency.
+> Still open: C2 maker-wallet backfill (key in .env, UNBLOCKED — start one-market probe); stale producer on other box (nag operator); C2 API key / pm2 cron operator items.
+
 > ## 🔁 LOOP STATUS (2026-09-06, after 5 test-loop iterations)
 > Commits: `4ea47d0` (iter1), `8dbe881` (iter2), `8283c4e` (iter3+4). Final artifact: kaggle `gghgg1/polymarket-5m-crypto` ready, 39 files, remote-verified uploads.
 >

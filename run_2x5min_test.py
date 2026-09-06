@@ -26,6 +26,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 KAGGLE_DATASET = "gghgg1/polymarket-5m-crypto"
+SRC_DIR = ROOT / "src"
+
+# loop2-iter1: hermetic imports — this box has a second checkout
+# (polymarket-data-collector) installed as editable, which shadows this repo's
+# package. Pin this repo's src first so the loop always collects withrepo code.
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+
+def _child_env() -> dict:
+    """Environment for child processes: inherit + force ROOT/src first on
+    PYTHONPATH so `python -m polymarket_collector.*` children import THIS
+    repo's code, not the shadowing editable install from the other checkout."""
+    import os
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    cur = env.get("PYTHONPATH", "")
+    parts = [p for p in cur.split(os.pathsep) if p] if cur else []
+    if str(SRC_DIR) not in parts:
+        parts.insert(0, str(SRC_DIR))
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 
 def wipe_local_data() -> None:
@@ -71,7 +92,7 @@ def run_test() -> int:
     ]
     print(f"[run] {' '.join(cmd)}")
     print(f"[run] log -> {log_path.name}")
-    env = {**__import__("os").environ, "PYTHONUNBUFFERED": "1"}  # live log lines
+    env = _child_env()  # live log lines + hermetic repo imports
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -121,13 +142,49 @@ def print_summary() -> None:
     print("[summary] no analysis file found — test did not complete?")
 
 
+def wait_for_official_resolutions(timeout_s: int = 12 * 60, poll_s: int = 60) -> bool:
+    """loop2-iter1: official CLOB winners lag ~10 min, but the old finalize ran
+    its backfill ~5 min after the last window — so the final Kaggle version
+    always shipped the last windows unresolved. Wait until every ended market
+    is `polymarket_official` or the budget elapses, THEN run the real backfill.
+
+    Uses a dry-run of backfill_resolutions as the probe (no writes, one cheap
+    CLOB GET per unresolved market per poll). Returns True when all resolved.
+    """
+    try:
+        from polymarket_collector.resolution_backfill import backfill_resolutions
+    except Exception as e:
+        print(f"[finalize-wait] cannot import backfill probe: {e} — skipping wait")
+        return False
+    deadline = time.time() + timeout_s
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            stats = backfill_resolutions(DATA_DIR, dry_run=True)
+        except Exception as e:
+            print(f"[finalize-wait] probe {attempt} failed: {e}")
+            stats = {}
+        pending = int(stats.get("pending", 0) or 0)
+        cands = int(stats.get("candidates", 0) or 0)
+        print(f"[finalize-wait] probe {attempt}: {cands} ended-unresolved, {pending} pending official winners")
+        if cands == 0 or pending == 0:
+            print("[finalize-wait] all ended markets have official winners — proceeding to backfill")
+            return True
+        if time.time() + poll_s >= deadline:
+            print(f"[finalize-wait] budget exhausted with {pending} still pending — proceeding anyway")
+            return False
+        time.sleep(poll_s)
+
+
 def run_post_test_finalize() -> None:
     """B-7: after the run, resolve everything ended (official CLOB outcome) and
     push the final Kaggle version carrying resolutions + enriched trades."""
+    wait_for_official_resolutions()
     cmd = [sys.executable, "-m", "polymarket_collector.resolution_backfill",
            "--config", "config/collector.yaml", "--reupload"]
     print("[finalize] resolution backfill + final Kaggle version")
-    env = {**__import__("os").environ, "PYTHONUNBUFFERED": "1"}
+    env = _child_env()
     # capture + echo: the child's output previously never reached the tee'd log
     # (Windows pipe inheritance), hiding whether the final upload happened
     proc = subprocess.run(cmd, cwd=str(ROOT), env=env,

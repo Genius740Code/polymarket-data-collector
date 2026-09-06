@@ -87,6 +87,11 @@ class CollectorEventType(StrEnum):
     kaggle_upload_failed = "kaggle_upload_failed"
     # liquidity filtering — no RPC, Gamma only
     low_liquidity = "low_liquidity"
+    # loop2-iter1 discovery observability: throttled poll-failure evidence,
+    # stale-after window jumps, and mid-window recovery probes (raw responses)
+    discovery_poll = "discovery_poll"
+    discovery_jump = "discovery_jump"
+    discovery_recovery = "discovery_recovery"
 
 
 class DisconnectReason(StrEnum):
