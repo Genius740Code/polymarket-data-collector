@@ -861,7 +861,7 @@ class Collector:
                         except Exception as e:
                             if self.on_event:
                                 try:
-                                    self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": str(e)})
+                                    self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": repr(e)})
                                 except Exception:
                                     pass
                             return False

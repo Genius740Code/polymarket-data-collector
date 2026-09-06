@@ -1752,69 +1752,84 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                 for _ in range(60):
                     try:
                         st = api.dataset_status(dataset)
-                        s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
-                        if s == "ready":
-                            _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4
-                            _rows_ok = _verify_staging_row_counts(staging, expected_assets)
-                            # Remote verification: ensure Kaggle actually stores expected files (not just local status)
-                            # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
-                            _remote_ok = True
-                            try:
-                                remote_names = set()
-                                next_token = None
-                                for _page in range(5):  # 5*20=100 >31 expected
-                                    kwargs = {}
-                                    if next_token:
-                                        kwargs["page_token"] = next_token
-                                        # kagglesdk may use page_token/nextPageToken; try both
-                                        try:
-                                            remote_files = api.dataset_list_files(dataset, page_token=next_token)  # type: ignore
-                                        except TypeError:
-                                            remote_files = api.dataset_list_files(dataset)  # fallback, ignore pagination
-                                            break
-                                    else:
-                                        remote_files = api.dataset_list_files(dataset)
-                                    if isinstance(remote_files, dict):
-                                        files_list = remote_files.get("datasetFiles") or remote_files.get("files") or []
-                                        next_token = remote_files.get("nextPageToken")
-                                    else:
-                                        files_list = getattr(remote_files, "files", None) or getattr(remote_files, "datasetFiles", None) or []
-                                        if files_list is None:
-                                            files_list = []
-                                        next_token = getattr(remote_files, "nextPageToken", None)
-                                    for f in files_list:
-                                        if isinstance(f, dict):
-                                            n = f.get("ref") or f.get("name") or f.get("fileName")
-                                        else:
-                                            n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
-                                        if n:
-                                            remote_names.add(Path(str(n)).name)
-                                    if not next_token:
+                        # kaggle 2.x returns a plain "ready"/"pending" STRING here;
+                        # older wrappers may return a dict or object. Normalise — the
+                        # previous str-only path threw AttributeError on st.get() and
+                        # the bare except swallowed it, so the poll NEVER matched and
+                        # every upload fell through to timeout.
+                        if isinstance(st, dict):
+                            s = st.get("status") or ""
+                        elif isinstance(st, str):
+                            s = st.strip().strip('"')
+                        else:
+                            s = getattr(st, "status", "") or ""
+                        if s != "ready" and _ % 6 == 0:
+                            print(f"[kaggle] poll {_}/60 dataset {dataset} status={s!r}")
+                    except Exception as _st_exc:
+                        # never swallow silently again — an exception here previously
+                        # made every poll a no-op and the upload "time out"
+                        print(f"[kaggle] poll {_}/60 dataset {dataset} status ERROR: {_st_exc!r}")
+                        s = ""
+                    if s == "ready":
+                        _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4
+                        _rows_ok = _verify_staging_row_counts(staging, expected_assets)
+                        # Remote verification: ensure Kaggle actually stores expected files (not just local status)
+                        # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
+                        _remote_ok = True
+                        try:
+                            remote_names = set()
+                            next_token = None
+                            for _page in range(5):  # 5*20=100 >31 expected
+                                kwargs = {}
+                                if next_token:
+                                    kwargs["page_token"] = next_token
+                                    # kagglesdk may use page_token/nextPageToken; try both
+                                    try:
+                                        remote_files = api.dataset_list_files(dataset, page_token=next_token)  # type: ignore
+                                    except TypeError:
+                                        remote_files = api.dataset_list_files(dataset)  # fallback, ignore pagination
                                         break
-                                # Check remote has at least expected parquets
-                                expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet", "markets_summary.parquet"}
-                                if not expected_names.issubset(remote_names):
-                                    _remote_ok = False
-                                if len(remote_names) < len(expected_names):
-                                    _remote_ok = False
-                            except Exception:
-                                _remote_ok = True
-                            if _rows_ok and _files_ok and _remote_ok:
-                                print(f"✓ Kaggle dataset ready: {dataset} (local files={_expected_staging_files(staging)}, remote verified)")
-                                _write_kaggle_state(staging, dataset, version_notes)
-                                return True
-                            elif not _rows_ok:
-                                print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
-                            elif not _files_ok:
-                                print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 4}; waiting for complete upload")
-                            elif not _remote_ok:
-                                print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
-                        elif s in ("failed", "error"):
-                            print(f"✗ Kaggle dataset in error state: {dataset}")
+                                else:
+                                    remote_files = api.dataset_list_files(dataset)
+                                if isinstance(remote_files, dict):
+                                    files_list = remote_files.get("datasetFiles") or remote_files.get("files") or []
+                                    next_token = remote_files.get("nextPageToken")
+                                else:
+                                    files_list = getattr(remote_files, "files", None) or getattr(remote_files, "datasetFiles", None) or []
+                                    if files_list is None:
+                                        files_list = []
+                                    next_token = getattr(remote_files, "nextPageToken", None)
+                                for f in files_list:
+                                    if isinstance(f, dict):
+                                        n = f.get("ref") or f.get("name") or f.get("fileName")
+                                    else:
+                                        n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
+                                    if n:
+                                        remote_names.add(Path(str(n)).name)
+                                if not next_token:
+                                    break
+                            # Check remote has at least expected parquets
+                            expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet", "markets_summary.parquet"}
+                            if not expected_names.issubset(remote_names):
+                                _remote_ok = False
+                            if len(remote_names) < len(expected_names):
+                                _remote_ok = False
+                        except Exception:
+                            _remote_ok = True
+                        if _rows_ok and _files_ok and _remote_ok:
+                            print(f"✓ Kaggle dataset ready: {dataset} (local files={_expected_staging_files(staging)}, remote verified)")
                             _write_kaggle_state(staging, dataset, version_notes)
-                            return False
-                    except Exception:
-                        pass
+                            return True
+                        elif not _rows_ok:
+                            print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
+                        elif not _files_ok:
+                            print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 4}; waiting for complete upload")
+                        elif not _remote_ok:
+                            print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
+                    elif s in ("failed", "error"):
+                        print(f"✗ Kaggle dataset in error state: {dataset}")
+                        _write_kaggle_state(staging, dataset, version_notes)
+                        return False
                     _time.sleep(10)
                 # Fail closed: unverified upload must not report success or mark state
                 print(f"✗ Kaggle dataset not verified ready after 10 min poll: {dataset}")

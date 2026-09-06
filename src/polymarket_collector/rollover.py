@@ -256,7 +256,7 @@ class MarketDiscovery:
                     return parsed2
             except Exception as e:
                 if self.on_event:
-                    self.on_event("subscription_failed", {"asset": asset, "error": str(e)})
+                    self.on_event("subscription_failed", {"asset": asset, "error": repr(e), "phase": "discovery_poll"})
                 return None
         return None
 
@@ -638,7 +638,7 @@ class RolloverManager:
                         await subscribe_fn(next_market)
                     except Exception as e:
                         if self.on_event:
-                            self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": str(e)})
+                            self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": repr(e)})
                     if self.on_event:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
                     return "market_added"
@@ -649,7 +649,7 @@ class RolloverManager:
                         await subscribe_fn(next_market)
                     except Exception as e:
                         if self.on_event:
-                            self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": str(e)})
+                            self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": repr(e)})
                     if self.on_event:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
                     return "rollover_started" if should_emit_rollover else "market_added"
