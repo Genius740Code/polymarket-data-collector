@@ -146,17 +146,20 @@ def test_build_markets_summary_values(hive: Path):
     # spread: mean of (0.02, 0.02, 0.02) = 0.02
     assert a["avg_spread_up"] == pytest.approx(0.02)
     assert a["snapshot_count"] == 3
-    # chainlink: nearest tick within 5s of both boundaries
+    # chainlink: nearest tick within tolerance of both boundaries
     assert a["underlying_open"] == pytest.approx(80000.0)
     assert a["underlying_close"] == pytest.approx(80100.0)
     assert a["underlying_open_ts_utc"] == "2026-09-05T20:35:00Z"
+    # applied tolerances recorded per row (open 10s per K-2, close 5s)
+    assert a["underlying_open_tolerance_s"] == 10
+    assert a["underlying_close_tolerance_s"] == 5
 
     b = rows["0xBBB"]
     # unresolved market: resolution fields null, no snapshots/trades → nulls, never zeros
     assert b["resolution_outcome"] == "unknown" and b["settlement_price"] is None
     assert b["fill_count"] is None and b["traded_volume"] is None
     assert b["up_open"] is None and b["snapshot_count"] is None
-    # chainlink tick 60s away from window start — beyond tolerance → NULL (honest gap)
+    # chainlink tick 60s away from window start — beyond the 10s open tolerance → NULL (honest gap)
     assert b["underlying_open"] is None
 
 

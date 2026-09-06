@@ -42,4 +42,4 @@ def test_from_yaml_tmp(tmp_path):
 def test_snapshot_interval_ms():
     cfg = CollectorConfig()
     assert cfg.snapshot_interval_ms == 500
-    assert cfg.l2_levels == 20
+    assert cfg.l2_levels == 10

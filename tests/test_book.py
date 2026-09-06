@@ -190,3 +190,108 @@ def test_full_book_diff_drift():
     diff = book.diff_against_rest(rest_drift)
     assert diff is not None
     assert "mismatches" in diff
+
+
+def _live_book_frame(ts=None):
+    """Realistic CLOB `book` frame (live probe 2026-09-05 shape)."""
+    m = {"event_type": "book", "asset_id": "up-123", "market": "0xm",
+         "bids": [{"price": "0.50", "size": "10"}], "asks": [{"price": "0.52", "size": "10"}],
+         "hash": "0df9ed199b15f73551ec79f2b0d43cb805c0dafa"}
+    if ts is not None:
+        m["timestamp"] = ts
+    return m
+
+
+def test_a1_ts_source_from_frame_timestamp():
+    # A1 probe: top-level `timestamp` always present live → events carry it
+    book = make_book()
+    book.apply_ws_message(_live_book_frame(ts="1788649334527"))
+    evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
+    assert evs, "BBO change must emit a price_change event"
+    assert all(e["ts_source"] == "1788649334527" for e in evs)
+
+
+def test_a1_ts_source_carry_forward_within_window():
+    # frame without timestamp reuses the previous frame's ts (same connection, fresh)
+    book = make_book()
+    book.apply_ws_message(_live_book_frame(ts="1788649334527"))
+    book.drain_pending_events()
+    f2 = _live_book_frame(ts=None)
+    f2["bids"] = [{"price": "0.51", "size": "10"}]  # move BBO so an event fires
+    book.apply_ws_message(f2)
+    evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
+    assert evs
+    assert all(e["ts_source"] == "1788649334527" for e in evs)
+
+
+def test_a1_ts_source_stays_null_without_source():
+    # no frame timestamp ever seen → NULL, never receive-time (no fabrication)
+    book = make_book()
+    book.apply_ws_message(_live_book_frame(ts=None))
+    evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
+    assert evs
+    assert all(e["ts_source"] is None for e in evs)
+
+
+def test_a1_bbo_snapped_carries_ts_source():
+    # bbo_snapped (previously always NULL) carries the frame timestamp
+    book = make_book()
+    book.apply_ws_message(_live_book_frame(ts="1788649334527"))
+    book.drain_pending_events()
+    pc = {"event_type": "price_change", "market": "0xm", "timestamp": "1788649335000",
+          "price_changes": [{"asset_id": "up-123", "price": "0.53", "size": "5",
+                             "side": "SELL", "hash": "abc123",
+                             "best_bid": "0.50", "best_ask": "0.55"}]}
+    book.apply_ws_message(pc)
+    evs = book.drain_pending_events()
+    snapped = [e for e in evs if e["event_type"] == "bbo_snapped"]
+    assert snapped, f"expected bbo_snapped, got {[e['event_type'] for e in evs]}"
+    assert all(e["ts_source"] == "1788649335000" for e in snapped)
+
+
+def test_a4_hash_captured_and_gates_promotion():
+    # full `book` frame WITH exchange hash promotes a stale book to live
+    book = make_book()
+    book.mark_stale("r1")
+    assert book.book_state == BookState.stale
+    applied, reason = book.apply_ws_message(_live_book_frame(ts="1788649334527"))
+    assert applied is True
+    assert reason is None
+    assert book.book_state == BookState.live
+    assert book.book_hash["up"] == "0df9ed199b15f73551ec79f2b0d43cb805c0dafa"
+
+
+def test_a4_promotion_refused_without_hash():
+    # snapshot WITHOUT hash: levels still applied, but NO promotion (REST heal covers)
+    book = make_book()
+    book.mark_stale("r1")
+    f = _live_book_frame(ts="1788649334527")
+    del f["hash"]
+    applied, reason = book.apply_ws_message(f)
+    assert applied is True
+    assert book.book_state == BookState.stale
+    assert reason is not None and "book_hash_missing_on_promotion" in reason
+    # content was still applied — no data loss, only trust refused
+    assert book.up.bids.best_price() == 0.50
+
+
+def test_a4_malformed_hash_refused():
+    book = make_book()
+    book.mark_stale("r1")
+    f = _live_book_frame(ts="1788649334527")
+    f["hash"] = "x"  # too short to be an attestation
+    applied, reason = book.apply_ws_message(f)
+    assert applied is True
+    assert book.book_state == BookState.stale
+    assert reason is not None and "book_hash_missing_on_promotion" in reason
+
+
+def test_a4_price_change_entry_hash_captured():
+    book = make_book()
+    pc = {"event_type": "price_change", "market": "0xm", "timestamp": "1788649335000",
+          "price_changes": [{"asset_id": "up-123", "price": "0.51", "size": "5",
+                             "side": "BUY", "hash": "entryhash001",
+                             "best_bid": "0.51", "best_ask": "0.52"}]}
+    applied, _ = book.apply_ws_message(pc)
+    assert applied is True
+    assert book.book_hash["up"] == "entryhash001"

@@ -186,8 +186,9 @@ def test_b7_resolution_backfill_official_outcome(tmp_path, monkeypatch):
     monkeypatch.setattr(httpx, "get", fake_get)
     stats = backfill_resolutions(tmp_path)
 
-    assert stats["candidates"] == 2, "resolved-outcome-up market must not be re-processed"
-    assert stats["resolved"] == 1 and stats["pending"] == 1
+    # 0xbbb is resolved-but-not-official → candidate for inferred→official upgrade
+    assert stats["candidates"] == 3
+    assert stats["resolved"] == 1 and stats["upgraded"] == 1 and stats["pending"] == 1
 
     latest = {r["condition_id"]: r for r in MarketsLog(tmp_path).load_latest()}
     aaa = latest["0xaaa"]
@@ -195,7 +196,8 @@ def test_b7_resolution_backfill_official_outcome(tmp_path, monkeypatch):
     assert aaa["resolution_outcome"] == "down"
     assert aaa["settlement_source"] == "polymarket_official"
     assert aaa["settlement_price"] == 1.0
-    # already-resolved market untouched
+    # already-resolved market upgraded in place (outcome unchanged, now official)
     assert latest["0xbbb"]["resolution_outcome"] == "up"
+    assert latest["0xbbb"]["settlement_source"] == "polymarket_official"
     # unsettled market stays unresolved (pending)
     assert latest["0xccc"]["status"] in ("active", "closed")

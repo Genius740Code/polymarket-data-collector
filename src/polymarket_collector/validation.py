@@ -115,10 +115,19 @@ def validate_ws_message(msg: dict) -> List[ValidationError]:
     """
     price_keys = {"price", "best_bid", "best_ask", "bid", "ask"}
     size_keys = {"size", "bid_size", "ask_size", "amount"}
+    # Top-level contextual metadata that merely LOOKS like a price field:
+    # `book` frames carry the trade that triggered the snapshot in
+    # `last_trade_price` — a numeric string when present, '' when the snapshot
+    # was not trade-triggered (14 live frames 2026-09-05). An empty value is
+    # "no context", not a malformed level — skipping it avoids rejecting the
+    # entire full-book snapshot (which also marks the book stale).
+    _SKIP_WHEN_EMPTY = {"last_trade_price"}
     # also L2 level arrays if present as lists
     errors: List[ValidationError] = []
     for k, v in msg.items():
         lk = k.lower()
+        if lk in _SKIP_WHEN_EMPTY and v in (None, ""):
+            continue
         if lk in price_keys or lk.endswith("_price"):
             err = validate_price(k, v, ctx=msg)
             if err:

@@ -71,3 +71,20 @@ def test_snapshot_depth_validation():
     snap = {"up_bid": 0.5, "up_bid_depth_1c": -5}  # depth negative size
     errors = validate_snapshot_fields(snap)
     assert any("depth" in e.field for e in errors)
+
+
+def test_ws_book_frame_empty_last_trade_price_ok():
+    # live 2026-09-05: `book` frames carry last_trade_price:'' when the
+    # snapshot was not trade-triggered — must not reject the whole frame
+    # (rejection dropped full snapshots and marked books stale ×14).
+    msg = {"event_type": "book", "asset_id": "up-1", "market": "0xm",
+           "bids": [{"price": "0.50", "size": "10"}],
+           "asks": [{"price": "0.52", "size": "10"}],
+           "timestamp": "1788649334527", "hash": "0df9ed199b15f73",
+           "tick_size": "0.01", "last_trade_price": ""}
+    assert validate_ws_message(msg) == []
+    # numeric context still validated when present
+    msg2 = dict(msg, last_trade_price="0.49")
+    assert validate_ws_message(msg2) == []
+    msg3 = dict(msg, last_trade_price="1.5")
+    assert any(e.field == "last_trade_price" for e in validate_ws_message(msg3))

@@ -22,13 +22,13 @@ def _os_replace_safe(src, dst):
     _os.replace(str(src), str(dst))
 
 
-from .parquet_io import read_table
+from .parquet_io import read_table, concat as _concat_tables
 import pyarrow.compute as pc
 
 
 def build_clean_view(
     data_dir: str | Path,
-    l2_levels: int = 20,
+    l2_levels: int = 10,
     opt_in_disputed: bool = False,
 ) -> int:
     """Build/refresh book_snapshots_clean.
@@ -76,7 +76,7 @@ def build_clean_view(
                     continue
             if not tables:
                 continue
-            combined = pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
+            combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
             # filter: book_state == 'live'
             try:
                 mask = pc.equal(combined.column("book_state"), pa.scalar("live"))
@@ -137,4 +137,4 @@ def load_clean(data_dir: str | Path, asset: Optional[str] = None, date: Optional
                 continue
         if not tables:
             return None
-        return pa.concat_tables(tables, promote=True) if len(tables) > 1 else tables[0]
+        return _concat_tables(tables) if len(tables) > 1 else tables[0]

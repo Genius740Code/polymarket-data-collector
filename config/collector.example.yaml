@@ -30,7 +30,7 @@ discovery_backoff_max_seconds: 8
 
 # §3 — snapshots (500ms aligned to UTC epoch grid, single scheduler)
 snapshot_interval_ms: 500
-l2_levels: 20              # 10–20 per spec; null-padded if fewer available
+l2_levels: 10              # 10–20 per spec; null-padded if fewer available
 depth_thresholds_cents: [1, 5, 10]
 
 # §8 / §9 — event detection thresholds (versioned via event_thresholds_config)

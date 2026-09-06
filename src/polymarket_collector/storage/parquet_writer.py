@@ -54,7 +54,7 @@ class ParquetWriter:
         buffer_max_rows: int = 50000,
         wal_enabled: bool = True,
         wal_dir: str | Path | None = None,
-        l2_levels: int = 20,
+        l2_levels: int = 10,
         schema_version: str = "3.0.0",
         on_event=None,  # callback(event_type, details) for collector_events
         synthetic_mode: bool = False,

@@ -193,7 +193,7 @@ class OrderBookState:
         down_token_id: str,
         market_end_ts_ms: int,
         schema_version: str = "3.0.0",
-        l2_levels: int = 20,
+        l2_levels: int = 10,
     ):
         self.asset = asset
         self.condition_id = condition_id
@@ -218,10 +218,91 @@ class OrderBookState:
         self._stale_since_ms: Optional[int] = None
         # §4 book_events: old/new BBO captured per applied WS message, drained by the collector
         self.pending_events: List[dict] = []
+        # A1: last exchange frame timestamp seen on THIS connection (ms epoch).
+        # Used ONLY as a carry-forward source-time fallback for frames that
+        # genuinely lack a top-level timestamp (batched deltas share a clock).
+        # Never stamped from receive-time: a missing value stays NULL.
+        self._last_frame_ts_ms: Optional[int] = None
+        self._last_frame_rx_ms: Optional[int] = None
+        # A4: exchange book-integrity hashes, per outcome (latest seen).
+        # `book` frames carry a top-level `hash` (hash of the orderbook
+        # content); `price_change` entries each carry a per-order `hash`.
+        # Both are REQUIRED per the AsyncAPI spec and were 100% present in
+        # the 2026-09-05 live probe — raw frames are also in raw_ws_archive.
+        self.book_hash: Dict[str, Optional[str]] = {"up": None, "down": None}
         self.event_thresholds: Dict[str, float] = {
             "spread_change_threshold": 0.002,
             "size_change_threshold_pct": 0.10,
         }
+
+    # -- A1 frame-timestamp helpers --------------------------------------
+    @staticmethod
+    def _parse_frame_ts_ms(msg: dict) -> Optional[int]:
+        """Extract the exchange frame timestamp as ms epoch, or None.
+
+        Live probe (2026-09-05, 37k frames): top-level `timestamp` is always
+        present (ms-epoch string); `ts` never appears (kept as dead fallback).
+        """
+        raw = msg.get("timestamp")
+        if raw is None:
+            raw = msg.get("ts")
+        if raw is None or raw == "":
+            return None
+        try:
+            v = int(str(raw).strip())
+        except (TypeError, ValueError):
+            try:
+                v = int(float(str(raw).strip()))
+            except (TypeError, ValueError):
+                return None
+        if v < 10**12:
+            v *= 1000  # tolerate seconds-epoch senders
+        return v
+
+    def _note_frame_ts(self, msg: dict) -> None:
+        """Record this frame's exchange timestamp for carry-forward."""
+        ts = self._parse_frame_ts_ms(msg)
+        if ts is not None:
+            self._last_frame_ts_ms = ts
+            self._last_frame_rx_ms = int(time.time() * 1000)
+
+    def _resolve_ts_source(self, msg: dict) -> Optional[str]:
+        """Source timestamp for an emitted book_event (string ms epoch).
+
+        Preference: the frame's own top-level timestamp → carry-forward of
+        the previous frame's timestamp from the SAME connection when fresh
+        (received within ~1.5s; batched deltas share a clock) → NULL.
+        Receive-time is used only as a freshness gate, never as the value.
+        """
+        raw = msg.get("timestamp")
+        if raw is None:
+            raw = msg.get("ts")
+        if raw not in (None, ""):
+            return str(raw)
+        if self._last_frame_ts_ms is not None and self._last_frame_rx_ms is not None:
+            try:
+                if int(time.time() * 1000) - self._last_frame_rx_ms <= 1500:
+                    return str(self._last_frame_ts_ms)
+            except Exception:
+                pass
+        return None
+
+    # -- A4 book-hash integrity primitive ----------------------------------
+    @staticmethod
+    def _well_formed_hash(h) -> bool:
+        """A usable exchange integrity attestation: non-empty string, hash-like."""
+        return isinstance(h, str) and len(h.strip()) >= 8
+
+    def _note_frame_hash(self, msg: dict, outcome: Optional[str],
+                         entry_hash: object = None) -> None:
+        """Capture the exchange hash for an outcome (top-level or per-entry)."""
+        if outcome not in ("up", "down"):
+            return
+        h = msg.get("hash") if isinstance(msg, dict) else None
+        if not self._well_formed_hash(h):
+            h = entry_hash
+        if self._well_formed_hash(h):
+            self.book_hash[outcome] = str(h).strip()
 
     # -- state transitions (§1A) -------------------------------------------
     def mark_stale(self, resync_id: str | None = None) -> None:
@@ -257,6 +338,13 @@ class OrderBookState:
             # per §3A: log book_anomaly and mark stale; trigger resync externally
             self.mark_stale()
             return False, f"sanity_bounds_failed: {errors[0].reason} field={errors[0].field} value={errors[0].value}"
+
+        # A1: record the frame's exchange timestamp (carry-forward source)
+        self._note_frame_ts(msg)
+        # A4: non-fatal integrity note (e.g. hash-gated promotion refusal).
+        # Returned as the reason with applied=True so the collector logs it
+        # as book_anomaly telemetry without triggering a resync.
+        promo_note: Optional[str] = None
 
         # sequence gap detection (where sequence_number present) — §1A
         # Use explicit None check: seq 0 is valid but falsy with `or` chaining.
@@ -334,8 +422,11 @@ class OrderBookState:
                         "event_type": "crossed_reverted",
                         "token_id": pc_token, "outcome": pc_outcome,
                         "price": p, "size": s, "side": side,
+                        "ts_source": self._resolve_ts_source(msg),
                     })
                 touched.setdefault(pc_outcome, pc_token)
+                # A4: capture the per-order exchange hash for this outcome
+                self._note_frame_hash(msg, pc_outcome, pc.get("hash"))
                 # exchange-reported authoritative BBO for this token after the change
                 try:
                     bb = float(pc["best_bid"]) if pc.get("best_bid") not in (None, "") else None
@@ -347,7 +438,7 @@ class OrderBookState:
             # enforce BBO against the exchange's own best_bid/best_ask — heals
             # stale ask/bid sides and guarantees the top-of-book is never crossed
             for outcome, ex in ex_bbo.items():
-                self._enforce_bbo(outcome, ex)
+                self._enforce_bbo(outcome, ex, msg)
             # update age
             self._last_update_ns = time.time_ns()
             # For price_change, we don't know which outcome was updated, so reset both ages slightly
@@ -369,15 +460,27 @@ class OrderBookState:
             else:
                 self._down_book_age_ms = 0
             touched.setdefault(outcome, token_id)
+            # A4: capture the full-book hash (hash of the orderbook content)
+            self._note_frame_hash(msg, outcome)
             # A full `book` snapshot is a complete exchange-side state — as trustworthy
             # as a REST fetch. Promote a stale/resyncing book to live when the snapshot
             # fills both sides (was the 55s cold-start and post-resync stale blocks).
+            # A4: promotion is hash-gated — the exchange attests every `book` frame
+            # (AsyncAPI REQUIRED, 100% present in the 2026-09-05 probe). A snapshot
+            # without a well-formed hash is still APPLIED (levels are real data)
+            # but must not promote: the book stays stale and the REST-heal path
+            # covers it. The refusal is returned as the reason so the collector
+            # emits a book_anomaly (no resync storm — content was applied).
             if self.book_state != BookState.live:
                 if book.bids.best_price() is not None and book.asks.best_price() is not None:
-                    self.mark_live()
+                    if self._well_formed_hash(msg.get("hash")):
+                        self.mark_live()
+                    else:
+                        promo_note = (f"book_hash_missing_on_promotion outcome={outcome} "
+                                      f"hash={msg.get('hash')!r} — levels applied, promotion refused; REST heal covers")
 
         self._emit_bbo_events(pre_bbo, touched, msg)
-        return True, None
+        return True, promo_note
 
     # -- BBO capture for §4 book_events ------------------------------------
     def _bbo(self, outcome: str) -> Dict[str, Optional[float]]:
@@ -387,7 +490,7 @@ class OrderBookState:
             "ask": book.asks.best_price(), "ask_size": book.asks.best_size(),
         }
 
-    def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], tick: float = 0.0101) -> None:
+    def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 0.0101) -> None:
         """Snap the book's top-of-book to the exchange-reported best_bid/best_ask.
 
         Every CLOB price_change carries the authoritative post-change BBO for its
@@ -425,6 +528,7 @@ class OrderBookState:
                     "token_id": self.up_token_id if outcome == "up" else self.down_token_id,
                     "outcome": outcome, "side": side,
                     "book_best": my_best, "exchange_best": ex_best,
+                    "ts_source": self._resolve_ts_source(msg) if isinstance(msg, dict) else None,
                 })
 
     def _emit_bbo_events(self, pre_bbo: Dict[str, Dict[str, Optional[float]]], touched: Dict[str, str], msg: dict) -> None:
@@ -447,7 +551,7 @@ class OrderBookState:
                 "old_best_ask": pre.get("ask"), "new_best_ask": post.get("ask"),
                 "old_bid_size": pre.get("bid_size"), "new_bid_size": post.get("bid_size"),
                 "old_ask_size": pre.get("ask_size"), "new_ask_size": post.get("ask_size"),
-                "ts_source": msg.get("timestamp") or msg.get("ts"),
+                "ts_source": self._resolve_ts_source(msg),
             })
 
     def drain_pending_events(self) -> List[dict]:

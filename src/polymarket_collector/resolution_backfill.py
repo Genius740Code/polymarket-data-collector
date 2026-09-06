@@ -8,7 +8,8 @@ slug lookup within minutes (probed live 2026-09-05).
 The collector's in-run resolution loop uses the Chainlink open/end reference
 (settlement_source=inferred_nearest); this script covers everything it could
 not resolve — windows that ended mid-outage, before process start, or after
-shutdown — and upgrades closed/unknown rows to the official outcome.
+shutdown — upgrades closed/unknown rows to the official outcome, and promotes
+already-resolved inferred_nearest rows to official (same fetch, no hot path).
 
 Append-only writes through MarketsLog (log row + atomic compact rebuild), so
 concurrent readers never see partial state. Run on a schedule:
@@ -82,9 +83,16 @@ def fetch_official_outcome(condition_id: str) -> Optional[Dict]:
 
 
 def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch: int = 200) -> Dict:
-    """Resolve every ended market still marked active/closed/unknown.
+    """Resolve every ended market still marked active/closed/unknown — and
+    upgrade `inferred_nearest` rows to the official CLOB outcome.
 
-    Returns stats {"candidates", "resolved", "already", "pending"}.
+    The in-run loop resolves via Chainlink open/end (settlement_source=
+    inferred_nearest) because it is fast; the official `tokens[].winner` flag
+    is authoritative and queryable indefinitely, so this pass promotes every
+    ended non-official row (filling minimum_order_size/tick_size on the way).
+    Rows already `polymarket_official` are skipped.
+
+    Returns stats {"candidates", "resolved", "upgraded", "already", "pending"}.
     """
     base = Path(data_dir)
     log = MarketsLog(base)
@@ -104,12 +112,14 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
             end_ms = None
         if end_ms is None or end_ms >= now_ms:
             continue
-        if r.get("status") == "resolved" and r.get("resolution_outcome") in ("up", "down", "tie"):
+        if (r.get("status") == "resolved"
+                and r.get("resolution_outcome") in ("up", "down", "tie")
+                and r.get("settlement_source") == "polymarket_official"):
             seen.add(cid)
             continue
         seen.add(cid)
         candidates.append(r)
-    stats = {"candidates": len(candidates), "resolved": 0, "already": 0, "pending": 0}
+    stats = {"candidates": len(candidates), "resolved": 0, "upgraded": 0, "already": 0, "pending": 0}
     for r in candidates[:max_fetch]:
         cid = r["condition_id"]
         official = fetch_official_outcome(cid)
@@ -120,6 +130,8 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
             print(f"[resolution-backfill] would resolve {r.get('asset')} w{r.get('window_index')} {cid[:14]}… → {official['outcome']}")
             stats["resolved"] += 1
             continue
+        was_inferred = (r.get("status") == "resolved"
+                        and r.get("resolution_outcome") in ("up", "down", "tie"))
         new_row = dict(r)
         new_row.update({
             "status": "resolved",
@@ -137,10 +149,14 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
         if official.get("minimum_order_size") is not None:
             new_row["minimum_order_size"] = official["minimum_order_size"]
         log.append(new_row)
-        stats["resolved"] += 1
-        print(f"[resolution-backfill] {r.get('asset')} w{r.get('window_index')} resolved {official['outcome']} (official)")
+        if was_inferred:
+            stats["upgraded"] += 1
+            print(f"[resolution-backfill] {r.get('asset')} w{r.get('window_index')} upgraded inferred→official {official['outcome']} (official)")
+        else:
+            stats["resolved"] += 1
+            print(f"[resolution-backfill] {r.get('asset')} w{r.get('window_index')} resolved {official['outcome']} (official)")
         time.sleep(0.2)  # gentle on the CLOB
-    if not dry_run and stats["resolved"]:
+    if not dry_run and (stats["resolved"] or stats["upgraded"]):
         log.flush_staging()
         log.compact()
     print(f"[resolution-backfill] done: {stats}")
@@ -159,7 +175,7 @@ def run_trades_enrichment_second_pass(data_dir: str | Path, assets: List[str]) -
         return {}
 
 
-def reupload_kaggle(data_dir: str | Path, assets: List[str], l2_levels: int = 20) -> bool:
+def reupload_kaggle(data_dir: str | Path, assets: List[str], l2_levels: int = 10) -> bool:
     """Re-export staging and push a new Kaggle version carrying the resolutions."""
     from .storage.export import export_and_upload_all_kaggle, _validate_kaggle_config
     res = export_and_upload_all_kaggle(
@@ -188,7 +204,7 @@ def main() -> None:
     stats = backfill_resolutions(data_dir, dry_run=args.dry_run)
     if not args.skip_enrich and not args.dry_run:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
-    if args.reupload and stats.get("resolved"):
+    if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
         reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels)
 
 

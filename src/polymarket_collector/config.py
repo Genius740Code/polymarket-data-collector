@@ -141,7 +141,7 @@ class CollectorConfig(BaseSettings):
     discovery_backoff_max_seconds: int = 8
 
     snapshot_interval_ms: int = 500
-    l2_levels: int = 20
+    l2_levels: int = 10
     depth_thresholds_cents: List[int] = Field(default_factory=lambda: [1, 5, 10])
 
     event_thresholds: EventThresholds = Field(default_factory=EventThresholds)

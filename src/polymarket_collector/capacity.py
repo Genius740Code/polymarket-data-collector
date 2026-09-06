@@ -53,7 +53,7 @@ class CapacityEstimate:
         }
 
 
-def estimate_from_schema(l2_levels: int = 20) -> CapacityEstimate:
+def estimate_from_schema(l2_levels: int = 10) -> CapacityEstimate:
     # count fields: snapshot_schema
     from .storage.schemas import snapshot_schema
     schema = snapshot_schema(l2_levels)
@@ -63,7 +63,7 @@ def estimate_from_schema(l2_levels: int = 20) -> CapacityEstimate:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Capacity planning — §11A")
-    ap.add_argument("--l2-levels", type=int, default=20)
+    ap.add_argument("--l2-levels", type=int, default=10)
     ap.add_argument("--assets", type=int, default=3)
     ap.add_argument("--bytes-per-row", type=int, default=2500)
     ap.add_argument("--compression", type=float, default=0.25)

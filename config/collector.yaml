@@ -37,7 +37,7 @@ kaggle:
   dataset_prefix: gghgg1/polymarket-5m-crypto
   test_upload_interval_seconds: 600
   upload_interval_seconds: 3600
-l2_levels: 20
+l2_levels: 10
 liquidity_filter:
   enabled: false
   min_liquidity: 1000

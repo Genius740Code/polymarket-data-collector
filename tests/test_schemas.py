@@ -13,13 +13,13 @@ def test_markets_schema_has_settlement():
 
 
 def test_snapshot_schema_wide():
-    schema = snapshot_schema(l2_levels=20)
+    schema = snapshot_schema()  # default: 10 levels (A3 — observed depth ~4-8)
     names = schema.names
     # top-of-book nullable
     assert "up_bid" in names and schema.field("up_bid").nullable is True
-    # L2 160 cols
+    # L2 80 cols by default
     l2_cols = [n for n in names if "_level_" in n]
-    assert len(l2_cols) == 160  # 2 outcomes *2 sides*20 levels*2 (price/size)
+    assert len(l2_cols) == 80  # 2 outcomes *2 sides*10 levels*2 (price/size)
     # depth aggregates (§3 — nullable)
     for outcome in ("up", "down"):
         for side in ("bid", "ask"):
@@ -31,9 +31,9 @@ def test_snapshot_schema_wide():
     assert schema.field("book_state").nullable is False
     assert schema.field("book_crossed").nullable is False
     assert schema.field("resync_id").nullable is True
-    # 10 levels variant
-    schema10 = snapshot_schema(l2_levels=10)
-    assert len([n for n in schema10.names if "_level_" in n]) == 80
+    # 20-level variant (old hive files keep 20 columns; export tolerates trailing extras)
+    schema20 = snapshot_schema(l2_levels=20)
+    assert len([n for n in schema20.names if "_level_" in n]) == 160
 
 
 def test_all_schemas_have_schema_version_where_expected():

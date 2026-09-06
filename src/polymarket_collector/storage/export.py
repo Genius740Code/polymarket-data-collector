@@ -68,7 +68,7 @@ def _sort_keys_for_schema(schema: pa.Schema) -> List[str]:
     return keys
 
 
-def _get_schema(dataset: str, l2_levels: int = 20) -> Optional[pa.Schema]:
+def _get_schema(dataset: str, l2_levels: int = 10) -> Optional[pa.Schema]:
     if dataset in ("book_snapshots_500ms", "book_snapshots_clean"):
         # B-6: the clean view ships to Kaggle as its own per-asset file and
         # carries the snapshot schema (it is the live-only subset of it)
@@ -578,9 +578,14 @@ def build_markets_summary(
     Sources: markets_latest (identity + resolution), book_snapshots_clean
     (outcome-token mid OHLC + average spread), trades incl. api- rows (volume,
     fill count, unique traders), chainlink_events (underlying open/close =
-    nearest tick to the window boundary, ≤5s tolerance). All nullable except
+    nearest tick to the window boundary; open ≤10s to match the resolution
+    loop K-2 open tolerance, close ≤5s). All nullable except
     condition_id/asset — missing ingredients stay NULL, never zero-filled.
+    The tolerance actually applied is recorded per row in
+    underlying_open_tolerance_s / underlying_close_tolerance_s.
     """
+    UNDERLYING_OPEN_TOL_MS = 10_000  # match resolution loop K-2 open tolerance
+    UNDERLYING_CLOSE_TOL_MS = 5_000
     import bisect
     import datetime as _dt2
     base = Path(data_dir)
@@ -657,7 +662,8 @@ def build_markets_summary(
             except Exception as e:
                 print(f"[export] WARN markets_summary snapshot aggregation failed: {e}")
 
-    # --- chainlink: underlying open/close = nearest tick to window boundary (≤5s) ---
+    # --- chainlink: underlying open/close = nearest tick to window boundary
+    # (open ≤10s per K-2, close ≤5s) ---
     ticks_by_asset: Dict[str, List] = {}
     cl = _read_dataset_per_asset(base, "chainlink_events", None)
     if cl is not None and cl.num_rows and {"asset", "ts_source", "price"}.issubset(set(cl.schema.names)):
@@ -720,8 +726,8 @@ def build_markets_summary(
 
         start_iso = _iso_from_ms(start_ms, m.get("market_start_ts"))
         end_iso = _iso_from_ms(end_ms, m.get("market_end_ts"))
-        o_open, o_open_ts = _nearest_tick(asset, start_ms)
-        o_close, o_close_ts = _nearest_tick(asset, end_ms)
+        o_open, o_open_ts = _nearest_tick(asset, start_ms, UNDERLYING_OPEN_TOL_MS)
+        o_close, o_close_ts = _nearest_tick(asset, end_ms, UNDERLYING_CLOSE_TOL_MS)
         ohlc = ohlc_by_cid.get(cid, {})
         resolution = m.get("resolution_outcome")
         if resolution in (None, "", "unknown"):
@@ -742,8 +748,10 @@ def build_markets_summary(
             "settlement_source": m.get("settlement_source"),
             "underlying_open": o_open,
             "underlying_open_ts_utc": o_open_ts,
+            "underlying_open_tolerance_s": UNDERLYING_OPEN_TOL_MS // 1000,
             "underlying_close": o_close,
             "underlying_close_ts_utc": o_close_ts,
+            "underlying_close_tolerance_s": UNDERLYING_CLOSE_TOL_MS // 1000,
             "up_open": ohlc.get("up_open"), "up_high": ohlc.get("up_high"),
             "up_low": ohlc.get("up_low"), "up_close": ohlc.get("up_close"),
             "down_open": ohlc.get("down_open"), "down_high": ohlc.get("down_high"),
@@ -994,7 +1002,7 @@ def export_per_asset_single_file(
     out_dir: str | Path | None = None,
     datasets: List[str] | None = None,
     assets: List[str] | None = None,
-    l2_levels: int = 20,
+    l2_levels: int = 10,
     include_binance: bool = False,
 ) -> dict:
     """Export one flat parquet per asset per dataset (Kaggle style).
@@ -1324,7 +1332,7 @@ def aggregate_5min_to_timeframe(
                 results.append(first_row)
         
         if results:
-            combined = pa.concat_tables(results, promote=True)
+            combined = pa.concat_tables(results, promote_options="default")
             # Drop the temporary bucket column - results are already ordered by bucket
             # since we iterate over unique buckets from the sorted table
             final_schema = [f for f in combined.schema.names if f != "__bucket__"]
@@ -1343,7 +1351,7 @@ def export_timeframe_aggregates(
     data_dir: str | Path,
     out_dir: str | Path,
     assets: List[str] | None = None,
-    l2_levels: int = 20,
+    l2_levels: int = 10,
 ) -> dict:
     """Export aggregated timeframe Parquet files from 5min base data.
     
@@ -1475,7 +1483,7 @@ def prepare_kaggle_staging_5m(
     data_dir: str | Path,
     staging_dir: str | Path | None = None,
     assets: List[str] | None = None,
-    l2_levels: int = 20,
+    l2_levels: int = 10,
     dataset_prefix: str = "gghgg1/polymarket-5m-crypto",
 ) -> dict:
     """Prepare Kaggle staging folder for 5m-only upload.
@@ -1514,7 +1522,7 @@ def prepare_kaggle_staging_5m(
     return {"staging_path": str(staging), "files": len(stats), "row_counts": row_counts, "dataset": dataset_prefix}
 
 
-def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[str] | None, l2_levels: int = 20) -> None:
+def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[str] | None, l2_levels: int = 10) -> None:
     """Best-effort download-merge of prior Kaggle version into staging.
 
     If local hive has no data for a file but Kaggle staging has prior rows, download
@@ -1563,7 +1571,7 @@ def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[st
                         # Need to merge: concat and dedup by time+condition_id if possible
                         # For book_snapshots use (asset,condition_id,ts_snapshot_ns) dedup
                         try:
-                            combined = pa.concat_tables([prior_t, cur_t], promote=True)
+                            combined = pa.concat_tables([prior_t, cur_t], promote_options="default")
                             # Dedup via pylist distinct by serialization if small, else keep prior larger
                             # Simple: if prior has more rows, keep prior + only new rows not in prior
                             # Use dedup key based on dataset type where possible
@@ -2036,7 +2044,7 @@ def export_and_upload_all_kaggle(
     kaggle_username: str | None = None,
     kaggle_key: str | None = None,
     timeframe_labels: List[str] | None = None,
-    l2_levels: int = 20,
+    l2_levels: int = 10,
     dry_run: bool = False,
 ) -> dict:
     """5m-only pipeline: export 7-asset staging (39 files) → Kaggle single dataset → safe prune.

@@ -54,7 +54,7 @@ MARKETS_SCHEMA = pa.schema([
 
 # §3 book_snapshots_500ms — wide flat-column (dynamic due to l2_levels, so base + generated)
 # time first, condition_id second per user request
-def snapshot_schema(l2_levels: int = 20) -> pa.Schema:
+def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
     fields = [
         pa.field("ts_snapshot_utc", pa.string(), nullable=False),
         pa.field("ts_snapshot_ns", pa.int64(), nullable=False),
@@ -246,8 +246,10 @@ MARKETS_SUMMARY_SCHEMA = pa.schema([
     # underlying (chainlink) reference at window boundaries
     pa.field("underlying_open", pa.float64(), nullable=True),
     pa.field("underlying_open_ts_utc", pa.string(), nullable=True),
+    pa.field("underlying_open_tolerance_s", pa.int64(), nullable=True),
     pa.field("underlying_close", pa.float64(), nullable=True),
     pa.field("underlying_close_ts_utc", pa.string(), nullable=True),
+    pa.field("underlying_close_tolerance_s", pa.int64(), nullable=True),
     # outcome-token OHLC (mid price from clean snapshots)
     pa.field("up_open", pa.float64(), nullable=True),
     pa.field("up_high", pa.float64(), nullable=True),

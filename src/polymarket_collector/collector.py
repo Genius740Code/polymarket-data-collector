@@ -1080,6 +1080,15 @@ class Collector:
                                                 )
                                             except Exception:
                                                 pass
+                                        # A4: hash-gated promotion refusal — content WAS
+                                        # applied, so no resync; log as book_anomaly only.
+                                        if reason and "book_hash" in reason:
+                                            if self.on_event:
+                                                self.on_event(
+                                                    CollectorEventType.book_anomaly,
+                                                    {"asset": asset, "condition_id": book.condition_id,
+                                                     "reason": reason},
+                                                )
                                         if not applied and self.on_event:
                                             self.on_event(
                                                 CollectorEventType.book_anomaly,
@@ -1304,6 +1313,15 @@ class Collector:
                                 )
                             except Exception:
                                 pass
+                        # A4: hash-gated promotion refusal — content WAS
+                        # applied, so no resync; log as book_anomaly only.
+                        if reason and "book_hash" in reason:
+                            if self.on_event:
+                                self.on_event(
+                                    CollectorEventType.book_anomaly,
+                                    {"asset": asset, "condition_id": book.condition_id,
+                                     "reason": reason},
+                                )
                         if not applied and self.on_event:
                             self.on_event(
                                 CollectorEventType.book_anomaly,
@@ -1925,7 +1943,7 @@ class Collector:
             print("[test-mode] background kaggle loop disabled (chunk uploads driven by test loop)")
         kaggle_interval = getattr(self.config.kaggle, "test_upload_interval_seconds", 600)
         print(f"[test-mode:real] QUICK TEST — {num_markets}×{ws}s (5m-only) = {num_markets*(ws/60):.0f}min total, {len(self.config.assets)} assets {self.config.assets}")
-        print(f"[test-mode] chunks: every 2 markets → kaggle every {kaggle_interval}s (10min), one-file-per-asset staging (38 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals")
+        print(f"[test-mode] chunks: every 2 markets → kaggle every {kaggle_interval}s (10min), one-file-per-asset staging (39 files for 7 assets): BTC/ETH/..._book_snapshots, trades, book_events, chainlink + 3 globals + summary")
 
         timeout_s = num_markets * ws + 90  # 4*300+90=1290s ~21.5 min
         # R-1: measure the run from the boundary, not from process start — the
@@ -1965,7 +1983,7 @@ class Collector:
                 except Exception as e:
                     print(f"[test-kaggle:{tag}] clean_view err {e}")
                 # Prepare staging + upload (dry_run if no creds to avoid crash)
-                # Staging is one-file-per-asset: 7 assets ×5 (snapshots, clean view, trades, book_events, chainlink) +3 globals =38 files
+                # Staging is one-file-per-asset: 7 assets ×5 (snapshots, clean view, trades, book_events, chainlink) +3 globals + summary =39 files
                 # Single dataset gghgg1/polymarket-5m-crypto — all assets share same slug, cumulative rows.
                 _has_creds = _validate_kaggle_config()
                 try:
@@ -2031,15 +2049,15 @@ class Collector:
                         kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
                     else:
                         print(f"[test-kaggle:{tag}] upload NOT counted as completed chunk (status={_up_status or res.get('error')}) — data retained, retry scheduled")
-                    # one-file-per-asset audit: staging should be 38 files for 7 assets
+                    # one-file-per-asset audit: staging should be 39 files for 7 assets
                     try:
                         st = res.get("staging", {})
                         files = st.get("files", 0)
-                        expected = len(self.config.assets) * 5 + 3
+                        expected = len(self.config.assets) * 5 + 4
                         if files != expected:
                             print(f"[test-kaggle:{tag}] WARN staging files {files} != expected {expected} (one-file-per-asset)")
                         else:
-                            print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: snapshots, clean view, trades, book_events, chainlink +3 globals)")
+                            print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: snapshots, clean view, trades, book_events, chainlink +3 globals + summary)")
                     except Exception:
                         pass
                     # also intermediate lightweight analysis
@@ -2233,12 +2251,32 @@ class Collector:
             "data_loss": {},
             "kaggle_staging": {},
         }
+        # I-4 / bonus-row accounting: expect ticks only for markets that
+        # actually exist AND have fully elapsed — counting the just-discovered
+        # next window (2 ticks so far) inflated the denominator and faked a
+        # completeness shortfall. Rows belonging to other windows (the
+        # pre-discovered next window, pre-warm tails) are counted separately
+        # as "bonus rows" instead of inflating completeness. Computed up front
+        # so per-dataset scans can record discovered-window row counts while
+        # the tables are in hand (they are stripped from the report after).
+        ticks_per_market = report["ticks_per_market"]
+        import time as _time_mod
+        _now_ms_a = int(_time_mod.time() * 1000)
+        elapsed_cids = {cid for cid, m in self.markets.items()
+                        if m.market_end_ts_ms < _now_ms_a
+                        # R-1: only windows that STARTED at/after the run start —
+                        # a pre-warm tail window (snapshots gated off) would
+                        # otherwise inflate the expected denominator to ~50%.
+                        and (m.market_start_ts_ms or 0) >= start_ms}
+        expected_snaps = num_markets * ticks_per_market * len(self.config.assets)
+        discovered = len(elapsed_cids)
+        expected_discovered = discovered * ticks_per_market
 
         def count_dataset(name: str):
             p = base / name
             if not p.exists():
                 # also handle single-file dataset markets_latest
-                return {"exists": False, "files": 0, "rows": 0, "sample": None, "columns": None, "table": None}
+                return {"exists": False, "files": 0, "rows": 0, "rows_discovered": 0, "sample": None, "columns": None, "table": None}
             files = [f for f in p.rglob("*.parquet") if not f.name.endswith(".tmp")]
             if not files and p.is_file():
                 files = [p]
@@ -2264,6 +2302,7 @@ class Collector:
                     continue
             # For accurate null analysis return concatenated table if multiple files
             combined = None
+            rows_discovered = 0
             if files:
                 try:
                     tables = []
@@ -2282,7 +2321,17 @@ class Collector:
                             table = combined
                 except Exception:
                     pass
-            return {"exists": True, "files": len(files), "rows": total, "sample": sample, "columns": columns, "table": table}
+            # discovered-window rows (for honest ≤100% completeness): counted
+            # while the table is in hand; elapsed_cids known up front.
+            if combined is not None and combined.num_rows and elapsed_cids and "condition_id" in combined.schema.names:
+                try:
+                    import pyarrow as _pa
+                    _mask = _pa.compute.is_in(combined.column("condition_id"),
+                                              value_set=_pa.array(sorted(elapsed_cids), type=_pa.string()))
+                    rows_discovered = combined.filter(_mask).num_rows
+                except Exception:
+                    rows_discovered = 0
+            return {"exists": True, "files": len(files), "rows": total, "rows_discovered": rows_discovered, "sample": sample, "columns": columns, "table": table}
 
         def null_stats(tbl) -> dict:
             if tbl is None or tbl.num_rows==0:
@@ -2342,37 +2391,12 @@ class Collector:
 
         checks = report["checks"]
         snap_info = report["datasets"]["book_snapshots_500ms"]
-        ticks_per_market = report["ticks_per_market"]
-        # I-4: expect ticks only for markets that actually exist AND have fully
-        # elapsed — counting the just-discovered next window (2 ticks so far)
-        # inflated the denominator and faked a completeness shortfall.
-        expected_snaps = num_markets * ticks_per_market * len(self.config.assets)
-        import time as _time_mod
-        _now_ms_a = int(_time_mod.time() * 1000)
-        elapsed_cids = {cid for cid, m in self.markets.items()
-                        if m.market_end_ts_ms < _now_ms_a
-                        # R-1: only windows that STARTED at/after the run start —
-                        # a pre-warm tail window (snapshots gated off) would
-                        # otherwise inflate the expected denominator to ~50%.
-                        and (m.market_start_ts_ms or 0) >= start_ms}
-        discovered = len(elapsed_cids)
-        expected_discovered = discovered * ticks_per_market
-        # Small cleanup: actual rows counted ONLY for discovered windows, so
-        # completeness reads ≤100% honestly. Rows belonging to other windows
-        # (the pre-discovered next window, pre-warm tails) are reported
-        # separately as "bonus rows" instead of inflating completeness.
-        def _rows_for_discovered(tbl):
-            if tbl is None or tbl.num_rows == 0 or not elapsed_cids or "condition_id" not in tbl.schema.names:
-                return 0
-            try:
-                _pa = __import__("pyarrow")
-                mask = _pa.compute.is_in(tbl.column("condition_id"),
-                                         value_set=_pa.array(sorted(elapsed_cids), type=_pa.string()))
-                return tbl.filter(mask).num_rows
-            except Exception:
-                return 0
-        actual_snaps_disc = _rows_for_discovered(snap_info.get("table"))
-        actual_clean_disc = _rows_for_discovered(report["datasets"]["book_snapshots_clean"].get("table"))
+        # elapsed_cids / expected_discovered / discovered computed up front
+        # (see above); per-dataset scans recorded rows_discovered while the
+        # tables were in hand. Headline actuals count ONLY discovered windows
+        # so completeness reads ≤100% honestly; anything else is bonus rows.
+        actual_snaps_disc = snap_info.get("rows_discovered") or 0
+        actual_clean_disc = report["datasets"]["book_snapshots_clean"].get("rows_discovered") or 0
         checks["expected_book_snapshots"] = expected_discovered
         checks["expected_book_snapshots_if_all_windows"] = expected_snaps
         checks["discovered_windows_total"] = discovered
