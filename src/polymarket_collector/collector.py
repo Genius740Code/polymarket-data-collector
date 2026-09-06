@@ -950,20 +950,46 @@ class Collector:
                     hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{asset}")
 
                     async def _staleness_watchdog() -> None:
-                        # 30s without any market-data frame → close the socket and
-                        # let the reconnect loop resubscribe with full books.
+                        # 30s without any market-data frame → force-abort the socket
+                        # and let the reconnect loop resubscribe with full books.
+                        # fail_connection (transport abort) instead of close(): the
+                        # closing HANDSHAKE needs a live peer, but a silently-dead
+                        # connection has none — 2026-09-06 14:09 BTC/DOGE went
+                        # data-silent (no frames, no close) and close() never
+                        # unwound the recv loop, so books stayed stale for 2 min
+                        # until REST heal; the 150s recycle can't help either
+                        # because it only fires on INCOMING messages.
                         while self._running:
                             await asyncio.sleep(5)
                             if time.time_ns() - last_data_ns > 30_000_000_000:
-                                if self.on_event:
-                                    try:
-                                        self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": "data_staleness_30s_forcing_reconnect"})
-                                    except Exception:
-                                        pass
+                                # Only force a reconnect if the event loop itself is
+                                # alive. During a long synchronous export/compaction
+                                # block the loop stalls, frames pile up in socket
+                                # buffers, and ALL 7 watchdogs woke at once and killed
+                                # healthy connections (2026-09-06 15:14 run: 33
+                                # subscription_failed + 18 coverage_gap after the
+                                # t10min export). The 500ms scheduler keeps
+                                # _last_snapshot_bucket_ms current; if it lags too,
+                                # the loop was stalled — wait it out instead.
                                 try:
-                                    await ws.close()
+                                    bucket_lag_s = time.time() - (self._last_snapshot_bucket_ms or 0) / 1000
                                 except Exception:
-                                    return
+                                    bucket_lag_s = 0
+                                if bucket_lag_s > 15:
+                                    last_data_ns = time.time_ns()
+                                    continue
+                                print(f"[ws:{asset}] data-staleness >30s — forcing reconnect")
+                                try:
+                                    self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": "data_staleness_30s_forcing_reconnect"})
+                                except Exception:
+                                    pass
+                                try:
+                                    ws.fail_connection(4000)
+                                except Exception:
+                                    try:
+                                        await ws.close()
+                                    except Exception:
+                                        return
 
                     wd_task = asyncio.create_task(_staleness_watchdog(), name=f"ws-watchdog-{asset}")
 
@@ -980,6 +1006,7 @@ class Collector:
                             # (via the ws_connected downgrade in the snapshot loop).
                             if int(time.time() * 1000) - conn_established_ms > 150_000:
                                 planned_recycle = True
+                                print(f"[ws:{asset}] planned 150s recycle — reconnecting")
                                 break
                             # §13 raw archive — persist every raw WS frame for replay/re-derive
                             try:
@@ -1143,7 +1170,13 @@ class Collector:
                                 pass
                         for _t in (disc_task, hb_task, wd_task):
                             try:
-                                await _t
+                                # BOUNDED: a task that swallows CancelledError (e.g.
+                                # inside a library call) used to hang the whole
+                                # per-asset WS loop here — observed 2026-09-06
+                                # 14:09: BTC/DOGE never reconnected after their
+                                # 150s recycle and streamed nothing for the rest
+                                # of the run. 3s budget, then abandon the zombie.
+                                await asyncio.wait_for(asyncio.shield(_t), timeout=3)
                             except asyncio.CancelledError:
                                 pass
                             except Exception:
