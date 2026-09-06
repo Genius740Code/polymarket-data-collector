@@ -54,9 +54,9 @@ def test_shared_wal_concurrent_writes():
 
         all_states = store.load_all()
         assert len(all_states) == 3
-        assert all_states["BTC"].current_condition_id == "BTC-cid"
-        assert all_states["ETH"].current_condition_id == "ETH-cid"
-        assert all_states["SOL"].current_condition_id == "SOL-cid"
+        assert all_states[("BTC", "5m")].current_condition_id == "BTC-cid"
+        assert all_states[("ETH", "5m")].current_condition_id == "ETH-cid"
+        assert all_states[("SOL", "5m")].current_condition_id == "SOL-cid"
 
 
 def test_cursor_persist_and_reload():

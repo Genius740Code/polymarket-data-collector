@@ -30,7 +30,7 @@ SRC_DIR = ROOT / "src"
 
 # loop2-iter1: hermetic imports — this box has a second checkout
 # (polymarket-data-collector) installed as editable, which shadows this repo's
-# package. Pin this repo's src first so the loop always collects withrepo code.
+# package. Pin this repo's src first so the loop always collects with repo code.
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -47,6 +47,23 @@ def _child_env() -> dict:
         parts.insert(0, str(SRC_DIR))
     env["PYTHONPATH"] = os.pathsep.join(parts)
     return env
+
+
+# plan.md §1.1 confirmed slugs per timeframe (1h/1d currently not live on Gamma —
+# keep them OFF until --probe-timeframes reports them ENABLE)
+TF_DATASETS = {
+    "5m": "gghgg1/polymarket-5m-crypto",
+    "15m": "gghgg1/polymarket-15m-crypto",
+    "1h": "gghgg1/polymarket-1h-crypto",
+    "4h": "gghgg1/polymarket-4h-crypto",
+    "1d": "gghgg1/polymarket-1d-crypto",
+}
+
+
+def kaggle_dataset_for(timeframe: str | None) -> str:
+    if timeframe:
+        return TF_DATASETS.get(timeframe, KAGGLE_DATASET)
+    return KAGGLE_DATASET
 
 
 def wipe_local_data() -> None:
@@ -66,13 +83,13 @@ def wipe_local_data() -> None:
     print(f"[wipe] removed {removed} items from {DATA_DIR}")
 
 
-def delete_kaggle_dataset() -> None:
-    cmd = ["kaggle", "datasets", "delete", KAGGLE_DATASET, "--yes"]
+def delete_kaggle_dataset(kaggle_dataset: str = KAGGLE_DATASET) -> None:
+    cmd = ["kaggle", "datasets", "delete", kaggle_dataset, "--yes"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
         r = subprocess.run(
-            [sys.executable, "-m", "kaggle", "datasets", "delete", KAGGLE_DATASET, "--yes"],
+            [sys.executable, "-m", "kaggle", "datasets", "delete", kaggle_dataset, "--yes"],
             capture_output=True, text=True, timeout=120,
         )
     out = (r.stdout + r.stderr).strip().splitlines()
@@ -83,13 +100,15 @@ def delete_kaggle_dataset() -> None:
         print(f"[kaggle] dataset delete skipped ({tail or 'not present'}) — continuing")
 
 
-def run_test() -> int:
+def run_test(timeframe: str | None = None) -> int:
     log_path = ROOT / f"test_run_{time.strftime('%Y%m%d_%H%M%S')}.log"
     cmd = [
         sys.executable, "-m", "polymarket_collector.cli",
         "--config", "config/collector.yaml",
         "--test-mode", "--test-markets", "2",
     ]
+    if timeframe:
+        cmd += ["--test-timeframe", timeframe]
     print(f"[run] {' '.join(cmd)}")
     print(f"[run] log -> {log_path.name}")
     env = _child_env()  # live log lines + hermetic repo imports
@@ -177,12 +196,15 @@ def wait_for_official_resolutions(timeout_s: int = 12 * 60, poll_s: int = 60) ->
         time.sleep(poll_s)
 
 
-def run_post_test_finalize() -> None:
+def run_post_test_finalize(timeframe: str | None = None) -> None:
     """B-7: after the run, resolve everything ended (official CLOB outcome) and
     push the final Kaggle version carrying resolutions + enriched trades."""
     wait_for_official_resolutions()
     cmd = [sys.executable, "-m", "polymarket_collector.resolution_backfill",
            "--config", "config/collector.yaml", "--reupload"]
+    if timeframe:
+        # lane-specific dataset for the final version push
+        cmd += ["--dataset-prefix", kaggle_dataset_for(timeframe), "--timeframe", timeframe]
     print("[finalize] resolution backfill + final Kaggle version")
     env = _child_env()
     # capture + echo: the child's output previously never reached the tee'd log
@@ -200,6 +222,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="One-command 2x5min live test + Kaggle upload")
     ap.add_argument("--keep-data", action="store_true",
                     help="do NOT wipe local data / delete the Kaggle dataset before the run")
+    ap.add_argument("--timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
+                    help="validate a specific timeframe lane (2 windows of that size; note 1h/1d must be probe-OK)")
     args = ap.parse_args()
 
     if args.keep_data:
@@ -208,11 +232,14 @@ def main() -> int:
         print("[1/3] wiping local collected data...")
         wipe_local_data()
         print("[2/3] deleting Kaggle dataset (fresh start)...")
-        delete_kaggle_dataset()
+        if args.timeframe:
+            delete_kaggle_dataset(kaggle_dataset_for(args.timeframe))
+        else:
+            delete_kaggle_dataset()
     print("[3/3] running 2x5min live test with Kaggle upload...")
-    code = run_test()
+    code = run_test(args.timeframe)
     print_summary()
-    run_post_test_finalize()
+    run_post_test_finalize(args.timeframe)
     return code
 
 

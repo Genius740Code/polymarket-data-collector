@@ -107,14 +107,22 @@ class MarketInfo:
 
 @dataclass
 class RolloverState:
-    """Per-asset rollover state (§1)."""
+    """Per-(asset, timeframe) rollover state (§1).
+
+    One lane per timeframe: each holds its own current/next market pair so a
+    5m lane and a 1h lane for the same asset roll over independently.
+    """
     asset: str
+    tf: str = "5m"
     current: Optional[MarketInfo] = None
     next: Optional[MarketInfo] = None
     is_rollover_window: bool = False
     last_discovery_attempt_ms: Optional[int] = None
     rollover_miss_logged: bool = False
-    rollover_started_emitted: bool = False  # throttle spam — emit once per window
+    # emit rollover_started once per TARGET WINDOW (keyed on after_ts), not once
+    # per lookahead phase — a transport-aborted cycle re-enters this path with the
+    # same target and must not re-emit (19:58 run: 28 started vs 21 completed)
+    rollover_started_for_ts: Optional[int] = None
     initial_discovery_attempts: int = 0  # for initial current=None phase
     # loop2-iter1: mid-window recovery probe bookkeeping
     consecutive_failures: int = 0  # polls with no market while current is None
@@ -169,6 +177,10 @@ class MarketDiscovery:
         self.liquidity_filter = liquidity_filter  # LiquidityFilterConfig or None
         # loop2-iter1: throttle for failure observability events (per asset)
         self._last_fail_event_ms: Dict[str, int] = {}
+        # transport-abort fast retry: discovery_timeout events are diagnostics,
+        # not signals — the fast retry itself is unchanged. Throttled to one
+        # per asset per 10s.
+        self._last_timeout_emit_ms: Dict[str, int] = {}
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
@@ -259,6 +271,7 @@ class MarketDiscovery:
         else:
             candidates = [ts]
         found: Optional[MarketInfo] = None
+        transport_abort = False
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 for cand_ts in candidates:
@@ -307,9 +320,25 @@ class MarketDiscovery:
                             failures.append({"slug": cand_slug, "status": resp.status_code, "unparseable": True})
                     except Exception as e:
                         failures.append({"slug": cand_slug, "error": repr(e)})
+                        # Transport errors (timeout/DNS/refused): one dead network
+                        # phase must not burn the rollover lead window on remaining
+                        # candidates and the legacy fallback — abort the cycle and
+                        # retry fast instead (a timeout is transient transport,
+                        # NOT "market not indexed yet").
+                        if isinstance(e, (httpx.TimeoutException, httpx.TransportError)):
+                            transport_abort = True
+                            _now_ms = int(time.time() * 1000)
+                            if _now_ms - self._last_timeout_emit_ms.get(asset, 0) > 10_000:
+                                self._last_timeout_emit_ms[asset] = _now_ms
+                                if self.on_event:
+                                    self.on_event("discovery_timeout", {"asset": asset, "error": repr(e), "phase": "gamma_poll"})
+                            break
                         continue
         except Exception as e:
             failures.append({"transport": repr(e)})
+        if transport_abort:
+            self._backoff_s = 1.0
+            return None
         if found is not None:
             return found
         # No market found for the candidate(s) — the 2s poll loop IS the retry;
@@ -683,41 +712,96 @@ class RolloverManager:
 
     def __init__(self, config, discovery: Optional[MarketDiscovery] = None, on_event=None):
         self.config = config
-        # §3.5 fix: use config.window_size_seconds not test_mode.window_size_seconds
-        # fallback to test_mode only if window_size_seconds missing (backward compat)
-        ws = getattr(config, "window_size_seconds", None)
-        if ws is None:
-            ws = getattr(getattr(config, "test_mode", None), "window_size_seconds", 300)
+        # Multi-timeframe lanes: one discovery + state per (asset, tf). Each lane
+        # derives its slug/window math from its own window size; discovery cadence
+        # and lookahead lead scale with the window width so total Gamma load stays
+        # ~flat as timeframes are added.
+        tf_cfg = getattr(config, "timeframe_window_sizes", None)
+        try:
+            lane_map: Dict[str, int] = dict(tf_cfg()) if tf_cfg else {}
+        except Exception:
+            lane_map = {}
+        if not lane_map:
+            # fallback to the scalar window (backward compat with tests)
+            ws = getattr(config, "window_size_seconds", None)
+            if ws is None:
+                ws = getattr(getattr(config, "test_mode", None), "window_size_seconds", 300)
+            from .config import CollectorConfig as _CC
+            lane_map = {_CC.window_label_for(int(ws)): int(ws)}
+        self.lane_ws: Dict[str, int] = lane_map
+        self.lane_poll_s: Dict[str, float] = {
+            tf: config.discovery_poll_interval_for(ws) for tf, ws in lane_map.items()
+        }
+        self.lane_lead_ms: Dict[str, int] = {
+            tf: config.rollover_lead_for(ws) * 1000 for tf, ws in lane_map.items()
+        }
         # liquidity filter config (no RPC)
         lf = getattr(config, "liquidity_filter", None)
-        self.discovery = discovery or MarketDiscovery(
-            rest_market_url=config.ws.rest_market_url,
-            poll_interval_s=config.discovery_poll_interval_seconds,
-            backoff_max_s=config.discovery_backoff_max_seconds,
-            on_event=on_event,
-            window_size_seconds=ws,
-            liquidity_filter=lf,
-        )
+        self.discoveries: Dict[str, MarketDiscovery] = {
+            tf: MarketDiscovery(
+                rest_market_url=config.ws.rest_market_url,
+                poll_interval_s=self.lane_poll_s[tf],
+                backoff_max_s=config.discovery_backoff_max_seconds,
+                on_event=on_event,
+                window_size_seconds=ws,
+                liquidity_filter=lf,
+            )
+            for tf, ws in lane_map.items()
+        }
+        # primary discovery for callers that expect a single object (5m lane first)
+        primary_tf = "5m" if "5m" in self.discoveries else next(iter(self.discoveries))
+        self.discovery = self.discoveries[primary_tf]
+        self.primary_tf = primary_tf
         # if external discovery passed, inject liquidity_filter if missing
-        if discovery is not None and getattr(discovery, "liquidity_filter", None) is None and lf is not None:
-            discovery.liquidity_filter = lf
+        if discovery is not None:
+            if getattr(discovery, "liquidity_filter", None) is None and lf is not None:
+                discovery.liquidity_filter = lf
+            self.discoveries[self.primary_tf] = discovery
         self.on_event = on_event
-        self.states: Dict[str, RolloverState] = {a.upper(): RolloverState(asset=a.upper()) for a in config.assets}
-        self.lead_ms = config.rollover_lead_seconds * 1000
+        # states keyed (asset, tf) — one current/next pair per lane
+        self.states: Dict[tuple, RolloverState] = {
+            (a.upper(), tf): RolloverState(asset=a.upper(), tf=tf)
+            for a in config.assets for tf in lane_map
+        }
         self.max_gap_ms = config.max_coverage_gap_seconds * 1000
+        # enabled lanes: None = all configured; test mode restricts to its lane
+        self.enabled_lanes: Optional[set] = None
+
+    # -- lane helpers -------------------------------------------------------
+    def enabled_lane_labels(self) -> List[str]:
+        if self.enabled_lanes is None:
+            return list(self.lane_ws.keys())
+        return [tf for tf in self.lane_ws if tf in self.enabled_lanes]
+
+    def set_enabled_lanes(self, labels) -> None:
+        self.enabled_lanes = {str(t).lower() for t in labels}
+
+    def state_for(self, asset: str, tf: str) -> Optional[RolloverState]:
+        return self.states.get((asset.upper(), tf))
+
+    def state_for_market(self, market: MarketInfo) -> Optional[RolloverState]:
+        """Resolve the lane that owns a market via its window size (MarketInfo
+        carries window_size_seconds; window_index alone collides across TFs)."""
+        from .config import CollectorConfig as _CC
+        tf = _CC.window_label_for(int(getattr(market, "window_size_seconds", 0) or 300))
+        return self.states.get((market.asset.upper(), tf))
 
     def _synthetic_market(self, asset: str, after_ts_ms: int) -> MarketInfo:
         """REMOVED: synthetic markets permanently disabled - never generate fake markets."""
         raise RuntimeError("synthetic markets disabled - _synthetic_market should never be called")
 
-    async def check_and_roll(self, asset: str, subscribe_fn: Callable, now_ms: Optional[int] = None) -> Optional[str]:
-        """Check if asset needs lookahead discovery and/or promotion.
+    async def check_and_roll(self, asset: str, subscribe_fn: Callable, now_ms: Optional[int] = None, tf: Optional[str] = None) -> Optional[str]:
+        """Check if asset lane needs lookahead discovery and/or promotion.
 
-        subscribe_fn: async callable(market: MarketInfo) → subscribe to feeds.
+        tf=None → the primary (5m) lane; use check_and_roll_all to drive every
+        enabled lane. subscribe_fn: async callable(market) → subscribe to feeds.
         Returns event type string if an event was emitted, else None.
         """
         asset = asset.upper()
-        state = self.states[asset]
+        tf = (tf or self.primary_tf).lower()
+        discovery = self.discoveries[tf]
+        lead_ms = self.lane_lead_ms[tf]
+        state = self.states[(asset, tf)]
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
         # Promotion: current ended, next becomes current (even if next is None -> gap)
@@ -728,7 +812,7 @@ class RolloverManager:
             state.next = None
             state.is_rollover_window = False
             state.rollover_miss_logged = False
-            state.rollover_started_emitted = False
+            state.rollover_started_for_ts = None
             if self.on_event:
                 if was_next_none and prev_cid:
                     self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
@@ -737,34 +821,37 @@ class RolloverManager:
             return "coverage_gap" if was_next_none else "rollover_completed"
 
         # Lookahead: need to discover next?
-        if state.needs_rollover_lookahead(now_ms, self.lead_ms):
+        if state.needs_rollover_lookahead(now_ms, lead_ms):
             # distinguish initial discovery (no current) from true rollover window
             is_initial = state.current is None
             if not is_initial:
                 state.is_rollover_window = True
             after = state.current.market_end_ts_ms if state.current else now_ms
             # rate-limited polling — don't tight-loop (§1 #7)
-            if state.last_discovery_attempt_ms and (now_ms - state.last_discovery_attempt_ms) < int(self.discovery._backoff_s * 1000):
+            if state.last_discovery_attempt_ms and (now_ms - state.last_discovery_attempt_ms) < int(discovery._backoff_s * 1000):
                 return None
             state.last_discovery_attempt_ms = now_ms
             # throttle rollover_started — emit once per window, not every poll (fixes 65k spam)
             # initial discovery phase does NOT emit rollover_started (would spam until first market found)
-            should_emit_rollover = (not is_initial) and (not state.rollover_started_emitted)
+            should_emit_rollover = (not is_initial) and (state.rollover_started_for_ts != after)
             if should_emit_rollover:
                 if self.on_event:
                     self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after})
-                state.rollover_started_emitted = True
+                state.rollover_started_for_ts = after
             elif is_initial:
                 state.initial_discovery_attempts += 1
                 # throttle initial discovery logging: only first attempt or every 10th to avoid spam
                 if state.initial_discovery_attempts == 1 and self.on_event:
-                    # lightweight trace, not the heavy rollover_started event
-                    self.on_event("rollover_started", {"asset": asset, "after_ts_ms": after, "initial": True})
-            next_market = await self.discovery.fetch_next_market(asset, after, strict_adjacent=not is_initial)
+                    # distinct event type: rollover_started must mean "real rollover
+                    # lookahead", otherwise audits miscount 43 started vs 21 completed
+                    self.on_event("initial_discovery", {"asset": asset, "after_ts_ms": after})
+            next_market = await discovery.fetch_next_market(asset, after, strict_adjacent=not is_initial)
             if next_market:
-                # reset emission flags on success
+                # target discovered — stop tracking it for emission dedup
+                # (keyed on target window, so a re-entered cycle can't double-emit)
+                state.rollover_started_for_ts = None
+                # reset recovery-probe bookkeeping on success
                 state.consecutive_failures = 0
-                state.rollover_started_emitted = False  # allow next window to emit again
                 state.initial_discovery_attempts = 0
                 # for initial discovery, set current directly; for rollover, set next
                 if state.current is None:
@@ -852,19 +939,43 @@ class RolloverManager:
                         return "rollover_miss"
         else:
             # not in rollover window
-            if state.current and (state.current.market_end_ts_ms - now_ms) > self.lead_ms:
+            if state.current and (state.current.market_end_ts_ms - now_ms) > lead_ms:
                 state.is_rollover_window = False
         return None
 
+    async def check_and_roll_all(self, asset: str, subscribe_fn: Callable, now_ms: Optional[int] = None) -> Optional[str]:
+        """Drive every ENABLED lane for this asset, each throttled by its own
+        poll cadence and backoff. The per-asset discovery poller calls this every
+        min(lane interval) seconds; lanes with longer cadences gate themselves on
+        last_discovery_attempt_ms vs their own interval. Returns the first
+        non-None event string across lanes (priority: gap events first)."""
+        asset = asset.upper()
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        first_event: Optional[str] = None
+        for tf in self.enabled_lane_labels():
+            try:
+                ev = await self.check_and_roll(asset, subscribe_fn, now_ms=now_ms, tf=tf)
+            except Exception:
+                continue
+            if ev and first_event is None:
+                first_event = ev
+        return first_event
+
     def active_markets(self, asset: str) -> List[MarketInfo]:
-        """Return list of currently active markets for asset (1 or 2 during overlap)."""
-        state = self.states[asset.upper()]
+        """Union of current+next across ENABLED lanes for the asset (1 or 2 per
+        lane during overlap; up to 2×lanes total)."""
+        au = asset.upper()
         res: List[MarketInfo] = []
-        if state.current:
-            res.append(state.current)
-        if state.next:
-            res.append(state.next)
+        for tf in self.enabled_lane_labels():
+            st = self.states.get((au, tf))
+            if st is None:
+                continue
+            if st.current:
+                res.append(st.current)
+            if st.next:
+                res.append(st.next)
         return res
 
     def set_current(self, asset: str, market: MarketInfo) -> None:
-        self.states[asset.upper()].current = market
+        st = self.state_for_market(market) or self.states[(asset.upper(), self.primary_tf)]
+        st.current = market
