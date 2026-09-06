@@ -1,5 +1,9 @@
 # 📌 CURRENT HANDOFF (2026-09-05 night) — MISSION: fix issues → test-loop → git commit
 
+> ## 🔁 LOOP STATUS (2026-09-06, loop2 iter2 — confirmation, zero code changes)
+> Log: `test_run_20260906T172323Z.log`. No fixes needed. Result: pytest 110/110; staging 39/39; completeness 100% / clean 99.93%; coverage_gaps 0; subscription_failed 0; data_loss 0.07%; critical_null false; live 9574 / stale 9; unpaired 0; log: 1 ERROR (known-normal 403 poll-0), 0 WARN, 0 watchdog fires. Finalize-wait exhausted budget with 7 pending (better than iter1's 10); follow-up backfill closed all → Kaggle remote-verified, fresh-download audited: 39 files, 28/28 polymarket_official, clean 9574 rows with 0 strict-crossed / 0 locked / 0 complementarity violations, monotonic PASS, windows consecutive. **Two consecutive clean iterations → loop exit criteria met for the discovery/backfill scope.**
+> Still open: C2 maker-wallet backfill (key NOT on this box — no .env anywhere, $ALCHEMY_POLYGON_URL absent — stays blocked); stale producer on other box (nag operator); C2 API key / pm2 cron operator items.
+
 > ## 🔁 LOOP STATUS (2026-09-06, loop2 iter1 — run 16:50–17:01 UTC + finalize)
 > Log: `test_run_20260906T164819Z.log`. Code: discovery no-skip + recovery probe (`rollover.py`), finalize-wait ~12 min + hermetic subprocess env (`run_2x5min_test.py`), 3 new enum members, 5 new rollover tests, DATA_CARD locked-book note.
 > Result: pytest 110/110; staging 39/39; completeness 100% / clean 99.89%; coverage_gaps 0 (vs 15 in iter-5); subscription_failed 0 (vs 19); windows consecutive 5962377–5962380 all 7 assets; data_loss 0.11%; critical_null false; live 9538 / stale 10; unpaired 0; log: 1 ERROR (known-normal 403 poll-0), 0 WARN, 0 watchdog fires (35 [ws:] lines all planned recycles); RTDS all 7 assets ~665 rows each.
