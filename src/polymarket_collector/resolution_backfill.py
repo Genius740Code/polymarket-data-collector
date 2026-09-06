@@ -208,6 +208,9 @@ def main() -> None:
     ap.add_argument("--skip-enrich", action="store_true", help="skip the trades enrichment second pass")
     ap.add_argument("--timeframe", default="5m", help="timeframe lane for the re-upload staging/dataset (5m/15m/1h/4h/1d)")
     ap.add_argument("--dataset-prefix", default=None, help="override the Kaggle dataset slug for this re-upload")
+    ap.add_argument("--all-lanes", action="store_true",
+                    help="re-upload EVERY enabled timeframe lane (loops cfg.timeframes); "
+                         "default re-uploads --timeframe only")
     args = ap.parse_args()
     cfg = CollectorConfig.load(args.config)
     data_dir = args.data_dir or cfg.storage.data_dir
@@ -215,8 +218,15 @@ def main() -> None:
     if not args.skip_enrich and not args.dry_run:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
     if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
-        reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels,
-                        timeframe=args.timeframe, dataset_prefix=args.dataset_prefix)
+        if args.all_lanes:
+            for tf in cfg.timeframes:
+                try:
+                    reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels, timeframe=tf)
+                except Exception as e:
+                    print(f"[resolution-backfill] WARN lane {tf} re-upload failed: {e!r} — continuing")
+        else:
+            reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels,
+                            timeframe=args.timeframe, dataset_prefix=args.dataset_prefix)
 
 
 if __name__ == "__main__":

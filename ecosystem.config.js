@@ -1,11 +1,28 @@
 /**
- * PM2 ecosystem — BTC/ETH/SOL 5-min Polymarket collector (PLAN.md v3)
+ * PM2 ecosystem — multi-timeframe Polymarket collector (single process).
  *
- * Two long-running processes (separate per §17A):
- *   1. polymarket-collector — main asyncio collector (BTC/ETH/SOL, 500ms snapshots, rollover, resync, cursor store)
+ * ONE collector process drives ALL enabled timeframe lanes (5m/15m/4h per
+ * config/collector.yaml `timeframes:`) — there are deliberately NO per-TF
+ * processes. Each (asset, tf) lane has its own current/next market pair,
+ * discovery cadence, cursor and Kaggle dataset, all inside the one asyncio
+ * loop (see NEXT_AI_PROMPT_MULTI_TF_RUNNER.md).
+ *
+ * Three PM2 entries:
+ *   1. polymarket-collector — main asyncio collector (7 assets × enabled lanes,
+ *      500ms snapshots, per-lane rollover, resync, per-lane cursor store)
  *   2. polymarket-watchdog  — separate heartbeat monitor + alerting (must not share process with collector)
+ *   3. polymarket-resolution-backfill (cron every 15 min) — official-outcome
+ *      backfill + `--reupload --all-lanes` so EVERY enabled lane's Kaggle
+ *      dataset gets a fresh version carrying resolutions.
  *
  * Optional cron: polymarket-compact — daily Parquet compaction (temp + atomic rename, §10A)
+ *
+ * Rollout order (each lane soaks before the next is enabled):
+ *   1. timeframes: [5m]            → soak ≥24h, completeness ≥99%, gaps 0
+ *   2. timeframes: [5m, 15m]       → soak ≥24h, both datasets uploading
+ *   3. timeframes: [5m, 15m, 4h]   → full 24/7 runner
+ * New lanes ONLY after: python -m polymarket_collector.verify_gate --probe-timeframes
+ * reports ENABLE for that lane (1h/1d do NOT exist on Gamma — keep OFF).
  *
  * Usage:
  *   pm2 start ecosystem.config.js
@@ -18,9 +35,11 @@
  * Requires:
  *   python3 -m venv .venv && .venv/bin/pip install -e .
  *   cp config/collector.example.yaml config/collector.yaml  # edit if needed
+ *   ~/.kaggle/kaggle.json with API credentials (chmod 600)
  *
  * (§18 gate) Run verification before live:
- *   .venv/bin/polymarket-verify-gate --live --config config/collector.yaml
+ *   python -m polymarket_collector.verify_gate --probe-timeframes --config config/collector.yaml
+ *   python -m pytest tests/ -q
  */
 
 const path = require('path');
@@ -41,7 +60,7 @@ module.exports = {
       instances: 1,
       autorestart: true,
       watch: false,
-      max_memory_restart: '800M',
+      max_memory_restart: '1G',   // multi-TF single process (3 lanes × 7 assets); e2-medium has 4GB
       restart_delay: 1000,
       exp_backoff_restart_delay: 100,
       kill_timeout: 10000,          // SIGINT → give collector time to flush + persist cursor (§1B)
@@ -104,11 +123,13 @@ module.exports = {
     // Upgrades ended markets (active/closed/unknown) to the OFFICIAL outcome via
     // the CLOB tokens[].winner flag, append-only + atomic compact. Idempotent:
     // already-resolved markets are skipped, unsettled ones retry next run.
+    // --reupload --all-lanes pushes a fresh Kaggle version for EVERY enabled
+    // timeframe lane (5m/15m/4h datasets), not just the 5m default.
     {
       name: 'polymarket-resolution-backfill',
       cwd,
       script: python,
-      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml',
+      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml --reupload --all-lanes',
       interpreter: 'none',
       exec_mode: 'fork',
       autorestart: false,
