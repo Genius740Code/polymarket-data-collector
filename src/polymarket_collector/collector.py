@@ -44,6 +44,18 @@ from .storage.raw_archive import RawArchive
 from .validation import validate_ws_message
 
 
+def _details_get(details: Any, key: str) -> Any:
+    """Read a key from a collector_events ``details`` payload (JSON string or dict)."""
+    if details is None:
+        return None
+    if isinstance(details, dict):
+        return details.get(key)
+    try:
+        return json.loads(str(details)).get(key)
+    except Exception:
+        return None
+
+
 class Collector:
     """BTC/ETH/SOL/HYPE/BNB/XRP/DOGE 5-min market collector (§1-§19) — 5m-only, 4 markets test, 10-min Kaggle."""
 
@@ -1395,41 +1407,12 @@ class Collector:
                                 pass
                             # FIX: every scheduler_lag catch-up is a timing jitter, not a data gap —
                             # the missed buckets are still emitted via catch-up (grid intact), so
-                            # book_state stays live. We still emit a lightweight resync_episode
-                            # so resync_episodes is not 0 and audit can correlate gaps, but we
-                            # do NOT mark books stale (would make clean 0% — previous bug).
-                            try:
-                                missed = len(buckets) - 1
-                                gap_ms = missed * 500
-                                now_iso = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-                                for asset in self.config.assets:
-                                    au = asset.upper()
-                                    rid = str(uuid.uuid4())
-                                    ep = {
-                                        "disconnect_ts_utc": now_iso,
-                                        "reconnect_ts_utc": now_iso,
-                                        "resync_rest_fetch_ts_utc": now_iso,
-                                        "resync_completed_ts_utc": now_iso,
-                                        "condition_id": None,
-                                        "asset": au,
-                                        "resync_id": rid,
-                                        "disconnect_reason": "scheduler_lag",
-                                        "gap_duration_ms": gap_ms,
-                                        "snapshots_missed_estimate": missed,
-                                        "resync_attempt_count": 0,
-                                    }
-                                    try:
-                                        ok = self.writer.append("resync_episodes", ep, asset=au)
-                                        if not ok:
-                                            self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": au})
-                                    except Exception:
-                                        pass
-                                    # keep collector_events correlation but don't change book_state
-                                    self._collector_event(CollectorEventType.ws_disconnected, {"asset": au, "resync_id": rid, "reason": "scheduler_lag", "gap_ms": gap_ms})
-                                    self._collector_event(CollectorEventType.ws_reconnected, {"asset": au, "resync_id": rid})
-                                    self._collector_event(CollectorEventType.resync_completed, {"asset": au, "resync_id": rid})
-                            except Exception:
-                                pass
+                            # book_state stays live. No resync_episodes row and NO fake
+                            # ws_disconnected/ws_reconnected/resync_completed events here:
+                            # 155 scheduler-lag catch-ups × 7 assets fabricated 1085
+                            # "disconnects" in the 2026-09-06 run and drowned the real WS
+                            # churn signal (31 connects). The scheduler_lag event above
+                            # already carries gap_ms/missed_buckets for audit correlation.
                 for bucket in buckets:
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
@@ -1864,8 +1847,6 @@ class Collector:
                             "resolution_outcome": outcome,
                             "settlement_price": end_price,
                             "settlement_ts_utc": end_ev.get("ts_source"),
-                            "settlement_report_id": end_ev.get("report_id"),
-                            "settlement_tx_hash": None,
                             "resolution_confirmed_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
                             "settlement_source": "inferred_nearest",
                         })
@@ -2484,6 +2465,21 @@ class Collector:
                     checks["coverage_gaps"] = by_type.get("coverage_gap",0)
                     checks["rollover_miss"] = by_type.get("rollover_miss",0)
                     checks["book_anomaly"] = by_type.get("book_anomaly",0)
+                    # Rollover pairing invariant: every rollover_started (excluding the
+                    # initial-discovery tag) must pair with a rollover_completed or a
+                    # coverage_gap; leftovers mean a swap never confirmed.
+                    starts = [r for r in pyl if r.get("event_type") == "rollover_started"]
+                    completed = [r for r in pyl if r.get("event_type") == "rollover_completed"]
+                    cov_gaps = [r for r in pyl if r.get("event_type") == "coverage_gap"]
+                    starts_real = [r for r in starts
+                                   if not _details_get(r.get("details"), "initial")]
+                    checks["rollover_pairing"] = {
+                        "started_initial": len(starts) - len(starts_real),
+                        "started": len(starts_real),
+                        "completed": len(completed),
+                        "coverage_gaps": len(cov_gaps),
+                        "unpaired_started": max(0, len(starts_real) - len(completed) - len(cov_gaps)),
+                    }
             except Exception:
                 pass
         # resync gap total

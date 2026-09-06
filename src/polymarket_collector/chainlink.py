@@ -65,19 +65,17 @@ def chainlink_event_from_ws(msg: Dict[str, Any], asset: str, schema_version: str
 @dataclass
 class SettlementRecord:
     condition_id: str
-    settlement_report_id: Optional[str]
     settlement_price: Optional[float]
     settlement_ts_utc: Optional[str]
-    settlement_tx_hash: Optional[str]
     resolution_confirmed_at: Optional[str]
     settlement_source: str  # on_chain_confirmed | inferred_nearest
+    # settlement_report_id / settlement_tx_hash removed 2026-09-06 — no wire
+    # source exists anywhere in the stack (100% NULL forever)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "settlement_report_id": self.settlement_report_id,
             "settlement_price": self.settlement_price,
             "settlement_ts_utc": self.settlement_ts_utc,
-            "settlement_tx_hash": self.settlement_tx_hash,
             "resolution_confirmed_at": self.resolution_confirmed_at,
             "settlement_source": self.settlement_source,
         }
@@ -100,7 +98,7 @@ async def fetch_settlement(
     if on_chain_fetcher:
         try:
             result = await on_chain_fetcher(condition_id)
-            if result and result.settlement_report_id:
+            if result and result.settlement_price is not None:
                 return result
         except Exception:
             pass
@@ -108,7 +106,6 @@ async def fetch_settlement(
     # fallback: nearest chainlink_events row
     nearest_price = None
     nearest_ts = None
-    nearest_report = None
     if chainlink_store:
         # chainlink_store may be a list or a queryable; handle list case
         candidates = chainlink_store if isinstance(chainlink_store, list) else []
@@ -131,20 +128,16 @@ async def fetch_settlement(
         if best:
             if isinstance(best, dict):
                 nearest_price = best.get("price")
-                nearest_report = best.get("report_id")
                 nearest_ts = best.get("ts_source")
             else:
                 nearest_price = getattr(best, "price", None)
-                nearest_report = getattr(best, "report_id", None)
                 nearest_ts = getattr(best, "ts_source", None)
 
     now_iso = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     return SettlementRecord(
         condition_id=condition_id,
-        settlement_report_id=nearest_report,
         settlement_price=nearest_price,
         settlement_ts_utc=nearest_ts,
-        settlement_tx_hash=None,
         resolution_confirmed_at=now_iso,
         settlement_source=SettlementSource.inferred_nearest.value,
     )

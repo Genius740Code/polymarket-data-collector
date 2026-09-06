@@ -42,8 +42,8 @@ def hive(tmp_path) -> Path:
             "resolution_outcome": "up", "question": None, "tick_size": 0.01,
             "minimum_order_size": None, "minimum_notional": None,
             "reported_volume": None, "reported_liquidity": None,
-            "settlement_report_id": None, "settlement_price": 1.0,
-            "settlement_ts_utc": None, "settlement_tx_hash": None,
+            "settlement_price": 1.0,
+            "settlement_ts_utc": None,
             "resolution_confirmed_at": None, "settlement_source": "polymarket_official",
         },
         {
@@ -57,8 +57,8 @@ def hive(tmp_path) -> Path:
             "resolution_outcome": "unknown", "question": None, "tick_size": 0.01,
             "minimum_order_size": None, "minimum_notional": None,
             "reported_volume": None, "reported_liquidity": None,
-            "settlement_report_id": None, "settlement_price": None,
-            "settlement_ts_utc": None, "settlement_tx_hash": None,
+            "settlement_price": None,
+            "settlement_ts_utc": None,
             "resolution_confirmed_at": None, "settlement_source": None,
         },
     ]

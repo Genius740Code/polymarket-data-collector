@@ -111,7 +111,8 @@ class ParquetWriter:
                         pass
             # 2) try ISO string fields
             if date_derived is None:
-                ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
+                ts_field = (row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
+                            or row.get("disconnect_ts_utc"))
                 if ts_field:
                     try:
                         dt = _dt_for_date.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))

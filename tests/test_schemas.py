@@ -8,7 +8,8 @@ from polymarket_collector.storage.schemas import (
 
 def test_markets_schema_has_settlement():
     names = MARKETS_SCHEMA.names
-    for field in ["settlement_report_id", "settlement_price", "settlement_ts_utc", "settlement_tx_hash", "resolution_confirmed_at", "settlement_source"]:
+    for field in ["settlement_price", "settlement_ts_utc", "resolution_confirmed_at", "settlement_source"]:
+        assert "settlement_report_id" not in names and "settlement_tx_hash" not in names  # dropped 2026-09-06 (no wire source)
         assert field in names, f"missing §6A field {field}"
 
 

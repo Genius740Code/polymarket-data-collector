@@ -44,10 +44,11 @@ MARKETS_SCHEMA = pa.schema([
     pa.field("reported_volume", pa.float64(), nullable=True),
     pa.field("reported_liquidity", pa.float64(), nullable=True),
     # §6A settlement ground truth
-    pa.field("settlement_report_id", pa.string(), nullable=True),
+    # settlement_report_id / settlement_tx_hash dropped 2026-09-06: no wire
+    # source exists (RTDS payload carries no reportId; CLOB winner flag carries
+    # no tx hash; the on-chain fetcher was never wired) — 100% NULL forever.
     pa.field("settlement_price", pa.float64(), nullable=True),
     pa.field("settlement_ts_utc", pa.string(), nullable=True),
-    pa.field("settlement_tx_hash", pa.string(), nullable=True),
     pa.field("resolution_confirmed_at", pa.string(), nullable=True),
     pa.field("settlement_source", pa.string(), nullable=True),  # on_chain_confirmed | inferred_nearest
 ])

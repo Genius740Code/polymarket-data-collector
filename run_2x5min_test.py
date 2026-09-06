@@ -128,7 +128,13 @@ def run_post_test_finalize() -> None:
            "--config", "config/collector.yaml", "--reupload"]
     print("[finalize] resolution backfill + final Kaggle version")
     env = {**__import__("os").environ, "PYTHONUNBUFFERED": "1"}
-    proc = subprocess.run(cmd, cwd=str(ROOT), env=env)
+    # capture + echo: the child's output previously never reached the tee'd log
+    # (Windows pipe inheritance), hiding whether the final upload happened
+    proc = subprocess.run(cmd, cwd=str(ROOT), env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding="utf-8", errors="replace")
+    sys.stdout.write(proc.stdout or "")
+    sys.stdout.flush()
     if proc.returncode != 0:
         print(f"[finalize] backfill exited with {proc.returncode}")
 

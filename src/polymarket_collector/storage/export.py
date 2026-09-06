@@ -1744,9 +1744,12 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         )
                     except TypeError:
                         api.dataset_create_new(dataset=dataset, dir=str(staging), public=True)
-                # Poll until ready — Kaggle can be slow, but don't block collector 20m.
-                # Test needs fast exit; poll 60s then treat upload as success (Kaggle processes async).
-                for _ in range(6):
+                # Poll until ready, then run the verification gates. Kaggle processing
+                # takes ~1-3 min, so a short poll would almost ALWAYS time out — and
+                # the "optimistic success" fallback below that used to fire at 60s
+                # skipped the row-count + remote-file verification on nearly every
+                # upload. Budget 10 min, then fail closed (audit fix #10/#20).
+                for _ in range(60):
                     try:
                         st = api.dataset_status(dataset)
                         s = st.get("status") if isinstance(st, dict) else getattr(st, "status", "")
@@ -1813,10 +1816,9 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                     except Exception:
                         pass
                     _time.sleep(10)
-                # Optimistic success: files uploaded, Kaggle will process async; don't block collector 20m
-                print(f"✓ Kaggle upload completed for {dataset} (status poll 60s, treating as success - Kaggle processes async)")
-                _write_kaggle_state(staging, dataset, version_notes)
-                return True
+                # Fail closed: unverified upload must not report success or mark state
+                print(f"✗ Kaggle dataset not verified ready after 10 min poll: {dataset}")
+                return False
             except Exception as e:
                 last_err = e
                 msg = str(e)
@@ -2148,6 +2150,15 @@ def export_and_upload_all_kaggle(
 
     # Step 1: Prepare staging (export per-asset single files into staging folder)
     print(f"=== Step 1: Preparing Kaggle staging 5m for {assets} -> {staging} ===")
+    # Snapshot the wall clock BEFORE the staging build: the pre-upload validation
+    # must compare staging against the hive AS OF the read, not as of validation
+    # time — while the collector is live, new part files land between the staging
+    # read and the validation, and counting them made staging look lossy
+    # (observed live 2026-09-06: BTC snapshots staging 1207 < hive 1330 → upload
+    # aborted although the staging was complete for its source files). Hive part
+    # files are immutable once written, so files with mtime <= build_start hold
+    # exactly the rows the export read; later files belong to the NEXT export.
+    build_start_ts = _time.time()
     prep = prepare_kaggle_staging_5m(data_dir, staging_dir=staging, assets=assets, l2_levels=l2_levels, dataset_prefix=dataset_prefix)
     result["export"] = prep["row_counts"]
     result["staging"] = {"path": prep["staging_path"], "files": prep["files"], "dataset": prep["dataset"]}
@@ -2176,6 +2187,13 @@ def export_and_upload_all_kaggle(
             hive_files = list(hive_root.glob(f"date=*/asset={a}/*.parquet")) if hive_root.exists() else []
             hive_rows = 0
             for hf in hive_files:
+                # only files that existed before the staging build (see build_start_ts
+                # above); files written during the export are the next export's input
+                try:
+                    if hf.stat().st_mtime > build_start_ts:
+                        continue
+                except OSError:
+                    continue
                 t_h = read_table(hf)
                 hive_rows += t_h.num_rows if t_h is not None else 0
             if hive_rows > staging_rows:
