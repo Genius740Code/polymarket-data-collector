@@ -788,7 +788,127 @@ class Collector:
                 await asyncio.sleep(self.config.discovery_poll_interval_seconds)
             return
 
- # Connect with automatic reconnect on disconnect via resync
+        # Discovery must run INDEPENDENT of WS state. The poller used to live
+        # inside the post-connect `async with` body, so while websockets.connect
+        # kept failing (2026-09-06 overnight: ~6h DNS outage) check_and_roll_all
+        # was never called and discovery went completely silent — zero
+        # discovery_timeout/initial_discovery rows in collector_events while the
+        # reconnect loop visibly cycled. It now runs for the whole asset-loop
+        # lifetime and sends subscriptions via ws_holder only while a live
+        # connection exists.
+        ws_holder: dict = {"ws": None, "subscribed_once": False, "subscribed_tokens": set()}
+
+        async def _ensure_ws_subscription() -> bool:
+            """Subscribe to all active market tokens for this asset (§1 dual-tracking).
+
+            Returns True when new tokens were subscribed. Safe to call while the
+            WS is down — returns False without sending; books already exist and
+            tokens subscribe on the next successful connect.
+            """
+            ws = ws_holder["ws"]
+            if ws is None:
+                return False
+            try:
+                markets = self.rollover.active_markets(asset)
+                tokens: list[str] = []
+                for m in markets:
+                    if m.up_token_id:
+                        tokens.append(m.up_token_id)
+                    if m.down_token_id:
+                        tokens.append(m.down_token_id)
+                # dedup + only new tokens
+                subscribed_tokens = ws_holder["subscribed_tokens"]
+                new_tokens = [t for t in tokens if t not in subscribed_tokens]
+                if not new_tokens:
+                    return False
+                if ws_holder["subscribed_once"]:
+                    # hot-add on the established connection (see R-1 note below)
+                    payload = json.dumps({
+                        "assets_ids": new_tokens,
+                        "operation": "subscribe",
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    })
+                else:
+                    # Polymarket CLOB initial subscribe shape
+                    payload = json.dumps({"assets_ids": tokens, "type": "market"})
+                await ws.send(payload)
+                ws_holder["subscribed_once"] = True
+                subscribed_tokens.update(new_tokens)
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
+                    except Exception:
+                        pass
+                return True
+            except Exception as e:
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": repr(e)})
+                    except Exception:
+                        pass
+                return False
+
+        async def _on_market(market: MarketInfo) -> None:
+            # Dedup: skip if already exists (prevents 2x market log rows)
+            if market.condition_id in self.markets:
+                return
+            self.markets[market.condition_id] = market
+            try:
+                row = market.to_markets_row()
+                self.markets_log.append(row)
+            except Exception:
+                pass
+            if market.condition_id not in self.books:
+                try:
+                    _nb3 = OrderBookState(
+                        asset=market.asset,
+                        condition_id=market.condition_id,
+                        market_id=market.market_id,
+                        series_id=market.series_id,
+                        window_index=market.window_index,
+                        up_token_id=market.up_token_id,
+                        down_token_id=market.down_token_id,
+                        market_end_ts_ms=market.market_end_ts_ms,
+                        schema_version=self.config.schema_version,
+                        l2_levels=self.config.l2_levels,
+                    )
+                except Exception:
+                    _nb3 = OrderBookState(
+                        asset=market.asset, condition_id=market.condition_id,
+                        market_id=market.market_id, series_id=market.series_id,
+                        window_index=market.window_index,
+                        up_token_id=market.up_token_id, down_token_id=market.down_token_id,
+                        market_end_ts_ms=market.market_end_ts_ms,
+                    )
+                try:
+                    _nb3.mark_stale(resync_id=str(uuid.uuid4()))
+                except Exception:
+                    pass
+                self.books[market.condition_id] = _nb3
+            # subscribe newly discovered market tokens (hot-add via
+            # operation:subscribe when connected; no-op while WS is down)
+            try:
+                await _ensure_ws_subscription()
+            except Exception:
+                pass
+
+        async def _discovery_poller() -> None:
+            # runs for the whole asset-loop lifetime, WS up OR down — during an
+            # outage this is the ONLY source of discovery observability
+            while self._running:
+                try:
+                    await self.rollover.check_and_roll_all(asset, _on_market)
+                except Exception:
+                    pass
+                await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+
+        disc_task = asyncio.create_task(_discovery_poller(), name=f"discovery-{asset}")
+        # stop() cancels everything in _tasks; never per-connection — the poller
+        # must survive the 150s recycles and every reconnect
+        self._tasks.append(disc_task)
+
+        # Connect with automatic reconnect on disconnect via resync
         # Track tokens already subscribed on this connection to avoid resending duplicates
         while self._running:
             attempt = 0
@@ -823,7 +943,6 @@ class Collector:
                                 self.resync.handle_reconnect(rid)
                     except Exception:
                         pass
-                    subscribed_tokens: set[str] = set()
                     # R-1 (SUPERSEDED, probed live 2026-09-05): the CLOB ignores a
                     # repeated plain {"assets_ids":[...],"type":"market"} subscribe on
                     # an established connection — BUT the documented
@@ -833,97 +952,11 @@ class Collector:
                     # New-window tokens are therefore added in place; no forced
                     # reconnect at rollover anymore. The 150s recycle + boundary
                     # REST heal remain as backstops.
-                    subscribed_once = False
-
-                    async def _ensure_ws_subscription() -> bool:
-                        """Subscribe to all active market tokens for this asset (§1 dual-tracking).
-
-                        Returns True when new tokens were subscribed.
-                        """
-                        nonlocal subscribed_once
-                        try:
-                            markets = self.rollover.active_markets(asset)
-                            tokens: list[str] = []
-                            for m in markets:
-                                if m.up_token_id:
-                                    tokens.append(m.up_token_id)
-                                if m.down_token_id:
-                                    tokens.append(m.down_token_id)
-                            # dedup + only new tokens
-                            new_tokens = [t for t in tokens if t not in subscribed_tokens]
-                            if not new_tokens:
-                                return False
-                            if subscribed_once:
-                                # hot-add on the established connection (see R-1 note above)
-                                payload = json.dumps({
-                                    "assets_ids": new_tokens,
-                                    "operation": "subscribe",
-                                    "type": "market",
-                                    "custom_feature_enabled": True,
-                                })
-                            else:
-                                # Polymarket CLOB initial subscribe shape
-                                payload = json.dumps({"assets_ids": tokens, "type": "market"})
-                            await ws.send(payload)
-                            subscribed_once = True
-                            subscribed_tokens.update(new_tokens)
-                            if self.on_event:
-                                try:
-                                    self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
-                                except Exception:
-                                    pass
-                            return True
-                        except Exception as e:
-                            if self.on_event:
-                                try:
-                                    self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": repr(e)})
-                                except Exception:
-                                    pass
-                            return False
-
-                    async def _on_market(market: MarketInfo) -> None:
-                        # Dedup: skip if already exists (prevents 2x market log rows)
-                        if market.condition_id in self.markets:
-                            return
-                        self.markets[market.condition_id] = market
-                        try:
-                            row = market.to_markets_row()
-                            self.markets_log.append(row)
-                        except Exception:
-                            pass
-                        if market.condition_id not in self.books:
-                            try:
-                                _nb2 = OrderBookState(
-                                    asset=market.asset,
-                                    condition_id=market.condition_id,
-                                    market_id=market.market_id,
-                                    series_id=market.series_id,
-                                    window_index=market.window_index,
-                                    up_token_id=market.up_token_id,
-                                    down_token_id=market.down_token_id,
-                                    market_end_ts_ms=market.market_end_ts_ms,
-                                    schema_version=self.config.schema_version,
-                                    l2_levels=self.config.l2_levels,
-                                )
-                            except Exception:
-                                _nb2 = OrderBookState(
-                                    asset=market.asset, condition_id=market.condition_id,
-                                    market_id=market.market_id, series_id=market.series_id,
-                                    window_index=market.window_index,
-                                    up_token_id=market.up_token_id, down_token_id=market.down_token_id,
-                                    market_end_ts_ms=market.market_end_ts_ms,
-                                )
-                            try:
-                                _nb2.mark_stale(resync_id=str(uuid.uuid4()))
-                            except Exception:
-                                pass
-                            self.books[market.condition_id] = _nb2
-                        # subscribe newly discovered market tokens (hot-add via
-                        # operation:subscribe — no reconnect needed, see R-1 note)
-                        try:
-                            await _ensure_ws_subscription()
-                        except Exception:
-                            pass
+                    # Fresh subscribe state per connection; publish the live socket
+                    # so the hoisted discovery poller can hot-add tokens.
+                    ws_holder["ws"] = ws
+                    ws_holder["subscribed_once"] = False
+                    ws_holder["subscribed_tokens"] = set()
 
                     # Initial discovery before reading (ensure at least current market)
                     try:
@@ -931,17 +964,6 @@ class Collector:
                         await _ensure_ws_subscription()
                     except Exception:
                         pass
-
-                    # Background discovery poller while WS is open (dual-tracking 30s lookahead)
-                    async def _discovery_poller() -> None:
-                        while self._running:
-                            try:
-                                await self.rollover.check_and_roll_all(asset, _on_market)
-                            except Exception:
-                                pass
-                            await asyncio.sleep(self.config.discovery_poll_interval_seconds)
-
-                    disc_task = asyncio.create_task(_discovery_poller(), name=f"discovery-{asset}")
 
                     # WS resilience (docs/WS_RESILIENCE_RESEARCH.md): app-level
                     # heartbeat + data-staleness watchdog. The text "PING" proves
@@ -1178,12 +1200,15 @@ class Collector:
                                 except Exception:
                                     pass
                     finally:
-                        for _t in (disc_task, hb_task, wd_task):
+                        # the discovery poller is NOT here — it is hoisted above
+                        # the connect loop and must survive recycles/disconnects
+                        ws_holder["ws"] = None
+                        for _t in (hb_task, wd_task):
                             try:
                                 _t.cancel()
                             except Exception:
                                 pass
-                        for _t in (disc_task, hb_task, wd_task):
+                        for _t in (hb_task, wd_task):
                             try:
                                 # BOUNDED: a task that swallows CancelledError (e.g.
                                 # inside a library call) used to hang the whole
