@@ -2136,8 +2136,11 @@ class Collector:
                         built_pruned = sum(res.get("cleanup", {}).values()) if isinstance(res.get("cleanup"), dict) else 0
                         if built_pruned == 0:
                             # built-in 2h prune kept everything (expected in 20min test); do test-buffer prune to demo delete
+                            # skip timestamp-only datasets: with the ~0h test cutoff they would be
+                            # wiped by mtime and the FINAL staging rebuild would publish truncated
+                            # collector_events/chainlink_events (seen 2026-09-07: 229->2 / ~765->11 rows)
                             try:
-                                extra = _cleanup(self.config.storage.data_dir, assets=self.config.assets, timeframe_labels=[test_tf], keep_seconds=120, checkpoint_ms=None, rolling_window=True, retention_hours=0)
+                                extra = _cleanup(self.config.storage.data_dir, assets=self.config.assets, timeframe_labels=[test_tf], keep_seconds=120, checkpoint_ms=None, rolling_window=True, retention_hours=0, skip_datasets=("chainlink_events", "collector_events", "resync_episodes"))
                                 if extra:
                                     print(f"[test-kaggle:{tag}] test-buffer prune (120s) extra: {extra} — closed markets only, open window kept")
                                     for k, v in extra.items():

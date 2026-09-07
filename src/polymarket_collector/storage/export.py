@@ -2088,6 +2088,7 @@ def cleanup_local_data(
     rolling_window: bool | None = None,
     retention_hours: int | None = None,
     dry_run: bool = False,
+    skip_datasets: list | tuple | None = None,
 ) -> dict:
     """Post-upload local prune — rolling-window mode (market-end aware, fail closed).
 
@@ -2108,6 +2109,11 @@ def cleanup_local_data(
     In cumulative mode (rolling_window=False, the legacy default) NOTHING is
     deleted — the staging is cumulative and rebuilt from the full local hive, so
     deleting local data would shrink future Kaggle versions.
+
+    skip_datasets: optional names of top-level datasets to never delete from
+    (e.g. ("collector_events", "chainlink_events") in the 2x5min test-buffer
+    prune — timestamp-only datasets would otherwise be wiped by the ~0h test
+    cutoff and the NEXT staging rebuild would publish truncated event files).
 
     Returns stats {relative_path: rows_deleted} (empty when nothing was deleted).
     """
@@ -2178,6 +2184,7 @@ def cleanup_local_data(
 
     CID_DATASETS = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades"]
     TS_DATASETS = ["chainlink_events", "collector_events"]
+    skipped = set(skip_datasets or [])
     stats: dict = {}
     pruned_rows = 0
 
@@ -2195,6 +2202,8 @@ def cleanup_local_data(
             print(f"[prune] WARN could not delete {rel}: {e}")
 
     for dataset in CID_DATASETS + TS_DATASETS:
+        if dataset in skipped:
+            continue
         ds_root = base / dataset
         if not ds_root.exists():
             continue

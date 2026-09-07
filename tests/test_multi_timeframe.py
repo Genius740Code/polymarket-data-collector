@@ -202,6 +202,50 @@ def test_tf_filter_and_rolling_prune(tmp_path):
     assert stats == {}
 
 
+def test_prune_skip_datasets_keeps_event_history(tmp_path):
+    """Regression (2026-09-07 5m live run): the test-buffer prune with a ~0h
+    cutoff wiped timestamp-only datasets by mtime, so the FINAL staging rebuild
+    published truncated collector_events (229->2 rows) and chainlink_events
+    (~765->11 rows). skip_datasets must keep them while CID files still prune."""
+    base = Path(tmp_path)
+    now_ms = int(time.time() * 1000)
+    old_end = now_ms - 10 * 3600 * 1000  # ended 10h ago (past ~0h test cutoff)
+    markets_rows = [{"condition_id": "cid-old", "asset": "BTC", "market_end_ts_ms": old_end}]
+    _write_parquet(base / "markets_latest" / "markets_latest.parquet", markets_rows,
+                   ["condition_id", "asset", "market_end_ts_ms"])
+
+    f_cid = base / "book_snapshots_500ms" / "date=x" / "asset=BTC" / "part-0.parquet"
+    _write_parquet(f_cid, [{"condition_id": "cid-old", "asset": "BTC", "series_id": "BTC-5m",
+                            "ts_snapshot_ns": old_end * 1e6}],
+                   ["condition_id", "asset", "series_id", "ts_snapshot_ns"])
+    old_ns = int((now_ms - 10 * 3600 * 1000) * 1e6)
+    f_events = base / "collector_events" / "date=x" / "part-0.parquet"
+    _write_parquet(f_events, [{"event_type": "market_added", "ts_utc": old_ns}], ["event_type", "ts_utc"])
+    f_chain = base / "chainlink_events" / "date=x" / "asset=BTC" / "part-0.parquet"
+    _write_parquet(f_chain, [{"asset": "BTC", "ts_utc": old_ns}], ["asset", "ts_utc"])
+
+    # without skip: the ~0h cutoff deletes everything old (the 2026-09-07 bug)
+    stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=0,
+                               checkpoint_ms=now_ms)
+    assert not f_events.exists() and not f_chain.exists()
+    # restore event files, keep CID file deleted state out of the equation
+    _write_parquet(f_events, [{"event_type": "market_added", "ts_utc": old_ns}], ["event_type", "ts_utc"])
+    _write_parquet(f_chain, [{"asset": "BTC", "ts_utc": old_ns}], ["asset", "ts_utc"])
+    f_cid2 = base / "book_snapshots_500ms" / "date=y" / "asset=BTC" / "part-0.parquet"
+    _write_parquet(f_cid2, [{"condition_id": "cid-old", "asset": "BTC", "series_id": "BTC-5m",
+                             "ts_snapshot_ns": old_end * 1e6}],
+                   ["condition_id", "asset", "series_id", "ts_snapshot_ns"])
+
+    # with skip: event history survives, eligible CID files still prune
+    stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=0,
+                               checkpoint_ms=now_ms,
+                               skip_datasets=("chainlink_events", "collector_events", "resync_episodes"))
+    assert f_events.exists(), "skip_datasets must keep collector_events"
+    assert f_chain.exists(), "skip_datasets must keep chainlink_events"
+    assert not f_cid2.exists(), "eligible CID files must still prune with skip_datasets"
+    assert all("collector_events" not in k and "chainlink_events" not in k for k in stats)
+
+
 def test_rolling_staging_allows_shrink(tmp_path):
     from polymarket_collector.storage.export import _verify_staging_row_counts
     staging = Path(tmp_path) / "staging"
