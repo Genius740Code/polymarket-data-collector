@@ -49,7 +49,10 @@ liquidity_filter:
   min_volume: 500
 max_coverage_gap_seconds: 5
 raw_archive:
-  enabled: true
+  # BOX-FIT 2026-09-07 (9.7G disk): disabled — raw WS frames grow ~1.8GB/h and
+  # filled the disk to 92% within 25 min of 3-lane prod. Diagnostic only; no
+  # dataset depends on it. Re-enable on a >=25GB box (RUNBOOK spec).
+  enabled: false
   format: jsonl
   path: ./data/raw_ws_archive
   retention_hours: 36
@@ -100,9 +103,14 @@ window_size_seconds: 300
 # reports ENABLE for a lane (probed 2026-09-06: 5m/15m/4h live on all 7 assets;
 # 1h/1d up/down series do not exist on Gamma yet — keep OFF).
 timeframes:
+  # ROLLOUT STEP 1 2026-09-07 (RUNBOOK §7): 5m-only soak. Full 21-lane set grows
+  # RSS ~1.1GB/10min -> 1.66GB/25min (pm2 mem-restart loop, separate P0 leak
+  # hunt). Re-enable 15m, then 4h, each after its own soak. Cursors persist per
+  # lane; no data loss on re-enable. 15m/4h lane plumbing already validated by
+  # Task 4 live run + backfill-cron 4h upload (2026-09-07).
   - 5m
-  - 15m
-  - 4h
+  # - 15m
+  # - 4h
 
 ws:
   full_book_diff_interval_seconds: 300
