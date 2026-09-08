@@ -42,6 +42,17 @@ scp -p oldbox:~/.kaggle/kaggle.json oldbox:~/.kaggle/access_token ~/.kaggle/ 2>/
 scp -p oldbox:~/.netrc ~/ 2>/dev/null; scp -p oldbox:~/.opencode.env ~/ 2>/dev/null
 chmod 600 ~/.kaggle/* ~/.netrc ~/.opencode.env 2>/dev/null
 ```
+- GitHub SSH (repo remote is SSH, so push needs it) — RECOMMENDED: fresh key
+  on the new box (old key keeps working until you delete it from GitHub →
+  Settings → SSH keys, after decommissioning the old box):
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "polymarket-newbox" && chmod 600 ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub   # paste into GitHub → Settings → SSH and GPG keys → New SSH key
+ssh -T git@github.com       # expect: "Hi Genius740Code! You've successfully authenticated"
+```
+  Fast path instead (same key both boxes — delete from GitHub when the old box
+  dies): `scp -p oldbox:~/.ssh/id_ed25519 oldbox:~/.ssh/id_ed25519.pub ~/.ssh/
+  && chmod 600 ~/.ssh/id_ed25519 && ssh -T git@github.com`.
 - What lives where on the old box: `~/.kaggle/kaggle.json` (+`access_token`) =
   Kaggle API; `~/.netrc` = GitHub auth; `~/.opencode.env` holds ONE line
   `OPENCODE_SERVER_PASSWORD=...` (OpenCode web login — keep it, do not regenerate
