@@ -476,6 +476,20 @@ class Collector:
         except Exception:
             return False
 
+    def _replay_buffer_id(self, asset: str, msg_resync_id: str = "") -> str:
+        """Return the resync buffer id for a live WS message, or "" if none.
+
+        Only an OPEN episode's buffer is ever consumed (replayed + popped in
+        ResyncManager.resync). Buffering under any other key leaks: per-asset
+        fallback deques were never replayed (P0 2026-09-08, ~110MB/min).
+        """
+        if msg_resync_id:
+            return msg_resync_id
+        for rid, ep in list(self.resync._episodes.items()):
+            if ep.asset == asset.upper() and ep.resync_completed_ts_utc is None:
+                return rid
+        return ""
+
     async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
         """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
         try:
@@ -1182,21 +1196,15 @@ class Collector:
                                     pass
 
                                 # Buffer message for resync/replay on disconnect
+                                # (only under a genuinely OPEN episode: buffering live
+                                # messages with no open episode piles them into an
+                                # unconsumed per-asset deque — P0 leak 2026-09-08,
+                                # ~22k msgs / 10 min, never replayed, ~110MB/min RSS)
                                 try:
-                                    resync_id = single_msg.get("resync_id", "")
-                                    # also buffer under asset-scoped active resync episode if any
-                                    if not resync_id:
-                                        # find active episode for this asset
-                                        for rid, ep in list(self.resync._episodes.items()):
-                                            if ep.asset == asset.upper() and ep.resync_completed_ts_utc is None:
-                                                resync_id = rid
-                                                break
-                                        if not resync_id:
-                                            resync_id = f"asset-{asset}"
-                                            if resync_id not in self.resync._buffers:
-                                                from collections import deque as _dq
-                                                self.resync._buffers[resync_id] = _dq()
-                                    self.resync.buffer_message(resync_id, single_msg)
+                                    resync_id = self._replay_buffer_id(
+                                        asset, single_msg.get("resync_id", "") or "")
+                                    if resync_id:
+                                        self.resync.buffer_message(resync_id, single_msg)
                                 except Exception:
                                     pass
                     finally:

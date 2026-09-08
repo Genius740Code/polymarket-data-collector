@@ -158,3 +158,26 @@ async def test_drift_check_triggers_stale():
     rid2 = await mgr2.periodic_drift_check("BTC", "cid-1", books2)
     assert rid2 is None
     assert books2["cid-1"].book_state.value == "live"
+
+
+def test_replay_buffer_id_no_fallback_leak(tmp_path):
+    """P0 2026-09-08: the live WS loop buffered EVERY message into unconsumed
+    per-asset `asset-{ASSET}` deques when no episode was open (~22k msgs /
+    10 min, never replayed, ~110MB/min RSS). _replay_buffer_id must return ""
+    with no open episode (and create no buffer keys), the episode id while
+    one is open, and "" again once it completes."""
+    from polymarket_collector.collector import Collector
+    cfg = CollectorConfig(assets=["BTC"],
+                          storage={"data_dir": str(tmp_path)},
+                          cursor_store={"path": str(tmp_path / "cursor_state")},
+                          timeframes=["5m"])
+    c = Collector(cfg)
+    assert c._replay_buffer_id("BTC") == ""
+    assert "asset-BTC" not in c.resync._buffers
+    rid = c.resync.handle_disconnect("BTC", None, "test", {})
+    assert c._replay_buffer_id("BTC") == rid
+    c.resync.buffer_message(rid, {"m": 1})
+    assert len(c.resync._buffers[rid]) == 1
+    c.resync._episodes[rid].resync_completed_ts_utc = "done"
+    assert c._replay_buffer_id("BTC") == ""
+    assert "asset-BTC" not in c.resync._buffers

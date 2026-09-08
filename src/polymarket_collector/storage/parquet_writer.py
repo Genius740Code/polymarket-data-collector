@@ -302,6 +302,21 @@ class ParquetWriter:
         except Exception:
             pass
 
+    # Bound for the on-disk dedup scan below: WAL content always postdates the
+    # last successful flush (flush truncates the WAL after every write), so a
+    # WAL row can only duplicate on-disk rows written by a flush that crashed
+    # mid-way — i.e. files about as new as the WAL itself. Scanning the whole
+    # hive is O(history) at every startup: 8+ min stall + GB RSS on real hives,
+    # which trips pm2 max_memory_restart / earlyoom and restart-loops forever
+    # (seen 2026-09-08: probe stuck 10 min in replay on a 175k-row hive).
+    _REPLAY_SCAN_WINDOW_S = 2 * 3600
+    _REPLAY_SCAN_ROW_CAP = 500_000
+    # A crashed flush writes at most (#groups) files; newest-first + cap keeps
+    # the dupe protection where it matters (the crash window) while bounding
+    # file-open overhead on hives with thousands of uncompacted flush files
+    # (seen 2026-09-08: 1354 files / 1.5M rows in 2.5h).
+    _REPLAY_SCAN_MAX_FILES_PER_DATASET = 50
+
     def _wal_replay(self) -> int:
         """Replay unflushed WAL entries into buffer on startup after crash/restart.
 
@@ -309,12 +324,29 @@ class ParquetWriter:
         Idempotent: skips rows whose dedup key already exists in _seen_keys
         or on disk, preventing duplicate writes when replaying after a crash where
         some rows may have already been flushed to parquet before the crash.
+        The on-disk scan is bounded to files newer than (oldest WAL mtime -
+        2h): older files predate the last WAL truncate and cannot hold dupes
+        of current WAL content in single-writer operation. A 500k-row cap with
+        WARN fails open toward possible dupes (tolerated downstream) rather
+        than OOM-killing the process on huge hives.
         """
         import json
+        import time as _time
         replayed = 0
         seen_replay_keys: Set[Tuple] = set()  # track keys replayed in this pass
         # Build set of on-disk dedup keys to avoid re-adding rows already in parquet
         on_disk_keys: Dict[str, Set[Tuple]] = {}
+        try:
+            # Only NON-EMPTY WAL files matter: replay truncates consumed files,
+            # so empty ones are husks from dead instances. Basing the cutoff on
+            # all files (incl. days-old husks) would disable the bound.
+            _wal_mtimes = [p.stat().st_mtime for p in self.wal_dir.glob("wal-*.jsonl")
+                           if p.is_file() and p.stat().st_size > 0]
+        except Exception:
+            _wal_mtimes = []
+        _scan_cutoff = (min(_wal_mtimes) if _wal_mtimes else _time.time()) - self._REPLAY_SCAN_WINDOW_S
+        _scanned_rows = 0
+        _scan_capped = False
         for dataset in set(
             entry.get("dataset") for wal_path in self.wal_dir.glob("wal-*.jsonl") for line in open(wal_path) if line.strip() for entry in [json.loads(line.strip())] if entry.get("dataset")
         ):
@@ -322,9 +354,43 @@ class ParquetWriter:
             # scan existing parquet files for this dataset to find keys already on disk
             ds_root = self.data_dir / dataset
             if ds_root.exists():
+                _cands = []
                 for parquet_file in ds_root.rglob("*.parquet"):
                     if parquet_file.name.endswith(".tmp"):
                         continue
+                    try:
+                        if parquet_file.stat().st_mtime < _scan_cutoff:
+                            continue  # predates last WAL truncate — cannot hold dupes
+                        _cands.append(parquet_file)
+                    except Exception:
+                        pass
+                # newest-first: crashed-flush dupes live in the newest files;
+                # cap file count so thousand-file hives stay cheap
+                try:
+                    _cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                except Exception:
+                    pass
+                # Phase 1 (cheap): budget files by metadata row counts — a full
+                # to_pylist on every candidate dominates on hives with huge
+                # compacted partitions. Newest files first, stop at 2x row cap
+                # (read pass below enforces the exact cap).
+                _picked: list = []
+                _budget = 0
+                for _pf in _cands[:self._REPLAY_SCAN_MAX_FILES_PER_DATASET]:
+                    if _scan_capped:
+                        break
+                    try:
+                        import pyarrow.parquet as _pq
+                        _nr = _pq.ParquetFile(str(_pf)).metadata.num_rows
+                    except Exception:
+                        _nr = 0
+                    _picked.append(_pf)
+                    _budget += _nr
+                    if _budget >= 2 * self._REPLAY_SCAN_ROW_CAP:
+                        break
+                for parquet_file in _picked:
+                    if _scan_capped:
+                        break
                     try:
                         t = read_table(parquet_file)
                         # extract dedup-relevant columns based on dataset type
@@ -333,6 +399,14 @@ class ParquetWriter:
                             key = self._dedup_key(dataset, row)
                             if key is not None:
                                 keys.add(key)
+                            _scanned_rows += 1
+                            if _scanned_rows >= self._REPLAY_SCAN_ROW_CAP:
+                                _scan_capped = True
+                                try:
+                                    print(f"[wal-replay] WARN on-disk scan capped at {self._REPLAY_SCAN_ROW_CAP} rows — proceeding, rare dupes possible")
+                                except Exception:
+                                    pass
+                                break
                     except Exception:
                         pass
             on_disk_keys[dataset] = keys

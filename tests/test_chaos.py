@@ -235,3 +235,48 @@ def test_chaos_backpressure():
         writer.flush()
         writer.append("book_snapshots_500ms", {"asset": "BTC", "condition_id": "c1", "ts_snapshot_ns": 1_500_000_000}, asset="BTC", date_str="2025-01-01")
         assert True  # if we got here, no silent drop
+
+
+# 7. Bounded WAL-replay scan (§1B startup stall)
+def test_wal_replay_scan_bounded_to_recent_files():
+    """Regression 2026-09-08 (P0): _wal_replay scanned the ENTIRE hive with
+    to_pylist() at every startup — 8+ min stall + GB RSS on a 175k-row hive,
+    restart-looping under pm2 max_memory_restart / earlyoom. The on-disk dedup
+    scan must skip files older than (oldest WAL mtime - 2h); a dupe in a
+    RECENT file must still be skipped."""
+    import os
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def _mk(tmp):
+        return ParquetWriter(
+            data_dir=tmp, wal_enabled=True, wal_dir=Path(tmp) / "_wal",
+            flush_interval_seconds=999, flush_row_count_threshold=999999,
+            buffer_max_rows=999999,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        row = {"token_id": "tok1", "trade_id": "t-bounded", "asset": "BTC"}
+        # OLD parquet (3h) already holding the key
+        old_dir = base / "trades" / "date=2026-09-01" / "asset=BTC"
+        old_dir.mkdir(parents=True)
+        old_f = old_dir / "old.parquet"
+        pq.write_table(pa.table({k: [v] for k, v in row.items()}), str(old_f))
+        old_t = time.time() - 3 * 3600
+        os.utime(old_f, (old_t, old_t))
+        # fresh WAL holding the same key
+        w = _mk(tmp)
+        w.append("trades", dict(row), asset="BTC", date_str="2026-09-08")
+        # new writer, same dirs: old file NOT scanned -> row re-added
+        w2 = _mk(tmp)
+        assert w2._wal_replay() == 1
+        assert len(w2._buffer) == 1
+        # RECENT parquet holding the key: dupe still skipped
+        new_dir = base / "trades" / "date=2026-09-08" / "asset=BTC"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({k: [v] for k, v in row.items()}),
+                       str(new_dir / "new.parquet"))
+        w3 = _mk(tmp)
+        assert w3._wal_replay() == 0
+        assert len(w3._buffer) == 0
