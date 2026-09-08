@@ -24,7 +24,7 @@ ladder — a different market type, out of scope until the operator says otherwi
 sudo apt update && sudo apt install -y git python3-venv python3-pip nodejs npm
 git clone https://github.com/Genius740Code/polymarket-data-collector.git \
   && cd polymarket-data-collector
-git log --oneline -3          # expect b99dc0f or newer on master
+git log --oneline -3          # expect d9ca7bd or newer on master
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev,kaggle]"
 npm install -g pm2 && pm2 --version
 cp config/collector.example.yaml config/collector.yaml   # ONLY if collector.yaml missing
