@@ -33,13 +33,65 @@ cp config/collector.example.yaml config/collector.yaml   # ONLY if collector.yam
 
 ## 3. Credentials + data migration (from the OLD box — operator assists)
 
-- `~/.kaggle/kaggle.json` (chmod 600) — copy from old box. NEVER commit it.
-  Verify: `.venv/bin/python -c "from polymarket_collector.storage.export import _validate_kaggle_config; print(_validate_kaggle_config())"` → True.
+⛔ NEVER paste secret VALUES into chat, git, or this file — transfer FILES only:
+
+```bash
+# run on the NEW box (old-box reachable as oldbox):
+scp -p oldbox:~/.kaggle/kaggle.json oldbox:~/.kaggle/access_token ~/.kaggle/ 2>/dev/null || \
+  scp -pr oldbox:~/.kaggle/ ~/.kaggle/
+scp -p oldbox:~/.netrc ~/ 2>/dev/null; scp -p oldbox:~/.opencode.env ~/ 2>/dev/null
+chmod 600 ~/.kaggle/* ~/.netrc ~/.opencode.env 2>/dev/null
+```
+- What lives where on the old box: `~/.kaggle/kaggle.json` (+`access_token`) =
+  Kaggle API; `~/.netrc` = GitHub auth; `~/.opencode.env` holds ONE line
+  `OPENCODE_SERVER_PASSWORD=...` (OpenCode web login — keep it, do not regenerate
+  unless you want a new password). There is NO repo `.env` and NO Alchemy key on
+  the old box — C2 on-chain uses the free public RPC, nothing to copy.
+- Verify: `.venv/bin/python -c "from polymarket_collector.storage.export import _validate_kaggle_config; print(_validate_kaggle_config())"` → True.
 - Hive continuity (else Kaggle history resets): on OLD box
   `pm2 stop polymarket-collector polymarket-resolution-backfill`, then
   `rsync -az oldbox:~/polymarket-collector/data/ ./data/` (~1–2 GB, 48 h window).
 - ⚠️ **Two collectors must NEVER upload to the same Kaggle slugs.**
   Old-box uploads stop BEFORE the new box's first hourly upload.
+
+## 3b. OpenCode web + Cloudflare tunnel (remote access, mirrors the old box)
+
+```bash
+curl -fsSL https://opencode.ai/install | bash   # → ~/.opencode/bin/opencode
+npm install -g pm2
+# tunnel binary (pick one):
+sudo dpkg -i /tmp/cloudflared.deb   # from https://github.com/cloudflare/cloudflared/releases (amd64 .deb)
+# same working dir + password file already scp'd in §3 (~/.opencode.env):
+cd ~ && pm2 start ~/.opencode/bin/opencode --interpreter none \
+  --name opencode --cwd /home/$USER -- web --port 4096 --hostname 127.0.0.1
+pm2 start /usr/local/bin/cloudflared --interpreter none --name cloud \
+  --cwd /home/$USER -- tunnel --url http://127.0.0.1:4096
+pm2 save && curl -s -o /dev/null --max-time 10 http://127.0.0.1:4096/ && echo WEB_OK
+pm2 logs cloud --lines 5 --nostream | grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" | head -n 1
+# ^ your remote URL (login with OPENCODE_SERVER_PASSWORD). NOTE: quick-tunnel
+# URLs ROTATE on every restart — read the fresh URL from `pm2 logs cloud`.
+# For a STABLE url later: `cloudflared tunnel login` (browser) →
+# `cloudflared tunnel create <name>` → route your domain → switch the pm2
+# `cloud` app to `tunnel run <name>`.
+```
+- Self-healing (same as old box) — install `~/healthcheck.sh` with this content,
+  then `crontab -e`:
+```bash
+#!/bin/bash
+LOG="$HOME/.healthcheck.log"; STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if ! curl -s -o /dev/null --max-time 10 http://127.0.0.1:4096/; then
+  echo "$STAMP ALERT port 4096 down, restarting opencode" >> "$LOG"
+  /usr/local/bin/pm2 restart opencode >> "$LOG" 2>&1
+else
+  MEM="$(free -m | awk '/^Mem:/{print "mem_used="$3"MB_avail="$7"MB"}')"
+  echo "$STAMP OK $MEM load:$(cut -d' ' -f1-3 /proc/loadavg)" >> "$LOG"
+fi
+tail -n 200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+```
+```
+*/5 * * * * /home/$USER/healthcheck.sh
+0 4 * * * /usr/local/bin/pm2 restart opencode >/dev/null 2>&1
+```
 
 ## 4. Staged rollout (cursors persist per lane — enabling is lossless)
 
