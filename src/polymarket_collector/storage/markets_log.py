@@ -30,12 +30,19 @@ from ..enums import MarketStatus, ResolutionOutcome
 class MarketsLog:
     """Append-only log for market metadata (§2 + §6A settlement fields)."""
 
+    # P0 leak hunt session 2 (2026-09-08): _seen_condition_ids grew unbounded
+    # (~2k cids/day per 5m lane). It suppresses duplicate ACTIVE rows from
+    # rollover re-discovery — a market seen long ago is final and its
+    # suppression window has passed, so FIFO eviction past the cap is safe.
+    MAX_SEEN_CONDITION_IDS = 20000
+
     def __init__(self, data_dir: str | Path, writer=None):
         self.data_dir = Path(data_dir)
         self.writer = writer  # optional ParquetWriter (batched)
         # small staging store for buffering before parquet flush (§9A)
         self._staging: List[Dict] = []
         self._seen_condition_ids: set = set()  # dedup within process lifetime (fixes duplicate 5961540)
+        self._seen_order: List[str] = []  # FIFO order for the cap eviction
 
     def append(self, market: Dict, updated_at: Optional[str] = None) -> None:
         """Append a new state snapshot for a market (condition_id)."""
@@ -54,8 +61,13 @@ class MarketsLog:
             if row.get("status", "active") == "active" and row.get("resolution_outcome", "unknown") == "unknown":
                 # Check if we've already seen this cid recently - skip duplicate
                 return
-        if cid:
+        if cid and cid not in self._seen_condition_ids:
             self._seen_condition_ids.add(cid)
+            self._seen_order.append(cid)
+            if len(self._seen_order) > self.MAX_SEEN_CONDITION_IDS:
+                evict = self._seen_order[:len(self._seen_order) - self.MAX_SEEN_CONDITION_IDS]
+                del self._seen_order[:len(self._seen_order) - self.MAX_SEEN_CONDITION_IDS]
+                self._seen_condition_ids.difference_update(evict)
         row["updated_at"] = updated_at or datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
         # §3.1 alias: recorded_at mirrors updated_at for Kaggle JSON
         if not row.get("recorded_at"):

@@ -479,14 +479,20 @@ class Collector:
     def _replay_buffer_id(self, asset: str, msg_resync_id: str = "") -> str:
         """Return the resync buffer id for a live WS message, or "" if none.
 
-        Only an OPEN episode's buffer is ever consumed (replayed + popped in
+        Only a LIVE buffer is ever consumed (replayed + popped in
         ResyncManager.resync). Buffering under any other key leaks: per-asset
-        fallback deques were never replayed (P0 2026-09-08, ~110MB/min).
+        fallback deques were never replayed (P0 2026-09-08, ~110MB/min); an
+        escalated episode's buffer is popped + dead and must not re-arm
+        (P0 leak hunt session 2).
         """
         if msg_resync_id:
             return msg_resync_id
         for rid, ep in list(self.resync._episodes.items()):
-            if ep.asset == asset.upper() and ep.resync_completed_ts_utc is None:
+            if (
+                ep.asset == asset.upper()
+                and ep.resync_completed_ts_utc is None
+                and rid in self.resync._buffers
+            ):
                 return rid
         return ""
 
@@ -705,7 +711,7 @@ class Collector:
                         continue
                     ts_ms = int(ts) // 1_000_000
                     if ts_ms >= cutoff_ms:
-                        self._chainlink_events.append({**r, "_ts_ms": ts_ms})
+                        self._note_chainlink_event(r, str(r.get("asset") or ""), ts_ms)
                         seeded += 1
                 if seeded:
                     print(f"[startup] seeded {seeded} chainlink events from parquet (resolution ground truth)")
@@ -1692,6 +1698,21 @@ class Collector:
                 except Exception:
                     pass
 
+    # in-RAM rolling store cap — settlement only ever looks back max_resolution_wait_seconds
+    # (120s) plus the 10s open-price tolerance; 20000 events ≈ 35+ min of all 7
+    # assets' RTDS ticks, orders of magnitude beyond any lookup window.
+    CHAINLINK_RAM_CAP = 20000
+
+    def _note_chainlink_event(self, row: dict, asset: str, ts_ms: int) -> None:
+        """Append to the in-RAM chainlink store with a hard cap (bounded RAM).
+
+        The full event is already persisted to the chainlink_events dataset;
+        the RAM copy exists only for _nearest_chainlink settlement lookups.
+        """
+        self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms})
+        if len(self._chainlink_events) > self.CHAINLINK_RAM_CAP:
+            del self._chainlink_events[:len(self._chainlink_events) - self.CHAINLINK_RAM_CAP]
+
     def _nearest_chainlink(self, ts_ms: int, asset: str, max_delta_ms: int = 2000) -> Optional[dict]:
         """Nearest stored chainlink event for THIS ASSET to ts_ms (settlement lookup §6A).
 
@@ -1843,10 +1864,8 @@ class Collector:
                             parsed_any = True
                             # keep asset in the RAM row — _nearest_chainlink filters on it
                             # (to_dict() omits it; without it no market could ever resolve)
-                            self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms or int(time.time() * 1000)})
+                            self._note_chainlink_event(row, asset, ts_ms or int(time.time() * 1000))
                             self._rtds_counts[asset]["parsed"] += 1
-                            if len(self._chainlink_events) > 20000:
-                                del self._chainlink_events[:len(self._chainlink_events) - 20000]
                     attempt = 0
                     # B-4: periodic received-vs-parsed report per asset — answers
                     # whether a thin feed (e.g. HYPE ~0.84s ticks) is upstream
@@ -1954,19 +1973,56 @@ class Collector:
                 # markets_log/export read the parquet, not these dicts). Without
                 # this, self.books/self.markets grow ~14k entries/day on the 5m
                 # lane alone and leak unboundedly.
-                evict_cutoff = now_ms - 6 * 3600 * 1000
-                evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
-                for cid in evict_cids:
-                    self.books.pop(cid, None)
-                    self.markets.pop(cid, None)
-                    self._closed_cids.discard(cid)
-                    self._resolved_cids.discard(cid)
-                    self._resolution_stuck_emitted.discard(cid)
-                    self._heal_inflight.discard(cid)
-                if evict_cids:
-                    print(f"[memory] evicted {len(evict_cids)} ended markets from RAM (books={len(self.books)}, markets={len(self.markets)})")
+                self._memory_eviction_tick(now_ms)
             except Exception:
                 pass
+
+    def _memory_eviction_tick(self, now_ms: int) -> None:
+        """One pass of 24/7 RAM hygiene (P0 leak hunt session 2):
+
+        1. evict books/markets + per-cid sets for markets ended >6h ago;
+        2. drop resync episodes/buffers tied to those ended markets (persisted
+           only — never an unwritten episode);
+        3. prune _episode_latest/_episode_persisted entries that are final AND
+           persisted (already in parquet, cannot change state).
+        """
+        evict_cutoff = now_ms - 6 * 3600 * 1000
+        evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
+        for cid in evict_cids:
+            self.books.pop(cid, None)
+            self.markets.pop(cid, None)
+            self._closed_cids.discard(cid)
+            self._resolved_cids.discard(cid)
+            self._resolution_stuck_emitted.discard(cid)
+            self._heal_inflight.discard(cid)
+            # RAM hygiene: episodes/buffers for an ended market can never be
+            # replayed into a live book — its books entry was just evicted.
+            # Episodes are persisted to parquet at every transition; guard on
+            # _episode_persisted so an unwritten episode is never dropped.
+            for rid in list(self.resync._episodes.keys()):
+                ep = self.resync._episodes.get(rid)
+                if (
+                    ep is not None
+                    and ep.condition_id == cid
+                    and rid in self._episode_persisted
+                ):
+                    self.resync._episodes.pop(rid, None)
+                    self.resync._buffers.pop(rid, None)
+                    self._episode_latest.pop(rid, None)
+                    self._episode_persisted.discard(rid)
+        if evict_cids:
+            print(f"[memory] evicted {len(evict_cids)} ended markets from RAM (books={len(self.books)}, markets={len(self.markets)})")
+        # per-episode bookkeeping RAM pruning: keep _episode_latest only for
+        # episodes that can still change state (open) or were not yet persisted.
+        # Final+persisted entries are already in parquet.
+        for rid in list(self._episode_latest.keys()):
+            ep = self.resync._episodes.get(rid)
+            if (
+                rid in self._episode_persisted
+                and (ep is None or ep.resync_completed_ts_utc is not None or rid in self.resync._escalated)
+            ):
+                self._episode_latest.pop(rid, None)
+                self._episode_persisted.discard(rid)
 
     async def stop(self) -> None:
         self._running = False

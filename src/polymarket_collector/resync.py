@@ -66,6 +66,16 @@ def exponential_backoff(attempt: int, initial_ms: int, max_ms: int, jitter: bool
 class ResyncManager:
     """Manages disconnect → resync lifecycle per (asset, condition_id)."""
 
+    # P0 leak hunt session 2 (2026-09-08): every container here must be bounded.
+    # Episodes are persisted to parquet at every transition via on_episode_persist,
+    # so evicting the finished ones from RAM drops no data. Open episodes are
+    # never evicted — they are the replay source of truth.
+    MAX_EPISODES = 500
+    # Hard cap per replay buffer. Overflow drops the OLDEST buffered deltas and
+    # counts them (honest accounting) — the REST snapshot supplies the base book,
+    # so replay correctness is preserved for the retained tail.
+    MAX_BUFFERED_MSGS_PER_EPISODE = 50_000
+
     def __init__(
         self,
         config,
@@ -82,6 +92,37 @@ class ResyncManager:
         self._episodes: Dict[str, ResyncEpisode] = {}  # resync_id -> episode
         self._buffers: Dict[str, deque] = {}  # resync_id -> buffered WS messages
         self._rest_attempt_counts: Dict[str, int] = {}
+        # episodes whose resync escalated (final state, buffer dead) — RAM-only
+        # bookkeeping so finished-episode eviction can classify them
+        self._escalated: set = set()
+        self._buffer_dropped_total: Dict[str, int] = {}
+
+    def is_finished(self, resync_id: str) -> bool:
+        ep = self._episodes.get(resync_id)
+        if ep is None:
+            return True
+        return ep.resync_completed_ts_utc is not None or resync_id in self._escalated
+
+    def _evict_finished_episodes(self) -> None:
+        """Bound _episodes/_buffers RAM: evict oldest FINISHED episodes when over cap.
+
+        Never evicts open episodes; every episode was already handed to
+        on_episode_persist (parquet) at its transitions, so this is RAM hygiene
+        only, not data loss.
+        """
+        if len(self._episodes) <= self.MAX_EPISODES:
+            return
+        excess = len(self._episodes) - self.MAX_EPISODES
+        evicted = 0
+        for rid in list(self._episodes.keys()):
+            if evicted >= excess:
+                break
+            if self.is_finished(rid):
+                self._episodes.pop(rid, None)
+                self._buffers.pop(rid, None)
+                self._escalated.discard(rid)
+                self._buffer_dropped_total.pop(rid, None)
+                evicted += 1
 
     # -- disconnect --------------------------------------------------------
     def handle_disconnect(self, asset: str, condition_id: Optional[str], reason: str, books: Dict[str, OrderBookState]) -> str:
@@ -98,6 +139,7 @@ class ResyncManager:
         )
         self._episodes[resync_id] = ep
         self._buffers[resync_id] = deque()
+        self._evict_finished_episodes()  # after insert: guarantees len(_episodes) <= cap
         # mark each affected book
         for key, book in books.items():
             if book.asset.upper() == asset.upper() and (condition_id is None or book.condition_id == condition_id):
@@ -144,7 +186,25 @@ class ResyncManager:
     # -- buffering during REST fetch ---------------------------------------
     def buffer_message(self, resync_id: str, msg: dict) -> None:
         if resync_id in self._buffers:
-            self._buffers[resync_id].append(msg)
+            q = self._buffers[resync_id]
+            if len(q) >= self.MAX_BUFFERED_MSGS_PER_EPISODE:
+                # honest overflow: count every drop, emit an event (throttled) —
+                # never silently lose data (AGENT.md)
+                self._buffer_dropped_total[resync_id] = self._buffer_dropped_total.get(resync_id, 0) + 1
+                dropped = self._buffer_dropped_total[resync_id]
+                if dropped == 1 or dropped % 1000 == 0:
+                    if self.on_event:
+                        try:
+                            self.on_event(CollectorEventType.book_anomaly, {
+                                "resync_id": resync_id,
+                                "reason": "resync_buffer_overflow",
+                                "dropped_total": dropped,
+                                "cap": self.MAX_BUFFERED_MSGS_PER_EPISODE,
+                            })
+                        except Exception:
+                            pass
+                q.popleft()
+            q.append(msg)
 
     # -- full resync -------------------------------------------------------
     async def resync(self, asset: str, condition_id: str, books: Dict[str, OrderBookState], resync_id: str) -> bool:
@@ -207,6 +267,8 @@ class ResyncManager:
 
                 buffered = list(self._buffers.get(resync_id, []))
                 for msg in buffered:
+                    if not isinstance(msg, dict):
+                        continue  # connection markers (None) — nothing to replay
                     msg_seq = msg.get("sequence_number")
                     if msg_seq is None:
                         msg_seq = msg.get("seq")
@@ -275,6 +337,14 @@ class ResyncManager:
                             pass
                     if self.on_event:
                         self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed})
+                    # P0 leak hunt session 2: an escalated episode must stop
+                    # consuming buffers. It can never complete (its REST target is
+                    # gone or refused), so leaving it open + buffered meant
+                    # _replay_buffer_id kept feeding every live WS message for the
+                    # asset into a never-consumed deque — unbounded (leak #2).
+                    # The episode record itself is kept (honest, already persisted).
+                    self._buffers.pop(resync_id, None)
+                    self._escalated.add(resync_id)
                     return False
                 # backoff before retry (independent of WS reconnect backoff)
                 delay = exponential_backoff(attempt, cfg.resync_rest_backoff_initial_ms, cfg.resync_rest_backoff_max_ms, jitter=True)
