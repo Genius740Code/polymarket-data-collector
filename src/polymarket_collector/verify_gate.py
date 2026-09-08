@@ -241,7 +241,13 @@ def probe_timeframes(assets: List[str], timeframes: List[str], timeout_s: float 
         per_asset: Dict[str, Any] = {}
         found_count = 0
         for asset in assets:
-            slug = f"{asset.lower()}-updown-{tf}-{ts}"
+            if ws == 3600:
+                # 1h lane: human-readable ET slug family (unix-ts 1h slugs are
+                # empty on Gamma — verified live 2026-09-08)
+                from .rollover import _hourly_slug_for
+                slug = _hourly_slug_for(asset, ts)
+            else:
+                slug = f"{asset.lower()}-updown-{tf}-{ts}"
             entry: Dict[str, Any] = {"slug": slug, "found": False}
             try:
                 resp = httpx.get(GAMMA, params={"slug": slug}, timeout=timeout_s)
