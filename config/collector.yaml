@@ -101,15 +101,17 @@ watchdog:
 window_size_seconds: 300
 # Multi-timeframe lanes. ONLY enable after verify-gate --probe-timeframes
 # reports ENABLE for a lane (probed 2026-09-06: 5m/15m/4h live on all 7 assets;
-# 1h/1d up/down series do not exist on Gamma yet — keep OFF).
+# 1h found 2026-09-08 under the ET slug family, NOT the unix-ts scheme).
 timeframes:
-  # ROLLOUT STEP 1 2026-09-07 (RUNBOOK §7): 5m-only soak. Full 21-lane set grows
-  # RSS ~1.1GB/10min -> 1.66GB/25min (pm2 mem-restart loop, separate P0 leak
-  # hunt). Re-enable 15m, then 4h, each after its own soak. Cursors persist per
-  # lane; no data loss on re-enable. 15m/4h lane plumbing already validated by
-  # Task 4 live run + backfill-cron 4h upload (2026-09-07).
+  # ROLLOUT STEP 2 2026-09-08: 5m+15m (14 lanes). P0 leak fixed+verified flat
+  # (5aa2feb, VPS probe 3849fd9); raw_ws_archive purged (was 894M stale).
+  # 15m validated end-to-end by Task 4 live run. 1h code-ready (ET slugs,
+  # live-validated discovery) but OFF until disk fits 3 lanes; 4h same.
+  # 1d up/down does not exist on Gamma (daily product is the price-touch
+  # ladder, a different market type) — keep OFF.
   - 5m
-  # - 15m
+  - 15m
+  # - 1h
   # - 4h
 
 ws:
