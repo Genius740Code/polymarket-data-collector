@@ -137,6 +137,11 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: false,
       cron_restart: '*/15 * * * *',   // every 15 minutes
+      // BOX-FIT 2026-09-08: staging build (full-hive pandas read) exceeds pm2's
+      // 1G default -> SIGINT restart-loop every ~30s, uploads never complete.
+      // Same 1.5G reasoning as the collector entry. Numeric bytes: pm2 ignores
+      // the '1536M' string form on cron apps (autorestart:false quirk).
+      max_memory_restart: 1610612736,
       time: true,
       out_file: path.join(cwd, 'logs', 'resolution-backfill-out.log'),
       error_file: path.join(cwd, 'logs', 'resolution-backfill-error.log'),

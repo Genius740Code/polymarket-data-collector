@@ -74,7 +74,22 @@ this report + box-fit config (below).
 15m/4h re-enable per rollout after their soaks. Box needs ≥25GB disk for
 full-tilt prod with raw archive.
 
-## Open
+## Addendum 2026-09-08 (prod day 2)
+- Overnight: collector+watchdog ran 5m-only; backfill cron died 07:01 with
+  KeyboardInterrupt (manual stop, not crash) → no uploads 02:24–10:15.
+- On restart, cron entered a **pm2 SIGINT loop (~30s period)**: full-hive
+  staging build exceeds pm2's 1G cap; `max_memory_restart` (string AND numeric)
+  is **ignored by pm2 on cron apps** (`autorestart:false` quirk — fresh
+  registrations from absolute path still enforce 1048576000). Uploads never
+  complete in-loop. Cron left STOPPED; uploads via manual foreground runs
+  (no pm2 cap).
+- Manual backfill+upload 08-09-08: 1 window upgraded → **5m v-latest published
+  (39 files, remote-verified)**. Reupload correctly skipped when
+  resolved=upgraded=0 (no empty versions by design).
+- Disk 98-99%: vacuumed journal (+96M). `data/raw_ws_archive/` 1.6G still
+  anchored (purge needs operator OK). Box remains undersized for 24/7 prod.
+
+## Open (updated 2026-09-08)
 1. P0: collector RSS growth (~110MB/min, lane-independent) → heap profile + fix.
 2. P1: in-process hourly upload starved by restarts (fix follows from P0).
 3. Optional: `markets_log.flush_staging` retry hardening (from task0 session).
