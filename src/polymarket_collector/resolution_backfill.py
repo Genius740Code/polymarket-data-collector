@@ -120,6 +120,15 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
         seen.add(cid)
         candidates.append(r)
     stats = {"candidates": len(candidates), "resolved": 0, "upgraded": 0, "already": 0, "pending": 0}
+    # Freshest-ended first: with a backlog (outage catch-up) the newest windows
+    # still resolve on the very next cron run — worst-case official latency for
+    # a freshly ended window stays ~one cron interval, never backlog_position × fetch.
+    def _end_ms(r: dict) -> int:
+        try:
+            return int(r.get("market_end_ts_ms") or 0)
+        except Exception:
+            return 0
+    candidates.sort(key=_end_ms, reverse=True)
     for r in candidates[:max_fetch]:
         cid = r["condition_id"]
         official = fetch_official_outcome(cid)
@@ -206,6 +215,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--reupload", action="store_true", help="re-export staging + push a new Kaggle version after backfilling")
     ap.add_argument("--skip-enrich", action="store_true", help="skip the trades enrichment second pass")
+    ap.add_argument("--skip-onchain", action="store_true", help="skip the on-chain wallet third pass (C2 OrderFilled)")
     ap.add_argument("--timeframe", default="5m", help="timeframe lane for the re-upload staging/dataset (5m/15m/1h/4h/1d)")
     ap.add_argument("--dataset-prefix", default=None, help="override the Kaggle dataset slug for this re-upload")
     ap.add_argument("--all-lanes", action="store_true",
@@ -217,6 +227,12 @@ def main() -> None:
     stats = backfill_resolutions(data_dir, dry_run=args.dry_run)
     if not args.skip_enrich and not args.dry_run:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
+        if not args.skip_onchain:
+            try:
+                from .storage.export import third_pass_onchain_wallets
+                third_pass_onchain_wallets(data_dir, cfg.assets)
+            except Exception as e:
+                print(f"[resolution-backfill] WARN on-chain wallet pass failed: {e}")
     if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
         if args.all_lanes:
             for tf in cfg.timeframes:

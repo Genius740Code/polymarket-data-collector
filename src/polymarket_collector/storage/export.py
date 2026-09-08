@@ -251,6 +251,14 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     takers_f, makers_f = _tx_fallback(txh, side)
                     w = w or takers_f
                     m = m or makers_f
+                else:
+                    # partial fallback: exact-key pool hit on one side must not
+                    # block the tx-level pool on the other — each side keeps its
+                    # own unanimity rule, so attribution stays honest.
+                    if w is None:
+                        w = _unambiguous_wallet(taker_pool.get((txh,)))
+                    if m is None:
+                        m = _unambiguous_wallet(maker_pool.get((txh,)))
                 if r.get("taker_wallet") is None and w:
                     r["taker_wallet"] = w
                     filled_wallet += 1
@@ -506,6 +514,83 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
         except Exception as e:
             print(f"[export] WARN second-pass write-back failed for {au}: {e}")
     print(f"[export] second-pass enrichment done: {stats}")
+    return stats
+
+
+def third_pass_onchain_wallets(data_dir: str | Path, assets: Optional[List[str]] = None,
+                               rpc_url: Optional[str] = None,
+                               max_txs: int = 1500) -> dict:
+    """Enrichment round 3 — on-chain maker/taker via CTF Exchange OrderFilled logs.
+
+    Runs after the Data-API passes and only touches rows STILL missing
+    maker_wallet/taker_wallet. Receipts are fetched per needed tx (newest
+    first, capped per run) — no range scans. No RPC call at all when nothing
+    is needed; RPC failures are loud but never fatal (Data-API results stand).
+    Intended to run inside resolution_backfill (pm2 cron, every 15 min).
+    """
+    from ..onchain import (DEFAULT_RPC_URL, backfill_wallets_from_chain,
+                           backfill_wallets_from_fills, fetch_receipt_fills,
+                           tx_map_from_fills)
+    if assets is None:
+        assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+    rpc_url = rpc_url or DEFAULT_RPC_URL
+    base = Path(data_dir)
+    stats = {"assets_scanned": 0, "rows_needed": 0, "txs_queried": 0,
+             "filled_maker": 0, "filled_taker": 0, "files_rewritten": 0,
+             "rpc_failed": False}
+    per_asset_rows: dict = {}
+    need_tx_order: dict = {}  # tx -> newest ts_received_ns (for newest-first cap)
+    for asset in assets:
+        au = asset.upper()
+        tbl = _read_dataset_per_asset_plain(base, "trades", au)
+        stats["assets_scanned"] += 1
+        if tbl is None or tbl.num_rows == 0 or "wallet" not in tbl.schema.names:
+            continue
+        rows = tbl.to_pylist()
+        needed = [r for r in rows
+                  if r.get("transaction_hash")
+                  and (r.get("maker_wallet") is None or r.get("taker_wallet") is None)]
+        if not needed:
+            continue
+        stats["rows_needed"] += len(needed)
+        per_asset_rows[au] = (tbl, rows)
+        for r in needed:
+            txh = str(r.get("transaction_hash") or "").lower()
+            try:
+                ts = int(r.get("ts_received_ns") or 0)
+            except Exception:
+                ts = 0
+            if ts > need_tx_order.get(txh, 0):
+                need_tx_order[txh] = ts
+    if not per_asset_rows:
+        return stats
+    txs = sorted(need_tx_order, key=lambda t: need_tx_order[t], reverse=True)[:max_txs]
+    stats["txs_queried"] = len(txs)
+    try:
+        fills = fetch_receipt_fills(rpc_url, txs)
+        print(f"[export] on-chain pass: receipts={len(txs)} fills={len(fills)}")
+    except Exception as e:
+        print(f"[export] WARN on-chain pass skipped (RPC failed: {e}) — data-api results stand")
+        stats["rpc_failed"] = True
+        return stats
+    # tx-level fallback map derived from the same fills (no extra RPC)
+    tx_map = tx_map_from_fills(fills)
+    for au, (tbl, rows) in per_asset_rows.items():
+        try:
+            # per-fill (tx, token) join first — survives multi-maker bundle txs;
+            # tx-level unanimity as fallback for rows without token_id.
+            filled = backfill_wallets_from_fills(rows, fills)
+            stats["filled_maker"] += filled["filled_maker"]
+            stats["filled_taker"] += filled["filled_taker"]
+            left = backfill_wallets_from_chain(rows, tx_map)
+            stats["filled_maker"] += left["filled_maker"]
+            stats["filled_taker"] += left["filled_taker"]
+            if filled["filled_maker"] or filled["filled_taker"] or left["filled_maker"] or left["filled_taker"]:
+                enriched = pa.Table.from_pylist(rows, schema=tbl.schema)
+                stats["files_rewritten"] += _writeback_enriched_trades(base, au, enriched)
+        except Exception as e:
+            print(f"[export] WARN on-chain write-back failed for {au}: {e}")
+    print(f"[export] on-chain pass done: {stats}")
     return stats
 
 

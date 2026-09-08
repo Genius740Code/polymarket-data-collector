@@ -327,3 +327,38 @@ async def test_recovery_probe_throttled_and_quiet_early():
     await mgr.check_and_roll("BTC", sub, now_ms=win_start_ms + 3_000)
     assert mgr.states[("BTC", "5m")].consecutive_failures == 1
     assert not [t for t, _ in events if t == "discovery_recovery"]
+
+
+def test_hourly_slug_known_vector():
+    """Live-verified vector: ts=1788890400 (2026-09-08 18:00 UTC = 2PM ET)."""
+    from polymarket_collector.rollover import _hourly_slug_for
+    assert _hourly_slug_for("BTC", 1788890400) == "bitcoin-up-or-down-september-8-2026-2pm-et"
+    assert _hourly_slug_for("eth", 1788890400) == "ethereum-up-or-down-september-8-2026-2pm-et"
+
+
+def test_hourly_slug_all_assets():
+    from polymarket_collector.rollover import _hourly_slug_for, HOURLY_SLUG_ASSET_NAMES
+    assert set(HOURLY_SLUG_ASSET_NAMES) == {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "HYPE"}
+    slugs = [_hourly_slug_for(a, 1788890400) for a in HOURLY_SLUG_ASSET_NAMES]
+    assert len(set(slugs)) == 7  # no collisions
+    assert _hourly_slug_for("HYPE", 1788890400) == "hype-up-or-down-september-8-2026-2pm-et"
+    assert _hourly_slug_for("DOGE", 1788890400) == "dogecoin-up-or-down-september-8-2026-2pm-et"
+
+
+def test_hourly_slug_am_and_boundaries():
+    """AM label + ET-date follows window START (00:30 UTC Sep 9 = Sep 8 evening ET)."""
+    from polymarket_collector.rollover import _hourly_slug_for
+    # 09:00 UTC Sep 8 = 5AM ET
+    assert _hourly_slug_for("BTC", 1788858000) == "bitcoin-up-or-down-september-8-2026-5am-et"
+    # 00:30 UTC Sep 9 = 8:30PM ET Sep 8 (hour start 8PM ET Sep 8)
+    assert _hourly_slug_for("BTC", 1788913800) == "bitcoin-up-or-down-september-8-2026-8pm-et"
+
+
+def test_discovery_slug_for_branches_1h():
+    """MarketDiscovery._slug_for uses the ET family only for the 1h lane."""
+    d1h = MarketDiscovery(rest_market_url="", window_size_seconds=3600)
+    assert d1h._slug_for("BTC", 1788890400) == "bitcoin-up-or-down-september-8-2026-2pm-et"
+    d5m = MarketDiscovery(rest_market_url="", window_size_seconds=300)
+    assert d5m._slug_for("BTC", 1788890400) == "btc-updown-5m-1788890400"
+    d4h = MarketDiscovery(rest_market_url="", window_size_seconds=14400)
+    assert d4h._slug_for("BTC", 1788890400) == "btc-updown-4h-1788890400"

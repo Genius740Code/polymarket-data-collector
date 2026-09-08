@@ -199,3 +199,44 @@ def test_b7_resolution_backfill_official_outcome(tmp_path, monkeypatch):
     assert latest["0xbbb"]["settlement_source"] == "polymarket_official"
     # unsettled market stays unresolved (pending)
     assert latest["0xccc"]["status"] in ("active", "closed")
+
+
+def test_b7_backfill_newest_first(tmp_path, monkeypatch):
+    """Freshly ended windows resolve on the very next cron run even with a
+    backlog: candidates are fetched newest-ended first (max_fetch bounds work,
+    not wall order)."""
+    import httpx
+    from polymarket_collector.resolution_backfill import backfill_resolutions
+    from polymarket_collector.storage.markets_log import MarketsLog
+
+    now_ms = int(time.time() * 1000)
+
+    def row(cid, end_ago_ms):
+        r = _market_row(cid, "BTC", 1, status="closed")
+        r["market_start_ts_ms"] = now_ms - end_ago_ms - 300_000
+        r["market_end_ts_ms"] = now_ms - end_ago_ms
+        return r
+
+    log = MarketsLog(tmp_path)
+    log.append(row("0xold", 5_000_000))  # ended ~83 min ago (backlog)
+    log.append(row("0xmid", 2_000_000))
+    log.append(row("0xnew", 100_000))    # ended ~100s ago (fresh)
+    log.flush_staging()
+    log.compact()
+
+    fetched = []
+
+    def fake_get(url, timeout=None, headers=None):
+        fetched.append(url)
+        return _Resp({"closed": True, "tokens": [
+            {"outcome": "Up", "price": 1, "winner": True},
+            {"outcome": "Down", "price": 0, "winner": False},
+        ]})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    stats = backfill_resolutions(tmp_path, max_fetch=1)
+    assert stats["resolved"] == 1
+    assert any("0xnew" in u for u in fetched), f"freshest window must be fetched first, got {fetched}"
+    latest = {r["condition_id"]: r for r in MarketsLog(tmp_path).load_latest()}
+    assert latest["0xnew"]["settlement_source"] == "polymarket_official"
+    assert latest["0xold"]["settlement_source"] != "polymarket_official"

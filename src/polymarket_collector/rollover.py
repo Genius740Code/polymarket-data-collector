@@ -26,6 +26,41 @@ def _window_label_for(window_size_seconds: int) -> str:
         return "5m"
 
 
+# Hourly up/down markets use a human-readable ET slug family, NOT the unix-ts
+# scheme (verified live 2026-09-08: btc-updown-1h-<ts> is empty, but
+# bitcoin-up-or-down-september-8-2026-2pm-et is a live market).
+HOURLY_SLUG_ASSET_NAMES = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "BNB": "bnb",
+    "XRP": "xrp",
+    "DOGE": "dogecoin",
+    "HYPE": "hype",
+}
+
+
+def _hourly_slug_for(asset: str, ts_seconds: int) -> str:
+    """Deterministic Gamma slug for the 1h lane.
+
+    Hourly windows are [h ET, h+1 ET); the slug names the window START in
+    America/New_York wall-clock, e.g. ts=1788890400 (2026-09-08 18:00 UTC) →
+    ``bitcoin-up-or-down-september-8-2026-2pm-et``. ET wall :00 always aligns
+    with a unix-hour boundary (whole-hour offsets year-round), so the
+    unix-floored ``ts_seconds`` passed by discovery is the correct input.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    name = HOURLY_SLUG_ASSET_NAMES.get(asset.upper())
+    if name is None:
+        raise ValueError(f"no hourly slug name for asset {asset!r}")
+    dt = datetime.fromtimestamp(ts_seconds, tz=ZoneInfo("America/New_York"))
+    h12 = dt.hour % 12 or 12
+    ampm = "am" if dt.hour < 12 else "pm"
+    return f"{name}-up-or-down-{dt.strftime('%B').lower()}-{dt.day}-{dt.year}-{h12}{ampm}-et"
+
+
 @dataclass
 class MarketInfo:
     condition_id: str
@@ -148,6 +183,10 @@ class MarketDiscovery:
     indexing delay of generic search (see Market-Finder repo).  Falls back to
     the configured rest_market_url only if Gamma is unreachable.
 
+    Exception: the 1h lane uses the human-readable ET family
+    ``{bitcoin,...}-up-or-down-{month}-{day}-{year}-{h}{am|pm}-et``
+    (the unix-ts 1h slugs are empty on Gamma — verified live 2026-09-08).
+
     ``window_size_seconds`` determines the market width (300=5min, 900=15min,
     3600=1h, 14400=4h, 86400=1d). The slug suffix is derived from this.
     """
@@ -184,6 +223,9 @@ class MarketDiscovery:
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
+        if self.window_size_seconds == 3600:
+            # 1h lane: human-readable ET slug family (unix-ts slugs are empty)
+            return _hourly_slug_for(asset, ts_seconds)
         # asset prefix is lower-case, e.g. btc-updown-5m-1787994000
         return f"{asset.lower()}-updown-{window_label}-{ts_seconds}"
 

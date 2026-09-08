@@ -237,3 +237,64 @@ async def test_r5_missed_buckets_emit_scheduler_lag_not_backpressure(tmp_path):
         pass
     assert CollectorEventType.scheduler_lag in events, "expected a scheduler_lag event on catch-up"
     assert CollectorEventType.backpressure not in events, "catch-up must not be reported as backpressure"
+
+
+def test_r2_partial_fallback_price_mismatch(monkeypatch):
+    """Partial tx-pool fallback: the taker's leg is indexed at a slightly
+    different price (WS vs API rounding) so the exact (tx,price,size) key
+    misses, while the maker leg matches exactly. The taker must still fill
+    from the unambiguous tx-level pool; ambiguity must still yield NULL."""
+    txh = "0xe" * 8
+    legs = [
+        # maker SELL leg at the exact streamed price/size
+        {"transactionHash": txh, "proxyWallet": "0xmaker", "side": "SELL",
+         "asset": "up-tok", "price": 0.5, "size": 10.0, "timestamp": time.time() - 60,
+         "outcome": "Up"},
+        # taker BUY leg rounded one tick off -> exact-key miss, tx-pool hit
+        {"transactionHash": txh, "proxyWallet": "0xtaker", "side": "BUY",
+         "asset": "up-tok", "price": 0.51, "size": 10.0, "timestamp": time.time() - 60,
+         "outcome": "Up"},
+    ]
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResp(legs)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    table = pa.Table.from_pylist(
+        [_trade_row(trade_id="t-part", transaction_hash=txh)], schema=TRADES_SCHEMA)
+    rows = _backfill_trade_wallets(table, Path("."), asset="BTC").to_pylist()
+    streamed = [r for r in rows if r["trade_id"] == "t-part"][0]
+    assert streamed["maker_wallet"] == "0xmaker"
+    assert streamed["taker_wallet"] == "0xtaker", "tx-pool fallback must fill the price-mismatched taker leg"
+    assert streamed["wallet"] == "0xtaker"
+
+
+def test_r2_partial_fallback_ambiguous_stays_null(monkeypatch):
+    """Two DISTINCT takers in one tx -> tx pool ambiguous -> NULL kept."""
+    txh = "0xf" * 8
+    legs = [
+        {"transactionHash": txh, "proxyWallet": "0xmaker", "side": "SELL",
+         "asset": "up-tok", "price": 0.5, "size": 10.0, "timestamp": time.time() - 60,
+         "outcome": "Up"},
+        {"transactionHash": txh, "proxyWallet": "0xtakerA", "side": "BUY",
+         "asset": "up-tok", "price": 0.51, "size": 6.0, "timestamp": time.time() - 60,
+         "outcome": "Up"},
+        {"transactionHash": txh, "proxyWallet": "0xtakerB", "side": "BUY",
+         "asset": "up-tok", "price": 0.52, "size": 4.0, "timestamp": time.time() - 60,
+         "outcome": "Up"},
+    ]
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResp(legs)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    table = pa.Table.from_pylist(
+        [_trade_row(trade_id="t-amb", transaction_hash=txh)], schema=TRADES_SCHEMA)
+    rows = _backfill_trade_wallets(table, Path("."), asset="BTC").to_pylist()
+    streamed = [r for r in rows if r["trade_id"] == "t-amb"][0]
+    assert streamed["maker_wallet"] == "0xmaker"
+    assert streamed["taker_wallet"] is None, "ambiguous tx pool must stay NULL, never guessed"
