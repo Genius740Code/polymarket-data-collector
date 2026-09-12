@@ -83,7 +83,10 @@ capacity:
   estimated_row_bytes_uncompressed: 2500
   parquet_compression_ratio: 0.25
 raw_archive:
-  enabled: true
+  # PERF 2026-09-12 (#2): disabled like crypto — per-frame 2-3x json.dumps +
+  # open/append/close cost CPU + ~GB/h disk for §13 replay/debug only.
+  # No dataset depends on it. Re-enable on a >=25GB box.
+  enabled: false
   format: jsonl
   path: ./data-weather-low/raw_ws_archive
   retention_hours: 36

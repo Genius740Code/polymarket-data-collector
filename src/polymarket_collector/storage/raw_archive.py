@@ -36,11 +36,20 @@ class RawArchive:
         if not self.enabled:
             return
         path = self._partition_path(asset, ts_ms)
-        entry = raw_msg if isinstance(raw_msg, str) else json.dumps(raw_msg, default=str)
-        # enrich with receive timestamp
-        envelope = json.dumps({"ts_received_ns": time.time_ns(), "asset": asset.upper(), "payload": raw_msg if isinstance(raw_msg, dict) else json.loads(entry) if entry.startswith("{") else entry})
-        # if raw_msg was dict, store as JSON line directly with added ts
-        line = json.dumps({"ts_received_ns": time.time_ns(), "payload": raw_msg}) if isinstance(raw_msg, dict) else envelope
+        # PERF 2026-09-12 (#2): single json.dumps per frame (was 2-3x dumps +
+        # a json.loads round-trip). Same line content: {ts_received_ns, payload}.
+        try:
+            if isinstance(raw_msg, (dict, list)):
+                line = json.dumps({"ts_received_ns": time.time_ns(), "payload": raw_msg}, default=str)
+            else:
+                s = raw_msg
+                try:
+                    payload = json.loads(s) if s.startswith("{") else s
+                except Exception:
+                    payload = s
+                line = json.dumps({"ts_received_ns": time.time_ns(), "asset": asset.upper(), "payload": payload}, default=str)
+        except Exception:
+            return
         with open(path, "a") as f:
             f.write(line + "\n")
 

@@ -331,6 +331,21 @@ class ParquetWriter:
     # (seen 2026-09-08: 1354 files / 1.5M rows in 2.5h).
     _REPLAY_SCAN_MAX_FILES_PER_DATASET = 50
 
+    # PERF 2026-09-12 (#10): dedup-key columns only for the replay scan.
+    # The old path did read_table().to_pylist() on full 120-col snapshot rows
+    # (up to 500k rows / 50 files at startup). Projecting to the columns
+    # _dedup_key() actually reads cuts RSS/CPU ~10-20x with identical dedup
+    # decisions. Caps unchanged (lowering them would risk dupes).
+    _REPLAY_DEDUP_COLS = {
+        "book_events": ["token_id", "sequence_number", "ts_received_ns", "event_type", "new_best_bid", "new_best_ask"],
+        "trades": ["token_id", "sequence_number", "trade_id"],
+        "book_snapshots_500ms": ["asset", "condition_id", "ts_snapshot_ns"],
+        "book_snapshots_clean": ["asset", "condition_id", "ts_snapshot_ns"],
+        "chainlink_events": ["report_id", "asset", "event_id", "ts_received_ns", "price"],
+        "resync_episodes": ["resync_id"],
+        "collector_events": ["event_id"],
+    }
+
     def _wal_replay(self) -> int:
         """Replay unflushed WAL entries into buffer on startup after crash/restart.
 
@@ -426,7 +441,27 @@ class ParquetWriter:
                     if _scan_capped:
                         break
                     try:
-                        t = read_table(parquet_file)
+                        # Project to dedup cols only (same keys, ~10-20x less RAM).
+                        t = None
+                        _want = self._REPLAY_DEDUP_COLS.get(dataset)
+                        if _want:
+                            try:
+                                import pyarrow.parquet as _pq2
+                                try:
+                                    _schema_names = _pq2.ParquetFile(str(parquet_file)).schema.names
+                                except Exception:
+                                    _schema_names = []
+                                _proj = [c for c in _want if c in _schema_names] if _schema_names else list(_want)
+                                if _proj:
+                                    t = _pq2.ParquetFile(str(parquet_file)).read(columns=_proj)
+                                else:
+                                    t = read_table(parquet_file)
+                            except Exception:
+                                t = read_table(parquet_file)
+                        else:
+                            t = read_table(parquet_file)
+                        if t is None:
+                            continue
                         # extract dedup-relevant columns based on dataset type
                         cols = t.column_names
                         for row in t.to_pylist():
@@ -778,18 +813,11 @@ class ParquetWriter:
                         table = pa.Table.from_pylist(norm_rows)
             else:
                 table = pa.Table.from_pylist(norm_rows)
-            # extra sort via pyarrow if possible (numeric ns sort)
-            try:
-                import pyarrow.compute as pc
-                sort_keys = []
-                for sk in (sort_ts_key, "condition_id"):
-                    if sk and sk in table.schema.names:
-                        sort_keys.append((sk, "ascending"))
-                if sort_keys:
-                    indices = pc.sort_indices(table, sort_keys=sort_keys)
-                    table = pc.take(table, indices)
-            except Exception:
-                pass
+            # PERF 2026-09-12 (#8): drop the 2nd Arrow sort — rows are already
+            # sorted in Python above (time, condition_id) before from_pylist,
+            # so sort_indices/take only re-sorted the same keys at full-table
+            # cost every flush. Row SET unchanged; per-file order follows the
+            # Python sort (downstream readers sort anyway per E13).
 
         # Write atomically: temp file + rename (§10A compaction same pattern)
         # Use meaningful filename: {dataset}_{timestamp_ms}.parquet instead of part-<random>

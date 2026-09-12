@@ -640,10 +640,28 @@ class Collector:
         # Book remains in its current state (likely stale/null) - downstream should handle
         return False
 
-    def _beat(self) -> None:
-        """Write heartbeat file for watchdog monitoring."""
+    def _beat(self, force: bool = False) -> None:
+        """Write heartbeat file for watchdog monitoring (PERF #17: throttled).
+
+        Called from the 500ms snapshot tick — writing at 2Hz is pure churn.
+        Throttle to >=5s cadence (watchdog is 5s interval / 15s stale, so 5s
+        is safe and never exceeds the 10s budget). Pass force=True on
+        startup/shutdown paths that need an immediate beat.
+        """
         import datetime
         import json
+        import time as _t
+        now = _t.monotonic()
+        try:
+            last = getattr(self, "_last_beat_monotonic", 0.0)
+        except Exception:
+            last = 0.0
+        if not force and (now - last) < 5.0:
+            return
+        try:
+            self._last_beat_monotonic = now
+        except Exception:
+            pass
         path = Path(self.config.storage.data_dir) / "heartbeat.json"
         ts_utc = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
         ts_ns = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1e9)
@@ -1126,36 +1144,35 @@ class Collector:
                                 planned_recycle = True
                                 print(f"[ws:{asset}] planned 150s recycle — reconnecting")
                                 break
-                            # §13 raw archive — persist every raw WS frame for replay/re-derive
+                            # §13 raw archive + processing share ONE parse (PERF #4):
+                            # previously json.loads ran once for archive and again
+                            # for processing, plus a no-op validate_ws_message here
+                            # (the gating validation lives in book.apply_ws_message).
+                            # Bytes/str/list branches preserved with same outcome.
                             try:
-                                raw_payload: dict | str
-                                if isinstance(message, bytes):
-                                    try:
-                                        raw_payload = json.loads(message.decode())
-                                    except Exception:
-                                        raw_payload = message.decode(errors="ignore")
-                                elif isinstance(message, str):
-                                    try:
-                                        raw_payload = json.loads(message)
-                                    except Exception:
-                                        raw_payload = message
-                                else:
-                                    raw_payload = message  # type: ignore
-                                # normalize to dict if json string, else keep string
-                                if isinstance(raw_payload, dict):
-                                    self.raw_archive.append(asset, raw_payload)
-                                else:
-                                    self.raw_archive.append(asset, str(raw_payload))
-                            except Exception:
-                                pass
-
-                            try:
-                                msg = json.loads(message) if isinstance(message, str) else message  # type: ignore
                                 if isinstance(message, bytes):
                                     try:
                                         msg = json.loads(message.decode())
                                     except Exception:
+                                        # Undecodable/non-JSON bytes: same as before,
+                                        # archive the raw string then skip processing
+                                        # (plain-text PONG never reaches liveness).
+                                        try:
+                                            self.raw_archive.append(asset, message.decode(errors="ignore"))
+                                        except Exception:
+                                            pass
                                         continue
+                                elif isinstance(message, str):
+                                    try:
+                                        msg = json.loads(message)
+                                    except Exception:
+                                        try:
+                                            self.raw_archive.append(asset, message)
+                                        except Exception:
+                                            pass
+                                        continue
+                                else:
+                                    msg = message  # type: ignore
                             except Exception:
                                 continue
                             # any parsed frame counts as data liveness — the
@@ -1164,11 +1181,15 @@ class Collector:
                             # socket still trips the watchdog)
                             last_data_ns = time.time_ns()
 
-                            # Validate WS message via shared validator
+                            # §13 raw archive reuses the single parse above (no 2nd loads).
+                            # Disabled in prod configs; when enabled the line content
+                            # is unchanged ({ts_received_ns, payload}).
                             try:
-                                validate_ws_message(msg if isinstance(msg, dict) else {})
+                                if isinstance(msg, dict):
+                                    self.raw_archive.append(asset, msg)
+                                elif isinstance(msg, list):
+                                    self.raw_archive.append(asset, msg)  # type: ignore
                             except Exception:
-                                # invalid messages are dropped; book will be marked stale
                                 pass
 
                             # Handle list payloads (some WS frames are arrays of events)
@@ -1741,10 +1762,13 @@ class Collector:
             await asyncio.sleep(self.config.clock.ntp_check_interval_seconds)
 
     async def _mem_report_loop(self) -> None:
-        """5-min RSS + gc-type self-report for the OOM hunt (cheap, always on)."""
-        import collections as _collections
+        """5-min RSS self-report (cheap, always on). Full gc-type breakdown is
+        opt-in via COLLECTOR_MEM_TYPE_BREAKDOWN=1 (PERF #16: get_objects() walks
+        every tracked object and self-spikes)."""
         import gc as _gc
+        import os as _os
 
+        _detailed = _os.environ.get("COLLECTOR_MEM_TYPE_BREAKDOWN") == "1"
         baseline = None
         while self._running:
             await asyncio.sleep(300)
@@ -1756,7 +1780,20 @@ class Collector:
                     )
             except Exception:
                 _rss = 0
+            if not _detailed:
+                # RSS + cheap counters only: buffer depth, tasks, gc generations.
+                try:
+                    _buf = len(getattr(getattr(self, "writer", None), "_buffer", []) or [])
+                except Exception:
+                    _buf = -1
+                try:
+                    _gc_counts = _gc.get_count()
+                except Exception:
+                    _gc_counts = ()
+                print(f"[mem] rss={_rss}MB buf={_buf} ntasks={len(self._tasks)} gc={_gc_counts}", flush=True)
+                continue
             try:
+                import collections as _collections
                 _cnt = _collections.Counter(type(_o).__name__ for _o in _gc.get_objects())
                 if baseline is None:
                     baseline = _cnt
@@ -2865,7 +2902,28 @@ class Collector:
         # The cap applies ONLY when uploads are actually enabled (interval <=
         # 1h); a huge interval means exports are deliberately paused (OOM
         # truce) and must NOT fire early.
+        # PERF 2026-09-12 (#20): deterministic stagger per data_dir so the
+        # crypto + weather-high + weather-low hourly uploads don't all fire at
+        # the same wall-clock minute and stack export/compaction/zstd spikes.
+        # Phase offset only — row content, versions, and cadence unchanged
+        # (cross-process export lock already serializes builds; this reduces
+        # the pile-up before the lock).
         initial_delay = min(interval, 300) if interval <= 3600 else interval
+        try:
+            import hashlib as _hl
+            _stagger = int(_hl.md5(str(self.config.storage.data_dir).encode()).hexdigest()[:4], 16) % 600
+        except Exception:
+            _stagger = 0
+        # Only stagger the steady hourly cadence, not the 5-min fast path or
+        # a paused (huge-interval) truce: cap the shift so the first upload
+        # still fires while RSS is low.
+        if interval <= 3600:
+            try:
+                initial_delay = min(initial_delay + _stagger, 600)
+            except Exception:
+                pass
+        if _stagger:
+            print(f"[kaggle] stagger +{_stagger}s for {self.config.storage.data_dir} (initial {initial_delay}s)")
         slept = 0
         while self._running and slept < initial_delay:
             await asyncio.sleep(min(5, interval - slept))

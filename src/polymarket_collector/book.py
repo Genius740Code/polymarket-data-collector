@@ -25,6 +25,28 @@ def snapshot_bucket_ms(unix_ms: int, interval_ms: int = 500) -> int:
     return (unix_ms // interval_ms) * interval_ms
 
 
+# PERF 2026-09-12 (#19): bucket_ms -> ISO string cache. snapshot() runs per
+# book per tick (28 books × 2Hz); the bucket string is identical for every
+# book in the same tick, so format once and reuse. snapshot_id stays uuid4
+# (must remain unique per row — never cached).
+_BUCKET_TS_CACHE: Dict[int, str] = {}
+
+
+def bucket_ts_utc(bucket_ms: int) -> str:
+    """ISO8601 ms-fraction UTC string for a 500ms bucket, cached per bucket."""
+    cached = _BUCKET_TS_CACHE.get(bucket_ms)
+    if cached is not None:
+        return cached
+    import datetime
+    dt = datetime.datetime.fromtimestamp(bucket_ms / 1000, tz=datetime.timezone.utc)
+    ts_utc = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    # Bounded: buckets advance monotonically; keep only the latest few so a
+    # long-lived process cannot grow this dict (2 entries cover a tick edge).
+    _BUCKET_TS_CACHE.clear()
+    _BUCKET_TS_CACHE[bucket_ms] = ts_utc
+    return ts_utc
+
+
 def depth_within(levels: List[Tuple[Optional[float], Optional[float]]], best: Optional[float], window_cents: int) -> Optional[float]:
     """Cumulative size within N cents of own best price (§3 definition).
 
@@ -710,11 +732,9 @@ class OrderBookState:
         now_ns = ts_ns if ts_ns is not None else time.time_ns()
         # bucket alignment for idempotent write key (§1A redundancy)
         bucket_ms = snapshot_bucket_ms(now_ms, 500)
-        import datetime
-
-        # always format with millisecond fraction for stable lexical sort (good format)
-        dt = datetime.datetime.fromtimestamp(bucket_ms / 1000, tz=datetime.timezone.utc)
-        ts_utc = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"  # 3ms fraction e.g. .000 or .500
+        # PERF #19: reuse the cached bucket string (same for all books/tick).
+        # 3ms fraction e.g. .000 or .500 for stable lexical sort.
+        ts_utc = bucket_ts_utc(bucket_ms)
         # align ts_snapshot_ns to bucket for dedup (not time.time_ns jitter)
         now_ns = bucket_ms * 1_000_000
         # E6: age each side from its last exchange update (None = never updated).
