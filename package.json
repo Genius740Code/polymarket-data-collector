@@ -1,0 +1,29 @@
+{
+  "name": "sports-arb-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sports arbitrage detection and execution platform (PAPER mode by default). Phase 1 scaffold.",
+  "type": "module",
+  "packageManager": "npm@10.0.0",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "echo 'lint: tsc --noEmit (eslint to be added in later phase)' && npm run typecheck",
+    "db:migrate": "node scripts/db-migrate.mjs || echo 'db:migrate requires DATABASE_URL and psql client; see infrastructure/database/migrations'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,108 @@
+openapi: 3.0.3
+info:
+  title: Sports Arb Platform API
+  version: 0.1.0
+  description: Phase 1 scaffold. PAPER mode only; live order routes are intentionally absent.
+servers:
+  - url: http://localhost:3001
+paths:
+  /health:
+    get:
+      summary: Health + venue status + public config
+      responses:
+        '200':
+          description: ok
+  /api/venues:
+    get:
+      summary: List venues + docs URLs + tradingAllowed flags
+      responses:
+        '200':
+          description: ok
+  /api/markets:
+    get:
+      summary: Normalized markets (Phase 3+)
+      responses:
+        '200':
+          description: ok
+  /api/events:
+    get:
+      summary: Canonical events (Phase 4+)
+      responses:
+        '200':
+          description: ok
+  /api/opportunities:
+    get:
+      summary: Arbitrage opportunities (Phase 7+; empty in Phase 1)
+      responses:
+        '200':
+          description: ok
+  /api/opportunities/{id}:
+    get:
+      summary: Opportunity detail
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: ok
+  /api/orderbooks/{marketId}:
+    get:
+      summary: Order book snapshot
+      parameters:
+        - in: path
+          name: marketId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: ok
+  /api/fees:
+    get:
+      summary: Fee schedules with source api|manual
+      responses:
+        '200':
+          description: ok
+  /api/balances:
+    get:
+      summary: Balances (server-side only)
+      responses:
+        '200':
+          description: ok
+  /api/positions:
+    get:
+      summary: Positions
+      responses:
+        '200':
+          description: ok
+  /api/orders:
+    get:
+      summary: Orders
+      responses:
+        '200':
+          description: ok
+  /api/trades:
+    get:
+      summary: Trades
+      responses:
+        '200':
+          description: ok
+  /api/risk:
+    get:
+      summary: Risk state + kill switch
+      responses:
+        '200':
+          description: ok
+  /api/simulation/start:
+    post:
+      summary: Start paper simulation (Phase 8+)
+      responses:
+        '200':
+          description: ok
+  /api/orders/paper:
+    post:
+      summary: Paper order only (Phase 8+). No live route in Phase 1.
+      responses:
+        '200':
+          description: ok

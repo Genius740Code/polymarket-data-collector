@@ -1,0 +1,108 @@
+# Weather LOW collector — daily lowest-temperature brackets (phase 1 soak: 3 cities).
+# Isolated from crypto: own data dir, cursor, WAL, Kaggle dataset. BTC runner untouched.
+# Discovery/manager/settlement wired by cli_weather.py (low mode) — stock cli.py must NOT run with this file.
+assets:
+- HONG-KONG
+- SHANGHAI
+- LONDON
+series_ids:
+  HONG-KONG: WEATHER-LOW-1D
+  SHANGHAI: WEATHER-LOW-1D
+  LONDON: WEATHER-LOW-1D
+schema_version: 3.2.0
+window_size_seconds: 86400
+timeframes:
+- 1d
+kaggle:
+  dataset_prefix: gghgg1/polymarket-weather-low
+  datasets:
+    1d: gghgg1/polymarket-weather-low
+  rolling_window: true
+  local_retention_hours: 12
+  upload_interval_seconds: 3600
+  test_upload_interval_seconds: 600
+rollover_lead_seconds: 120
+max_coverage_gap_seconds: 30
+discovery_poll_interval_seconds: 60
+discovery_backoff_max_seconds: 300
+snapshot_interval_ms: 5000
+l2_levels: 10
+depth_thresholds_cents:
+- 1
+- 5
+- 10
+event_thresholds:
+  crossing_threshold: 0.0
+  depth_change_threshold_pct: 0.15
+  size_change_threshold_pct: 0.1
+  spread_change_threshold: 0.002
+ws:
+  full_book_diff_interval_seconds: 300
+  full_book_diff_tolerance: 0.01
+  max_resync_duration_seconds: 60
+  reconnect_backoff_initial_ms: 500
+  reconnect_backoff_max_ms: 30000
+  reconnect_jitter: true
+  rest_book_url: https://clob.polymarket.com/book
+  rest_market_url: https://clob.polymarket.com/markets
+  resync_rest_backoff_initial_ms: 1000
+  resync_rest_backoff_max_ms: 20000
+  sequence_gap_detection: true
+  url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+cursor_store:
+  flush_interval_seconds: 5
+  mode: per_asset
+  path: ./data-weather-low/cursor_state
+chainlink:
+  enable_binance_fallback: false
+  max_resolution_wait_seconds: 120
+  settlement_source_preference: on_chain_confirmed
+  ws_url: wss://ws-live-data.polymarket.com
+storage:
+  buffer_max_rows: 50000
+  compaction_schedule: daily
+  compaction_temp_suffix: .tmp
+  data_dir: ./data-weather-low
+  disk_space_check_interval_seconds: 30
+  disk_space_min_bytes: 1073741824
+  flush_interval_seconds: 30
+  flush_row_count_threshold: 1500
+  wal_dir: ./data-weather-low/_wal
+  wal_enabled: true
+synthetic_mode: false
+test_mode:
+  enabled: false
+  num_markets: 1
+  window_size_seconds: 86400
+liquidity_filter:
+  enabled: true
+  min_liquidity: 500.0
+  min_spread_liquidity_check: false
+  min_volume: 50.0
+capacity:
+  estimated_row_bytes_uncompressed: 2500
+  parquet_compression_ratio: 0.25
+raw_archive:
+  enabled: true
+  format: jsonl
+  path: ./data-weather-low/raw_ws_archive
+  retention_hours: 36
+clock:
+  clock_issue_threshold_ms: 50
+  ntp_check_interval_seconds: 60
+  ntp_server: pool.ntp.org
+watchdog:
+  alert_on:
+  - ws_disconnected
+  - resync_failed
+  - coverage_gap
+  - rollover_miss
+  - backpressure
+  - write_failed
+  - clock_issue
+  - resolution_stuck
+  - book_anomaly
+  - kaggle_upload_failed
+  daily_summary_hour_utc: 0
+  heartbeat_interval_seconds: 5
+  heartbeat_stale_seconds: 15

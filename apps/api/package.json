@@ -1,0 +1,17 @@
+{
+  "name": "@arb/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "start": "node --loader ts-node/esm src/index.ts"
+  },
+  "dependencies": {
+    "@arb/types": "*",
+    "@arb/config": "*",
+    "@arb/logging": "*",
+    "@arb/database": "*",
+    "@arb/market-connectors": "*"
+  }
+}

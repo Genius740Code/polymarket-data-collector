@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .env
 data/
+data-weather-high/
+data-weather-low/
+data-*/
 *.db
 *.parquet
 *.tmp
@@ -14,6 +17,10 @@ data/
 htmlcov/
 dist/
 build/
+node_modules/
+apps/*/dist/
+services/*/dist/
+packages/*/dist/
 *.egg-info/
 .DS_Store
 .mypy_cache/
