@@ -33,6 +33,57 @@ def _os_replace_safe(src, dst):
     _os.replace(str(src), str(dst))
 
 
+def _export_lock_path(data_dir) -> Path:
+    return Path(data_dir) / ".export.lock"
+
+
+def _acquire_export_lock(data_dir):
+    """Blocking cross-process mutex for the heavy Kaggle export pipeline.
+
+    2026-09-09: the collector hourly loop (4 lanes back-to-back) and the
+    15-min backfill cron (--all-lanes) ran exports concurrently in separate
+    processes — combined RSS spiked past the pm2 cap and the box OOM'd
+    (11:20 SIGKILL mid-export). flock serializes them; the kernel releases
+    the lock if the holder dies, so a crash can never wedge uploads.
+    Returns an fd to pass to _release_export_lock, or None on non-Unix.
+    """
+    try:
+        import fcntl as _fcntl
+    except Exception:
+        return None
+    import os as _os2
+    try:
+        p = _export_lock_path(data_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = _os2.open(str(p), _os2.O_CREAT | _os2.O_RDWR, 0o644)
+    except Exception:
+        return None
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)  # blocking
+    except Exception:
+        try:
+            _os2.close(fd)
+        except Exception:
+            pass
+        return None
+    return fd
+
+
+def _release_export_lock(fd) -> None:
+    if fd is None:
+        return
+    try:
+        import fcntl as _fcntl
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        import os as _os3
+        _os3.close(fd)
+    except Exception:
+        pass
+
+
 from .parquet_io import read_table
 import pyarrow.compute as pc
 
@@ -2352,7 +2403,7 @@ def cleanup_local_data(
 # Kaggle upload orchestrator — 5m-only, single dataset, 10-min / hourly
 # =============================================================================
 
-def export_and_upload_all_kaggle(
+def _export_and_upload_all_kaggle_impl(
     data_dir: str | Path = "./data",
     out_dir: str | Path | None = None,
     assets: List[str] | None = None,
@@ -2547,6 +2598,21 @@ def export_and_upload_all_kaggle(
         print(f"✗ Upload failed {dataset_prefix}, NOT pruning (data retained for retry)")
 
     return result
+
+
+def export_and_upload_all_kaggle(*args, **kwargs):
+    """Serialized entry point — holds the cross-process export lock, then runs.
+
+    Keeps the collector hourly loop and the backfill cron from building
+    staging (clean_view ~300k rows + 39 files/lane + wallet backfill) at the
+    same time. Callers keep the original signature (data_dir first).
+    """
+    _dd = kwargs.get("data_dir", args[0] if args else "./data")
+    _fd = _acquire_export_lock(_dd)
+    try:
+        return _export_and_upload_all_kaggle_impl(*args, **kwargs)
+    finally:
+        _release_export_lock(_fd)
 
 
 def _validate_kaggle_config() -> bool:

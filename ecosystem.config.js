@@ -63,10 +63,15 @@ module.exports = {
       // BOX-FIT 2026-09-07 (3.9GB box): 21 lanes peak ~1.1GB (startup + export
       // overlap); 1G caused restart-loop. 1.5G cap leaves ~2GB headroom before
       // earlyoom. Revisit if RSS plateaus above 1.5G (leak hunt, not cap raise).
-      max_memory_restart: '1536M',
+      // 2026-09-09 28 lanes: hourly Kaggle export (4×39 files + clean_view
+      // ~300k rows + wallet backfill) spiked over 1536M → pm2 SIGKILLed mid-
+      // export 08:15 (10s kill_timeout too short for in-flight export).
+      // 2048M fits the 3.9GB box (2G collector + 0.74G opencode + 0.52G
+      // backfill transient ≈ 3.3G peak); 60s kill lets stop() flush + cursor.
+      max_memory_restart: '2048M',
       restart_delay: 1000,
       exp_backoff_restart_delay: 100,
-      kill_timeout: 10000,          // SIGINT → give collector time to flush + persist cursor (§1B)
+      kill_timeout: 60000,          // SIGINT → give collector time to flush + persist cursor (§1B)
       wait_ready: false,
       time: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',

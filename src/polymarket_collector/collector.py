@@ -1621,9 +1621,20 @@ class Collector:
                             # Honest freshness labeling (I-8): if the asset's WS is
                             # down, a REST-healed book is frozen — label stale, never
                             # live, so the clean view reflects reality.
+                            # T1: stale must carry resync_id, live must be NULL.
+                            # Do NOT persist rid onto book (that pollutes future live
+                            # snapshots — 2026-09-09: 76k live carried rid). Just tag
+                            # this row; book.mark_live() already clears book.resync_id.
                             try:
                                 if not self._ws_connected.get(m.asset.upper(), False) and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
+                                    if not row.get("resync_id"):
+                                        rid = getattr(book, "resync_id", None) or str(uuid.uuid4())
+                                        row["resync_id"] = rid
+                                # Enforce live=>NULL (defensive: if book carried a stale
+                                # rid into a live snapshot, drop it — spec §8).
+                                if row.get("book_state") == "live" and row.get("resync_id") is not None:
+                                    row["resync_id"] = None
                             except Exception:
                                 pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
@@ -1768,6 +1779,33 @@ class Collector:
                             except Exception:
                                 return
                     rtds_hb_task = asyncio.create_task(_rtds_heartbeat(), name="ws-heartbeat-RTDS")
+                    # 2026-09-09 stall watchdog: RTDS went silent 08:27-09:13
+                    # (46 min) with the connection open — `async for` blocked
+                    # forever, no ticks, no errors, resolutions starved
+                    # (90 resolution_stuck). Any inbound frame proves liveness.
+                    _last_rx = time.time()
+
+                    async def _rtds_stall_watchdog() -> None:
+                        while self._running:
+                            await asyncio.sleep(5)
+                            try:
+                                idle = time.time() - _last_rx
+                                if idle > 30:
+                                    try:
+                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": "CHAINLINK", "chainlink_stall_s": round(idle, 1)})
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await ws.close()
+                                    except Exception:
+                                        pass
+                                    return
+                            except asyncio.CancelledError:
+                                return
+                            except Exception:
+                                return
+
+                    stall_task = asyncio.create_task(_rtds_stall_watchdog(), name="ws-stall-RTDS")
                     # RTDS subscribe — chainlink topic ONLY (cleanup 2026-09-05).
                     # Both topics delivered identical cadence; `crypto_prices` carried
                     # a ROUNDED duplicate of 6 assets (HYPE only exists on the
@@ -1789,6 +1827,7 @@ class Collector:
                         if not self._running:
                             break
                         rx_count += 1
+                        _last_rx = time.time()
                         try:
                             msg = _json.loads(message) if isinstance(message, (str, bytes)) else message
                         except Exception:
@@ -1886,6 +1925,10 @@ class Collector:
                             pass
                     try:
                         rtds_hb_task.cancel()
+                    except Exception:
+                        pass
+                    try:
+                        stall_task.cancel()
                     except Exception:
                         pass
             except asyncio.CancelledError:

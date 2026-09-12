@@ -111,8 +111,8 @@ timeframes:
   # ladder, a different market type) — keep OFF.
   - 5m
   - 15m
-  # - 1h
-  # - 4h
+  - 1h
+  - 4h
 
 ws:
   full_book_diff_interval_seconds: 300

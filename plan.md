@@ -304,3 +304,66 @@ Never `age_seconds > keep_seconds` on `mtime` alone.
 ---
 
 *This `plan.md` is the build checklist; P1 precedes P2, P2 before P3. After you confirm §7, build proceeds P2→P6 in order.*
+
+---
+
+## 13. 28-Lane Prod (2026-09-09) + Wallet Null Fix + 8h Gap Handling (NO RESTART)
+
+**Status:** `timeframes: [5m,15m,1h,4h]` 28 lanes live since `06:38:22 UTC` (`ea83c76`).
+Gate `verify_gate --probe-timeframes`: `5m/15m/1h/4h 7/7 ENABLE`, `1d OFF`
+(`1h` via ET slug `_hourly_slug_for`, `verify_gate.py`). `1d` stays OFF
+(price-touch ladder, out of scope).
+
+**8h gap 2026-09-08 22:29 → 2026-09-09 06:38 UTC (honest, no fake):**
+- Cause: `config/collector.yaml` 4-space `    - 1h` parsed as
+  `['5m','15m - 1h - 4h']` → `ValidationError` → 1860 crash loops.
+  Fixed `ea83c76` (2-space). `collector_events coverage_gap:14`,
+  `resync_episodes` + `book_state='stale'` cover the gap per AGENT.md.
+  Backtest must filter `date=2026-09-08` partial; never interpolate.
+
+**Wallet NULL fix plan (`trades.maker_wallet/taker_wallet/wallet`):**
+- Source truth: CLOB WS carries NO wallets → hive NULL is HONEST at ingest.
+- Fill path (already wired, no restart needed):
+  1. Export-time `_backfill_trade_wallets` (Data-API `takerOnly=false` both legs,
+     unanimity rule `_unambiguous_wallet`; multi-party txs stay NULL, never guessed)
+     + `trade reconciliation` (`api-` inserts for coalesced fills, `fee_is_estimated=True`)
+     + `_writeback_enriched_trades` (NULLs only, atomic, idempotent).
+  2. `second_pass_enrich_trades` (15-min cron, deferred <900s for Data-API healing).
+  3. `third_pass_onchain_wallets` (CTF `OrderFilled` receipts, 1500 txs/run,
+     `backfill_wallets_from_fills` + `tx_map` fallback, NULLs only).
+- Coverage: all TFs (asset-filtered plain read includes `5m/15m/1h/4h`;
+  staging per-TF filtered then enriched). `2026-09-09 06:51 UTC`:
+  `5m wallet 19% null / maker 62% null`, `15m 23%/57%`,
+  `1h 90% null (110 rows, 13 min old)`, `4h 100% (2 rows)` — freshness,
+  heals via cron + hourly Kaggle `07:38 UTC` (creates `gghgg1/polymarket-1h-crypto`,
+  updates `4h`). Multi-party NULLs stay NULL per `DATA_CARD.md`.
+- Backtest read path: prefer Kaggle staging (enriched) or hive after
+  `resolution_backfill --reupload --all-lanes`; hive `wallet` NULL = honest
+  (no source) until backfill lands.
+
+**Resync_id T1 (`book_snapshots_500ms.resync_id`):**
+- Spec: NULL on `live`, non-null on `stale/resyncing`.
+- Bug `2d5c349` persisted rid onto `book` → 76k live carried rid.
+  Fixed (no restart): tag row only, enforce `live=>NULL`
+  (`collector.py` I-8 block). Takes effect on next restart / rollover
+  (5m/15m clear within 15 min via `mark_live`; 1h/4h longer). Historical
+  41 pre-fix `stale` without rid documented as honest WS-recycle gaps.
+- `book_snapshots_clean` = `live` only (`clean_view.py`), built hourly at
+  Kaggle export (`export_and_upload_all_kaggle` Step 0b); empty until first
+  `07:38` upload is expected, not a bug.
+
+**Kaggle (no deletes; `chainlink-btc-1s` never touched):**
+- `5m 06:44 ready`, `15m 22:22 stale 8h`, `4h 2026-09-07 stale`,
+  `1h missing (403)` → all heal at `07:38` collector loop (auto `create_new`
+  on 403, `export.py:1887`). `chainlink_events` shared across lanes.
+- Backfill cron `*/15` firing (`06:45 5m success + on-chain 995 fills`);
+  `stopped` status is normal (autorestart:false, cron-driven).
+- `polymarket-compact` stays STOPPED (`pm2 stop + save` after every full-file
+  restart); RSS `1.3GB@28` at 13m (ramp, baseline ~1G@28) — watch ≥30 min
+  before `leak_probe` (probe stops prod → gaps, so only on sustained climb).
+
+**Soak (no restart unless T1):** `06:38 → 18:38 UTC 12h`, hourly
+`hourly_audit.py` (purity `series_id==ASSET-TF`, completeness, null
+HONEST/BUG, leak `ps -o rss`, Kaggle fresh/version/hour, backfill firing,
+`df -h />150MB`, `uptime`). Advance only on green + `5m≥12 / 15m≥4 / 1h≥2`
+closed windows; `4h PROVISIONAL` if no boundary overnight.

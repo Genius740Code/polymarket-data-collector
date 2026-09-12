@@ -241,11 +241,13 @@ def probe_timeframes(assets: List[str], timeframes: List[str], timeout_s: float 
         per_asset: Dict[str, Any] = {}
         found_count = 0
         for asset in assets:
-            if ws == 3600:
-                # 1h lane: human-readable ET slug family (unix-ts 1h slugs are
-                # empty on Gamma — verified live 2026-09-08)
-                from .rollover import _hourly_slug_for
-                slug = _hourly_slug_for(asset, ts)
+            # 1h uses ET slug family (verified live 2026-09-08), not unix-ts
+            if tf == "1h":
+                try:
+                    from .rollover import _hourly_slug_for as _hs
+                    slug = _hs(asset, ts)
+                except Exception:
+                    slug = f"{asset.lower()}-updown-{tf}-{ts}"
             else:
                 slug = f"{asset.lower()}-updown-{tf}-{ts}"
             entry: Dict[str, Any] = {"slug": slug, "found": False}
