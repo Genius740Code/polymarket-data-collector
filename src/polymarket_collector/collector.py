@@ -770,7 +770,10 @@ class Collector:
         self._kaggle_uploads: list[dict] = []  # track 10-min uploads during test
         if enable_kaggle_loop:
             self._kaggle_task = asyncio.create_task(self._kaggle_upload_loop(), name="kaggle_upload")
-        else:
+        # 2026-09-11 OOM hunt: 5-min RSS + gc-type self-report (cheap, always
+        # on). Pinpoints which container grows between restarts.
+        self._mem_task = asyncio.create_task(self._mem_report_loop(), name="mem_report")
+        if not enable_kaggle_loop:
             self._kaggle_task = None  # type: ignore
 
     # -- missing stubs for lifecycle — filled below (keep compat with start/stop) ----
@@ -1705,6 +1708,34 @@ class Collector:
             except Exception:
                 pass
             await asyncio.sleep(self.config.clock.ntp_check_interval_seconds)
+
+    async def _mem_report_loop(self) -> None:
+        """5-min RSS + gc-type self-report for the OOM hunt (cheap, always on)."""
+        import collections as _collections
+        import gc as _gc
+
+        baseline = None
+        while self._running:
+            await asyncio.sleep(300)
+            try:
+                with open("/proc/self/status") as _f:
+                    _rss = next(
+                        (int(_l.split()[1]) // 1024 for _l in _f if _l.startswith("VmRSS:")),
+                        0,
+                    )
+            except Exception:
+                _rss = 0
+            try:
+                _cnt = _collections.Counter(type(_o).__name__ for _o in _gc.get_objects())
+                if baseline is None:
+                    baseline = _cnt
+                _grow = sorted(
+                    ((k, _cnt[k] - baseline.get(k, 0)) for k in _cnt if _cnt[k] - baseline.get(k, 0) > 500),
+                    key=lambda _kv: -_kv[1],
+                )[:8]
+                print(f"[mem] rss={_rss}MB objs={sum(_cnt.values())} ntasks={len(self._tasks)} growth={_grow}", flush=True)
+            except Exception as _e:
+                print(f"[mem] report err {_e}", flush=True)
 
     async def _flush_loop(self) -> None:
         while self._running:

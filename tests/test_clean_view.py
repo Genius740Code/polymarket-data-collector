@@ -111,7 +111,10 @@ def test_clean_view_incremental_appends_without_dupes():
         pq.write_table(pa.Table.from_pylist([_row("1", 0), _row("2", 1)]), str(src_dir / "p1-compacted.parquet"))
         os.remove(str(src_dir / "p1.parquet"))
         n2 = build_clean_view(tmp)
-        assert n2 == 3  # merged total, compaction rewrite NOT double-counted
+        assert n2 == 3  # sidecar rows: 1 genuinely new + 2 compaction rewrite
         got = load_clean(tmp)
-        assert got.num_rows == 3
-        assert sorted(r["snapshot_id"] for r in got.to_pylist()) == ["1", "2", "3"]
+        # sidecar design: the compaction rewrite (rows 1,2) is kept honestly
+        # at clean level (2 + 1 + 2 = 5); published staging dedups by
+        # (condition_id, ts) via DedupState (see test_streaming_export).
+        assert got.num_rows == 5
+        assert sorted(r["snapshot_id"] for r in got.to_pylist()).count("1") == 2

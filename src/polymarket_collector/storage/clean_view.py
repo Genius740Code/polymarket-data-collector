@@ -93,12 +93,15 @@ def build_clean_view(
 
     # collect source tables per partition (date/asset) to preserve partitioning
     # We need to walk src partitions and filter per partition so output mirrors input partitions
-    # 2026-09-10 OOM: INCREMENTAL append — when the output exists, read only
-    # source files newer than the output, filter those, and merge with the
-    # existing output (dedup by (condition_id, ts_snapshot_ns) guards against
-    # compaction rewrites re-adding old rows as "new" files). Full-partition
-    # concat only on first build / filter-flag change. Peak ~ two files.
-    from .streaming import DedupState
+    # 2026-09-10 OOM: SIDECAR append — when output exists, filter only source
+    # files newer than the newest clean file and append the survivors as a new
+    # sidecar file (never rewrite/merge the partition output: reading it back
+    # costs GBs). No compaction runs anywhere, so new files hold only new
+    # rows; published dedup happens downstream in staging (DedupState). New
+    # files per call are byte-capped (oldest first) so a long catch-up
+    # backlog converges over several hourly exports instead of dying at once.
+    # Full-partition concat only on first build / filter-flag change.
+    _MAX_NEW_BYTES_PER_CALL = 30 * 1024 * 1024
 
     written = 0
     for date_dir in src_root.glob("date=*"):
@@ -107,32 +110,49 @@ def build_clean_view(
             asset = asset_dir.name.split("=", 1)[1] if "=" in asset_dir.name else asset_dir.name
             out_dir = dst_root / date_str / f"asset={asset}"
             final_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
-            incremental = False
-            prior = None
+            sidecar = False
             if not full_rebuild and final_path.exists():
                 try:
-                    out_mtime = final_path.stat().st_mtime
-                    src_files = [p for p in asset_dir.glob("*.parquet")]
-                    new_files = [p for p in src_files if p.stat().st_mtime > out_mtime]
-                    if not new_files:
+                    _outs = [p for p in out_dir.glob("*.parquet") if not p.name.endswith(".tmp")]
+                    _out_mtime = max([p.stat().st_mtime for p in _outs]) if _outs else 0.0
+                    _src_files = sorted(
+                        (p for p in asset_dir.glob("*.parquet")),
+                        key=lambda p: p.stat().st_mtime,
+                    )
+                    _new_files = [p for p in _src_files if p.stat().st_mtime > _out_mtime]
+                    if not _new_files:
                         continue  # fresh — skip rebuild of this partition
-                    prior = read_table(final_path)
-                    if prior is not None and prior.num_rows > 0:
-                        incremental = True
-                        tables = []
-                        for part in new_files:
-                            try:
-                                tables.append(read_table(part))
-                            except Exception:
-                                continue
-                        if not tables:
+                    # byte-capped oldest-first slice; the rest converge later
+                    _capped: list = []
+                    _bytes = 0
+                    for _p in _new_files:
+                        try:
+                            _sz = _p.stat().st_size
+                        except Exception:
+                            _sz = 0
+                        if _capped and _bytes + _sz > _MAX_NEW_BYTES_PER_CALL:
+                            break
+                        _capped.append(_p)
+                        _bytes += _sz
+                    tables = []
+                    for part in _capped:
+                        try:
+                            tables.append(read_table(part))
+                        except Exception:
                             continue
-                        combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
-                    # else: fall through to full-partition rebuild below
+                    if not tables:
+                        continue
+                    combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
+                    del tables
+                    sidecar = True
+                    sidecar = True
                 except Exception:
-                    incremental = False
-                    prior = None
-            if not incremental:
+                    sidecar = False
+            if not sidecar:
+                # No sidecar this call: either first build / flag change (full
+                # rebuild below) or usable output already exists (skip).
+                if not full_rebuild and final_path.exists():
+                    continue
                 tables: List[pa.Table] = []
                 for part in asset_dir.glob("*.parquet"):
                     try:
@@ -142,6 +162,7 @@ def build_clean_view(
                 if not tables:
                     continue
                 combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
+                del tables
             # filter: book_state == 'live'
             try:
                 mask = pc.equal(combined.column("book_state"), pa.scalar("live"))
@@ -162,40 +183,23 @@ def build_clean_view(
                 except Exception:
                     pass
 
-            if filtered.num_rows == 0 and not incremental:
-                continue
-
-            # incremental merge: prior output + newly filtered rows, deduped by
-            # (condition_id, ts_snapshot_ns) — compaction rewrites surface old
-            # rows as new files; without this the view would double-count.
-            if incremental and prior is not None and prior.num_rows > 0:
-                try:
-                    if filtered.num_rows > 0:
-                        _dd = DedupState(["condition_id", "ts_snapshot_ns"])
-                        _keep_prior = _dd.filter(prior)
-                        _merged_new = _dd.filter(filtered)
-                        if _merged_new.num_rows > 0:
-                            filtered = _concat_tables([_keep_prior, _merged_new])
-                        else:
-                            filtered = _keep_prior
-                    else:
-                        filtered = prior
-                    del prior
-                except Exception:
-                    try:
-                        filtered = _concat_tables([prior, filtered]) if filtered.num_rows > 0 else prior
-                    except Exception:
-                        pass
             if filtered.num_rows == 0:
                 continue
 
             out_dir = dst_root / date_str / f"asset={asset}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet.tmp"
-            final_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
+            if sidecar:
+                # append-only sidecar (never rewrite the partition output)
+                import uuid as _uuid
+
+                _tag = f"{int(_time2.time() * 1000)}-{_uuid.uuid4().hex[:8]}"
+                _dest = out_dir / f"inc-{asset}-{date_str.replace('date=', '')}-{_tag}.parquet"
+            else:
+                _dest = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
+            tmp_path = _dest.with_suffix(".parquet.tmp")
             # atomic write (§10A)
             pq.write_table(filtered, str(tmp_path), compression="zstd")
-            _os_replace_safe(tmp_path, final_path)
+            _os_replace_safe(tmp_path, _dest)
             written += filtered.num_rows
 
     return written

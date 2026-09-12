@@ -230,6 +230,9 @@ def main() -> None:
     # under 24/7 collection). Heavy passes ride the :00 run only.
     import datetime as _dt0
     _hourly0 = int(_dt0.datetime.now(tz=_dt0.timezone.utc).strftime("%M")) < 15
+    # Second pass reads the full trades hive per asset (concat ~1GB); under
+    # 24/7 collection it defers anyway (newest trade always <900s old), so
+    # only pay for the check hourly. (Same OOM family as the :00-gated passes.)
     if not args.skip_enrich and not args.dry_run and _hourly0:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
         if not args.skip_onchain:

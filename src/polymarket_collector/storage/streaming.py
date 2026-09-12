@@ -152,26 +152,39 @@ def stream_batches(
     ts_col: Optional[str] = None,
     transform: Optional[Callable[[pa.Table], pa.Table]] = None,
     max_files: Optional[int] = None,
+    batch_rows: int = 20000,
 ) -> Iterator[pa.Table]:
-    """Yield per-file transformed tables, oldest first. Peak = one file."""
+    """Yield row-group batches (bounded RAM), oldest file first.
+
+    2026-09-11 OOM: per-FILE tables still explode (100MB staging/hive files
+    expand ~30x). Batches cap the transient at batch_rows regardless of
+    file size. Order across batches follows footer order (approx time).
+    """
+    import pyarrow.parquet as _pq
+
     files = iter_source_files(data_dir, dataset, asset, ts_col)
     if max_files is not None:
         files = files[:max_files]
     for p in files:
         try:
-            t = read_table(p)
+            _pf = _pq.ParquetFile(str(p))
         except Exception:
             continue
-        if t is None or t.num_rows == 0:
+        try:
+            for chunk in _pf.iter_batches(batch_size=batch_rows):
+                t = pa.Table.from_batches([chunk])
+                if t.num_rows == 0:
+                    continue
+                if transform is not None:
+                    try:
+                        t = transform(t)
+                    except Exception:
+                        continue
+                    if t is None or t.num_rows == 0:
+                        continue
+                yield t
+        except Exception:
             continue
-        if transform is not None:
-            try:
-                t = transform(t)
-            except Exception:
-                continue
-            if t is None or t.num_rows == 0:
-                continue
-        yield t
 
 
 def write_batches(

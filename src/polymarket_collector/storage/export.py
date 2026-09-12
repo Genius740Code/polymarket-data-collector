@@ -19,6 +19,8 @@ Additional functionality:
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import uuid
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -213,7 +215,7 @@ def _backfill_trade_wallets_chunked(
     data_dir: Path,
     asset: Optional[str] = None,
     reconcile: bool = True,
-    chunk_rows: int = 25000,
+    chunk_rows: int = 8000,
 ) -> pa.Table:
     """Bounded-RAM wrapper around _backfill_trade_wallets (2026-09-10 OOM).
 
@@ -556,14 +558,26 @@ def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: p
     """
     if enriched.num_rows == 0 or "trade_id" not in enriched.schema.names:
         return 0
-    # field updates keyed by trade_id — only rows where a NULL got filled
+    # field updates keyed by trade_id — only rows where a NULL got filled.
+    # 2026-09-10 OOM: build the map from NARROW columns only (trade_id + 6
+    # fill cols); the full enriched table is released before the per-file
+    # loop so peak stays flat.
     updates: dict = {}
     cols = ("maker_wallet", "taker_wallet", "wallet", "outcome", "fee", "fee_is_estimated")
-    for r in enriched.to_pylist():
-        tid = r.get("trade_id")
-        if not tid or str(tid).startswith("api-"):
-            continue
-        updates[str(tid)] = {c: r.get(c) for c in cols}
+    try:
+        _tids = enriched.column("trade_id").to_pylist()
+        _fills = {c: enriched.column(c).to_pylist() if c in enriched.schema.names else [None] * enriched.num_rows for c in cols}
+        for _i, _tid in enumerate(_tids):
+            if not _tid or str(_tid).startswith("api-"):
+                continue
+            updates[str(_tid)] = {c: _fills[c][_i] for c in cols}
+        del _tids, _fills
+    except Exception:
+        for r in enriched.to_pylist():
+            tid = r.get("trade_id")
+            if not tid or str(tid).startswith("api-"):
+                continue
+            updates[str(tid)] = {c: r.get(c) for c in cols}
     if not updates:
         return 0
     base = Path(data_dir) / "trades"
@@ -804,24 +818,75 @@ def _load_markets_latest_rows(base: Path) -> List[dict]:
 
 
 def _read_trades_for_summary(base: Path, staging_dir: Optional[Path], assets: List[str]) -> Optional[pa.Table]:
-    """Trades table for the summary — staging files preferred (they carry the
-    api- reconciled fills), hive fallback otherwise."""
+    """Trades aggregates for the summary — staging files preferred (they carry
+    the api- reconciled fills), hive fallback otherwise.
+
+    2026-09-10 OOM: NARROW columns only (condition_id/notional/wallet) —
+    the summary aggregates per-cid and never touches wide L2/tx columns.
+    Full-width concat of trades staging (~30x Arrow expansion) SIGKilled
+    the box inside this exact call.
+    """
+    _need = ["condition_id", "notional", "wallet"]
+
+    def _narrow(p) -> Optional[pa.Table]:
+        # 2026-09-11 OOM: project columns AT READ TIME (100MB staging files
+        # expand ~30x; selecting after a full read does not save RAM).
+        try:
+            try:
+                t = pq.read_table(str(p), columns=_need)
+            except Exception:
+                t = read_table(p)
+                if t is None or t.num_rows == 0:
+                    return None
+                keep = [c for c in _need if c in t.schema.names]
+                t = t.select(keep) if keep else None
+                if t is None:
+                    return None
+            if t.num_rows == 0:
+                return None
+            cols = {}
+            for c in _need:
+                if c in t.schema.names:
+                    cols[c] = t.column(c)
+                else:
+                    cols[c] = pa.array(
+                        [None] * t.num_rows,
+                        type=pa.string() if c == "wallet" else (pa.float64() if c == "notional" else pa.string()),
+                    )
+            out = pa.table(cols)
+            del t
+            return out
+        except Exception as e:
+            print(f"[export] WARN staging trades unreadable {Path(p).name}: {e}")
+            return None
+
     tables: List[pa.Table] = []
     if staging_dir is not None:
         for a in assets:
             p = Path(staging_dir) / f"{a}_trades.parquet"
             if p.exists():
-                try:
-                    tables.append(read_table(p))
-                except Exception as e:
-                    print(f"[export] WARN staging trades unreadable {p.name}: {e}")
+                t = _narrow(p)
+                if t is not None:
+                    tables.append(t)
     if not tables:
         hive = _read_dataset_per_asset(base, "trades", None)
-        if hive is not None:
-            tables.append(hive)
+        if hive is not None and hive.num_rows:
+            try:
+                cols = {}
+                for c in _need:
+                    cols[c] = hive.column(c) if c in hive.schema.names else pa.array(
+                        [None] * hive.num_rows,
+                        type=pa.string() if c in ("wallet", "condition_id") else pa.float64())
+                tables.append(pa.table(cols))
+            except Exception:
+                pass
+            finally:
+                del hive
     if not tables:
         return None
-    return tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
+    out = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
+    del tables
+    return out
 
 
 def build_markets_summary(
@@ -904,15 +969,25 @@ def build_markets_summary(
             print(f"[export] WARN markets_summary trades aggregation failed: {e}")
 
     # --- snapshots (clean): outcome-token mid OHLC + average spread per condition_id ---
-    # 2026-09-10 OOM: streaming accumulation (per-cid min/max/sum/count state
-    # is KBs) instead of concat-loading the full clean hive (~30x Arrow
-    # expansion SIGKilled the box). Open/close = row at min/max ts per cid
-    # (order-independent, identical to sorted first/last); means ignore NULLs.
+    # 2026-09-10 OOM: prefer the just-built staging clean files (lane-pure,
+    # small, current) over the clean hive; streaming hive accumulation only
+    # as fallback. Per-cid state stays KBs either way; open/close = row at
+    # min/max ts among non-null mids (matches sorted first/last).
     ohlc_by_cid: Dict[str, dict] = {}
     try:
         from .streaming import stream_batches as _stream_batches
 
         _acc: Dict[str, dict] = {}
+        _staging_clean: list = []
+        try:
+            _sdir = Path(staging_dir) if staging_dir else None
+            if _sdir is not None:
+                for _a in (assets or []):
+                    _p = _sdir / f"{str(_a).upper()}_book_snapshots_clean.parquet"
+                    if _p.exists():
+                        _staging_clean.append(_p)
+        except Exception:
+            _staging_clean = []
 
         def _fold_batch(_b: pa.Table) -> None:
             _need = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
@@ -979,9 +1054,25 @@ def build_markets_summary(
                     _a["s_n_dn"] += 1
                 _a["n"] += 1
 
-        for _bt in _stream_batches(base, "book_snapshots_clean", None, ts_col="ts_snapshot_ns"):
-            _fold_batch(_bt)
-            del _bt
+        if _staging_clean:
+            for _fp in _staging_clean:
+                try:
+                    _pf = pq.ParquetFile(str(_fp))
+                except Exception:
+                    continue
+                try:
+                    for _chunk in _pf.iter_batches(batch_size=20000):
+                        _bt = pa.Table.from_batches([_chunk])
+                        if _bt.num_rows == 0:
+                            continue
+                        _fold_batch(_bt)
+                        del _bt
+                except Exception:
+                    continue
+        else:
+            for _bt in _stream_batches(base, "book_snapshots_clean", None, ts_col="ts_snapshot_ns"):
+                _fold_batch(_bt)
+                del _bt
         for _cid, _a in _acc.items():
             ohlc_by_cid[_cid] = {
                 "up_open": _a["up_open"], "up_close": _a["up_close"],
@@ -998,20 +1089,45 @@ def build_markets_summary(
 
     # --- chainlink: underlying open/close = nearest tick to window boundary
     # (open ≤10s per K-2, close ≤5s) ---
+    # 2026-09-10 OOM: narrow per-file reads (3 cols) instead of full-hive concat.
     ticks_by_asset: Dict[str, List] = {}
-    cl = _read_dataset_per_asset(base, "chainlink_events", None)
-    if cl is not None and cl.num_rows and {"asset", "ts_source", "price"}.issubset(set(cl.schema.names)):
-        for r in cl.select(["asset", "ts_source", "price"]).to_pylist():
-            a = r.get("asset")
-            p = r.get("price")
-            ts_str = r.get("ts_source")
-            if not a or p is None or not ts_str:
-                continue
+    try:
+        from .streaming import iter_source_files as _iter_cl_files
+
+        for _cf in _iter_cl_files(base, "chainlink_events", None):
+            # 2026-09-11 OOM: 3-col projection at read time (never full rows).
             try:
-                ts_ms = int(_dt2.datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() * 1000)
+                _ct = pq.read_table(str(_cf), columns=["asset", "ts_source", "price"])
             except Exception:
+                try:
+                    _full = read_table(_cf)
+                    if _full is None:
+                        continue
+                    _ct = _full.select([c for c in ["asset", "ts_source", "price"] if c in _full.schema.names])
+                    del _full
+                except Exception:
+                    continue
+            if _ct.num_rows == 0:
+                del _ct
                 continue
-            ticks_by_asset.setdefault(a, []).append((ts_ms, float(p)))
+            _need_cl = {"asset", "ts_source", "price"}
+            if not _need_cl.issubset(set(_ct.schema.names)):
+                del _ct
+                continue
+            for r in _ct.to_pylist():
+                a = r.get("asset")
+                p = r.get("price")
+                ts_str = r.get("ts_source")
+                if not a or p is None or not ts_str:
+                    continue
+                try:
+                    ts_ms = int(_dt2.datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() * 1000)
+                except Exception:
+                    continue
+                ticks_by_asset.setdefault(a, []).append((ts_ms, float(p)))
+            del _ct
+    except Exception as e:
+        print(f"[export] WARN markets_summary chainlink load failed: {e}")
         for a in ticks_by_asset:
             ticks_by_asset[a].sort(key=lambda x: x[0])
 
@@ -1593,6 +1709,9 @@ def _stream_export_asset_dataset(
     timeframe_label: Optional[str],
     l2_levels: int,
     market_id_map: Dict[str, str],
+    live_only: bool = False,
+    excluded_cids: Optional[set] = None,
+    source_dataset: Optional[str] = None,
 ) -> int:
     """Stream one (asset, whale-dataset) staging build. Returns rows written.
 
@@ -1602,17 +1721,28 @@ def _stream_export_asset_dataset(
     per-batch sorted, and appended incrementally. Global cross-file order
     follows footer order (source files are time-ordered appends; readers
     sort anyway per E13).
+
+    live_only + source_dataset: stage the CLEAN file straight from the
+    snapshots hive (live + not-disputed filter per batch) instead of the
+    clean hive — the clean hive (2.85M rows after 40h without prune) can no
+    longer be concat-loaded, and its catch-up rebuild belongs off-peak.
     """
     from .streaming import DedupState, stream_batches, write_batches
 
-    ts_col = {"book_snapshots_500ms": "ts_snapshot_ns"}.get(ds, "ts_received_ns")
+    src_ds = source_dataset or ds
+    ts_col = {"book_snapshots_500ms": "ts_snapshot_ns"}.get(src_ds, "ts_received_ns")
     schema = _get_schema(ds, l2_levels)
     dedup = DedupState(["asset", "condition_id", "ts_snapshot_ns"]) if ds == "book_snapshots_500ms" else None
+    # CLEAN staging shares the snapshots dedup scope (same rows, filtered):
+    # without it a compaction rewrite would double-count in clean files.
+    if ds == "book_snapshots_clean":
+        dedup = DedupState(["asset", "condition_id", "ts_snapshot_ns"])
     want = f"{asset_upper}-{timeframe_label}" if timeframe_label else None
     try:
         sort_keys = [k for k in (_sort_keys_for_schema(schema) if schema is not None else [])]
     except Exception:
         sort_keys = []
+    _excluded = set(excluded_cids or [])
 
     def _transform(t: pa.Table) -> pa.Table:
         if want and "series_id" in t.schema.names:
@@ -1620,7 +1750,21 @@ def _stream_export_asset_dataset(
                 t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
             except Exception:
                 pass
-        if ds in ("book_snapshots_500ms", "book_events") and market_id_map:
+        if live_only and "book_state" in t.schema.names:
+            try:
+                t = t.filter(pc.equal(t.column("book_state"), pa.scalar("live")))
+            except Exception:
+                pass
+        if live_only and _excluded and "condition_id" in t.schema.names:
+            # disputed exclusion (small set; per-batch mask, no pylist)
+            try:
+                _bad = pc.is_in(t.column("condition_id"), value_set=pa.array(sorted(_excluded)))
+                t = t.filter(pc.invert(pc.fill_null(_bad, False)))
+            except Exception:
+                pass
+        # E1: heal hex market_ids (clean staging included — it must match
+        # the raw staging file row-for-row on identity columns).
+        if ds in ("book_snapshots_500ms", "book_snapshots_clean", "book_events") and market_id_map:
             t = _apply_market_id_map(t, market_id_map)
         if dedup is not None:
             t = dedup.filter(t)
@@ -1634,7 +1778,7 @@ def _stream_export_asset_dataset(
         return t
 
     def _gen():
-        for b in stream_batches(base, ds, asset_upper, ts_col=ts_col, transform=_transform):
+        for b in stream_batches(base, src_ds, asset_upper, ts_col=ts_col, transform=_transform):
             yield b
 
     healed_note = ""
@@ -1644,6 +1788,296 @@ def _stream_export_asset_dataset(
     if healed_note:
         print(f"[export:stream] {asset_upper} {ds}: {rows} rows{healed_note}")
     return rows
+
+
+# 2026-09-11 OOM: pre-flight memory gate (module level for testability).
+def _avail_mb() -> int:
+    try:
+        with open("/proc/meminfo") as _f:
+            for _line in _f:
+                if _line.startswith("MemAvailable:"):
+                    return int(_line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 9999
+
+
+def _commit_staging_file(
+    out_path: Path,
+    tmp_path: Optional[Path],
+    rows: Optional[int],
+    *,
+    ds: str,
+    rolling_window: bool,
+    l2_levels: int,
+    base: Path,
+    out: Path,
+) -> int:
+    """Guard + publish for one staging file. Shared by inline and worker builds.
+
+    Semantics (unchanged from the inline branches this replaces):
+    - cumulative mode: never replace non-empty prior with fewer rows.
+    - rows>0: publish tmp. 0 rows: keep prior if any; snapshots fail closed
+      (no file); other datasets get a schema-empty file.
+    Returns the row count recorded in stats.
+    """
+    rel_key = str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)
+    prior_rows = None
+    prior_exists = out_path.exists()
+    if prior_exists:
+        try:
+            prior_rows = pq.read_metadata(str(out_path)).num_rows
+        except Exception:
+            prior_rows = None
+    if not rolling_window and prior_rows is not None and prior_rows > 0 and (rows is None or rows < prior_rows):
+        try:
+            if tmp_path is not None and Path(tmp_path).exists():
+                Path(tmp_path).unlink()
+        except Exception:
+            pass
+        return prior_rows
+    if rows is not None and rows > 0:
+        if tmp_path is None or not Path(tmp_path).exists():
+            return prior_rows if prior_rows is not None else 0
+        _os_replace_safe(Path(tmp_path), out_path)
+        return rows
+    try:
+        if tmp_path is not None and Path(tmp_path).exists():
+            Path(tmp_path).unlink()
+    except Exception:
+        pass
+    if prior_exists and prior_rows is not None and prior_rows > 0:
+        return prior_rows
+    if ds == "book_snapshots_500ms":
+        return 0  # fail closed: never publish a missing snapshots file
+    try:
+        _schema_for_empty = _get_schema(ds, l2_levels)
+        if _schema_for_empty is not None:
+            _tmp2 = out_path.with_suffix(".parquet.tmp")
+            pq.write_table(
+                pa.table({f.name: [] for f in _schema_for_empty}, schema=_schema_for_empty),
+                str(_tmp2), compression="zstd")
+            _os_replace_safe(_tmp2, out_path)
+    except Exception:
+        pass
+    return 0
+
+
+# 2026-09-10 OOM: datasets whose build transient exceeds safe in-process RAM
+# run in a short-lived worker process (OS reclaims 100% on exit). Arrow
+# arenas otherwise retain GBs across sequential per-dataset builds in one
+# process until the kernel kills the box mid-upload.
+SUBPROCESS_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
+
+
+def _build_worker_main(payload_path: str, result_path: str) -> None:
+    """Subprocess entry: build tmp staging files for a few datasets.
+
+    Payload JSON: {base, out, datasets, assets, timeframe_label, l2_levels,
+    include_binance, rolling_window}. Writes result JSON {rel_key: {"tmp":
+    tmp_path, "rows": n}}. Tmp files are left on disk; the parent guards +
+    publishes them. NEVER raises (reports {"error": ...} instead).
+    """
+    import json as _js
+
+    # 2026-09-11 OOM: worker-side RSS cap. A runaway build (giant file,
+    # enrichment spiral) must abort ITSELF gracefully (fail-closed upstream)
+    # instead of growing until the kernel kills a random process.
+    import threading as _th
+
+    _stop_cap = _th.Event()
+
+    def _rss_cap_watch(_limit_mb: int = 700) -> None:
+        while not _stop_cap.wait(2):
+            try:
+                with open("/proc/self/status") as _f:
+                    for _line in _f:
+                        if _line.startswith("VmRSS:"):
+                            if int(_line.split()[1]) // 1024 > _limit_mb:
+                                try:
+                                    with open(result_path, "w") as _rf:
+                                        _js.dump({"error": "rss-cap-abort"}, _rf)
+                                except Exception:
+                                    pass
+                                import os as _os_k
+
+                                _os_k._exit(3)
+                            break
+            except Exception:
+                return
+
+    _cap_thread = _th.Thread(target=_rss_cap_watch, daemon=True)
+    _cap_thread.start()
+
+    # 2026-09-10 OOM: die with the parent. A SIGKilled parent (kernel OOM
+    # mid-export) otherwise orphans this worker, which keeps building and
+    # OOMs the resurrected collector in turn — a death cascade.
+    try:
+        import ctypes as _ct
+        import os as _os_p
+
+        _libc = _ct.CDLL("libc.so.6", use_errno=True)
+        _libc.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG = 1, SIGKILL = 9
+    except Exception:
+        pass
+
+    try:
+        with open(payload_path) as _f:
+            _p0 = _js.load(_f)
+        # close the fork/spawn race: if the invoker is already gone, exit now
+        try:
+            import os as _os_p2
+
+            _want_ppid = int((_p0.get("_ppid") or 0))
+            if _want_ppid and _os_p2.getppid() != _want_ppid:
+                return
+        except Exception:
+            pass
+        with open(payload_path) as _f:
+            _p = _js.load(_f)
+        base = Path(_p["base"])
+        out = Path(_p["out"])
+        _res: dict = {}
+        _mid_map: Dict[str, str] = {}
+        _excluded_cids: set = set()
+        _ds_list = _p.get("datasets") or []
+        print(f"[export:worker] start ds={_ds_list} assets={_p.get('assets')}", flush=True)
+        if any(d in ("book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades") for d in _ds_list):
+            try:
+                _mid_map = _load_market_id_map(base)
+            except Exception:
+                _mid_map = {}
+        if any(d == "book_snapshots_clean" for d in _ds_list):
+            # disputed exclusion for clean staging (tiny lookup, loaded once)
+            try:
+                from .markets_log import MarketsLog as _ML
+
+                for _mr in _ML(base).load_latest():
+                    if _mr.get("resolution_outcome") == "disputed" and _mr.get("condition_id"):
+                        _excluded_cids.add(str(_mr["condition_id"]))
+            except Exception:
+                try:
+                    _latest = base / "markets_latest" / "markets_latest.parquet"
+                    if _latest.exists():
+                        for _r in read_table(_latest).to_pylist():
+                            if _r.get("resolution_outcome") == "disputed" and _r.get("condition_id"):
+                                _excluded_cids.add(str(_r["condition_id"]))
+                except Exception:
+                    pass
+        for _ds in _ds_list:
+            for _a in (_p.get("assets") or []):
+                _au = str(_a).upper()
+                _out_path = out / f"{_au}_{_ds}.parquet"
+                _rel = str(_out_path.relative_to(base) if _out_path.is_relative_to(base) else _out_path)
+                _tmp = _out_path.with_suffix(".parquet.tmp")
+                try:
+                    if _ds in STREAM_WHALE_DATASETS:
+                        _src = "book_snapshots_500ms" if _ds == "book_snapshots_clean" else None
+                        _n = _stream_export_asset_dataset(
+                            base, _ds, _au, _tmp, _p.get("timeframe_label"),
+                            int(_p.get("l2_levels") or 10), _mid_map,
+                            live_only=(_ds == "book_snapshots_clean"),
+                            excluded_cids=_excluded_cids,
+                            source_dataset=_src)
+                    elif _ds == "chainlink_events":
+                        # 2026-09-11 OOM: full-hive concat isolated here too.
+                        _t = _read_dataset_per_asset(
+                            base, _ds, _au,
+                            include_binance=bool(_p.get("include_binance", False)),
+                            timeframe_label=_p.get("timeframe_label"))
+                        _n = _t.num_rows if _t is not None else 0
+                        if _t is not None and _t.num_rows > 0:
+                            pq.write_table(_t, str(_tmp), compression="zstd")
+                        del _t
+                        import gc as _gc_w
+                        _gc_w.collect()
+                    elif _ds == "trades":
+                        _t = _read_dataset_per_asset(
+                            base, _ds, _au,
+                            include_binance=bool(_p.get("include_binance", False)),
+                            timeframe_label=_p.get("timeframe_label"))
+                        _n = _t.num_rows if _t is not None else 0
+                        if _t is not None and _t.num_rows > 0:
+                            pq.write_table(_t, str(_tmp), compression="zstd")
+                        del _t
+                        import gc as _gc_w
+                        _gc_w.collect()
+                    else:
+                        _res[_rel] = {"tmp": None, "rows": None, "skip": True}
+                        continue
+                    _res[_rel] = {"tmp": str(_tmp) if _tmp.exists() else None, "rows": _n}
+                except Exception as _e:
+                    try:
+                        if _tmp.exists():
+                            _tmp.unlink()
+                    except Exception:
+                        pass
+                    _res[_rel] = {"tmp": None, "rows": None, "error": repr(_e)[:300]}
+        with open(result_path, "w") as _f:
+            _js.dump(_res, _f)
+    except Exception as _e:
+        try:
+            with open(result_path, "w") as _f:
+                _js.dump({"error": repr(_e)[:500]}, _f)
+        except Exception:
+            pass
+
+
+def _build_in_subprocess(
+    base: Path,
+    out: Path,
+    datasets: List[str],
+    assets: List[str],
+    timeframe_label: Optional[str],
+    l2_levels: int,
+    include_binance: bool,
+    rolling_window: bool,
+    timeout_s: int = 900,
+) -> Optional[Dict[str, dict]]:
+    """Run the per-(dataset,asset) tmp builds in a worker process."""
+    import json as _js
+    import subprocess as _sp
+    import tempfile as _tf
+
+    payload = {
+        "base": str(base), "out": str(out), "datasets": datasets, "assets": assets,
+        "timeframe_label": timeframe_label, "l2_levels": l2_levels,
+        "include_binance": include_binance, "rolling_window": rolling_window,
+        "_ppid": os.getpid(),
+    }
+    try:
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as _pf:
+            _js.dump(payload, _pf)
+            _ppath = _pf.name
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as _rf:
+            _rpath = _rf.name
+        _code = (
+            "import sys; sys.path.insert(0, 'src'); "
+            "from polymarket_collector.storage.export import _build_worker_main; "
+            "import sys as _s; _build_worker_main(_s.argv[1], _s.argv[2])"
+        )
+        _r = _sp.run(
+            [sys.executable, "-c", _code, _ppath, _rpath],
+            cwd=str(Path(__file__).resolve().parents[3]),
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        try:
+            with open(_rpath) as _f:
+                res = _js.load(_f)
+        except Exception:
+            print(f"[export:worker] no result (rc={_r.returncode} err tail:\n{(_r.stderr or '')[-2000:]}")
+            return None
+        return res
+    except Exception as e:
+        print(f"[export:worker] spawn failed, caller falls back in-process: {e}")
+        return None
+    finally:
+        for _p in (locals().get("_ppath"), locals().get("_rpath")):
+            try:
+                if _p and Path(_p).exists():
+                    Path(_p).unlink()
+            except Exception:
+                pass
 
 
 def export_per_asset_single_file(
@@ -1690,7 +2124,138 @@ def export_per_asset_single_file(
     per_asset_datasets = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
 
     stats: dict = {}
+    # 2026-09-11 OOM: pre-flight memory gate helper (module-level _avail_mb).
+    # Spawning workers into a starved box grinds them one by one (each death
+    # frees RAM for the next victim). Below the floor, skip new builds.
+    # 2026-09-11 OOM: checkpoint-resume — incarnations live ~25 min, full
+    # cycles take ~40. Completed (lane, dataset) files are recorded with
+    # timestamps in _progress.json; fresh ones (<45 min) are skipped so the
+    # next incarnation continues past the death point instead of redoing lanes.
+    _prog_path = base / "kaggle_staging" / "_progress.json"
+    _progress: dict = {}
+    try:
+        if _prog_path.exists():
+            import json as _js_p
+
+            _progress = _js_p.loads(_prog_path.read_text()) or {}
+    except Exception:
+        _progress = {}
+
+    def _mark_done(_lane: str, _ds: str) -> None:
+        try:
+            _progress[f"{_lane}/{_ds}"] = int(__import__("time").time())
+            _prog_path.parent.mkdir(parents=True, exist_ok=True)
+            import json as _js_p2
+
+            _prog_path.write_text(_js_p2.dumps(_progress))
+        except Exception:
+            pass
+
+    def _is_fresh(_lane: str, _ds: str, _max_age_s: int = 2700) -> bool:
+        try:
+            _ts = int(_progress.get(f"{_lane}/{_ds}") or 0)
+            return (int(__import__("time").time()) - _ts) < _max_age_s
+        except Exception:
+            return False
+
     for ds in datasets:
+        # 2026-09-10 OOM: heavy datasets build in short-lived workers, ONE
+        # (dataset, asset) per worker (OS reclaims 100% on exit — Arrow
+        # arenas otherwise stack GBs across sequential builds until the
+        # kernel kills the box). Parent only guards + publishes tmp files
+        # (footer counts, no reads). A 7-asset lane costs ~28 small spawns.
+        if ds in SUBPROCESS_DATASETS and ds in PER_ASSET_DATASETS:
+            for _asset in assets:
+                _au_one = str(_asset).upper()
+                _out_path = out / f"{_au_one}_{ds}.parquet"
+                _rel = str(_out_path.relative_to(base) if _out_path.is_relative_to(base) else _out_path)
+                if _avail_mb() < 900:
+                    print(f"[export] SKIP {ds}/{_au_one}: only {_avail_mb()}MB available (floor 900) — keeping prior staging")
+                    try:
+                        stats[_rel] = pq.read_metadata(str(_out_path)).num_rows if _out_path.exists() else 0
+                    except Exception:
+                        stats[_rel] = 0
+                    continue
+                # 2026-09-11 OOM: resume-fast — passes die mid-cycle (~25 min
+                # incarnations vs ~40 min lanes), so skip files already fresh
+                # this run: staging newer than every source file needs no
+                # rebuild. Next incarnation resumes where death left off
+                # instead of redoing all lanes from scratch.
+                try:
+                    if _out_path.exists():
+                        _om = _out_path.stat().st_mtime
+                        _src_root = base / ds
+                        _pats = {p for p in _src_root.glob(f"date=*/asset={_au_one}/*.parquet")}
+                        _pats.update(p for p in _src_root.glob(f"date=*/asset={_au_one.lower()}/*.parquet"))
+                        if _pats and all(p.stat().st_mtime <= _om for p in _pats):
+                            try:
+                                stats[_rel] = pq.read_metadata(str(_out_path)).num_rows
+                            except Exception:
+                                stats[_rel] = 0
+                            continue
+                except Exception:
+                    pass
+                # checkpoint-resume: fresh this cycle window (<45 min) → skip
+                # rebuild entirely (staging misses only the last minutes of
+                # ticks, which the next cycle picks up).
+                _lane_key = str(timeframe_label or "5m")
+                try:
+                    if _is_fresh(_lane_key, f"{ds}/{_au_one}") and _out_path.exists():
+                        try:
+                            stats[_rel] = pq.read_metadata(str(_out_path)).num_rows
+                        except Exception:
+                            stats[_rel] = 0
+                        continue
+                except Exception:
+                    pass
+                _built_one = _build_in_subprocess(
+                    base, out, [ds], [_asset], timeframe_label, l2_levels,
+                    include_binance, rolling_window)
+                _out_path = out / f"{_au_one}_{ds}.parquet"
+                _rel = str(_out_path.relative_to(base) if _out_path.is_relative_to(base) else _out_path)
+                _failed = _built_one is None or (isinstance(_built_one, dict) and _built_one.get("error"))
+                if _failed:
+                    _why = ""
+                    try:
+                        if isinstance(_built_one, dict):
+                            _why = f" reason={str(_built_one.get('error'))[:200]}"
+                    except Exception:
+                        pass
+                    print(f"[export] WARN {ds}/{_au_one} worker failed{_why} — keeping prior staging (fail closed)")
+                    try:
+                        _pr = pq.read_metadata(str(_out_path)).num_rows if _out_path.exists() else None
+                    except Exception:
+                        _pr = None
+                    stats[_rel] = _pr if _pr is not None else 0
+                    continue
+                _info = _built_one.get(_rel) or {}
+                if _info.get("skip"):
+                    continue
+                _tmp = Path(_info["tmp"]) if _info.get("tmp") else None
+                _rows = _info.get("rows")
+                if _info.get("error") or _rows is None:
+                    try:
+                        if _tmp is not None and _tmp.exists():
+                            _tmp.unlink()
+                    except Exception:
+                        pass
+                    try:
+                        _pr = pq.read_metadata(str(_out_path)).num_rows if _out_path.exists() else None
+                    except Exception:
+                        _pr = None
+                    stats[_rel] = _pr if _pr is not None else 0
+                    continue
+                stats[_rel] = _commit_staging_file(
+                    _out_path, _tmp, int(_rows), ds=ds,
+                    rolling_window=rolling_window, l2_levels=l2_levels,
+                    base=base, out=out)
+                try:
+                    _mark_done(_lane_key, f"{ds}/{_au_one}")
+                except Exception:
+                    pass
+            import gc as _gc_ds
+            _gc_ds.collect()
+            continue
         # Derived analyst-facing summary — must run AFTER the per-asset trades
         # staging files are (re)written so it sees the api- reconciled fills.
         if ds == "markets_summary":
@@ -1700,7 +2265,7 @@ def export_per_asset_single_file(
             prior_rows_s = None
             if out_path.exists():
                 try:
-                    prior_rows_s = read_table(out_path).num_rows
+                    prior_rows_s = pq.read_metadata(str(out_path)).num_rows
                 except Exception:
                     prior_rows_s = None
             new_rows_s = table.num_rows if table is not None else 0
@@ -1738,11 +2303,7 @@ def export_per_asset_single_file(
                 prior_exists = out_path.exists()
                 if prior_exists:
                     try:
-                        if ds in STREAM_WHALE_DATASETS:
-                            prior_rows = pq.read_metadata(str(out_path)).num_rows
-                        else:
-                            _prior = read_table(out_path)
-                            prior_rows = _prior.num_rows
+                        prior_rows = pq.read_metadata(str(out_path)).num_rows
                     except Exception:
                         prior_rows = None
                 if ds in STREAM_WHALE_DATASETS:
@@ -1883,8 +2444,7 @@ def export_per_asset_single_file(
             prior_rows_g = None
             if out_path.exists():
                 try:
-                    _pg = read_table(out_path)
-                    prior_rows_g = _pg.num_rows
+                    prior_rows_g = pq.read_metadata(str(out_path)).num_rows
                 except Exception:
                     prior_rows_g = None
             new_rows_g = table.num_rows if (table is not None and hasattr(table, "num_rows")) else 0
@@ -2614,7 +3174,18 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
       empty-file overwrite (1a). DISABLED in rolling_window mode — after a retention
       prune the staging legitimately shrinks; history lives in old Kaggle versions.
     Returns True if all expected files exist, False otherwise.
+
+    2026-09-10 OOM: footer metadata ONLY (pq.read_metadata = row count with
+    zero data read). The old code read_table()'d all 32 staging files
+    (~500MB parquet, ~30x Arrow expansion) in the parent right before
+    upload — a 2GB+ bomb that SIGKilled the box at the finish line.
     """
+    def _rows(_p: Path) -> Optional[int]:
+        try:
+            return pq.read_metadata(str(_p)).num_rows
+        except Exception:
+            return None
+
     # Only snapshots are required >0; other per-asset datasets allow 0 (null vs zero fix 4b)
     required_gt_zero = {"book_snapshots_500ms"}
     optional_per_asset = {"book_events", "trades", "chainlink_events"}
@@ -2630,27 +3201,20 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
             fpath = staging / f"{au}_{ds}.parquet"
             if not fpath.exists():
                 return False
-            try:
-                t = read_table(fpath)
-                if t.num_rows == 0:
-                    return False
-            except Exception:
+            _n = _rows(fpath)
+            if _n is None or _n == 0:
                 return False
         for ds in optional_per_asset:
             fpath = staging / f"{au}_{ds}.parquet"
             if not fpath.exists():
                 return False
-            try:
-                read_table(fpath)
-            except Exception:
+            if _rows(fpath) is None:
                 return False
     for ds, fname in global_file_map.items():
         fpath = staging / fname
         if not fpath.exists():
             return False
-        try:
-            read_table(fpath)
-        except Exception:
+        if _rows(fpath) is None:
             return False
     # Monotonic check vs prior staging (download-merge fallback when no local hive yet)
     if not check_monotonic:
@@ -2971,14 +3535,12 @@ def _export_and_upload_all_kaggle_impl(
     # standalone compact cron off-peak instead (polymarket-compact, 03:00).
     # (Kept as a no-op block so the step numbering below stays stable.)
 
-    # Step 0b: Build clean view (§9B book_state='live') so completeness metrics and backtest path are valid
-    try:
-        from polymarket_collector.storage.clean_view import build_clean_view as _build_clean
-        n_clean = _build_clean(data_dir)
-        if n_clean is not None:
-            print(f"clean_view built: {n_clean} rows (live only, disputed excluded)")
-    except Exception as e:
-        print(f"clean_view err {e}")
+    # Step 0b: clean view — SKIPPED in the export path (2026-09-10 OOM).
+    # Clean staging files are built straight from the snapshots hive by the
+    # per-asset loop below, and the summary reads those staging files. The
+    # clean HIVE is maintained out-of-band (build_clean_view stays for manual
+    # use + test mode, which calls it explicitly). Rebuilding 2.85M rows here
+    # SIGKilled the box on every lane export.
 
     # Gate: only upload full closed markets
     try:

@@ -137,11 +137,14 @@ module.exports = {
     // trades-hive reads) still spiked to 1.9GB and died. Wallets keep healing
     // via export-time first pass; on-chain resumes after the export diet.
     // (Also: single exporter per earlier note — no --reupload here.)
+    // 2026-09-11 OOM: --skip-enrich — the :00 second-pass full trades-hive
+    // read co-spiked with the collector export (death 00:01). Resolutions
+    // (cheap CLOB GETs) continue every 15 min; enrichment rides the export.
     {
       name: 'polymarket-resolution-backfill',
       cwd,
       script: python,
-      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml --skip-onchain',
+      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml --skip-onchain --skip-enrich',
       interpreter: 'none',
       exec_mode: 'fork',
       autorestart: false,

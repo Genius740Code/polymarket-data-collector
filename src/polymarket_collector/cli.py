@@ -3,8 +3,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import signal
 import sys
+
+# 2026-09-10 OOM: C++ bad_alloc aborts (pyarrow/pandas) kill silently with no
+# traceback. Dump native+python stacks on fatal signals so the next one
+# names its killer frame instead of vanishing.
+try:
+    faulthandler.enable()
+except Exception:
+    pass
 
 from .config import CollectorConfig
 from .collector import Collector
