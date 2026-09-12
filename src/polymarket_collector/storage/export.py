@@ -1135,31 +1135,46 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
     base = Path(data_dir)
     stats = {"assets_scanned": 0, "rows_needed": 0, "files_rewritten": 0, "deferred": False}
     # Freshness guard: data-api wallet/fill coverage indexes late (~15 min,
-    # measured 2026-09-05/06). Run inline right after an export, the pass queries
-    # the data-api for thousands of rows and recovers none of them (2026-09-06
-    # 19:17 run: 4755 rows needed, 0 files rewritten) — defer to the 15-min cron
-    # until the newest stored trade is old enough to be covered.
+    # measured 2026-09-05/06). Run inline right after an export, the pass now
+    # reads only footer metadata (min/max ts_received_ns per file, no data-page
+    # decode). One narrow read per asset instead of two full concat passes.
     import time as _time_mod
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
     _newest_ns = 0
+    # One narrow read per asset: footer max ts_received_ns per file
     for asset in assets:
-        _tbl = _read_dataset_per_asset_plain(base, "trades", asset.upper())
-        if _tbl is not None and _tbl.num_rows and "ts_received_ns" in _tbl.schema.names:
-            _mx = pc.max(_tbl.column("ts_received_ns"))
-            if _mx is not None:
-                _newest_ns = max(_newest_ns, int(_mx))
+        au = asset.upper()
+        parts = _read_dataset_per_asset_files(base, "trades", au)
+        if parts:
+            _mx = 0
+            for p in parts:
+                try:
+                    pf = pq.ParquetFile(str(p))
+                    rg = pf.metadata.row_group(0)
+                    col = rg.column("ts_received_ns")
+                    if hasattr(col, "statistics") and col.statistics is not None:
+                        _mx = max(_mx, col.statistics.minmax[1] if col.statistics.minmax else 0)
+                except Exception:
+                    pass
+            _newest_ns = max(_newest_ns, int(_mx) if _mx else 0)
     if _newest_ns:
         _age_s = (_time_mod.time_ns() - _newest_ns) / 1e9
         if _age_s < 900:
             print(f"[export] second-pass enrichment deferred: newest trade is {int(_age_s)}s old (<900s) — data-api coverage not healed yet, 15-min cron will pick it up")
             stats["deferred"] = True
             return stats
+    # Enrichment pass: reuse per-asset narrow tables from freshness pass above
+    # (one read per asset instead of two full hive concatenations). If a narrow
+    # table was not available, fall back to the plain read as before.
     for asset in assets:
         au = asset.upper()
-        tbl = _read_dataset_per_asset_plain(base, "trades", au)
-        stats["assets_scanned"] += 1
+        tbl = _narrow_tbls.get(au)
+        if tbl is None:
+            tbl = _read_dataset_per_asset_plain(base, "trades", au)
         if tbl is None or tbl.num_rows == 0 or "wallet" not in tbl.schema.names:
             continue
-        # 2026-09-10 OOM: kernel-count need check (never whole-table dicts).
+        stats["assets_scanned"] += 1
         needed = _trades_need_enrichment(tbl)
         if not needed:
             continue

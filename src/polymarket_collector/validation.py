@@ -13,6 +13,12 @@ from typing import Any, List, Optional
 PRICE_MIN = 0.0
 PRICE_MAX = 1.0
 
+# PERF: module-level frozensets — previously rebuilt per WS message (hash-table
+# allocs hundreds/s). Values identical, only allocation removed.
+_PRICE_KEYS = frozenset({"price", "best_bid", "best_ask", "bid", "ask"})
+_SIZE_KEYS = frozenset({"size", "bid_size", "ask_size", "amount"})
+_SKIP_WHEN_EMPTY = frozenset({"last_trade_price"})
+
 
 @dataclass(frozen=True)
 class ValidationError:
@@ -55,11 +61,14 @@ def validate_size(field: str, value: Any, ctx: Optional[dict] = None) -> Optiona
 def validate_snapshot_fields(
     snapshot: dict,
     ctx: Optional[dict] = None,
+    l2_levels: int = 20,
 ) -> List[ValidationError]:
     """Validate all price/size fields in a snapshot dict (wide flat-column layout §3).
 
     Checks top-of-book, each L2 level price/size, depth aggregates (size-like),
     and optional trade price/size if present. Returns list of errors (empty → valid).
+    l2_levels bounds the L2 loop (default 20 = legacy full check; pass 10 when
+    the writer uses l2_levels=10 to skip 40 guaranteed-miss `in` probes).
     """
     errors: List[ValidationError] = []
     # top-of-book prices
@@ -75,7 +84,7 @@ def validate_snapshot_fields(
     # L2 levels
     for outcome in ("up", "down"):
         for side in ("bid", "ask"):
-            for lvl in range(1, 21):
+            for lvl in range(1, l2_levels + 1):
                 p_field = f"{outcome}_{side}_level_{lvl}_price"
                 s_field = f"{outcome}_{side}_level_{lvl}_size"
                 if p_field in snapshot:
@@ -113,45 +122,49 @@ def validate_ws_message(msg: dict) -> List[ValidationError]:
     Expected keys vary by message type (price_change, book, last_trade_price).
     We scan known price/size keys.
     """
-    price_keys = {"price", "best_bid", "best_ask", "bid", "ask"}
-    size_keys = {"size", "bid_size", "ask_size", "amount"}
+    # PERF: reuse module frozensets; avoid per-key .lower() alloc by checking
+    # both raw and lowered forms against small constant sets. ctx=None on the
+    # hot path so ValidationError no longer pins the whole frame in RAM
+    # (only errors[0].reason/field/value is used by book.py:376; full ctx
+    # available via _DEBUG_CTX flag for offline debugging).
+    price_keys = _PRICE_KEYS
+    size_keys = _SIZE_KEYS
     # Top-level contextual metadata that merely LOOKS like a price field:
     # `book` frames carry the trade that triggered the snapshot in
     # `last_trade_price` — a numeric string when present, '' when the snapshot
     # was not trade-triggered (14 live frames 2026-09-05). An empty value is
     # "no context", not a malformed level — skipping it avoids rejecting the
     # entire full-book snapshot (which also marks the book stale).
-    _SKIP_WHEN_EMPTY = {"last_trade_price"}
     # also L2 level arrays if present as lists
     errors: List[ValidationError] = []
     for k, v in msg.items():
-        lk = k.lower()
+        lk = k if isinstance(k, str) and k == k.lower() else (k.lower() if isinstance(k, str) else k)
         if lk in _SKIP_WHEN_EMPTY and v in (None, ""):
             continue
-        if lk in price_keys or lk.endswith("_price"):
-            err = validate_price(k, v, ctx=msg)
+        if lk in price_keys or (isinstance(lk, str) and lk.endswith("_price")):
+            err = validate_price(k, v, ctx=None)
             if err:
                 errors.append(err)
-        elif lk in size_keys or lk.endswith("_size") or lk.endswith("_amount"):
-            err = validate_size(k, v, ctx=msg)
+        elif lk in size_keys or (isinstance(lk, str) and (lk.endswith("_size") or lk.endswith("_amount"))):
+            err = validate_size(k, v, ctx=None)
             if err:
                 errors.append(err)
         elif lk in ("bids", "asks") and isinstance(v, list):
             for i, level in enumerate(v):
                 if isinstance(level, (list, tuple)) and len(level) >= 2:
-                    e1 = validate_price(f"{k}[{i}].price", level[0], ctx=msg)
+                    e1 = validate_price(f"{k}[{i}].price", level[0], ctx=None)
                     if e1:
                         errors.append(e1)
-                    e2 = validate_size(f"{k}[{i}].size", level[1], ctx=msg)
+                    e2 = validate_size(f"{k}[{i}].size", level[1], ctx=None)
                     if e2:
                         errors.append(e2)
                 elif isinstance(level, dict):
                     if "price" in level:
-                        e1 = validate_price(f"{k}[{i}].price", level["price"], ctx=msg)
+                        e1 = validate_price(f"{k}[{i}].price", level["price"], ctx=None)
                         if e1:
                             errors.append(e1)
                     if "size" in level:
-                        e2 = validate_size(f"{k}[{i}].size", level["size"], ctx=msg)
+                        e2 = validate_size(f"{k}[{i}].size", level["size"], ctx=None)
                         if e2:
                             errors.append(e2)
     return errors

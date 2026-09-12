@@ -43,22 +43,54 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     parts = sorted(parts)
     if len(parts) <= 1:
         return 0
-    tables = []
-    for p in parts:
-        try:
-            tables.append(read_table(p))
-        except Exception:
-            continue
-    if not tables:
-        return 0
-    combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
+    # PERF: incremental ParquetWriter append (was: hold all tables + concat
+    # copy in RAM). Same rows, row_group_size=20000 preserved; del per table.
     tmp_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet{temp_suffix}"
     final_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet"
     # 2026-09-11: small row groups — one giant single-row-group file forces
     # the streaming export to materialize the whole row group at once
     # (PyArrow reads row-group-at-a-time; iter_batches slices do not release
     # the parent), tripping the worker RSS cap and killing uploads.
-    pq.write_table(combined, str(tmp_path), compression="zstd", row_group_size=20000)
+    total_rows = 0
+    _writer = None
+    try:
+        for p in parts:
+            try:
+                t = read_table(p)
+            except Exception:
+                continue
+            if t is None or t.num_rows == 0:
+                continue
+            try:
+                if _writer is None:
+                    _writer = pq.ParquetWriter(str(tmp_path), t.schema, compression="zstd", row_group_size=20000)
+                _writer.write_table(t)
+                total_rows += t.num_rows
+            finally:
+                try:
+                    del t
+                except Exception:
+                    pass
+        if _writer is not None:
+            try:
+                _writer.close()
+            except Exception:
+                pass
+            _writer = None
+        else:
+            return 0
+    except Exception:
+        try:
+            if _writer is not None:
+                _writer.close()
+        except Exception:
+            pass
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return 0
     _os_replace_safe(tmp_path, final_path)
     # remove old parts only after successful new write
     for p in parts:
@@ -66,7 +98,7 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
             p.unlink()
         except Exception:
             pass
-    return combined.num_rows
+    return total_rows
 
 
 def compact_all(data_dir: str | Path, datasets: list[str] | None = None, temp_suffix: str = ".tmp") -> dict:
@@ -87,10 +119,22 @@ def compact_all(data_dir: str | Path, datasets: list[str] | None = None, temp_su
         ds_path = base / ds_name
         if not ds_path.exists():
             continue
-        # find leaf partition dirs (those containing parquet files)
-        for leaf in ds_path.rglob("*.parquet"):
-            leaf_dir = leaf.parent
-            key = str(leaf_dir.relative_to(base))
+        # PERF: collect distinct leaf dirs in one walk (was: per-FILE
+        # iteration + relative_to per file + re-listdir per leaf).
+        leaf_dirs: set = set()
+        try:
+            for leaf in ds_path.rglob("*.parquet"):
+                try:
+                    leaf_dirs.add(leaf.parent)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        for leaf_dir in sorted(leaf_dirs, key=str):
+            try:
+                key = str(leaf_dir.relative_to(base))
+            except Exception:
+                continue
             if key in stats:
                 continue
             rows = compact_dataset(leaf_dir, temp_suffix=temp_suffix)

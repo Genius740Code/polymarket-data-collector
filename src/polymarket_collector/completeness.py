@@ -83,14 +83,25 @@ def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[Dail
     for asset in assets:
         dc = DailyCompleteness(date=date_str, asset=asset, expected_snapshots=expected_per_day)
         # count snapshots
+        # PERF: footer-only row counts — previously decompressed + decoded every
+        # 120-col snapshot row just to learn COUNT(*). pq.read_metadata num_rows
+        # is exact; nulls/dedup untouched (no rows read).
         snap_dir = base / "book_snapshots_500ms" / f"date={date_str}" / f"asset={asset}"
         clean_dir = base / "book_snapshots_clean" / f"date={date_str}" / f"asset={asset}"
         for p in [snap_dir, clean_dir]:
             if p.exists():
-                parts = list(p.glob("*.parquet"))
-                tbl = read_files(parts, label=f"completeness {p.name}")
-                cnt = tbl.num_rows if tbl is not None else 0
-                if parts and tbl is None:
+                try:
+                    parts = [x for x in p.glob("*.parquet") if not x.name.endswith(".tmp")]
+                except Exception:
+                    parts = []
+                cnt = 0
+                _unreadable = 0
+                for _fp in parts:
+                    try:
+                        cnt += pq.read_metadata(str(_fp)).num_rows
+                    except Exception:
+                        _unreadable += 1
+                if parts and cnt == 0 and _unreadable == len(parts):
                     print(f"[completeness] ERROR all {len(parts)} files unreadable for {p} — counts would be silently wrong")
                 if "clean" in str(p):
                     dc.actual_clean_snapshots = cnt
@@ -99,37 +110,84 @@ def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[Dail
         dc.missing_intervals = max(0, dc.expected_snapshots - dc.actual_clean_snapshots)
 
         # aggregate collector_events for this date/asset
-        ce_root = base / "collector_events" / f"date={date_str}"
-        if ce_root.exists():
-            ce_parts = list(ce_root.glob("*.parquet"))
-            ce_tbl = read_files(ce_parts, label="completeness collector_events")
-            if ce_tbl is not None:
-                for row in ce_tbl.to_pylist():
-                    if row.get("asset") and row["asset"].upper() != asset.upper():
-                        continue
-                    et = row.get("event_type")
-                    if et == "sequence_gap":
-                        dc.sequence_gaps += 1
-                    elif et == "duplicate_event":
-                        dc.duplicate_events += 1
-                    elif et == "write_failed":
-                        dc.write_failures += 1
-                    elif et == "rollover_miss":
-                        dc.rollover_misses += 1
-                    elif et == "coverage_gap":
-                        dc.coverage_gaps += 1
-                    elif et == "resolution_stuck":
-                        dc.resolution_stuck += 1
-                    elif et == "book_anomaly":
-                        dc.sanity_violations += 1
+        # PERF: hoisted — single CE/RE read per date (was N_assets × full
+        # re-read + full to_pylist). Per-asset filtering below preserves the
+        # exact predicate incl. NULL-asset rows.
+        if asset == assets[0]:
+            ce_root = base / "collector_events" / f"date={date_str}"
+            _ce_rows: list = []
+            if ce_root.exists():
+                try:
+                    ce_parts = [x for x in ce_root.glob("*.parquet") if not x.name.endswith(".tmp")]
+                except Exception:
+                    ce_parts = []
+                if ce_parts:
+                    try:
+                        ce_tbl = read_files(ce_parts, label="completeness collector_events")
+                    except Exception:
+                        ce_tbl = None
+                    if ce_tbl is not None:
+                        try:
+                            # project to needed cols only when present
+                            _names = set(ce_tbl.schema.names)
+                            _proj = [c for c in ("asset", "event_type") if c in _names]
+                            _ce_src = ce_tbl.select(_proj) if _proj else ce_tbl
+                            _ce_rows = _ce_src.to_pylist()
+                        except Exception:
+                            try:
+                                _ce_rows = ce_tbl.to_pylist()
+                            except Exception:
+                                _ce_rows = []
+            re_root = base / "resync_episodes" / f"date={date_str}"
+            _re_rows: list = []
+            if re_root.exists():
+                try:
+                    re_parts = [x for x in re_root.glob("*.parquet") if not x.name.endswith(".tmp")]
+                except Exception:
+                    re_parts = []
+                if re_parts:
+                    try:
+                        re_tbl = read_files(re_parts, label="completeness resync_episodes")
+                    except Exception:
+                        re_tbl = None
+                    if re_tbl is not None:
+                        try:
+                            _names = set(re_tbl.schema.names)
+                            _proj = [c for c in ("asset", "gap_duration_ms") if c in _names]
+                            _re_src = re_tbl.select(_proj) if _proj else re_tbl
+                            _re_rows = _re_src.to_pylist()
+                        except Exception:
+                            try:
+                                _re_rows = re_tbl.to_pylist()
+                            except Exception:
+                                _re_rows = []
+            # cache on function attribute for the remaining assets in this call
+            compute_daily_completeness._ce_rows = _ce_rows  # type: ignore[attr-defined]
+            compute_daily_completeness._re_rows = _re_rows  # type: ignore[attr-defined]
+        else:
+            _ce_rows = getattr(compute_daily_completeness, "_ce_rows", [])  # type: ignore[attr-defined]
+            _re_rows = getattr(compute_daily_completeness, "_re_rows", [])  # type: ignore[attr-defined]
+        for row in _ce_rows:
+            if row.get("asset") and row["asset"].upper() != asset.upper():
+                continue
+            et = row.get("event_type")
+            if et == "sequence_gap":
+                dc.sequence_gaps += 1
+            elif et == "duplicate_event":
+                dc.duplicate_events += 1
+            elif et == "write_failed":
+                dc.write_failures += 1
+            elif et == "rollover_miss":
+                dc.rollover_misses += 1
+            elif et == "coverage_gap":
+                dc.coverage_gaps += 1
+            elif et == "resolution_stuck":
+                dc.resolution_stuck += 1
+            elif et == "book_anomaly":
+                dc.sanity_violations += 1
 
-        # resync episodes
-        re_root = base / "resync_episodes" / f"date={date_str}"
-        if re_root.exists():
-            re_parts = list(re_root.glob("*.parquet"))
-            re_tbl = read_files(re_parts, label="completeness resync_episodes")
-            if re_tbl is not None:
-                for row in re_tbl.to_pylist():
+        # resync episodes (rows hoisted above — single read per date)
+        for row in _re_rows:
                     if row.get("asset", "").upper() == asset.upper():
                         dc.resync_episode_count += 1
                         if row.get("gap_duration_ms"):
