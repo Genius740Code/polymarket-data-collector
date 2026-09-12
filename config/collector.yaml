@@ -38,7 +38,10 @@ kaggle:
   # one dataset per timeframe lane (plan.md §1.1 confirmed slugs)
   rolling_window: true
   # leeway kept locally after a VERIFIED upload before deletion
-  local_retention_hours: 48
+  # 2026-09-09: 48h -> 12h — 28 lanes burn ~500MB/h (every lane ticks 500ms
+  # + clean-view duplicate + 4x staging); 48h retention = ~24GB > 14GB free.
+  # 12h steady state ~= 6GB. Kaggle versions are rolling windows by design.
+  local_retention_hours: 12
   test_upload_interval_seconds: 600
   upload_interval_seconds: 3600
 l2_levels: 10

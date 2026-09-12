@@ -115,7 +115,7 @@ class BookSnapshot:
     series_id: str
     window_index: int
     condition_id: str
-    market_id: str
+    market_id: Optional[str]
     asset: str
     up_token_id: str
     down_token_id: str
@@ -191,7 +191,7 @@ class OrderBookState:
         self,
         asset: str,
         condition_id: str,
-        market_id: str,
+        market_id: Optional[str],
         series_id: str,
         window_index: int,
         up_token_id: str,
@@ -202,7 +202,12 @@ class OrderBookState:
     ):
         self.asset = asset
         self.condition_id = condition_id
-        self.market_id = market_id
+        # E1: never store a hex condition_id as market_id — NULL is honest.
+        try:
+            from .rollover import clean_market_id as _clean_mid
+            self.market_id = _clean_mid(market_id)
+        except Exception:
+            self.market_id = market_id
         self.series_id = series_id
         self.window_index = window_index
         self.up_token_id = up_token_id
@@ -218,6 +223,10 @@ class OrderBookState:
         self._last_update_ns: Optional[int] = None
         self._up_book_age_ms: Optional[int] = None
         self._down_book_age_ms: Optional[int] = None
+        # E6: per-outcome last-exchange-update clock — snapshot() derives
+        # book_age_ms as now - last update (was: always 0, never aged).
+        self._up_last_update_ns: Optional[int] = None
+        self._down_last_update_ns: Optional[int] = None
         self.is_rollover_window: bool = False
         self.sequence_numbers: Dict[str, int] = {}  # token_id -> last seq
         self._stale_since_ms: Optional[int] = None
@@ -426,7 +435,7 @@ class OrderBookState:
                     self.pending_events.append({
                         "event_type": "crossed_reverted",
                         "token_id": pc_token, "outcome": pc_outcome,
-                        "price": p, "size": s, "side": side,
+                        "price": p, "size": s, "side": side.lower(),
                         "ts_source": self._resolve_ts_source(msg),
                     })
                 touched.setdefault(pc_outcome, pc_token)
@@ -446,8 +455,13 @@ class OrderBookState:
                 self._enforce_bbo(outcome, ex, msg)
             # update age
             self._last_update_ns = time.time_ns()
-            # For price_change, we don't know which outcome was updated, so reset both ages slightly
-            # Use timestamp from msg if available
+            # E6: stamp per-outcome update clocks for price_change touches.
+            for _toc in touched:
+                if _toc == "up":
+                    self._up_last_update_ns = self._last_update_ns
+                elif _toc == "down":
+                    self._down_last_update_ns = self._last_update_ns
+            # E6: per-outcome update clocks stamped above; snapshot() ages from them.
             self._emit_bbo_events(pre_bbo, touched, msg)
             return True, None
 
@@ -462,8 +476,10 @@ class OrderBookState:
             self._last_update_ns = time.time_ns()
             if outcome == "up":
                 self._up_book_age_ms = 0
+                self._up_last_update_ns = self._last_update_ns
             else:
                 self._down_book_age_ms = 0
+                self._down_last_update_ns = self._last_update_ns
             touched.setdefault(outcome, token_id)
             # A4: capture the full-book hash (hash of the orderbook content)
             self._note_frame_hash(msg, outcome)
@@ -572,9 +588,12 @@ class OrderBookState:
         return None
 
     def _apply_price_change_level(self, side: SideBook, price: float, size: float, is_bid: bool) -> None:
-        # Apply single price_change level update (size 0 = remove)
+        # Apply single price_change level update (size 0 = remove).
+        # E4: price 0 is an empty-side sentinel, never a resting quote — drop it
+        # like a removal so 0.0 never ships as a BBO/L1 price (null-vs-zero).
         price_map = {lvl.price: lvl for lvl in side.levels if lvl.price is not None}
-        if size == 0:
+        if size == 0 or price == 0:
+            # size 0 = remove; price 0 = empty-side sentinel (E4), also removed
             price_map.pop(price, None)
         else:
             price_map[price] = Level(price=price, size=size)
@@ -603,6 +622,8 @@ class OrderBookState:
                     p = float(price); s = float(size)
                 except (TypeError, ValueError):
                     continue
+                if p == 0:
+                    continue  # E4: 0-price is an empty-side sentinel, not a quote
                 if s == 0:
                     removals.add(float(p))
                     continue  # removal — tracked below
@@ -615,6 +636,8 @@ class OrderBookState:
                     pf = float(p); sf = float(s)
                 except (TypeError, ValueError):
                     continue
+                if pf == 0:
+                    continue  # E4: 0-price is an empty-side sentinel, not a quote
                 if sf == 0:
                     try:
                         removals.add(float(pf))
@@ -647,12 +670,16 @@ class OrderBookState:
                             p = float(lvl[0]); s = float(lvl[1])
                         except (TypeError, ValueError):
                             continue
+                        if p == 0:
+                            continue  # E4: 0-price sentinel, not a quote
                         new_levels.append(Level(price=p, size=s))
                     elif isinstance(lvl, dict):
                         try:
                             p = float(lvl["price"]); s = float(lvl["size"])
                         except (TypeError, ValueError, KeyError):
                             continue
+                        if p == 0:
+                            continue  # E4: 0-price sentinel, not a quote
                         new_levels.append(Level(price=p, size=s))
                 new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
                 side.levels = new_levels[: self.l2_levels]
@@ -690,14 +717,24 @@ class OrderBookState:
         ts_utc = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"  # 3ms fraction e.g. .000 or .500
         # align ts_snapshot_ns to bucket for dedup (not time.time_ns jitter)
         now_ns = bucket_ms * 1_000_000
+        # E6: age each side from its last exchange update (None = never updated).
+        if self._up_last_update_ns is not None:
+            self._up_book_age_ms = max(0, (now_ns - self._up_last_update_ns) // 1_000_000)
+        if self._down_last_update_ns is not None:
+            self._down_book_age_ms = max(0, (now_ns - self._down_last_update_ns) // 1_000_000)
         # top-of-book extracts (null-vs-zero: empty → None)
-        up_bid = self.up.bids.best_price()
+        # E4: belt-and-braces — a 0.0 best is an empty-side sentinel (ingest
+        # paths above already drop 0-price levels; this covers legacy RAM).
+        def _nz(v: Optional[float]) -> Optional[float]:
+            return None if v is None or v == 0 else v
+
+        up_bid = _nz(self.up.bids.best_price())
         up_bid_size = self.up.bids.best_size()
-        up_ask = self.up.asks.best_price()
+        up_ask = _nz(self.up.asks.best_price())
         up_ask_size = self.up.asks.best_size()
-        down_bid = self.down.bids.best_price()
+        down_bid = _nz(self.down.bids.best_price())
         down_bid_size = self.down.bids.best_size()
-        down_ask = self.down.asks.best_price()
+        down_ask = _nz(self.down.asks.best_price())
         down_ask_size = self.down.asks.best_size()
 
         # if empty side, ensure sizes are None (not 0) per §3

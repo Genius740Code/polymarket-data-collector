@@ -400,7 +400,11 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 if fee_rate is not None and notional is not None:
                     fee = round(notional * fee_rate, 6)
                     fee_is_estimated = True  # derived from the market's reported rate, not reported per fill
-                    fee_derived += 1
+                    # E7: 0-fee market — keep the real 0.0, flag N/A (NULL).
+                    if fee == 0.0:
+                        fee_is_estimated = None
+                    else:
+                        fee_derived += 1
                 # R-2: attribute the maker leg when the earlier both-legs fetch
                 # exposed it unambiguously for this fill key (single distinct wallet)
                 maker_w = None
@@ -481,14 +485,25 @@ def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: p
         changed = False
         for r in rows:
             upd = updates.get(str(r.get("trade_id")))
-            if not upd:
-                continue
-            for c in cols:
-                cur = r.get(c)
-                fillable = cur is None or (c == "outcome" and cur == "unknown")
-                if fillable and upd[c] is not None:
-                    r[c] = upd[c]
+            if upd:
+                for c in cols:
+                    cur = r.get(c)
+                    fillable = cur is None or (c == "outcome" and cur == "unknown")
+                    if fillable and upd[c] is not None:
+                        # E7: a 0.0 fee never takes a True/False flag (stays NULL).
+                        if c == "fee_is_estimated" and (r.get("fee") == 0.0 or upd.get("fee") == 0.0):
+                            continue
+                        r[c] = upd[c]
+                        changed = True
+            # E5: lowercase legacy uppercase aggressor sides (representation fix).
+            for sc in ("side", "aggressor_side"):
+                if sc in r and isinstance(r[sc], str) and r[sc] != r[sc].lower():
+                    r[sc] = r[sc].lower()
                     changed = True
+            # E7: 0-fee market — real 0.0 kept, flag N/A (NULL).
+            if r.get("fee") == 0.0 and r.get("fee_is_estimated") is not None:
+                r["fee_is_estimated"] = None
+                changed = True
         if not changed:
             continue
         tmp = p.with_suffix(".parquet.tmp")
@@ -945,6 +960,56 @@ def build_markets_summary(
     return pa.Table.from_pylist(rows, schema=MARKETS_SUMMARY_SCHEMA)
 
 
+def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
+    """E1 migration (non-destructive): replace hex market_id with numeric ids.
+
+    Reads condition_id → market_id from markets_latest (ground truth, 0 hex),
+    rewrites rows where market_id looks like a hex condition_id (0x+64hex).
+    Rows with no mapping get NULL. Hive files are untouched — healing applies
+    to the staging build only.
+    """
+    if "market_id" not in table.schema.names or "condition_id" not in table.schema.names:
+        return table
+    try:
+        import re as _re
+        hex_re = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+    except Exception:
+        return table
+    pylist = table.to_pylist()
+    needs = any(
+        isinstance(r.get("market_id"), str) and bool(hex_re.match(r["market_id"].strip()))
+        for r in pylist
+    )
+    if not needs:
+        return table
+    mapping: dict = {}
+    try:
+        latest = Path(data_dir) / "markets_latest" / "markets_latest.parquet"
+        if latest.exists():
+            for r in read_table(latest).to_pylist():
+                cid, mid = r.get("condition_id"), r.get("market_id")
+                if cid and mid and not (isinstance(mid, str) and bool(hex_re.match(mid.strip()))):
+                    mapping[str(cid)] = str(mid)
+    except Exception as e:
+        print(f"[export] WARN markets_latest unreadable for market_id heal: {e}")
+    healed = nulled = 0
+    for r in pylist:
+        mid = r.get("market_id")
+        if isinstance(mid, str) and bool(hex_re.match(mid.strip())):
+            new = mapping.get(str(r.get("condition_id") or ""))
+            r["market_id"] = new
+            if new:
+                healed += 1
+            else:
+                nulled += 1
+    if healed or nulled:
+        print(f"[export] market_id heal: {healed} hex→numeric, {nulled} hex→NULL (E1)")
+    try:
+        return pa.Table.from_pylist(pylist, schema=table.schema)
+    except Exception:
+        return pa.Table.from_pylist(pylist)
+
+
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None) -> Optional[pa.Table]:
     """Read all parquet files for dataset (+ optional asset filter).
 
@@ -1073,7 +1138,8 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                 # fee stays NULL if not observed — real data only
                 if r.get("aggressor_side") is None and r.get("side"):
                     try:
-                        r["aggressor_side"] = str(r["side"]).upper()
+                        # E5: lowercase (enums.py convention)
+                        r["aggressor_side"] = str(r["side"]).lower()
                         changed = True
                     except Exception:
                         pass
@@ -1109,6 +1175,45 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         except Exception as e:
             print(f"[export] WARN backfill failed for {dataset}: {e}")
             pass
+    # E1 (2026-09-09): heal hex market_id (== condition_id) from markets_latest.
+    # Old hive rows carry the corruption; staging must ship numeric ids for joins.
+    # Unmapped rows keep NULL (honest gap) — never the hex value.
+    # E2 (2026-09-09): drop trades with NULL/0 window_index from staging (breaks
+    # market joins); hive retains them honestly.
+    if dataset in ("book_snapshots_500ms", "book_events", "trades") and combined.num_rows > 0:
+        try:
+            combined = _heal_hex_market_ids(combined, Path(data_dir))
+        except Exception as e:
+            print(f"[export] WARN market_id heal failed for {dataset}: {e}")
+    if dataset == "trades" and combined.num_rows > 0 and "window_index" in combined.schema.names:
+        try:
+            col = combined.column("window_index")
+            not_null = pc.invert(pc.is_null(col))
+            not_zero = pc.not_equal(col, pa.scalar(0))
+            mask = pc.and_(not_null, not_zero)
+            if mask.null_count > 0:
+                mask = pc.fill_null(mask, False)
+            dropped = combined.num_rows - int(pc.sum(mask).as_py() or 0)
+            if dropped:
+                print(f"[export] trades window_index filter: dropped {dropped} NULL/0 rows (E2 honest-gap)")
+            combined = combined.filter(mask)
+        except Exception as e:
+            print(f"[export] WARN window_index filter failed: {e}")
+    # E5: lowercase legacy uppercase aggressor sides at staging-read (hive is
+    # migrated by the write-back below; staging must never ship mixed case).
+    if dataset == "trades" and combined.num_rows > 0:
+        try:
+            pylist = combined.to_pylist()
+            lowered = False
+            for r in pylist:
+                for sc in ("side", "aggressor_side"):
+                    if isinstance(r.get(sc), str) and r[sc] != r[sc].lower():
+                        r[sc] = r[sc].lower()
+                        lowered = True
+            if lowered:
+                combined = pa.Table.from_pylist(pylist, schema=combined.schema)
+        except Exception as e:
+            print(f"[export] WARN side normalization failed: {e}")
     # dedup before sort: remove exact duplicate rows that writer missed (WAL replay, buffer races)
     # For resync_episodes keep latest per resync_id, for snapshots keep first per (asset,condition_id,ts_snapshot_ns)
     try:

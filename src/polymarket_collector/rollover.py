@@ -12,6 +12,35 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 
+import re as _re
+
+# E1 (2026-09-09): Gamma `id` (numeric market id, e.g. 4349753) must never be
+# replaced by the hex condition_id. A 0x+64hex market_id is corruption — it
+# silently drops ticks on market_id joins/dedup downstream.
+_HEX_CONDITION_RE = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+
+
+def is_hex_condition_id(value: object) -> bool:
+    """True if value looks like a hex condition_id (0x + 64 hex)."""
+    return isinstance(value, str) and bool(_HEX_CONDITION_RE.match(value.strip()))
+
+
+def clean_market_id(raw: object) -> Optional[str]:
+    """Return the numeric Gamma market id as str, or None.
+
+    E1: when Gamma `id` is missing, the caller must store NULL — never fall
+    back to condition_id (that fallback corrupted 19.7% of distinct
+    market_ids in book_snapshots_500ms). Hex-looking values are rejected
+    even when explicitly passed.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or is_hex_condition_id(s):
+        return None
+    return s
+
+
 def _window_label_for(window_size_seconds: int) -> str:
     """Map window_size_seconds -> label per plan.md §1.1."""
     if window_size_seconds >= 86400:
@@ -64,7 +93,7 @@ def _hourly_slug_for(asset: str, ts_seconds: int) -> str:
 @dataclass
 class MarketInfo:
     condition_id: str
-    market_id: str
+    market_id: Optional[str]
     asset: str
     up_token_id: str
     down_token_id: str
@@ -589,7 +618,8 @@ class MarketDiscovery:
 
         return MarketInfo(
             condition_id=str(condition_id),
-            market_id=str(data.get("id") or condition_id),
+            # E1: Gamma `id` only — missing/hex → None (NULL), never condition_id.
+            market_id=clean_market_id(data.get("id")),
             asset=asset.upper(),
             up_token_id=str(up_token),
             down_token_id=str(down_token),
@@ -679,7 +709,8 @@ class MarketDiscovery:
 
         return MarketInfo(
             condition_id=str(condition_id),
-            market_id=str(data.get("market_id") or data.get("marketId") or condition_id),
+            # E1: explicit market_id only — missing/hex → None (NULL).
+            market_id=clean_market_id(data.get("market_id") or data.get("marketId")),
             asset=asset.upper(),
             up_token_id=str(up_token),
             down_token_id=str(down_token),

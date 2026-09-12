@@ -230,12 +230,30 @@ def main() -> None:
         if not args.skip_onchain:
             try:
                 from .storage.export import third_pass_onchain_wallets
-                third_pass_onchain_wallets(data_dir, cfg.assets)
+                # 2026-09-09 OOM: 1500 receipts/run × 4 runs/hour + concurrent
+                # collector exports spiked the 3.9GB box into SIGKILLs. 500/run
+                # still heals ~2000 txs/hour (runs now complete instead of
+                # being cron-killed mid-reupload); newest-first so lag stays low.
+                third_pass_onchain_wallets(data_dir, cfg.assets, max_txs=500)
             except Exception as e:
                 print(f"[resolution-backfill] WARN on-chain wallet pass failed: {e}")
     if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
         if args.all_lanes:
+            # 2026-09-09 OOM: 4-lane reupload (~2-4 min/lane + on-chain) never
+            # fits the 15-min cron — each run was SIGKILLed mid-upload, wasting
+            # the work and spiking memory against the collector export. Heavy
+            # reuploads ride the :00/:30 cadence (Kaggle lag ≤30 min, within
+            # spec); resolutions + enrichment still run every 15 min.
+            import datetime as _dt2
+            # <15 (not ==0): this check runs minutes after cron start (the
+            # enrichment passes precede it), so accept the first half of each
+            # half-hour window — :00/:30 runs proceed, :15/:45 runs defer.
+            _all = (int(_dt2.datetime.now(tz=_dt2.timezone.utc).strftime("%M")) % 30 < 15)
+            if not _all:
+                print("[resolution-backfill] reupload deferred to :00/:30 cadence (resolutions+enrichment done)")
             for tf in cfg.timeframes:
+                if not _all:
+                    break
                 try:
                     reupload_kaggle(data_dir, cfg.assets, cfg.l2_levels, timeframe=tf)
                 except Exception as e:

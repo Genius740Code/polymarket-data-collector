@@ -194,7 +194,7 @@ def test_r2_r3_wallet_backfill_both_legs_and_reconciliation(monkeypatch):
     # R-3: outcome from the API's own label, fee derived from the streamed rate
     assert filled["outcome"] == "down"
     assert filled["fee"] == 0.0
-    assert filled["fee_is_estimated"] is True
+    assert filled["fee_is_estimated"] is None  # E7: 0-fee market, flag N/A
 
     # R-2 honesty: the API has no wallet for this fill → NULL is kept
     unknown = by_tx["0xd" * 8]

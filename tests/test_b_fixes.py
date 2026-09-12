@@ -81,7 +81,7 @@ def test_b5_writeback_fills_nulls_only_and_is_idempotent(tmp_path):
     by_id = {r["trade_id"]: r for r in got}
     t1 = by_id["t-1"]
     assert t1["maker_wallet"] == "0xmaker" and t1["wallet"] == "0xtaker"
-    assert t1["outcome"] == "up" and t1["fee"] == 0.0 and t1["fee_is_estimated"] is True
+    assert t1["outcome"] == "up" and t1["fee"] == 0.0 and t1["fee_is_estimated"] is None  # E7: 0-fee flag N/A
     # non-NULL values were never overwritten
     t2 = by_id["t-2"]
     assert t2["outcome"] == "up" and t2["wallet"] is None

@@ -170,7 +170,8 @@ class Collector:
                                 book = OrderBookState(
                                     asset=asset,
                                     condition_id=state.current_condition_id,
-                                    market_id=state.current_condition_id,
+                                    # E1: cursor stores no numeric market id — NULL, never the hex cid.
+                                    market_id=None,
                                     series_id=f"{asset}-{tf}",
                                     window_index=state.current_window_index or 0,
                                     up_token_id=f"{state.current_condition_id}-UP",
@@ -402,7 +403,8 @@ class Collector:
             # If CLOB did not provide wallet, keep NULL (do NOT fabricate from token_id/hash/market)
             # NULL is correct signal for research; fake 0x addresses poison clustering.
             # Export backfill also respects real fields only (storage/export.py:184).
-            side = str(msg.get("side") or msg.get("aggressor_side") or "").upper() or None
+            # E5: aggressor side stored lowercase (enums.py convention).
+            side = str(msg.get("side") or msg.get("aggressor_side") or "").lower() or None
             outcome = msg.get("outcome")
             if not outcome:
                 # infer from token vs market
@@ -444,13 +446,19 @@ class Collector:
                 except Exception:
                     fee = None
                     fee_is_estimated = None
+            # E7: Polymarket 5m markets are 0-fee (fee_rate_bps="0") — a 0.0 fee
+            # with a True/False flag misleads P&L readers, so the flag is NULL
+            # (not applicable) while the real 0.0 value is kept.
+            if fee == 0.0:
+                fee_is_estimated = None
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
                 "condition_id": str(condition_id),
-                "market_id": market.market_id if market else str(condition_id),
+                # E1: unknown numeric id → NULL (never hex cid); E2: unknown window → NULL.
+                "market_id": market.market_id if (market and market.market_id) else None,
                 "series_id": market.series_id if market else f"{asset.upper()}-5m",
-                "window_index": market.window_index if market else 0,
+                "window_index": market.window_index if market else None,
                 "asset": asset.upper(),
                 "trade_id": trade_id,
                 "transaction_hash": tx_hash,
@@ -2242,18 +2250,15 @@ class Collector:
                     if not is_dry and _has_creds:
                         built_pruned = sum(res.get("cleanup", {}).values()) if isinstance(res.get("cleanup"), dict) else 0
                         if built_pruned == 0:
-                            # built-in 2h prune kept everything (expected in 20min test); do test-buffer prune to demo delete
-                            # skip timestamp-only datasets: with the ~0h test cutoff they would be
-                            # wiped by mtime and the FINAL staging rebuild would publish truncated
-                            # collector_events/chainlink_events (seen 2026-09-07: 229->2 / ~765->11 rows)
-                            try:
-                                extra = _cleanup(self.config.storage.data_dir, assets=self.config.assets, timeframe_labels=[test_tf], keep_seconds=120, checkpoint_ms=None, rolling_window=True, retention_hours=0, skip_datasets=("chainlink_events", "collector_events", "resync_episodes"))
-                                if extra:
-                                    print(f"[test-kaggle:{tag}] test-buffer prune (120s) extra: {extra} — closed markets only, open window kept")
-                                    for k, v in extra.items():
-                                        res["cleanup"][k] = res["cleanup"].get(k, 0) + v
-                            except Exception as e:
-                                print(f"[test-kaggle:{tag}] test prune err {e}")
+                            # 2026-09-09 15m run: the 0h/120s test-buffer prune
+                            # deleted CLOSED-window snapshot files mid-run (window-1
+                            # lost ~1200 ticks before the final staging build →
+                            # 30% completeness artifact + thin finalize re-upload).
+                            # Test hives are <100MB — disk hygiene never justifies
+                            # eating the measured windows. Prune DISABLED in test
+                            # mode (production 2h path above still runs). The gate
+                            # staging + analysis now always see the full run.
+                            print(f"[test-kaggle:{tag}] test-buffer prune SKIPPED (harness fix 2026-09-09: 0h cutoff ate closed windows on 15m lanes)")
                     elif is_dry:
                         # dry_run: simulate prune, don't delete — show what would be deleted after real Kaggle
                         try:
@@ -2837,6 +2842,13 @@ class Collector:
                         if not self._running:
                             break
                         await _upload_one(tf)
+                        # 2026-09-09 OOM: drop per-lane staging tables between
+                        # lanes so the 4-lane export peak stays flat, not stacked.
+                        try:
+                            import gc as _gc
+                            _gc.collect()
+                        except Exception:
+                            pass
                 # Sleep interval with early-exit check every 5s
                 slept2 = 0
                 while self._running and slept2 < interval:

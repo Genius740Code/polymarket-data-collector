@@ -132,6 +132,20 @@ class ParquetWriter:
         if date_str is None:
             date_str = _resolved_date_str
 
+        # E5: normalize aggressor side to lowercase at the write path
+        # (enums.py convention) — covers every producer, incl. legacy callers.
+        if dataset == "trades":
+            _needs_lower = any(
+                isinstance(row.get(_sk), str) and row.get(_sk) != row.get(_sk).lower()
+                for _sk in ("side", "aggressor_side")
+            )
+            if _needs_lower:
+                row = dict(row)
+                for _sk in ("side", "aggressor_side"):
+                    _sv = row.get(_sk)
+                    if isinstance(_sv, str) and _sv:
+                        row[_sk] = _sv.lower()
+
         # dedup check first (§4, §5) — duplicates never hit WAL or buffer
         # For resync_episodes we do upsert (replace buffered row) rather than drop, so latest
         # reconnect/gap fields survive instead of creating duplicate rows per state transition.
@@ -548,9 +562,17 @@ class ParquetWriter:
                 # bucket already aligned to 500ms grid; use it directly
                 return (row.get("asset"), row.get("condition_id"), int(int(bucket) // 500_000_000 * 500_000_000))
         if dataset == "chainlink_events":
+            # E9: report_id is 100% NULL (reserved — RTDS carries no reportId),
+            # so (report_id,) never fires and burst duplicates slip through.
+            # Dedup on (asset, event_id), falling back to (asset, ts, price).
             rid = row.get("report_id")
             if rid:
                 return (str(rid),)
+            eid = row.get("event_id")
+            if row.get("asset") is not None and eid:
+                return (str(row.get("asset")), str(eid))
+            if row.get("asset") is not None and row.get("ts_received_ns") is not None:
+                return (str(row.get("asset")), row.get("ts_received_ns"), row.get("price"))
         if dataset == "resync_episodes":
             rid = row.get("resync_id")
             if rid:

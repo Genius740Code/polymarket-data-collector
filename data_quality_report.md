@@ -1,4 +1,16 @@
-# Data Quality Report - Polymarket Collector Test Mode (Fresh Run)
+# Data Quality Report — Kaggle Staging 4-TF Null Audit (2026-09-09)
+
+> Supersedes the 4-market test-mode note below. Full audit is in `kaggle_null_audit_2026-09-09.md` (156 files, `kaggle_staging/{5m,15m,1h,4h}`, `pyarrow` per-column `null/zero/distinct`, `T4` checks). This file now summarizes the best-data fix plan.
+
+## Current staging truth (2026-09-09)
+
+* `5m: 39 files 2,808,684 rows` `15m: 2,007,630` `1h: 995,039` `4h: 258,676` = **6,070,029** rows (`1d` not staged: `0` `1d` markets in `markets_latest`, lane `OFF` `config.py:157`)
+* `5m` completeness `8.7%` low (`63/721` `<570/600`, worst `177`), `15m` `14.3%`, `1h` `33%`, `4h` `100%` (`28,800` expected >17.5h span) — see `§2` below for honest vs fixable gaps.
+* **Not healthy** per `PERFECT_DATA_SPEC.md:212` `99.9%` gate: `clean BBO 17.8%` vs `0.1%`, chainlink `56` dups (`0.04%`) vs `0`, `window_index 0` sentinel, side `4-way` mix, `fee`/`book_age` dead. Honest (`L2` holes `0%`, grid `0`, prices `0..1` `0%`, FK `0`).
+
+---
+
+# Archive: Data Quality Report - Polymarket Collector Test Mode (Fresh Run)
 
 **Test Command**: `python3 -m src.polymarket_collector.cli --test-mode --test-markets 4`
 **Test Mode**: 4×5-minute markets for 7 assets (BTC/ETH/SOL/HYPE/BNB/XRP/DOGE)

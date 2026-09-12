@@ -4,6 +4,15 @@ book_snapshots_clean = SELECT * FROM book_snapshots_500ms WHERE book_state='live
   AND condition_id NOT IN (markets with resolution_outcome in disputed)
   — unknown is NOT excluded (active markets are unknown until resolved; excluding would make clean 0% during live)
 
+E3 (2026-09-09): `clean` means live-book only, NOT fully-quoted. Late in the
+window makers pull one side-pair (live exchange-side thinning: 0% of ticks in
+min 0-2, ~11% in min 3, ~83% in min 4 carry an empty side), so ~17.8% of 5m
+clean rows have a NULL BBO side. Thesis OHLC must filter
+`WHERE up_bid IS NOT NULL AND up_ask IS NOT NULL
+  AND down_bid IS NOT NULL AND down_ask IS NOT NULL`
+(or read `markets_summary`, whose OHLC is quoted-mid only) and report the
+thin-book attrition in methods — dropping them silently is survivorship bias.
+
 This is the default read path for backtests; querying book_snapshots_500ms
 directly includes stale/resyncing intentionally.
 """

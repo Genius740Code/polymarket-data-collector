@@ -22,7 +22,8 @@ MARKETS_SCHEMA = pa.schema([
     pa.field("market_end_ts_ms", pa.int64(), nullable=True),
     pa.field("resolution_ts", pa.string(), nullable=True),
     pa.field("condition_id", pa.string(), nullable=False),
-    pa.field("market_id", pa.string(), nullable=False),
+    # E1 (2026-09-09): NULL when Gamma `id` missing — never the hex condition_id.
+    pa.field("market_id", pa.string(), nullable=True),
     pa.field("slug", pa.string(), nullable=True),  # §3.1 e.g. btc-updown-5m-1774390200
     pa.field("series_id", pa.string(), nullable=False),
     pa.field("window_index", pa.int64(), nullable=False),
@@ -60,7 +61,8 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
         pa.field("ts_snapshot_utc", pa.string(), nullable=False),
         pa.field("ts_snapshot_ns", pa.int64(), nullable=False),
         pa.field("condition_id", pa.string(), nullable=False),
-        pa.field("market_id", pa.string(), nullable=False),
+        # E1: NULL when the numeric Gamma id is unknown (never hex).
+        pa.field("market_id", pa.string(), nullable=True),
         pa.field("series_id", pa.string(), nullable=False),
         pa.field("window_index", pa.int64(), nullable=False),
         pa.field("asset", pa.string(), nullable=False),
@@ -110,7 +112,8 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("ts_source", pa.string(), nullable=True),
     pa.field("ts_received_ns", pa.int64(), nullable=False),
     pa.field("condition_id", pa.string(), nullable=False),
-    pa.field("market_id", pa.string(), nullable=False),
+    # E1: NULL when the numeric Gamma id is unknown (never hex).
+    pa.field("market_id", pa.string(), nullable=True),
     pa.field("series_id", pa.string(), nullable=False),
     pa.field("window_index", pa.int64(), nullable=False),
     pa.field("asset", pa.string(), nullable=False),
@@ -138,9 +141,11 @@ TRADES_SCHEMA = pa.schema([
     pa.field("ts_source", pa.string(), nullable=True),
     pa.field("ts_received_ns", pa.int64(), nullable=False),
     pa.field("condition_id", pa.string(), nullable=False),
-    pa.field("market_id", pa.string(), nullable=False),
+    # E1: NULL when the numeric Gamma id is unknown (never hex).
+    pa.field("market_id", pa.string(), nullable=True),
     pa.field("series_id", pa.string(), nullable=False),
-    pa.field("window_index", pa.int64(), nullable=False),
+    # E2: NULL when the trade arrived with no resolvable market (honest gap, never 0).
+    pa.field("window_index", pa.int64(), nullable=True),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("trade_id", pa.string(), nullable=False),
     pa.field("transaction_hash", pa.string(), nullable=True),
