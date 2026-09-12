@@ -70,22 +70,78 @@ def build_clean_view(
         except Exception:
             pass
 
+    # 2026-09-10 OOM: partition-level freshness gate — the hourly 4-lane
+    # export rebuilt the ENTIRE clean view (full-hive read+write) every time.
+    # Skip (date,asset) partitions whose output is newer than every source
+    # file. The disputed filter is part of the gate key (marker file) so a
+    # filter change still rebuilds everything.
+    import os as _os2
+    import time as _time2
+    marker = dst_root / ".clean_filter"
+    try:
+        prev_flag = marker.read_text().strip() if marker.exists() else None
+    except Exception:
+        prev_flag = None
+    flag = "disputed-in" if opt_in_disputed else "disputed-out"
+    full_rebuild = prev_flag != flag
+    if full_rebuild:
+        try:
+            dst_root.mkdir(parents=True, exist_ok=True)
+            marker.write_text(flag)
+        except Exception:
+            pass
+
     # collect source tables per partition (date/asset) to preserve partitioning
     # We need to walk src partitions and filter per partition so output mirrors input partitions
+    # 2026-09-10 OOM: INCREMENTAL append — when the output exists, read only
+    # source files newer than the output, filter those, and merge with the
+    # existing output (dedup by (condition_id, ts_snapshot_ns) guards against
+    # compaction rewrites re-adding old rows as "new" files). Full-partition
+    # concat only on first build / filter-flag change. Peak ~ two files.
+    from .streaming import DedupState
+
     written = 0
     for date_dir in src_root.glob("date=*"):
         date_str = date_dir.name  # e.g. date=2025-01-01
         for asset_dir in date_dir.glob("asset=*"):
             asset = asset_dir.name.split("=", 1)[1] if "=" in asset_dir.name else asset_dir.name
-            tables: List[pa.Table] = []
-            for part in asset_dir.glob("*.parquet"):
+            out_dir = dst_root / date_str / f"asset={asset}"
+            final_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
+            incremental = False
+            prior = None
+            if not full_rebuild and final_path.exists():
                 try:
-                    tables.append(read_table(part))
+                    out_mtime = final_path.stat().st_mtime
+                    src_files = [p for p in asset_dir.glob("*.parquet")]
+                    new_files = [p for p in src_files if p.stat().st_mtime > out_mtime]
+                    if not new_files:
+                        continue  # fresh — skip rebuild of this partition
+                    prior = read_table(final_path)
+                    if prior is not None and prior.num_rows > 0:
+                        incremental = True
+                        tables = []
+                        for part in new_files:
+                            try:
+                                tables.append(read_table(part))
+                            except Exception:
+                                continue
+                        if not tables:
+                            continue
+                        combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
+                    # else: fall through to full-partition rebuild below
                 except Exception:
+                    incremental = False
+                    prior = None
+            if not incremental:
+                tables: List[pa.Table] = []
+                for part in asset_dir.glob("*.parquet"):
+                    try:
+                        tables.append(read_table(part))
+                    except Exception:
+                        continue
+                if not tables:
                     continue
-            if not tables:
-                continue
-            combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
+                combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
             # filter: book_state == 'live'
             try:
                 mask = pc.equal(combined.column("book_state"), pa.scalar("live"))
@@ -106,6 +162,30 @@ def build_clean_view(
                 except Exception:
                     pass
 
+            if filtered.num_rows == 0 and not incremental:
+                continue
+
+            # incremental merge: prior output + newly filtered rows, deduped by
+            # (condition_id, ts_snapshot_ns) — compaction rewrites surface old
+            # rows as new files; without this the view would double-count.
+            if incremental and prior is not None and prior.num_rows > 0:
+                try:
+                    if filtered.num_rows > 0:
+                        _dd = DedupState(["condition_id", "ts_snapshot_ns"])
+                        _keep_prior = _dd.filter(prior)
+                        _merged_new = _dd.filter(filtered)
+                        if _merged_new.num_rows > 0:
+                            filtered = _concat_tables([_keep_prior, _merged_new])
+                        else:
+                            filtered = _keep_prior
+                    else:
+                        filtered = prior
+                    del prior
+                except Exception:
+                    try:
+                        filtered = _concat_tables([prior, filtered]) if filtered.num_rows > 0 else prior
+                    except Exception:
+                        pass
             if filtered.num_rows == 0:
                 continue
 

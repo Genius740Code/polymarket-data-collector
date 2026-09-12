@@ -169,6 +169,103 @@ def _unambiguous_wallet(pool: Optional[list]) -> Optional[str]:
     return next(iter(distinct)) if len(distinct) == 1 else None
 
 
+def _trades_need_enrichment(table: pa.Table) -> int:
+    """Count rows needing wallet/outcome enrichment, Arrow-only (no pylist).
+
+    Same predicate as the legacy row loop: has transaction_hash AND
+    (wallet NULL OR (maker NULL AND side is buy/sell) OR outcome missing).
+    """
+    try:
+        names = table.schema.names
+        if "transaction_hash" not in names:
+            return 0
+        has_tx = pc.is_valid(table.column("transaction_hash"))
+        parts = []
+        if "wallet" in names:
+            parts.append(pc.is_null(table.column("wallet")))
+        if "maker_wallet" in names and "side" in names:
+            try:
+                _up = pc.utf8_upper(pc.cast(table.column("side"), pa.string()))
+                _is_bs = pc.or_(pc.equal(_up, pa.scalar("BUY")), pc.equal(_up, pa.scalar("SELL")))
+                parts.append(pc.and_(pc.is_null(table.column("maker_wallet")), pc.fill_null(_is_bs, False)))
+            except Exception:
+                pass
+        if "outcome" in names:
+            try:
+                _oc = table.column("outcome")
+                _missing = pc.or_(pc.is_null(_oc), pc.or_(pc.equal(_oc, pa.scalar("")), pc.equal(_oc, pa.scalar("unknown"))))
+                parts.append(pc.fill_null(_missing, False))
+            except Exception:
+                pass
+        if not parts:
+            return 0
+        need = parts[0]
+        for p in parts[1:]:
+            need = pc.or_(need, p)
+        need = pc.and_(pc.fill_null(has_tx, False), pc.fill_null(need, False))
+        return int(pc.sum(pc.cast(need, pa.int64())).as_py() or 0)
+    except Exception:
+        return 1  # fail open: assume work needed
+
+
+def _backfill_trade_wallets_chunked(
+    table: pa.Table,
+    data_dir: Path,
+    asset: Optional[str] = None,
+    reconcile: bool = True,
+    chunk_rows: int = 25000,
+) -> pa.Table:
+    """Bounded-RAM wrapper around _backfill_trade_wallets (2026-09-10 OOM).
+
+    The inner function converts the whole input to python dicts (~10x RAM).
+    Split by condition_id groups (a fill's tx never spans markets, so pools
+    and reconcile inserts stay exactly correct per group) and concat the
+    enriched groups at the end. Small inputs take the direct path.
+    """
+    if table is None or table.num_rows == 0 or table.num_rows <= chunk_rows:
+        return _backfill_trade_wallets(table, data_dir, asset=asset, reconcile=reconcile)
+    try:
+        import gc as _gc_c
+        vc = table.column("condition_id").value_counts()
+        vals = vc.field("values").to_pylist()
+        counts = vc.field("counts").to_pylist()
+        order = sorted(range(len(vals)), key=lambda i: -(counts[i] or 0))
+        groups: list = []
+        cur: list = []
+        cur_n = 0
+        for i in order:
+            c = vals[i]
+            if c is None:
+                continue
+            cur.append(c)
+            cur_n += counts[i] or 0
+            if cur_n >= chunk_rows:
+                groups.append(cur)
+                cur = []
+                cur_n = 0
+        if cur:
+            groups.append(cur)
+        parts = []
+        for g in groups:
+            try:
+                mask = pc.is_in(table.column("condition_id"), value_set=pa.array(g))
+            except Exception:
+                mask = None
+            sub = table.filter(mask) if mask is not None else table
+            parts.append(_backfill_trade_wallets(sub, data_dir, asset=asset, reconcile=reconcile))
+            del sub
+            _gc_c.collect()
+        if not parts:
+            return table
+        out = parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
+        del parts
+        _gc_c.collect()
+        return out
+    except Exception as e:
+        print(f"[export] WARN chunked backfill failed, direct fallback: {e}")
+        return _backfill_trade_wallets(table, data_dir, asset=asset, reconcile=reconcile)
+
+
 def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None, reconcile: bool = True) -> pa.Table:
     """Fill maker_wallet/taker_wallet/wallet and missing outcome on trades.
 
@@ -556,24 +653,13 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
         stats["assets_scanned"] += 1
         if tbl is None or tbl.num_rows == 0 or "wallet" not in tbl.schema.names:
             continue
-        rows = tbl.to_pylist()
-        needed = 0
-        for r in rows:
-            # rows without a transaction_hash cannot be joined to the data-api — skip
-            if not r.get("transaction_hash"):
-                continue
-            needs = (
-                r.get("wallet") is None
-                or (r.get("maker_wallet") is None and str(r.get("side") or "").upper() in ("BUY", "SELL"))
-                or r.get("outcome") in (None, "", "unknown")
-            )
-            if needs:
-                needed += 1
+        # 2026-09-10 OOM: kernel-count need check (never whole-table dicts).
+        needed = _trades_need_enrichment(tbl)
         if not needed:
             continue
         stats["rows_needed"] += needed
         print(f"[export] second-pass enrichment: {au} {needed} rows still missing wallet/outcome — querying data-api")
-        enriched = _backfill_trade_wallets(tbl, base, asset=au, reconcile=False)
+        enriched = _backfill_trade_wallets_chunked(tbl, base, asset=au, reconcile=False)
         try:
             rewritten = _writeback_enriched_trades(base, au, enriched)
             stats["files_rewritten"] += rewritten
@@ -818,42 +904,97 @@ def build_markets_summary(
             print(f"[export] WARN markets_summary trades aggregation failed: {e}")
 
     # --- snapshots (clean): outcome-token mid OHLC + average spread per condition_id ---
+    # 2026-09-10 OOM: streaming accumulation (per-cid min/max/sum/count state
+    # is KBs) instead of concat-loading the full clean hive (~30x Arrow
+    # expansion SIGKilled the box). Open/close = row at min/max ts per cid
+    # (order-independent, identical to sorted first/last); means ignore NULLs.
     ohlc_by_cid: Dict[str, dict] = {}
-    snaps = _read_dataset_per_asset(base, "book_snapshots_clean", None)
-    if snaps is not None and snaps.num_rows:
-        needed = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
-        if all(c in snaps.schema.names for c in needed):
-            try:
-                s = pa.table({
-                    "condition_id": snaps.column("condition_id"),
-                    "ts": snaps.column("ts_snapshot_ns"),
-                    "mid_up": pc.divide(pc.add(snaps.column("up_bid"), snaps.column("up_ask")), pa.scalar(2.0)),
-                    "mid_dn": pc.divide(pc.add(snaps.column("down_bid"), snaps.column("down_ask")), pa.scalar(2.0)),
-                    "spr_up": pc.subtract(snaps.column("up_ask"), snaps.column("up_bid")),
-                    "spr_dn": pc.subtract(snaps.column("down_ask"), snaps.column("down_bid")),
-                })
-                s = s.sort_by([("ts", "ascending"), ("condition_id", "ascending")])
-                _old_cpu = pa.cpu_count()
-                pa.set_cpu_count(1)  # first/last aggregators are single-threaded only
-                try:
-                    agg = s.group_by("condition_id").aggregate([
-                        ("mid_up", "first"), ("mid_up", "last"), ("mid_up", "min"), ("mid_up", "max"),
-                        ("mid_dn", "first"), ("mid_dn", "last"), ("mid_dn", "min"), ("mid_dn", "max"),
-                        ("spr_up", "mean"), ("spr_dn", "mean"), ("ts", "count"),
-                    ])
-                finally:
-                    pa.set_cpu_count(_old_cpu)
-                for r in agg.to_pylist():
-                    ohlc_by_cid[r["condition_id"]] = {
-                        "up_open": r["mid_up_first"], "up_close": r["mid_up_last"],
-                        "up_low": r["mid_up_min"], "up_high": r["mid_up_max"],
-                        "down_open": r["mid_dn_first"], "down_close": r["mid_dn_last"],
-                        "down_low": r["mid_dn_min"], "down_high": r["mid_dn_max"],
-                        "avg_spread_up": r["spr_up_mean"], "avg_spread_down": r["spr_dn_mean"],
-                        "snapshot_count": int(r["ts_count"] or 0),
+    try:
+        from .streaming import stream_batches as _stream_batches
+
+        _acc: Dict[str, dict] = {}
+
+        def _fold_batch(_b: pa.Table) -> None:
+            _need = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
+            if not all(c in _b.schema.names for c in _need):
+                return
+            _cols = {c: _b.column(c).to_pylist() for c in _need}
+            for _i in range(_b.num_rows):
+                _cid = _cols["condition_id"][_i]
+                _ts = _cols["ts_snapshot_ns"][_i]
+                if _cid is None or _ts is None:
+                    continue
+                _ub, _ua = _cols["up_bid"][_i], _cols["up_ask"][_i]
+                _db, _da = _cols["down_bid"][_i], _cols["down_ask"][_i]
+                _mu = (_ub + _ua) / 2.0 if _ub is not None and _ua is not None else None
+                _md = (_db + _da) / 2.0 if _db is not None and _da is not None else None
+                _su = _ua - _ub if _ub is not None and _ua is not None else None
+                _sd = _da - _db if _db is not None and _da is not None else None
+                _a = _acc.get(_cid)
+                # open/close = mid at min/max ts AMONG NON-NULL mids per side
+                # (matches sorted first/last which skip nulls); low/high over
+                # non-null; spreads averaged over non-null. Order-independent.
+                if _a is None:
+                    _a = _acc[_cid] = {
+                        "min_ts_up": _ts if _mu is not None else None,
+                        "max_ts_up": _ts if _mu is not None else None,
+                        "min_ts_dn": _ts if _md is not None else None,
+                        "max_ts_dn": _ts if _md is not None else None,
+                        "up_open": _mu, "up_close": _mu,
+                        "down_open": _md, "down_close": _md,
+                        "up_low": _mu, "up_high": _mu,
+                        "down_low": _md, "down_high": _md,
+                        "s_up": 0.0, "s_dn": 0.0, "s_n_up": 0, "s_n_dn": 0, "n": 0,
                     }
-            except Exception as e:
-                print(f"[export] WARN markets_summary snapshot aggregation failed: {e}")
+                else:
+                    if _mu is not None:
+                        if _a["min_ts_up"] is None or _ts < _a["min_ts_up"]:
+                            _a["min_ts_up"] = _ts
+                            _a["up_open"] = _mu
+                        if _a["max_ts_up"] is None or _ts >= _a["max_ts_up"]:
+                            _a["max_ts_up"] = _ts
+                            _a["up_close"] = _mu
+                    if _md is not None:
+                        if _a["min_ts_dn"] is None or _ts < _a["min_ts_dn"]:
+                            _a["min_ts_dn"] = _ts
+                            _a["down_open"] = _md
+                        if _a["max_ts_dn"] is None or _ts >= _a["max_ts_dn"]:
+                            _a["max_ts_dn"] = _ts
+                            _a["down_close"] = _md
+                if _mu is not None:
+                    if _a["up_low"] is None or _mu < _a["up_low"]:
+                        _a["up_low"] = _mu
+                    if _a["up_high"] is None or _mu > _a["up_high"]:
+                        _a["up_high"] = _mu
+                if _md is not None:
+                    if _a["down_low"] is None or _md < _a["down_low"]:
+                        _a["down_low"] = _md
+                    if _a["down_high"] is None or _md > _a["down_high"]:
+                        _a["down_high"] = _md
+                if _su is not None:
+                    _a["s_up"] += _su
+                    _a["s_n_up"] += 1
+                if _sd is not None:
+                    _a["s_dn"] += _sd
+                    _a["s_n_dn"] += 1
+                _a["n"] += 1
+
+        for _bt in _stream_batches(base, "book_snapshots_clean", None, ts_col="ts_snapshot_ns"):
+            _fold_batch(_bt)
+            del _bt
+        for _cid, _a in _acc.items():
+            ohlc_by_cid[_cid] = {
+                "up_open": _a["up_open"], "up_close": _a["up_close"],
+                "up_low": _a["up_low"], "up_high": _a["up_high"],
+                "down_open": _a["down_open"], "down_close": _a["down_close"],
+                "down_low": _a["down_low"], "down_high": _a["down_high"],
+                "avg_spread_up": (_a["s_up"] / _a["s_n_up"]) if _a["s_n_up"] else None,
+                "avg_spread_down": (_a["s_dn"] / _a["s_n_dn"]) if _a["s_n_dn"] else None,
+                "snapshot_count": int(_a["n"] or 0),
+            }
+        del _acc
+    except Exception as e:
+        print(f"[export] WARN markets_summary snapshot aggregation failed: {e}")
 
     # --- chainlink: underlying open/close = nearest tick to window boundary
     # (open ≤10s per K-2, close ≤5s) ---
@@ -967,47 +1108,51 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
     rewrites rows where market_id looks like a hex condition_id (0x+64hex).
     Rows with no mapping get NULL. Hive files are untouched — healing applies
     to the staging build only.
+
+    2026-09-10 OOM: column-at-a-time via Arrow (never whole-table to_pylist —
+    a 150-col snapshot table explodes ~10x as python dicts and SIGKilled the
+    box on every export).
     """
     if "market_id" not in table.schema.names or "condition_id" not in table.schema.names:
         return table
     try:
         import re as _re
         hex_re = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+        mids = table.column("market_id").to_pylist()  # one narrow column only
     except Exception:
         return table
-    pylist = table.to_pylist()
-    needs = any(
-        isinstance(r.get("market_id"), str) and bool(hex_re.match(r["market_id"].strip()))
-        for r in pylist
-    )
-    if not needs:
+    idx = [i for i, m in enumerate(mids) if isinstance(m, str) and bool(hex_re.match(m.strip()))]
+    if not idx:
         return table
     mapping: dict = {}
     try:
         latest = Path(data_dir) / "markets_latest" / "markets_latest.parquet"
         if latest.exists():
-            for r in read_table(latest).to_pylist():
+            for r in read_table(latest).to_pylist():  # tiny (one row/market)
                 cid, mid = r.get("condition_id"), r.get("market_id")
                 if cid and mid and not (isinstance(mid, str) and bool(hex_re.match(mid.strip()))):
                     mapping[str(cid)] = str(mid)
     except Exception as e:
         print(f"[export] WARN markets_latest unreadable for market_id heal: {e}")
-    healed = nulled = 0
-    for r in pylist:
-        mid = r.get("market_id")
-        if isinstance(mid, str) and bool(hex_re.match(mid.strip())):
-            new = mapping.get(str(r.get("condition_id") or ""))
-            r["market_id"] = new
+    try:
+        cids = table.column("condition_id").to_pylist()
+        new_mids = list(mids)
+        healed = nulled = 0
+        idx_set = set(idx)
+        for i in idx_set:
+            new = mapping.get(str(cids[i] or ""))
+            new_mids[i] = new
             if new:
                 healed += 1
             else:
                 nulled += 1
-    if healed or nulled:
-        print(f"[export] market_id heal: {healed} hex→numeric, {nulled} hex→NULL (E1)")
-    try:
-        return pa.Table.from_pylist(pylist, schema=table.schema)
-    except Exception:
-        return pa.Table.from_pylist(pylist)
+        if healed or nulled:
+            print(f"[export] market_id heal: {healed} hex→numeric, {nulled} hex→NULL (E1)")
+        pos = table.schema.get_field_index("market_id")
+        return table.set_column(pos, "market_id", pa.array(new_mids, type=pa.string()))
+    except Exception as e:
+        print(f"[export] WARN market_id heal failed: {e}")
+        return table
 
 
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None) -> Optional[pa.Table]:
@@ -1113,7 +1258,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     # the CLOB market channel never carries them, so they were 100% null on Kaggle
     if dataset == "trades" and combined.num_rows > 0:
         try:
-            combined = _backfill_trade_wallets(combined, data_dir, asset=asset)
+            combined = _backfill_trade_wallets_chunked(combined, data_dir, asset=asset)
             # B-5: persist the enrichment into the hive so data/trades/ matches
             # what ships to Kaggle (NULLs filled only, atomic per file)
             try:
@@ -1123,55 +1268,104 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         except Exception as e:
             print(f"[export] WARN wallet backfill failed: {e}")
     # backfill trades: compute notional, fee, aggressor_side, transaction_hash where null for old 3.1.0 data
+    # 2026-09-10 OOM: Arrow kernels for the mechanical fills; the legacy
+    # dict-key fallback scan (to_pylist) runs only when its inputs exist.
     if dataset == "trades" and combined.num_rows > 0:
+        def _any_true(mask) -> bool:
+            try:
+                return int(pc.sum(mask).as_py() or 0) > 0
+            except Exception:
+                return True  # fail open: run the fill path
+
         try:
-            # convert to pylist for easy backfill, then back to table
-            pylist = combined.to_pylist()
-            changed = False
-            for r in pylist:
-                if r.get("notional") is None and r.get("price") is not None and r.get("size") is not None:
-                    try:
-                        r["notional"] = float(r["price"]) * float(r["size"])
-                        changed = True
-                    except Exception:
-                        pass
-                # fee stays NULL if not observed — real data only
-                if r.get("aggressor_side") is None and r.get("side"):
-                    try:
-                        # E5: lowercase (enums.py convention)
-                        r["aggressor_side"] = str(r["side"]).lower()
-                        changed = True
-                    except Exception:
-                        pass
-                if r.get("transaction_hash") is None and r.get("trade_id"):
-                    # fallback: trade_id may be hash if hash was used as trade_id
-                    # check if trade_id looks like hash (hex length 32+)
-                    tid = str(r.get("trade_id"))
-                    if len(tid) >= 32 and all(c in "0123456789abcdef" for c in tid.lower()[:8]):
-                        r["transaction_hash"] = tid
-                        changed = True
-                # sequence_number stays NULL if not observed — real data only (no synthetic ts_source -> seq backfill per AGENT.md)
-                # previously fabricated seq from ts_source here; removed to preserve null honesty
-                # wallet backfill — no RPC, just normalize existing CLOB fields
-                # old data may have proxyWallet/wallet under different keys already flattened
-                if r.get("wallet") is None:
-                    for cand in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner"):
-                        if r.get(cand):
-                            r["wallet"] = str(r[cand])
+            names = combined.schema.names
+            if "notional" in names and "price" in names and "size" in names:
+                try:
+                    _not = combined.column("notional")
+                    _need = pc.invert(pc.is_valid(_not))
+                    if _any_true(_need):
+                        _calc = pc.multiply(
+                            pc.cast(combined.column("price"), pa.float64()),
+                            pc.cast(combined.column("size"), pa.float64()),
+                        )
+                        _filled = pc.case_when(_need, _calc, _not)
+                        _pos = combined.schema.get_field_index("notional")
+                        combined = combined.set_column(_pos, "notional", _filled.cast(pa.float64()))
+                except Exception:
+                    pass
+            if "aggressor_side" in names and "side" in names:
+                try:
+                    _ag = combined.column("aggressor_side")
+                    _sd = pc.cast(combined.column("side"), pa.string())
+                    _need_ag = pc.and_(
+                        pc.is_null(_ag),
+                        pc.and_(pc.is_valid(_sd), pc.greater(pc.utf8_length(_sd), 0)),
+                    )
+                    if _any_true(_need_ag):
+                        _low = pc.utf8_lower(_sd)
+                        _filled_ag = pc.case_when(_need_ag, _low, _ag)
+                        _posa = combined.schema.get_field_index("aggressor_side")
+                        combined = combined.set_column(_posa, "aggressor_side", _filled_ag.cast(_ag.type))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[export] WARN backfill (kernels) failed for {dataset}: {e}")
+        # legacy fallbacks (transaction_hash-from-trade_id, old dict wallet
+        # keys): only for rows that can benefit — skip the pylist scan
+        # entirely when no NULL wallet/tx_hash exists alongside inputs.
+        try:
+            names = combined.schema.names
+            _may_help = False
+            if "transaction_hash" in names and "trade_id" in names:
+                try:
+                    _th = combined.column("transaction_hash")
+                    if _th.null_count > 0:
+                        _may_help = True
+                except Exception:
+                    _may_help = True
+            if not _may_help and "wallet" in names:
+                try:
+                    if combined.column("wallet").null_count > 0 and any(
+                        c in names for c in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner", "maker_wallet", "taker_wallet")
+                    ):
+                        _may_help = True
+                except Exception:
+                    _may_help = True
+            if _may_help:
+                # convert to pylist for easy backfill, then back to table
+                pylist = combined.to_pylist()
+                changed = False
+                for r in pylist:
+                    if r.get("transaction_hash") is None and r.get("trade_id"):
+                        # fallback: trade_id may be hash if hash was used as trade_id
+                        # check if trade_id looks like hash (hex length 32+)
+                        tid = str(r.get("trade_id"))
+                        if len(tid) >= 32 and all(c in "0123456789abcdef" for c in tid.lower()[:8]):
+                            r["transaction_hash"] = tid
                             changed = True
-                            break
-                if r.get("maker_wallet") is None and r.get("proxyWallet"):
-                    r["maker_wallet"] = str(r["proxyWallet"])
-                    changed = True
-                if r.get("wallet") is None and r.get("maker_wallet"):
-                    r["wallet"] = r["maker_wallet"]
-                    changed = True
-                if r.get("wallet") is None and r.get("taker_wallet"):
-                    r["wallet"] = r["taker_wallet"]
-                    changed = True
-            if changed:
-                # rebuild table with same schema as combined (preserve types where possible)
-                combined = pa.Table.from_pylist(pylist, schema=combined.schema)
+                    # wallet backfill — no RPC, just normalize existing CLOB fields
+                    # old data may have proxyWallet/wallet under different keys already flattened
+                    if r.get("wallet") is None:
+                        for cand in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner"):
+                            if r.get(cand):
+                                r["wallet"] = str(r[cand])
+                                changed = True
+                                break
+                    if r.get("maker_wallet") is None and r.get("proxyWallet"):
+                        r["maker_wallet"] = str(r["proxyWallet"])
+                        changed = True
+                    if r.get("wallet") is None and r.get("maker_wallet"):
+                        r["wallet"] = r["maker_wallet"]
+                        changed = True
+                    if r.get("wallet") is None and r.get("taker_wallet"):
+                        r["wallet"] = r["taker_wallet"]
+                        changed = True
+                if changed:
+                    # rebuild table with same schema as combined (preserve types where possible)
+                    combined = pa.Table.from_pylist(pylist, schema=combined.schema)
+                del pylist
+                import gc as _gc_tb
+                _gc_tb.collect()
         except Exception as e:
             print(f"[export] WARN backfill failed for {dataset}: {e}")
             pass
@@ -1201,34 +1395,55 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             print(f"[export] WARN window_index filter failed: {e}")
     # E5: lowercase legacy uppercase aggressor sides at staging-read (hive is
     # migrated by the write-back below; staging must never ship mixed case).
+    # 2026-09-10 OOM: Arrow kernels on narrow columns (never to_pylist).
     if dataset == "trades" and combined.num_rows > 0:
         try:
-            pylist = combined.to_pylist()
-            lowered = False
-            for r in pylist:
-                for sc in ("side", "aggressor_side"):
-                    if isinstance(r.get(sc), str) and r[sc] != r[sc].lower():
-                        r[sc] = r[sc].lower()
-                        lowered = True
-            if lowered:
-                combined = pa.Table.from_pylist(pylist, schema=combined.schema)
+            for sc in ("side", "aggressor_side"):
+                if sc not in combined.schema.names:
+                    continue
+                col = combined.column(sc)
+                vals = col.to_pylist()
+                if any(isinstance(v, str) and v != v.lower() for v in vals):
+                    lowered = [v.lower() if isinstance(v, str) else v for v in vals]
+                    pos = combined.schema.get_field_index(sc)
+                    combined = combined.set_column(pos, sc, pa.array(lowered, type=col.type))
         except Exception as e:
             print(f"[export] WARN side normalization failed: {e}")
     # dedup before sort: remove exact duplicate rows that writer missed (WAL replay, buffer races)
     # For resync_episodes keep latest per resync_id, for snapshots keep first per (asset,condition_id,ts_snapshot_ns)
+    # 2026-09-10 OOM: value_counts guard — the pylist path below explodes wide
+    # tables ~10x; run it only when duplicates actually exist (rare).
+    def _has_dupes(_tbl: pa.Table, _cols: list) -> bool:
+        try:
+            _keys = pa.StructArray.from_arrays(
+                [_tbl.column(c) for c in _cols], names=[f"_{i}" for i in range(len(_cols))]
+            )
+            _counts = _keys.value_counts().field("counts").to_pylist()
+            return bool(_counts) and max(_counts) > 1
+        except Exception:
+            return True  # fail open: keep old behavior on Arrow errors
+
     try:
         if combined.num_rows > 1:
             if dataset == "book_snapshots_500ms" and all(c in combined.schema.names for c in ["asset", "condition_id", "ts_snapshot_ns"]):
-                pylist = combined.to_pylist()
-                seen = set()
-                uniq = []
-                for r in pylist:
-                    k = (r.get("asset"), r.get("condition_id"), r.get("ts_snapshot_ns"))
-                    if k not in seen:
-                        seen.add(k)
-                        uniq.append(r)
-                if len(uniq) < combined.num_rows:
-                    combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+                if not _has_dupes(combined, ["asset", "condition_id", "ts_snapshot_ns"]):
+                    pass  # unique — skip the pylist round-trip entirely
+                else:
+                    _pylist = combined.to_pylist()
+                    seen = set()
+                    uniq = []
+                    for r in _pylist:
+                        k = (r.get("asset"), r.get("condition_id"), r.get("ts_snapshot_ns"))
+                        if k not in seen:
+                            seen.add(k)
+                            uniq.append(r)
+                    del _pylist
+                    if len(uniq) < combined.num_rows:
+                        combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+                    else:
+                        del uniq
+                    import gc as _gc_dd
+                    _gc_dd.collect()
             elif dataset == "resync_episodes" and "resync_id" in combined.schema.names:
                 # keep latest row per resync_id (max reconnect_ts or last occurrence)
                 pylist = combined.to_pylist()
@@ -1251,16 +1466,24 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                 if len(uniq) < combined.num_rows:
                     combined = pa.Table.from_pylist(uniq, schema=combined.schema)
             elif dataset == "trades" and "trade_id" in combined.schema.names and "token_id" in combined.schema.names:
-                pylist = combined.to_pylist()
-                seen = set()
-                uniq = []
-                for r in pylist:
-                    k = (r.get("token_id"), r.get("trade_id"))
-                    if k not in seen:
-                        seen.add(k)
-                        uniq.append(r)
-                if len(uniq) < combined.num_rows:
-                    combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+                if not _has_dupes(combined, ["token_id", "trade_id"]):
+                    pass  # unique — skip the pylist round-trip entirely
+                else:
+                    pylist = combined.to_pylist()
+                    seen = set()
+                    uniq = []
+                    for r in pylist:
+                        k = (r.get("token_id"), r.get("trade_id"))
+                        if k not in seen:
+                            seen.add(k)
+                            uniq.append(r)
+                    del pylist
+                    if len(uniq) < combined.num_rows:
+                        combined = pa.Table.from_pylist(uniq, schema=combined.schema)
+                    else:
+                        del uniq
+                    import gc as _gc_dd2
+                    _gc_dd2.collect()
             elif dataset == "markets_log" and "condition_id" in combined.schema.names:
                 # Fix #7: markets 84->28 duplicate — keep latest per condition_id (max updated_at/market_end)
                 pylist = combined.to_pylist()
@@ -1314,6 +1537,113 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         except Exception:
             pass
     return combined
+
+
+# 2026-09-10 OOM: whale datasets (snapshots/clean/events) stream file-by-file
+# via _stream_export_asset_dataset (peak ~one source file). See below.
+STREAM_WHALE_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events"}
+
+
+def _load_market_id_map(data_dir: str | Path) -> Dict[str, str]:
+    """condition_id -> numeric market_id from markets_latest (tiny)."""
+    import re as _re
+
+    mapping: Dict[str, str] = {}
+    try:
+        hex_re = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+        latest = Path(data_dir) / "markets_latest" / "markets_latest.parquet"
+        if latest.exists():
+            for r in read_table(latest).to_pylist():
+                cid, mid = r.get("condition_id"), r.get("market_id")
+                if cid and mid and not (isinstance(mid, str) and bool(hex_re.match(str(mid).strip()))):
+                    mapping[str(cid)] = str(mid)
+    except Exception as e:
+        print(f"[export] WARN markets_latest unreadable for market_id map: {e}")
+    return mapping
+
+
+def _apply_market_id_map(table: pa.Table, mapping: Dict[str, str]) -> pa.Table:
+    """E1 heal on narrow columns only (never whole-row dicts)."""
+    if not mapping or "market_id" not in table.schema.names or "condition_id" not in table.schema.names:
+        return table
+    try:
+        import re as _re
+
+        hex_re = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+        mids = table.column("market_id").to_pylist()
+        idx = [i for i, m in enumerate(mids) if isinstance(m, str) and bool(hex_re.match(m.strip()))]
+        if not idx:
+            return table
+        cids = table.column("condition_id").to_pylist()
+        new_mids = list(mids)
+        for i in idx:
+            new_mids[i] = mapping.get(str(cids[i] or ""))
+        pos = table.schema.get_field_index("market_id")
+        return table.set_column(pos, "market_id", pa.array(new_mids, type=pa.string()))
+    except Exception as e:
+        print(f"[export] WARN market_id map apply failed: {e}")
+        return table
+
+
+def _stream_export_asset_dataset(
+    base: Path,
+    ds: str,
+    asset_upper: str,
+    tmp_path: Path,
+    timeframe_label: Optional[str],
+    l2_levels: int,
+    market_id_map: Dict[str, str],
+) -> int:
+    """Stream one (asset, whale-dataset) staging build. Returns rows written.
+
+    Same row content as the concat Table path (timeframe filter, E1 heal,
+    snapshot dedup), but peak RAM is ~one source file: files are processed
+    oldest-first (footer timestamps), transformed with Arrow kernels,
+    per-batch sorted, and appended incrementally. Global cross-file order
+    follows footer order (source files are time-ordered appends; readers
+    sort anyway per E13).
+    """
+    from .streaming import DedupState, stream_batches, write_batches
+
+    ts_col = {"book_snapshots_500ms": "ts_snapshot_ns"}.get(ds, "ts_received_ns")
+    schema = _get_schema(ds, l2_levels)
+    dedup = DedupState(["asset", "condition_id", "ts_snapshot_ns"]) if ds == "book_snapshots_500ms" else None
+    want = f"{asset_upper}-{timeframe_label}" if timeframe_label else None
+    try:
+        sort_keys = [k for k in (_sort_keys_for_schema(schema) if schema is not None else [])]
+    except Exception:
+        sort_keys = []
+
+    def _transform(t: pa.Table) -> pa.Table:
+        if want and "series_id" in t.schema.names:
+            try:
+                t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
+            except Exception:
+                pass
+        if ds in ("book_snapshots_500ms", "book_events") and market_id_map:
+            t = _apply_market_id_map(t, market_id_map)
+        if dedup is not None:
+            t = dedup.filter(t)
+        if t.num_rows > 1 and sort_keys:
+            try:
+                keys = [(k, "ascending") for k in sort_keys if k in t.schema.names]
+                if keys:
+                    t = pc.take(t, pc.sort_indices(t, sort_keys=keys))
+            except Exception:
+                pass
+        return t
+
+    def _gen():
+        for b in stream_batches(base, ds, asset_upper, ts_col=ts_col, transform=_transform):
+            yield b
+
+    healed_note = ""
+    rows = write_batches(_gen(), tmp_path, schema=schema)
+    if dedup is not None and (dedup.dupes or ds == "book_snapshots_500ms"):
+        healed_note = f" (dedup dropped {dedup.dupes})" if dedup.dupes else ""
+    if healed_note:
+        print(f"[export:stream] {asset_upper} {ds}: {rows} rows{healed_note}")
+    return rows
 
 
 def export_per_asset_single_file(
@@ -1388,22 +1718,90 @@ def export_per_asset_single_file(
             continue
         schema = _get_schema(ds, l2_levels)
         if ds in PER_ASSET_DATASETS:
+            # 2026-09-10 OOM: market_id map loaded once per dataset (tiny).
+            _mid_map: Dict[str, str] = {}
+            if ds in ("book_snapshots_500ms", "book_events", "trades"):
+                try:
+                    _mid_map = _load_market_id_map(base)
+                except Exception:
+                    _mid_map = {}
             for asset in assets:
                 au = asset.upper()
-                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance, timeframe_label=timeframe_label)
                 out_path = out / f"{au}_{ds}.parquet"
+                rel_key = str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)
                 # --- never overwrite non-empty staging with empty/smaller data (cumulative history guard) ---
                 # Load prior staging first to enforce monotonic row-count (never shrink).
                 # Skipped in rolling_window mode: after a retention prune the staging
                 # legitimately shrinks — freezing prior rows would ship deleted data forever.
+                # 2026-09-10 OOM: footer row count (no data read) for whale lanes.
                 prior_rows = None
                 prior_exists = out_path.exists()
                 if prior_exists:
                     try:
-                        _prior = read_table(out_path)
-                        prior_rows = _prior.num_rows
+                        if ds in STREAM_WHALE_DATASETS:
+                            prior_rows = pq.read_metadata(str(out_path)).num_rows
+                        else:
+                            _prior = read_table(out_path)
+                            prior_rows = _prior.num_rows
                     except Exception:
                         prior_rows = None
+                if ds in STREAM_WHALE_DATASETS:
+                    # Streaming build into tmp; guard decides replace vs keep.
+                    # (Same row content as the concat path: timeframe filter,
+                    # E1 heal, snapshot dedup; cross-file order follows footer
+                    # timestamps + per-batch sort instead of one global sort.)
+                    tmp_path = out_path.with_suffix(".parquet.tmp")
+                    try:
+                        new_rows = _stream_export_asset_dataset(
+                            base, ds, au, tmp_path, timeframe_label, l2_levels, _mid_map
+                        )
+                    except Exception as e:
+                        print(f"[export:stream] WARN {au} {ds} failed: {e}")
+                        try:
+                            if tmp_path.exists():
+                                tmp_path.unlink()
+                        except Exception:
+                            pass
+                        stats[rel_key] = prior_rows if prior_rows is not None else 0
+                        continue
+                    if not rolling_window and prior_rows is not None and prior_rows > 0 and new_rows < prior_rows:
+                        try:
+                            if tmp_path.exists():
+                                tmp_path.unlink()
+                        except Exception:
+                            pass
+                        stats[rel_key] = prior_rows
+                        continue
+                    if new_rows > 0:
+                        _os_replace_safe(tmp_path, out_path)
+                        stats[rel_key] = new_rows
+                        continue
+                    # 0 rows streamed.
+                    try:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+                    except Exception:
+                        pass
+                    if prior_exists and prior_rows is not None and prior_rows > 0:
+                        stats[rel_key] = prior_rows
+                        continue
+                    if ds == "book_snapshots_500ms":
+                        # fail closed: never publish a missing snapshots file
+                        stats[rel_key] = 0
+                        continue
+                    # other whales legitimately 0 early -> schema-empty file
+                    try:
+                        _schema_for_empty = _get_schema(ds, l2_levels)
+                        if _schema_for_empty is not None:
+                            pq.write_table(
+                                pa.table({f.name: [] for f in _schema_for_empty}, schema=_schema_for_empty),
+                                str(tmp_path), compression="zstd")
+                            _os_replace_safe(tmp_path, out_path)
+                    except Exception:
+                        pass
+                    stats[rel_key] = 0
+                    continue
+                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance, timeframe_label=timeframe_label)
                 new_rows = table.num_rows if (table is not None) else 0
                 # If prior has data, never replace it with fewer rows (empty read, transient error, or legitimate 0)
                 # This prevents 1a empty-file overwrite and guarantees cumulative history
@@ -2566,25 +2964,12 @@ def _export_and_upload_all_kaggle_impl(
     }
 
     # Step 0: Compact hive data (§10A) — merge small parquet files before export
-    # This ensures staging files are compacted, reducing file count and improving upload efficiency.
-    # compaction is best-effort: if no compactable files exist, it is a no-op.
-    try:
-        from polymarket_collector.storage.compaction import compact_all as _compact_all
-        compact_stats = _compact_all(
-            data_dir,
-            datasets=[
-                "book_snapshots_500ms",
-                "book_events",
-                "trades",
-                "chainlink_events",
-                "collector_events",
-                "resync_episodes",
-            ],
-        )
-        if compact_stats:
-            print(f"compacted: {compact_stats}")
-    except Exception as e:
-        print(f"compact err {e}")
+    # 2026-09-10 OOM: DISABLED inside the export path — compact_all reads the
+    # ENTIRE hive into pandas on every lane export (4x/hour), stacking GBs
+    # against collection until the kernel SIGKills the box. Staging concat
+    # handles many small files correctly (opens sequentially). Run the
+    # standalone compact cron off-peak instead (polymarket-compact, 03:00).
+    # (Kept as a no-op block so the step numbering below stays stable.)
 
     # Step 0b: Build clean view (§9B book_state='live') so completeness metrics and backtest path are valid
     try:

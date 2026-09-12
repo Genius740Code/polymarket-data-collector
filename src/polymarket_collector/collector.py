@@ -707,13 +707,31 @@ class Collector:
 
         # K-2: seed the in-RAM chainlink store from parquet so resolution works for
         # windows that opened before this process (restart mid-window, first window)
+        # 2026-09-10 OOM: only today's + yesterday's date partitions can hold
+        # 30-min-fresh rows — never concat the full hive at startup.
         try:
-            from .storage.parquet_io import read_dataset_dir
-            _cl = read_dataset_dir(Path(self.config.storage.data_dir) / "chainlink_events", label="startup chainlink seed")
-            if _cl is not None and _cl.num_rows > 0:
-                cutoff_ms = int(time.time() * 1000) - 30 * 60 * 1000
-                seeded = 0
-                for r in _cl.to_pylist():
+            from .storage.parquet_io import read_table
+            import datetime as _dt_seed
+            _cl_dir = Path(self.config.storage.data_dir) / "chainlink_events"
+            _days = {
+                _dt_seed.datetime.now(tz=_dt_seed.timezone.utc).strftime("date=%Y-%m-%d"),
+                (_dt_seed.datetime.now(tz=_dt_seed.timezone.utc) - _dt_seed.timedelta(days=1)).strftime("date=%Y-%m-%d"),
+            }
+            _seed_files: list = []
+            if _cl_dir.exists():
+                for _dd in _cl_dir.glob("date=*"):
+                    if _dd.name in _days:
+                        _seed_files.extend(p for p in _dd.rglob("*.parquet") if not p.name.endswith(".tmp"))
+            cutoff_ms = int(time.time() * 1000) - 30 * 60 * 1000
+            seeded = 0
+            for _fp in _seed_files:
+                try:
+                    _t = read_table(_fp)
+                except Exception:
+                    continue
+                if _t is None or _t.num_rows == 0 or "ts_received_ns" not in _t.schema.names:
+                    continue
+                for r in _t.select(["ts_received_ns", "asset", "price", "event_id"]).to_pylist():
                     ts = r.get("ts_received_ns")
                     if ts is None:
                         continue
@@ -721,8 +739,9 @@ class Collector:
                     if ts_ms >= cutoff_ms:
                         self._note_chainlink_event(r, str(r.get("asset") or ""), ts_ms)
                         seeded += 1
-                if seeded:
-                    print(f"[startup] seeded {seeded} chainlink events from parquet (resolution ground truth)")
+                del _t
+            if seeded:
+                print(f"[startup] seeded {seeded} chainlink events from parquet (resolution ground truth)")
         except Exception as e:
             print(f"[startup] chainlink seed skipped: {e}")
 
@@ -2773,9 +2792,17 @@ class Collector:
         _has_creds = _validate_kaggle_config()
         _tfs = self.rollover.enabled_lane_labels()
         print(f"[kaggle] datasets for lanes {_tfs}: {[self.config.kaggle_dataset_for(t) for t in _tfs]} interval {interval}s ({interval//60} min), creds={'ok' if _has_creds else 'missing (dry-run only)'}")
-        # Initial delay before first upload (so collector can discover markets)
+        # Initial delay before first upload (so collector can discover markets).
+        # 2026-09-10 OOM: capped at 300s — leak-driven restarts (~30-90 min)
+        # kept resetting the full-interval wait, so the upload pass never fired and
+        # Kaggle went 20h stale. Every incarnation now uploads within 5 min
+        # (while RSS is still low, which also helps the export survive).
+        # The cap applies ONLY when uploads are actually enabled (interval <=
+        # 1h); a huge interval means exports are deliberately paused (OOM
+        # truce) and must NOT fire early.
+        initial_delay = min(interval, 300) if interval <= 3600 else interval
         slept = 0
-        while self._running and slept < interval:
+        while self._running and slept < initial_delay:
             await asyncio.sleep(min(5, interval - slept))
             slept += 5
             if not self._running:

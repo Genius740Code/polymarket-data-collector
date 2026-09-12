@@ -133,11 +133,15 @@ module.exports = {
     // already-resolved markets are skipped, unsettled ones retry next run.
     // --reupload --all-lanes pushes a fresh Kaggle version for EVERY enabled
     // timeframe lane (5m/15m/4h datasets), not just the 5m default.
+    // 2026-09-10 OOM: --skip-onchain — the :00 full run (500 receipts + full
+    // trades-hive reads) still spiked to 1.9GB and died. Wallets keep healing
+    // via export-time first pass; on-chain resumes after the export diet.
+    // (Also: single exporter per earlier note — no --reupload here.)
     {
       name: 'polymarket-resolution-backfill',
       cwd,
       script: python,
-      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml --reupload --all-lanes',
+      args: '-m polymarket_collector.resolution_backfill --config config/collector.yaml --skip-onchain',
       interpreter: 'none',
       exec_mode: 'fork',
       autorestart: false,

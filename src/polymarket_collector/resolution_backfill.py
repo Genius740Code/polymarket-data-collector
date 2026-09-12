@@ -225,18 +225,35 @@ def main() -> None:
     cfg = CollectorConfig.load(args.config)
     data_dir = args.data_dir or cfg.storage.data_dir
     stats = backfill_resolutions(data_dir, dry_run=args.dry_run)
-    if not args.skip_enrich and not args.dry_run:
+    # 2026-09-10 OOM: the second-pass freshness CHECK reads the full trades
+    # hive per asset just to learn the newest timestamp (then defers anyway
+    # under 24/7 collection). Heavy passes ride the :00 run only.
+    import datetime as _dt0
+    _hourly0 = int(_dt0.datetime.now(tz=_dt0.timezone.utc).strftime("%M")) < 15
+    if not args.skip_enrich and not args.dry_run and _hourly0:
         run_trades_enrichment_second_pass(data_dir, cfg.assets)
         if not args.skip_onchain:
-            try:
-                from .storage.export import third_pass_onchain_wallets
-                # 2026-09-09 OOM: 1500 receipts/run × 4 runs/hour + concurrent
-                # collector exports spiked the 3.9GB box into SIGKILLs. 500/run
-                # still heals ~2000 txs/hour (runs now complete instead of
-                # being cron-killed mid-reupload); newest-first so lag stays low.
-                third_pass_onchain_wallets(data_dir, cfg.assets, max_txs=500)
-            except Exception as e:
-                print(f"[resolution-backfill] WARN on-chain wallet pass failed: {e}")
+            # 2026-09-10 OOM: the on-chain third pass (RPC receipts + hive
+            # rewrites, ~1GB) + 4-lane reupload pandas on EVERY 15-min run
+            # kept the 3.9GB box in a permanent OOM loop (kernel SIGKILLed
+            # collector/backfill mid-upload ~30-minutely; zero Kaggle uploads
+            # for 20h from Sept 9 19:42). Resolutions are cheap (CLOB GETs);
+            # the heavy wallet pass rides the :00 run only (1x/hour, 500 txs).
+            # Wallets are analysis-grade, not time-critical.
+            import datetime as _dt3
+            _hourly = int(_dt3.datetime.now(tz=_dt3.timezone.utc).strftime("%M")) < 15
+            if not _hourly:
+                print("[resolution-backfill] on-chain pass deferred to :00 run (resolutions done)")
+            else:
+                try:
+                    from .storage.export import third_pass_onchain_wallets
+                    # 2026-09-09 OOM: 1500 receipts/run × 4 runs/hour + concurrent
+                    # collector exports spiked the 3.9GB box into SIGKILLs. 500/run
+                    # still heals ~2000 txs/hour (runs now complete instead of
+                    # being cron-killed mid-reupload); newest-first so lag stays low.
+                    third_pass_onchain_wallets(data_dir, cfg.assets, max_txs=500)
+                except Exception as e:
+                    print(f"[resolution-backfill] WARN on-chain wallet pass failed: {e}")
     if args.reupload and (stats.get("resolved") or stats.get("upgraded")):
         if args.all_lanes:
             # 2026-09-09 OOM: 4-lane reupload (~2-4 min/lane + on-chain) never

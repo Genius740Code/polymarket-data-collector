@@ -79,3 +79,39 @@ def test_clean_view_empty_no_crash():
         n = build_clean_view(tmp)
         assert n == 0
         assert load_clean(tmp) is None
+
+
+def test_clean_view_incremental_appends_without_dupes():
+    """Hourly exports must merge only new files (bounded RAM, no double-count)."""
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        src_dir = base / "book_snapshots_500ms" / "date=2025-01-01" / "asset=BTC"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        def _row(sid, ts):
+            return {"snapshot_id": sid, "schema_version": "3.0.0", "series_id": "BTC-5MIN",
+                    "window_index": 1, "condition_id": "cid-live", "market_id": "m1",
+                    "asset": "BTC", "up_token_id": "up", "down_token_id": "down",
+                    "ts_snapshot_utc": "2025-01-01T00:00:00Z", "ts_snapshot_ns": ts,
+                    "up_bid": 0.5, "up_ask": 0.6, "up_bid_size": 10, "up_ask_size": 10,
+                    "down_bid": 0.4, "down_ask": 0.5, "down_bid_size": 10, "down_ask_size": 10,
+                    "market_time_remaining_ms": 1000, "up_book_age_ms": 0, "down_book_age_ms": 0,
+                    "is_rollover_window": False, "book_state": "live", "resync_id": None,
+                    "book_crossed": False}
+
+        pq.write_table(pa.Table.from_pylist([_row("1", 0), _row("2", 1)]), str(src_dir / "p1.parquet"))
+        assert build_clean_view(tmp) == 2
+        assert load_clean(tmp).num_rows == 2
+        # new file arrives (plus a compaction-style rewrite of old rows)
+        time.sleep(0.05)
+        pq.write_table(pa.Table.from_pylist([_row("3", 2)]), str(src_dir / "p2.parquet"))
+        time.sleep(0.05)
+        pq.write_table(pa.Table.from_pylist([_row("1", 0), _row("2", 1)]), str(src_dir / "p1-compacted.parquet"))
+        os.remove(str(src_dir / "p1.parquet"))
+        n2 = build_clean_view(tmp)
+        assert n2 == 3  # merged total, compaction rewrite NOT double-counted
+        got = load_clean(tmp)
+        assert got.num_rows == 3
+        assert sorted(r["snapshot_id"] for r in got.to_pylist()) == ["1", "2", "3"]

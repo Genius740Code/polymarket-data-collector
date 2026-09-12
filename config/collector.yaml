@@ -43,6 +43,8 @@ kaggle:
   # 12h steady state ~= 6GB. Kaggle versions are rolling windows by design.
   local_retention_hours: 12
   test_upload_interval_seconds: 600
+  # 2026-09-10: restored 3600 — streaming export bounds staging peak to
+  # ~one source file, verified 186k rows at 392MB peak (was 2.2GB+ death).
   upload_interval_seconds: 3600
 l2_levels: 10
 liquidity_filter:
