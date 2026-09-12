@@ -68,7 +68,13 @@ module.exports = {
       // export 08:15 (10s kill_timeout too short for in-flight export).
       // 2048M fits the 3.9GB box (2G collector + 0.74G opencode + 0.52G
       // backfill transient ≈ 3.3G peak); 60s kill lets stop() flush + cursor.
-      max_memory_restart: '2048M',
+      // 2026-09-12: 2048M → 1500M. The streaming fixes cut export peaks, but
+      // the long-lived parent retains ~200-400MB per summary tick (mimalloc)
+      // and marches to 2G+ over hours; at 2048M the KERNEL oom-killed it
+      // mid-prune (anon 2.1GB, Sep 11) instead of pm2 restarting it cleanly.
+      // 1500M restarts via SIGINT (60s flush window) well before the kernel
+      // must intervene; ticks are fail-closed and resume next cycle.
+      max_memory_restart: '1500M',
       restart_delay: 1000,
       exp_backoff_restart_delay: 100,
       kill_timeout: 60000,          // SIGINT → give collector time to flush + persist cursor (§1B)

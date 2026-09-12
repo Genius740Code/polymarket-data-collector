@@ -184,3 +184,42 @@ def test_staging_includes_summary_file(hive: Path):
     out = hive / "staging"
     export_per_asset_single_file(hive, out_dir=out, datasets=["book_snapshots_500ms", "trades", "book_events", "chainlink_events", "markets_log", "collector_events", "resync_episodes", "markets_summary"], assets=["BTC"])
     assert (out / "markets_summary.parquet").exists()
+
+
+def test_chainlink_nearest_tick_vectorized(tmp_path):
+    """Vectorized chainlink load: exact open/close ticks, fraction + garbage
+    handling, no per-row Python blowup."""
+    base = tmp_path / "data"
+    # market: 5m window [1000000, 1300000] ms
+    ml = base / "markets_latest"
+    ml.mkdir(parents=True)
+    pq.write_table(pa.table({
+        "condition_id": ["cid-1"], "asset": ["BTC"], "series_id": ["BTC-5m"],
+        "window_index": [1], "window_size_seconds": [300],
+        "market_start_ts_ms": [1000000], "market_end_ts_ms": [1300000],
+        "status": ["resolved"], "resolution_outcome": ["up"],
+        "settlement_source": ["polymarket_official"],
+    }), str(ml / "markets_latest.parquet"))
+    d = base / "chainlink_events" / "date=x" / "asset=BTC"
+    d.mkdir(parents=True)
+    rows = [
+        {"asset": "BTC", "ts_source": "1970-01-01T00:16:35Z", "price": 10.0},   # 995000
+        {"asset": "BTC", "ts_source": "1970-01-01T00:16:40Z", "price": 11.0},   # 1000000 exact
+        {"asset": "BTC", "ts_source": "1970-01-01T00:16:40.500Z", "price": 11.5},  # fraction
+        {"asset": "BTC", "ts_source": "1970-01-01T00:21:42Z", "price": 20.0},   # 1302000 (2s after end)
+        {"asset": "BTC", "ts_source": "1970-01-01T00:22:40Z", "price": 21.0},   # far -> out of tol
+        {"asset": "BTC", "ts_source": "garbage", "price": 99.0},                # dropped
+        {"asset": "BTC", "ts_source": None, "price": 99.0},                     # dropped
+    ]
+    pq.write_table(pa.table({"asset": [r["asset"] for r in rows],
+                             "ts_source": [r["ts_source"] for r in rows],
+                             "price": [r["price"] for r in rows]}), str(d / "t.parquet"))
+    out = tmp_path / "staging"
+    out.mkdir()
+    t = build_markets_summary(base, staging_dir=out, assets=["BTC"], timeframe_label="5m")
+    assert t.num_rows == 1
+    r = t.to_pylist()[0]
+    # open: exact-boundary tick wins (11.0 @ 1000000)
+    assert r["underlying_open"] == 11.0, r
+    # close: 1302000 within 5s tol (20.0); far tick ignored
+    assert r["underlying_close"] == 20.0, r

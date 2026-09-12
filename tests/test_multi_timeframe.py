@@ -158,6 +158,20 @@ def _write_parquet(path: Path, rows: list, schema_cols: dict) -> None:
     pq.write_table(table, str(path))
 
 
+def _fresh_staging(base: Path, lanes=("5m", "15m", "1h", "4h"), files=("BTC_book_snapshots_500ms.parquet",)) -> None:
+    """Coverage-proof evidence: fresh per-(lane, dataset) staging files.
+
+    Since 2026-09-12 the prune deletes a hive file only if every lane's
+    staging for that dataset is newer (minus slack) than the file — tests
+    exercising deletion must provide that evidence.
+    """
+    for lane in lanes:
+        for name in files:
+            p = base / "kaggle_staging" / lane / "gghgg1" / "ds" / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"")
+
+
 def test_tf_filter_and_rolling_prune(tmp_path):
     base = Path(tmp_path)
     now_ms = int(time.time() * 1000)
@@ -186,6 +200,11 @@ def test_tf_filter_and_rolling_prune(tmp_path):
 
     # rolling prune: the file also contains a RECENT market's rows → kept (conservative)
     cfg = _cfg(str(base))
+    _fresh_staging(base)
+    import os as _os
+
+    _old_ts = (now_ms / 1000 - 5 * 3600,)
+    _os.utime(f, _old_ts * 2)  # older than the 3h coverage slack
     stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=48, checkpoint_ms=now_ms)
     assert f.exists(), "prune deleted a file containing an in-leeway market"
 
@@ -193,6 +212,7 @@ def test_tf_filter_and_rolling_prune(tmp_path):
     f_old = base / "book_snapshots_500ms" / "date=2026-09-01" / "asset=BTC" / "part-0.parquet"
     _write_parquet(f_old, [{"condition_id": "cid-old", "asset": "BTC", "series_id": "BTC-5m", "ts_snapshot_ns": now_ms * 1e6}],
                    ["condition_id", "asset", "series_id", "ts_snapshot_ns"])
+    _os.utime(f_old, _old_ts * 2)
     stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=48, checkpoint_ms=now_ms)
     assert not f_old.exists(), "file with only pre-cutoff markets should be deleted"
     assert f.exists(), "file with an in-leeway market must survive"
@@ -223,6 +243,15 @@ def test_prune_skip_datasets_keeps_event_history(tmp_path):
     _write_parquet(f_events, [{"event_type": "market_added", "ts_utc": old_ns}], ["event_type", "ts_utc"])
     f_chain = base / "chainlink_events" / "date=x" / "asset=BTC" / "part-0.parquet"
     _write_parquet(f_chain, [{"asset": "BTC", "ts_utc": old_ns}], ["asset", "ts_utc"])
+    # coverage proof needs fresh per-(lane, dataset) staging; hive files must
+    # predate the 3h slack
+    import os as _os2
+
+    _fresh_staging(base, files=("BTC_book_snapshots_500ms.parquet", "collector_events.parquet",
+                                "BTC_chainlink_events.parquet"))
+    _old2 = (now_ms / 1000 - 5 * 3600,)
+    for _f in (f_cid, f_events, f_chain):
+        _os2.utime(_f, _old2 * 2)
 
     # without skip: the ~0h cutoff deletes everything old (the 2026-09-07 bug)
     stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=0,
@@ -231,10 +260,13 @@ def test_prune_skip_datasets_keeps_event_history(tmp_path):
     # restore event files, keep CID file deleted state out of the equation
     _write_parquet(f_events, [{"event_type": "market_added", "ts_utc": old_ns}], ["event_type", "ts_utc"])
     _write_parquet(f_chain, [{"asset": "BTC", "ts_utc": old_ns}], ["asset", "ts_utc"])
+    _os2.utime(f_events, _old2 * 2)
+    _os2.utime(f_chain, _old2 * 2)
     f_cid2 = base / "book_snapshots_500ms" / "date=y" / "asset=BTC" / "part-0.parquet"
     _write_parquet(f_cid2, [{"condition_id": "cid-old", "asset": "BTC", "series_id": "BTC-5m",
                              "ts_snapshot_ns": old_end * 1e6}],
                    ["condition_id", "asset", "series_id", "ts_snapshot_ns"])
+    _os2.utime(f_cid2, _old2 * 2)
 
     # with skip: event history survives, eligible CID files still prune
     stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=0,

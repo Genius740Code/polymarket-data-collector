@@ -56,6 +56,37 @@ def _details_get(details: Any, key: str) -> Any:
         return None
 
 
+def _next_kaggle_lane(data_dir: str | Path, lanes: List[str]) -> Optional[str]:
+    """Round-robin lane picker with a persistent cursor (2026-09-11).
+
+    A full multi-lane export pass (~40 min/lane × 4 lanes) never fits inside
+    one process incarnation on this box (OOM/max-memory restarts every
+    ~25-90 min), so the old "all lanes every tick" loop never reached any
+    upload. Each tick now uploads ONE lane; the cursor file survives
+    restarts so lanes keep rotating across incarnations. Per-lane cadence =
+    upload_interval × len(lanes) (~4h with the prod defaults).
+    """
+    if not lanes:
+        return None
+    if len(lanes) == 1:
+        return lanes[0]
+    cursor = Path(data_dir) / "kaggle_staging" / "_lane_cursor.json"
+    idx = 0
+    try:
+        if cursor.exists():
+            idx = int((json.loads(cursor.read_text()) or {}).get("idx", 0))
+    except Exception:
+        idx = 0
+    lane = lanes[idx % len(lanes)]
+    try:
+        cursor.parent.mkdir(parents=True, exist_ok=True)
+        cursor.write_text(json.dumps({"idx": idx + 1, "lane": lane,
+                                      "lanes": list(lanes)}))
+    except Exception:
+        pass
+    return lane
+
+
 class Collector:
     """BTC/ETH/SOL/HYPE/BNB/XRP/DOGE 5-min market collector (§1-§19) — 5m-only, 4 markets test, 10-min Kaggle."""
 
@@ -2802,13 +2833,16 @@ class Collector:
         return report
 
     async def _kaggle_upload_loop(self) -> None:
-        """Multi-timeframe Kaggle loop: one dataset per enabled timeframe lane.
+        """Multi-timeframe Kaggle loop: one lane per tick, round-robin.
 
         Prod: hourly (3600s). Test: every 10 min (600s) via config.kaggle.test_upload_interval_seconds.
-        Each tick iterates the enabled lanes and uploads that lane's dataset
-        (staging kaggle_staging/{tf}/, dataset from config.kaggle.datasets).
-        Uses staging folder upload with retry 5 + status poll; prune runs only
-        after verified ready (rolling-window mode, see cleanup_local_data).
+        Each tick stages + uploads + prunes ONE enabled lane (persistent
+        round-robin cursor in data/kaggle_staging/_lane_cursor.json), so a
+        pass always fits inside one process incarnation. Uploading all lanes
+        sequentially per tick never completed on this box (OOM/restarts) and
+        starved Kaggle for 44h (2026-09-09→11). Per-lane cadence =
+        interval × #lanes. Uses staging folder upload with retry 5 + status
+        poll; prune runs only after verified ready (rolling-window mode).
         Starts with delay = interval (not immediate) to avoid empty first upload.
         """
         # Determine interval: prod hourly unless test_mode enabled
@@ -2896,21 +2930,34 @@ class Collector:
                         # Bounded: result dicts are nontrivial; keep only recent history
                         if len(self._kaggle_uploads) > 200:
                             del self._kaggle_uploads[:len(self._kaggle_uploads) - 200]
-                    for tf in self.rollover.enabled_lane_labels():
-                        if not self._running:
-                            break
-                        await _upload_one(tf)
-                        # 2026-09-09 OOM: drop per-lane staging tables between
-                        # lanes so the 4-lane export peak stays flat, not stacked.
+                    _lanes = self.rollover.enabled_lane_labels()
+                    _tf = _next_kaggle_lane(self.config.storage.data_dir, _lanes)
+                    _tick_start = time.time()
+                    if _tf is None:
+                        print("[kaggle] no enabled lanes, skipping")
+                    else:
+                        print(f"[kaggle] tick lane={_tf} (lanes={_lanes})")
+                        await _upload_one(_tf)
+                        # drop per-lane staging tables between ticks so the
+                        # export peak stays flat, not stacked.
                         try:
                             import gc as _gc
                             _gc.collect()
                         except Exception:
                             pass
-                # Sleep interval with early-exit check every 5s
+                # Sleep interval with early-exit check every 5s.
+                # 2026-09-11: account for tick duration — the old code slept
+                # the FULL interval after every tick, so with 70-min ticks
+                # each lane uploaded every ~9h. Ticks now start every
+                # interval (lane cadence = interval x lanes ≈ 4h prod).
+                try:
+                    _elapsed = time.time() - _tick_start
+                except Exception:
+                    _elapsed = 0
+                _wait = max(0, interval - _elapsed)
                 slept2 = 0
-                while self._running and slept2 < interval:
-                    await asyncio.sleep(min(5, interval - slept2))
+                while self._running and slept2 < _wait:
+                    await asyncio.sleep(min(5, _wait - slept2))
                     slept2 += 5
             except asyncio.CancelledError:
                 print("[kaggle] cancelled")

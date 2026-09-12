@@ -54,7 +54,11 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
     tmp_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet{temp_suffix}"
     final_path = dataset_path / f"part-compacted-{uuid.uuid4().hex[:8]}.parquet"
-    pq.write_table(combined, str(tmp_path), compression="zstd")
+    # 2026-09-11: small row groups — one giant single-row-group file forces
+    # the streaming export to materialize the whole row group at once
+    # (PyArrow reads row-group-at-a-time; iter_batches slices do not release
+    # the parent), tripping the worker RSS cap and killing uploads.
+    pq.write_table(combined, str(tmp_path), compression="zstd", row_group_size=20000)
     _os_replace_safe(tmp_path, final_path)
     # remove old parts only after successful new write
     for p in parts:

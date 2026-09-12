@@ -1,4 +1,4 @@
-"""Streaming export module: per-file batches, footer ordering, narrow dedup."""
+"""Streaming export module: per-file batches, mtime ordering, narrow dedup."""
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -14,12 +14,22 @@ def _tbl(rows, schema=None):
     return pa.Table.from_pylist(rows, schema=schema)
 
 
-def test_iter_orders_by_footer_ts(tmp_path):
+def test_iter_orders_by_mtime(tmp_path):
+    # 2026-09-11: footer-timestamp ordering was removed — pq footer reads
+    # leak ~250KB/call in pyarrow 25 and pinned ~1GB RSS per export pass,
+    # killing every Kaggle upload. Date partition + mtime approximates write
+    # order with metadata only (exact cross-file order is not required:
+    # dedup is key-exact, batches are per-batch sorted, readers sort).
+    import os
+    import time
     d = tmp_path / "ds" / "date=2026-09-10" / "asset=BTC"
     d.mkdir(parents=True)
-    # write out of order: partB (older ts) second
+    # write out of order: partB (older content) second
     pq.write_table(_tbl([{"ts": 200, "v": "b"}]), str(d / "partB.parquet"))
     pq.write_table(_tbl([{"ts": 100, "v": "a"}]), str(d / "partA.parquet"))
+    now = time.time()
+    os.utime(d / "partA.parquet", (now - 100, now - 100))  # older content, older mtime
+    os.utime(d / "partB.parquet", (now, now))
     files = iter_source_files(tmp_path, "ds", asset=None, ts_col="ts")
     assert [p.name for p in files] == ["partA.parquet", "partB.parquet"]
     got = [r["v"] for t in stream_batches(tmp_path, "ds", ts_col="ts") for r in t.to_pylist()]

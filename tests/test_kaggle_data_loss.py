@@ -28,6 +28,15 @@ from polymarket_collector.storage.cursor_store import CursorStore
 
 
 # ------------------------------------------------------------------ helpers
+@pytest.fixture(autouse=True)
+def _no_ram_gate(monkeypatch):
+    """Hermetic unit tests: the prod box-RAM pre-flight gate (SKIP below
+    900MB available) must not skip tiny fixture builds on a loaded box.
+    Same pattern as tests/test_checkpoint_resume.py."""
+    import polymarket_collector.storage.export as _E
+    monkeypatch.setattr(_E, "_avail_mb", lambda: 99999)
+
+
 def make_cfg(tmpdir: str, assets: list | None = None) -> CollectorConfig:
     cfg = CollectorConfig()
     cfg.storage.data_dir = tmpdir

@@ -6,14 +6,14 @@ needs GBs and the kernel SIGKills the box. Small hives passed by luck.
 
 Rule enforced here: never materialize more than a small group of files at
 once. Per-file tables are transformed with Arrow kernels, appended to an
-incremental pq.ParquetWriter, and released. Files are processed in footer
-timestamp order so each staging file stays time-ordered without a global
+incremental pq.ParquetWriter, and released. Files are processed in
+date/mtime order so each staging file stays time-ordered without a global
 sort (readers sort across files anyway; see E13).
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -21,31 +21,34 @@ import pyarrow.parquet as pq
 from .parquet_io import read_table
 
 
-def _footer_ts_range(path: Path, ts_col: str) -> Tuple[Optional[int], Optional[int]]:
-    """Min/max of ts_col from the parquet FOOTER only (no data read)."""
+def _order_key(p: Path):
+    """Cheap time-approx ordering without reading file footers.
+
+    2026-09-11: footer-timestamp ordering (pq.read_metadata().schema per
+    file) leaks ~250KB/call in pyarrow 25 (FileMetaData.schema retention)
+    and pinned ~1GB RSS per export pass, killing every upload. Date
+    partition + mtime approximates write order well enough: exact cross-file
+    order is NOT required anywhere (snapshot dedup is key-exact, batches are
+    per-batch sorted, the summary OHLC fold tracks min/max ts itself, and
+    readers sort per E13).
+    """
+    date = ""
     try:
-        md = pq.read_metadata(str(path))
-        lo, hi = None, None
-        for rg in range(md.num_row_groups):
-            col = None
-            try:
-                names = md.schema.names
-                if ts_col not in names:
-                    break
-                ci = names.index(ts_col)
-                stats = md.row_group(rg).column(ci).statistics
-                if stats is None or not stats.has_min_max:
-                    continue
-                mn, mx = stats.min, stats.max
-            except Exception:
-                continue
-            if mn is not None:
-                lo = mn if lo is None else min(lo, mn)
-            if mx is not None:
-                hi = mx if hi is None else max(hi, mx)
-        return lo, hi
+        for part in p.parts:
+            if part.startswith("date="):
+                date = part[5:]
+                break
     except Exception:
-        return None, None
+        pass
+    try:
+        mt = p.stat().st_mtime_ns
+    except OSError:
+        mt = 0
+    try:
+        s = str(p)
+    except Exception:
+        s = ""
+    return (date, mt, s)
 
 
 def iter_source_files(
@@ -54,11 +57,12 @@ def iter_source_files(
     asset: Optional[str] = None,
     ts_col: Optional[str] = None,
 ) -> List[Path]:
-    """Source files for (dataset, asset), oldest-first by footer timestamp.
+    """Source files for (dataset, asset), oldest-first by date partition + mtime.
 
     Asset-partitioned datasets read only their asset= dir (partition pruning
-    at the FILE level — the whole point). Unknown-ts files sort last (they
-    belong to the next export, same convention as the mtime build-start rule).
+    at the FILE level — the whole point). Ordering is approximate (exact
+    cross-file order is not required: dedup is key-exact, batches are
+    per-batch sorted, readers sort per E13).
     """
     from .export import PER_ASSET_DATASETS  # local import: export imports this module too
 
@@ -74,18 +78,9 @@ def iter_source_files(
             files = [p for p in base.rglob("*.parquet") if not p.name.endswith(".tmp")]
     else:
         files = [p for p in base.rglob("*.parquet") if not p.name.endswith(".tmp")]
-    if ts_col and len(files) > 1:
-        keyed = []
-        for p in files:
-            try:
-                lo, _ = _footer_ts_range(p, ts_col)
-            except Exception:
-                lo = None
-            keyed.append(((lo is None), lo if lo is not None else 0, str(p), p))
-        keyed.sort(key=lambda k: (k[0], k[1], k[2]))
-        files = [k[3] for k in keyed]
-    else:
-        files.sort(key=str)
+    # ts_col is accepted for API compat but intentionally IGNORED (see
+    # _order_key): footer-timestamp ordering leaked ~1GB/pass.
+    files.sort(key=_order_key)
     return files
 
 
@@ -153,37 +148,93 @@ def stream_batches(
     transform: Optional[Callable[[pa.Table], pa.Table]] = None,
     max_files: Optional[int] = None,
     batch_rows: int = 20000,
+    stats: Optional[Dict] = None,
+    cutoff_ts: Optional[float] = None,
 ) -> Iterator[pa.Table]:
     """Yield row-group batches (bounded RAM), oldest file first.
 
     2026-09-11 OOM: per-FILE tables still explode (100MB staging/hive files
     expand ~30x). Batches cap the transient at batch_rows regardless of
-    file size. Order across batches follows footer order (approx time).
+    file size. Order across batches follows date/mtime order (approx time).
+
+    stats (optional dict): filled with files_ok / files_failed /
+    failed_bytes / rows_read so the export-coverage manifest can fail closed
+    on unreadable inputs without re-reading the hive. cutoff_ts: skip files
+    newer than the export build start (they belong to the next cycle).
     """
     import pyarrow.parquet as _pq
 
     files = iter_source_files(data_dir, dataset, asset, ts_col)
+    if cutoff_ts is not None:
+        kept = []
+        for p in files:
+            try:
+                if p.stat().st_mtime > cutoff_ts:
+                    continue
+            except OSError:
+                continue
+            kept.append(p)
+        files = kept
     if max_files is not None:
         files = files[:max_files]
+    if stats is not None:
+        stats["files_ok"] = 0
+        stats["files_failed"] = 0
+        stats["failed_bytes"] = 0
+        stats["rows_read"] = 0
     for p in files:
         try:
             _pf = _pq.ParquetFile(str(p))
         except Exception:
+            if stats is not None:
+                stats["files_failed"] += 1
+                try:
+                    stats["failed_bytes"] += p.stat().st_size
+                except OSError:
+                    pass
             continue
         try:
+            read_any = False
+            yielded_any = False
+            transform_errored = False
             for chunk in _pf.iter_batches(batch_size=batch_rows):
                 t = pa.Table.from_batches([chunk])
                 if t.num_rows == 0:
                     continue
+                read_any = True
+                if stats is not None:
+                    stats["rows_read"] += t.num_rows
                 if transform is not None:
                     try:
                         t = transform(t)
                     except Exception:
+                        transform_errored = True
                         continue
                     if t is None or t.num_rows == 0:
+                        # filtered out (e.g. other-lane series_id) — the file
+                        # itself read fine, so it is NOT a read failure.
                         continue
+                yielded_any = True
                 yield t
+            if stats is not None:
+                # Failed only when batches errored AND nothing usable came
+                # out. Clean reads (fully lane-filtered, schema-empty) are ok.
+                if transform_errored and not yielded_any:
+                    stats["files_failed"] += 1
+                    try:
+                        stats["failed_bytes"] += p.stat().st_size
+                    except OSError:
+                        pass
+                else:
+                    stats["files_ok"] += 1
+            _ = read_any  # documents the loop ran; kept for clarity
         except Exception:
+            if stats is not None:
+                stats["files_failed"] += 1
+                try:
+                    stats["failed_bytes"] += p.stat().st_size
+                except OSError:
+                    pass
             continue
 
 
@@ -192,8 +243,17 @@ def write_batches(
     out_path: str | Path,
     schema: Optional[pa.Schema] = None,
     compression: str = "zstd",
+    row_group_rows: int = 20000,
 ) -> int:
-    """Append batches to one parquet file with a FIXED schema. Returns rows."""
+    """Append batches to one parquet file with a FIXED schema. Returns rows.
+
+    Small input batches are coalesced to ~row_group_rows before each write
+    so the output has sane row-group counts AND the writer never buffers an
+    unbounded row group: 2026-09-11 — ParquetWriter's default 1M-row row
+    group buffered the whole staging file until close (encode ~1GB transient
+    at close on the BTC lane, tripping the worker RSS cap every cycle).
+    Peak transient here stays ~one row group regardless of total rows.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
@@ -210,6 +270,20 @@ def write_batches(
 
     writer: Optional[pq.ParquetWriter] = None
     rows = 0
+    pending: List[pa.Table] = []
+    pending_rows = 0
+
+    def _flush_pending() -> None:
+        nonlocal pending, pending_rows, writer, rows
+        if not pending:
+            return
+        t = pending[0] if len(pending) == 1 else pa.concat_tables(pending, promote_options="default")
+        pending = []
+        pending_rows = 0
+        writer.write_table(t, row_group_size=row_group_rows)
+        rows += t.num_rows
+        del t
+
     try:
         for t in tables:
             if t is None or t.num_rows == 0:
@@ -242,9 +316,12 @@ def write_batches(
                     t = pa.table(cols, schema=writer.schema)
                 except Exception:
                     continue
-            writer.write_table(t)
-            rows += t.num_rows
+            pending.append(t)
+            pending_rows += t.num_rows
+            if pending_rows >= row_group_rows:
+                _flush_pending()
             del t
+        _flush_pending()
         if writer is None:
             # no rows: still write an (empty, schema-correct) file when asked
             if schema is not None:

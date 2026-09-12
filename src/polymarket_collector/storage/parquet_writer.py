@@ -361,9 +361,29 @@ class ParquetWriter:
         _scan_cutoff = (min(_wal_mtimes) if _wal_mtimes else _time.time()) - self._REPLAY_SCAN_WINDOW_S
         _scanned_rows = 0
         _scan_capped = False
-        for dataset in set(
-            entry.get("dataset") for wal_path in self.wal_dir.glob("wal-*.jsonl") for line in open(wal_path) if line.strip() for entry in [json.loads(line.strip())] if entry.get("dataset")
-        ):
+        # 2026-09-11 DATA-LOSS FIX: the old one-liner parsed every line inline
+        # (json.loads with no guard), so ONE truncated line (SIGKILL mid-append)
+        # aborted the ENTIRE replay on every startup — 73MB of WAL sat
+        # un-replayed forever while the same error logged each boot. Parse
+        # defensively per line; the main loop below drops the bad line the
+        # same way and truncates the file, so the corruption heals itself.
+        _datasets_seen: Set[str] = set()
+        for wal_path in self.wal_dir.glob("wal-*.jsonl"):
+            try:
+                with open(wal_path) as _wf:
+                    for line in _wf:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+                        if entry.get("dataset"):
+                            _datasets_seen.add(entry["dataset"])
+            except Exception:
+                continue
+        for dataset in _datasets_seen:
             keys = set()
             # scan existing parquet files for this dataset to find keys already on disk
             ds_root = self.data_dir / dataset
