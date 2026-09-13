@@ -7,9 +7,13 @@ states per asset during overlap.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt_top
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_ET = _ZoneInfo("America/New_York")
 
 
 import re as _re
@@ -78,13 +82,11 @@ def _hourly_slug_for(asset: str, ts_seconds: int) -> str:
     with a unix-hour boundary (whole-hour offsets year-round), so the
     unix-floored ``ts_seconds`` passed by discovery is the correct input.
     """
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
+    # PERF: cached ET zone + top-level datetime (was per-poll ZoneInfo file IO).
     name = HOURLY_SLUG_ASSET_NAMES.get(asset.upper())
     if name is None:
         raise ValueError(f"no hourly slug name for asset {asset!r}")
-    dt = datetime.fromtimestamp(ts_seconds, tz=ZoneInfo("America/New_York"))
+    dt = _dt_top.datetime.fromtimestamp(ts_seconds, tz=_ET)
     h12 = dt.hour % 12 or 12
     ampm = "am" if dt.hour < 12 else "pm"
     return f"{name}-up-or-down-{dt.strftime('%B').lower()}-{dt.day}-{dt.year}-{h12}{ampm}-et"
@@ -120,9 +122,8 @@ class MarketInfo:
         """Map Gamma active field to status: active / closed / resolved when settlement known."""
         # self.status is always "active" at discovery; lifecycle transitions happen via settlement
         # Keep "active" until market_end_ts_ms passed, then "closed" (resolved still requires settlement)
-        import time as _t
         try:
-            now_ms = int(_t.time() * 1000)
+            now_ms = int(time.time() * 1000)
             if now_ms >= self.market_end_ts_ms:
                 # market ended but not yet resolved via settlement fetch
                 return "closed"
@@ -136,11 +137,10 @@ class MarketInfo:
 
     def to_markets_row(self, updated_at: Optional[str] = None) -> dict:
         """Convert to markets_log row dict per enriched MARKETS_SCHEMA (§3)."""
-        import datetime as _dt
-        now_iso = updated_at or _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        now_iso = updated_at or _dt_top.datetime.now(tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
         def _ms_to_iso(ms: int) -> str:
             try:
-                return _dt.datetime.fromtimestamp(ms/1000, tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                return _dt_top.datetime.fromtimestamp(ms/1000, tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
             except Exception:
                 return now_iso
         return {

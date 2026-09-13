@@ -6,7 +6,9 @@ markets_latest (one row per condition_id, most recent state).
 """
 from __future__ import annotations
 
+import datetime as _dt_top
 import json
+import sys as _sys_top
 import time
 import uuid
 from pathlib import Path
@@ -43,19 +45,36 @@ class MarketsLog:
         self._staging: List[Dict] = []
         self._seen_condition_ids: set = set()  # dedup within process lifetime (fixes duplicate 5961540)
         self._seen_order: List[str] = []  # FIFO order for the cap eviction
+        # PERF: cid -> set((status, outcome)) for staged markets rows.
+        # Same skip decision as the old linear scan, O(1). Collector_events
+        # rows share _staging but never match (their status/outcome are None
+        # vs row defaults active/unknown) — index stores raw .get() values
+        # so the comparison stays exact.
+        self._staging_index: Dict[str, set] = {}
 
     def append(self, market: Dict, updated_at: Optional[str] = None) -> None:
         """Append a new state snapshot for a market (condition_id)."""
-        import datetime
         row = dict(market)
         # Dedup: skip if same condition_id already staged (prevents 2x rows from concurrent discovery)
         cid = row.get("condition_id") or market.get("condition_id")
         if cid and cid in self._seen_condition_ids:
             # Allow update if status/resolution changed, otherwise skip duplicate active row
             # Check existing staged row for same cid has same status - if so skip
-            for existing in self._staging:
-                if existing.get("condition_id") == cid and existing.get("status") == row.get("status", "active") and existing.get("resolution_outcome", "unknown") == row.get("resolution_outcome", "unknown"):
+            _want = (row.get("status", "active"), row.get("resolution_outcome", "unknown"))
+            try:
+                _have = self._staging_index.get(cid)
+                if _have is not None and _want in _have:
                     return
+                # Fallback scan only when index misses (e.g. rows staged
+                # before this process version): preserves exact old behavior.
+                if _have is None:
+                    for existing in self._staging:
+                        if existing.get("condition_id") == cid and existing.get("status") == row.get("status", "active") and existing.get("resolution_outcome", "unknown") == row.get("resolution_outcome", "unknown"):
+                            return
+            except Exception:
+                for existing in self._staging:
+                    if existing.get("condition_id") == cid and existing.get("status") == row.get("status", "active") and existing.get("resolution_outcome", "unknown") == row.get("resolution_outcome", "unknown"):
+                        return
             # Also check if already exists in committed latest (via writer dedup handled in compact) - still stage update if different, else skip
             # For exact duplicate active+unknown, skip
             if row.get("status", "active") == "active" and row.get("resolution_outcome", "unknown") == "unknown":
@@ -68,7 +87,7 @@ class MarketsLog:
                 evict = self._seen_order[:len(self._seen_order) - self.MAX_SEEN_CONDITION_IDS]
                 del self._seen_order[:len(self._seen_order) - self.MAX_SEEN_CONDITION_IDS]
                 self._seen_condition_ids.difference_update(evict)
-        row["updated_at"] = updated_at or datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        row["updated_at"] = updated_at or _dt_top.datetime.now(tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
         # §3.1 alias: recorded_at mirrors updated_at for Kaggle JSON
         if not row.get("recorded_at"):
             row["recorded_at"] = row["updated_at"]
@@ -77,26 +96,26 @@ class MarketsLog:
         if row.get("market_start_ts_ms") is not None and not row.get("market_start_ts"):
             try:
                 ms = int(row["market_start_ts_ms"])
-                row["market_start_ts"] = datetime.datetime.fromtimestamp(ms/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                row["market_start_ts"] = _dt_top.datetime.fromtimestamp(ms/1000, tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
             except Exception:
                 pass
         if row.get("market_end_ts_ms") is not None and not row.get("market_end_ts"):
             try:
                 ms = int(row["market_end_ts_ms"])
-                row["market_end_ts"] = datetime.datetime.fromtimestamp(ms/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                row["market_end_ts"] = _dt_top.datetime.fromtimestamp(ms/1000, tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
             except Exception:
                 pass
         if row.get("market_start_ts") and row.get("market_start_ts_ms") is None:
             try:
                 iso = str(row["market_start_ts"])
-                dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                dt = _dt_top.datetime.fromisoformat(iso.replace("Z", "+00:00"))
                 row["market_start_ts_ms"] = int(dt.timestamp()*1000)
             except Exception:
                 pass
         if row.get("market_end_ts") and row.get("market_end_ts_ms") is None:
             try:
                 iso = str(row["market_end_ts"])
-                dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                dt = _dt_top.datetime.fromisoformat(iso.replace("Z", "+00:00"))
                 row["market_end_ts_ms"] = int(dt.timestamp()*1000)
             except Exception:
                 pass
@@ -112,9 +131,18 @@ class MarketsLog:
         row.setdefault("market_start_ts_ms", None)
         row.setdefault("market_end_ts_ms", None)
         self._staging.append(row)
+        # Keep index in sync (raw .get() values, exactly like the scan).
+        try:
+            if cid:
+                _s = self._staging_index.get(cid)
+                if _s is None:
+                    _s = set()
+                    self._staging_index[cid] = _s
+                _s.add((row.get("status"), row.get("resolution_outcome")))
+        except Exception:
+            pass
         if self.writer:
-            import datetime as dtmod
-            date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
+            date_str = _dt_top.datetime.now(tz=_dt_top.timezone.utc).date().isoformat()
             ok = self.writer.append("markets_log", row, asset=None, date_str=date_str)
             if not ok:
                 # Backpressure: staging already holds row, writer WAL-persisted if enabled;
@@ -137,8 +165,14 @@ class MarketsLog:
         details: Optional[dict] = None,
     ) -> None:
         """Append a collector_events row for data-quality tracking."""
-        import datetime
         # details column is pa.string() — serialize dicts so payloads survive to Parquet
+        # PERF: intern repeated small strings (same values, less RAM; import hoisted).
+        try:
+            event_type = _sys_top.intern(str(event_type)) if isinstance(event_type, str) else event_type
+            if isinstance(asset, str):
+                asset = _sys_top.intern(asset)
+        except Exception:
+            pass
         if isinstance(details, dict):
             details = json.dumps(details, default=str)
         elif details is not None:
@@ -157,8 +191,7 @@ class MarketsLog:
         }
         self._staging.append(row)
         if self.writer:
-            import datetime as dtmod
-            date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
+            date_str = _dt_top.datetime.now(tz=_dt_top.timezone.utc).date().isoformat()
             ok = self.writer.append("collector_events", row, asset=asset, date_str=date_str)
             if not ok:
                 pass  # staged already, will be retried
@@ -186,13 +219,16 @@ class MarketsLog:
         if not self._staging:
             return 0
         if self.writer:
-            # already appended via append(); just clear staging
+            # already appended via append(); just clear staging (+ index, same lifecycle)
             n = len(self._staging)
             self._staging.clear()
+            try:
+                self._staging_index.clear()
+            except Exception:
+                pass
             return n
         # direct write without writer (test path)
-        import datetime as dtmod
-        date_str = dtmod.datetime.now(tz=dtmod.timezone.utc).date().isoformat()
+        date_str = _dt_top.datetime.now(tz=_dt_top.timezone.utc).date().isoformat()
         out_dir = self.data_dir / "markets_log" / f"date={date_str}"
         out_dir.mkdir(parents=True, exist_ok=True)
         normalized = self._normalize_rows(self._staging)
@@ -203,6 +239,10 @@ class MarketsLog:
         _os_replace_safe(tmp, final)
         n = len(self._staging)
         self._staging.clear()
+        try:
+            self._staging_index.clear()
+        except Exception:
+            pass
         return n
 
     # -- compaction --------------------------------------------------------

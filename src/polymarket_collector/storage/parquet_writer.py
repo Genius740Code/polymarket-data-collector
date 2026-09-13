@@ -9,11 +9,12 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -33,13 +34,57 @@ from .parquet_io import read_table
 from ..enums import CollectorEventType
 from .schemas import SCHEMAS, snapshot_schema
 
+import sys as _sys
 
-@dataclass
+try:
+    _intern = _sys.intern
+except Exception:
+    def _intern(s):  # type: ignore
+        return s
+
+# PERF: bounded ns-day -> date_str cache. append() hot path (56/s) did
+# fromtimestamp+isoformat per row; the date changes at most once/day.
+# Same date= values; fallback paths unchanged.
+_DATE_CACHE: Dict[int, str] = {}
+
+
+def _date_str_from_ns(ns_val: Any) -> Optional[str]:
+    try:
+        ns_int = int(ns_val)
+    except Exception:
+        return None
+    try:
+        day = ns_int // 86_400_000_000_000
+        cached = _DATE_CACHE.get(day)
+        if cached is not None:
+            return cached
+        dt = _dt.datetime.fromtimestamp(ns_int / 1e9, tz=_dt.timezone.utc)
+        s = dt.date().isoformat()
+        # Bounded: at most 2 entries (day rollover edge).
+        if len(_DATE_CACHE) >= 2:
+            _DATE_CACHE.clear()
+        _DATE_CACHE[day] = s
+        return s
+    except Exception:
+        return None
+
+
+@dataclass(slots=True)
 class BufferedRow:
     dataset: str  # e.g. book_snapshots_500ms, trades, book_events
     asset: Optional[str]  # None for non-partitioned datasets
     date_str: str  # YYYY-MM-DD UTC
     row: Dict[str, Any]
+
+
+class _OrderedSet(OrderedDict):
+    """OrderedDict-backed set with add/discard compat (old set API)."""
+
+    def add(self, key):
+        self[key] = None
+
+    def discard(self, key):
+        self.pop(key, None)
 
 
 class ParquetWriter:
@@ -74,8 +119,16 @@ class ParquetWriter:
         self._buffer: deque[BufferedRow] = deque()
         self._dropped_rows: Dict[str, int] = defaultdict(int)  # K-3: honest no-loss accounting
         self._last_flush_ts = time.monotonic()
-        self._seen_keys: Dict[str, Set[Tuple]] = defaultdict(set)  # dataset -> set of dedup keys
-        self._seen_order: Dict[str, deque] = defaultdict(deque)  # dataset -> insertion-order deque for LRU eviction
+        # PERF RAM: single OrderedDict[key]=None per dataset instead of
+        # set + deque holding every key twice (100k x 7 datasets).
+        # Same membership + FIFO eviction (popitem(last=False)); keys keep
+        # the FULL (asset, cid, bucket) triple — asset is NOT dropped because
+        # condition_id can be None on honest-gap rows (collapsing would false-dupe).
+        # cids are sys.interned on insert/lookup so equality is identical.
+        self._seen_keys: Dict[str, OrderedDict] = defaultdict(_OrderedSet)  # dataset -> OrderedDict[key, None]
+        self._seen_order: Dict[str, deque] = defaultdict(deque)  # legacy alias, kept empty (see _seen_add/_seen_discard)
+        # PERF: cache created output dirs (was mkdir per group per flush).
+        self._mkdir_cache: Set[str] = set()
         self._wal_path = self.wal_dir / f"wal-{uuid.uuid4().hex}.jsonl"
         if self.wal_enabled:
             self.wal_dir.mkdir(parents=True, exist_ok=True)
@@ -104,29 +157,25 @@ class ParquetWriter:
         """
         # Resolve date_str early so WAL entry is complete even under backpressure
         # Prefer ns bucket fields for authoritative UTC date (§11); string ISO is secondary.
+        # PERF: top-level datetime (was per-row import) + ns fast-path
+        # (datetime.fromtimestamp once, no fromisoformat attempt). Same date=.
         _resolved_date_str = date_str
         if _resolved_date_str is None:
-            import datetime as _dt_for_date
             date_derived = None
             # 1) try ns buckets (most authoritative, avoids .500 frac parse issues)
             for ns_key in ("ts_snapshot_ns", "ts_received_ns"):
                 ns_val = row.get(ns_key)
                 if ns_val is not None:
-                    try:
-                        ns_int = int(ns_val)
-                        # ns → ms → date UTC
-                        dt = _dt_for_date.datetime.fromtimestamp(ns_int / 1e9, tz=_dt_for_date.timezone.utc)
-                        date_derived = dt.date().isoformat()
+                    date_derived = _date_str_from_ns(ns_val)
+                    if date_derived is not None:
                         break
-                    except Exception:
-                        pass
             # 2) try ISO string fields
             if date_derived is None:
                 ts_field = (row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
                             or row.get("disconnect_ts_utc"))
                 if ts_field:
                     try:
-                        dt = _dt_for_date.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
+                        dt = _dt.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
                         date_derived = dt.date().isoformat()
                     except Exception:
                         pass
@@ -137,7 +186,7 @@ class ParquetWriter:
                     print(f"[parquet_writer] WARN date_str fallback to now for dataset={dataset} row keys={list(row.keys())[:5]}")
                 except Exception:
                     pass
-                date_derived = _dt_for_date.datetime.now(tz=_dt_for_date.timezone.utc).date().isoformat()
+                date_derived = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
             _resolved_date_str = date_derived
         if date_str is None:
             date_str = _resolved_date_str
@@ -173,27 +222,31 @@ class ParquetWriter:
                     if replaced:
                         return True
                     # already flushed — allow update; remove old key so append proceeds (dedup map re-added below)
-                    self._seen_keys[dataset].discard(dedup_key)
+                    try:
+                        self._seen_keys[dataset].pop(dedup_key, None)
+                    except Exception:
+                        pass
                 else:
                     if self.on_event:
                         self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
                     return True
         # reserve key immediately to prevent duplicate WAL entries under concurrency
+        # Single OrderedDict (was set+deque double-store). Same FIFO eviction.
         if dedup_key is not None:
-            self._seen_keys[dataset].add(dedup_key)
             try:
-                self._seen_order[dataset].append(dedup_key)
+                self._seen_keys[dataset][dedup_key] = None
             except Exception:
                 pass
             # LRU eviction: drop oldest keys when cap exceeded (preserves recent dedup for today)
             if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
                 try:
                     evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
+                    _od = self._seen_keys[dataset]
                     for _ in range(evict_count):
-                        if not self._seen_order[dataset]:
+                        try:
+                            _od.popitem(last=False)
+                        except KeyError:
                             break
-                        oldest = self._seen_order[dataset].popleft()
-                        self._seen_keys[dataset].discard(oldest)
                 except Exception:
                     pass
             # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
@@ -222,7 +275,10 @@ class ParquetWriter:
                     except Exception:
                         # WAL failed: remove reserved dedup key so retry can succeed after WAL recovers
                         if dedup_key is not None:
-                            self._seen_keys[dataset].discard(dedup_key)
+                            try:
+                                self._seen_keys[dataset].pop(dedup_key, None)
+                            except Exception:
+                                pass
                         self._dropped_rows[dataset] = self._dropped_rows.get(dataset, 0) + 1
                         return False
                     return True
@@ -230,7 +286,10 @@ class ParquetWriter:
             else:
                 # WAL disabled: strict backpressure — remove reserved key so retry works
                 if dedup_key is not None:
-                    self._seen_keys[dataset].discard(dedup_key)
+                    try:
+                        self._seen_keys[dataset].pop(dedup_key, None)
+                    except Exception:
+                        pass
                 return False
 
         # WAL-before-buffer with fsync (fixes 3a loss window)
@@ -240,7 +299,10 @@ class ParquetWriter:
             except Exception as e:
                 # WAL failed — remove dedup reservation so caller can retry
                 if dedup_key is not None:
-                    self._seen_keys[dataset].discard(dedup_key)
+                    try:
+                        self._seen_keys[dataset].pop(dedup_key, None)
+                    except Exception:
+                        pass
                 if self.on_event:
                     self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": f"WAL append failed: {e}"})
                 return False
@@ -275,6 +337,16 @@ class ParquetWriter:
                 for r in reversed(rows):
                     self._buffer.appendleft(BufferedRow(dataset=dataset, asset=asset, date_str=date_str, row=r))
                 raise
+            finally:
+                # PERF RAM: release per-group Arrow/Py list peak promptly.
+                try:
+                    del rows
+                except Exception:
+                    pass
+        try:
+            del groups
+        except Exception:
+            pass
         self._last_flush_ts = time.monotonic()
         # truncate WAL after successful flush — fsync directory to ensure durability (fixes 3 duplicate window)
         if self.wal_enabled and flushed:
@@ -557,49 +629,45 @@ class ParquetWriter:
                                 pending_lines.append(line)
                                 continue
                             # Direct buffer insert without re-WALing (replay already has WAL entry)
-                            # Reserve dedup key
+                            # Reserve dedup key (single OrderedDict)
                             if dedup_key is not None:
                                 if dedup_key in self._seen_keys[dataset]:
                                     continue
-                                self._seen_keys[dataset].add(dedup_key)
                                 try:
-                                    self._seen_order[dataset].append(dedup_key)
+                                    self._seen_keys[dataset][dedup_key] = None
                                 except Exception:
                                     pass
                                 if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
                                     try:
                                         evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
+                                        _od2 = self._seen_keys[dataset]
                                         for _ in range(evict_count):
-                                            if not self._seen_order[dataset]:
+                                            try:
+                                                _od2.popitem(last=False)
+                                            except KeyError:
                                                 break
-                                            oldest = self._seen_order[dataset].popleft()
-                                            self._seen_keys[dataset].discard(oldest)
                                     except Exception:
                                         pass
                                 seen_replay_keys.add(dedup_key)
                             # date handling already in entry — prefer ns bucket for correctness
                             if date_str is None:
-                                import datetime as _dt_for_date2
                                 date_str = None
                                 for ns_key in ("ts_snapshot_ns", "ts_received_ns"):
                                     ns_val = row.get(ns_key)
                                     if ns_val is not None:
-                                        try:
-                                            dt = _dt_for_date2.datetime.fromtimestamp(int(ns_val)/1e9, tz=_dt_for_date2.timezone.utc)
-                                            date_str = dt.date().isoformat()
+                                        date_str = _date_str_from_ns(ns_val)
+                                        if date_str is not None:
                                             break
-                                        except Exception:
-                                            pass
                                 if date_str is None:
                                     ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
                                     if ts_field:
                                         try:
-                                            dt = _dt_for_date2.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
+                                            dt = _dt.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
                                             date_str = dt.date().isoformat()
                                         except Exception:
-                                            date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
+                                            date_str = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
                                     else:
-                                        date_str = _dt_for_date2.datetime.now(tz=_dt_for_date2.timezone.utc).date().isoformat()
+                                        date_str = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
                             self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
                             replayed += 1
                         else:
@@ -624,56 +692,67 @@ class ParquetWriter:
 
     # -- internals ---------------------------------------------------------
     def _dedup_key(self, dataset: str, row: Dict[str, Any]) -> Optional[Tuple]:
+        # PERF: sys.intern on long id strings (cid/token) — same equality,
+        # less RAM per key. Asset KEPT in the triple (None-cid honest gaps
+        # would false-dupe across assets without it).
+        # PERF: _intern hoisted to module level (was per-row import + closure).
+        def _is(s):
+            try:
+                return _intern(str(s)) if s is not None else s
+            except Exception:
+                return s
         if dataset in ("book_events", "trades"):
             token = row.get("token_id")
             seq = row.get("sequence_number")
             if token is not None and seq is not None:
                 try:
-                    return (str(token), int(seq))
+                    return (_is(token), int(seq))
                 except Exception:
                     # seq may be non-numeric (e.g. ISO string) — fall through to fallback key
                     pass
             # fallback per §4/§5
             if dataset == "book_events":
                 return (
-                    str(token),
+                    _is(token),
                     row.get("ts_received_ns"),
                     row.get("event_type"),
                     row.get("new_best_bid"),
                     row.get("new_best_ask"),
                 )
             if dataset == "trades":
-                return (str(token), str(row.get("trade_id")))
+                return (_is(token), str(row.get("trade_id")))
         if dataset == "book_snapshots_500ms":
             # idempotent key for redundant collector (§1A): (asset, condition_id, ts_snapshot_bucket)
             bucket = row.get("ts_snapshot_ns")
             if bucket is not None:
                 # bucket already aligned to 500ms grid; use it directly
-                return (row.get("asset"), row.get("condition_id"), int(int(bucket) // 500_000_000 * 500_000_000))
+                return (row.get("asset"), _is(row.get("condition_id")), int(int(bucket) // 500_000_000 * 500_000_000))
         if dataset == "chainlink_events":
             # E9: report_id is 100% NULL (reserved — RTDS carries no reportId),
             # so (report_id,) never fires and burst duplicates slip through.
             # Dedup on (asset, event_id), falling back to (asset, ts, price).
             rid = row.get("report_id")
             if rid:
-                return (str(rid),)
+                return (_is(rid),)
             eid = row.get("event_id")
             if row.get("asset") is not None and eid:
-                return (str(row.get("asset")), str(eid))
+                return (_is(row.get("asset")), _is(eid))
             if row.get("asset") is not None and row.get("ts_received_ns") is not None:
-                return (str(row.get("asset")), row.get("ts_received_ns"), row.get("price"))
+                return (_is(row.get("asset")), row.get("ts_received_ns"), row.get("price"))
         if dataset == "resync_episodes":
             rid = row.get("resync_id")
             if rid:
-                return (str(rid),)
+                return (_is(rid),)
         if dataset == "collector_events":
             eid = row.get("event_id")
             if eid:
-                return (str(eid),)
+                return (_is(eid),)
         return None
 
     def _wal_append(self, dataset: str, row: Dict[str, Any], asset: Optional[str], date_str: Optional[str]) -> None:
-        entry = json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": row, "ts": time.time()})
+        # PERF: compact separators (was default ', '/': '). WAL is internal;
+        # json.loads yields identical rows. Same durability semantics below.
+        entry = json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": row, "ts": time.time()}, separators=(",", ":"))
         # open handle reused across rows; NO per-row fsync: fsync cost 10-20ms
         # each on Windows/OneDrive and consumed the whole 500ms tick budget at 14
         # snapshot rows per tick (scheduler_lag p95 556ms, 2026-09-06 19:58 run).
@@ -737,7 +816,11 @@ class ParquetWriter:
             out_dir = self.data_dir / dataset / f"date={date_str}" / f"asset={asset}"
         else:
             out_dir = self.data_dir / dataset / f"date={date_str}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # PERF: mkdir once per dir (was per group per flush). Same dirs.
+        _od = str(out_dir)
+        if _od not in self._mkdir_cache:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            self._mkdir_cache.add(_od)
 
         # Build pyarrow table — normalize to union keys (pyarrow drops cols not in first row)
         def _normalize(rs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -755,64 +838,58 @@ class ParquetWriter:
             return out
 
         norm_rows = _normalize(rows)
-        # Coerce details dict to JSON string for collector_events (schema expects pa.string())
+        # PERF: single fused coerce pass (was 4 full passes: details/notional/
+        # sequence/defaults + SCHEMAS.get per row). Same per-row logic in the
+        # same order; missing-ts time.time_ns/now fallbacks preserved as-is.
+        _schema_obj = SCHEMAS.get(dataset)
+        _schema_names = set(_schema_obj.names) if _schema_obj is not None else set()
+        _is_coll = dataset == "collector_events"
+        _is_tr = dataset == "trades"
+        _is_ml = dataset == "markets_log"
+        _is_re = dataset == "resync_episodes"
+        _is_snap = dataset in ("book_snapshots_500ms", "book_snapshots_clean")
+        _needs_ts_fill = dataset in ("trades", "book_events", "chainlink_events", "collector_events", "resync_episodes", "markets_log", "book_snapshots_500ms", "book_snapshots_clean")
         for nr in norm_rows:
-            if dataset == "collector_events" and "details" in nr and isinstance(nr["details"], dict):
+            if _is_coll and "details" in nr and isinstance(nr["details"], dict):
                 try:
                     nr["details"] = json.dumps(nr["details"]) if nr["details"] else None
                 except Exception:
                     nr["details"] = None
-            elif dataset == "collector_events" and nr.get("details") is not None and not isinstance(nr["details"], str):
+            elif _is_coll and nr.get("details") is not None and not isinstance(nr["details"], str):
                 try:
                     nr["details"] = json.dumps(nr["details"])
                 except Exception:
                     nr["details"] = str(nr["details"])
-        # Backfill trades notional only; fee stays NULL if not observed (real data only per AGENT.md)
-        for nr in norm_rows:
-            if dataset == "trades":
+            if _is_tr:
                 if nr.get("notional") is None and nr.get("price") is not None and nr.get("size") is not None:
                     try:
                         nr["notional"] = float(nr["price"]) * float(nr["size"])
                     except Exception:
                         pass
-        # Coerce sequence_number to int64 consistently across datasets before schema enforcement
-        # Prevents inferred string/object column when fallback timestamp is string
-        for nr in norm_rows:
             if "sequence_number" in nr and nr["sequence_number"] is not None:
                 try:
                     s = str(nr["sequence_number"]).strip()
                     if s.lstrip("-").isdigit():
                         nr["sequence_number"] = int(s)
                     else:
-                        # Try float-string path; if fails treat as null (e.g. ISO timestamp)
                         nr["sequence_number"] = int(float(s))
                 except Exception:
                     nr["sequence_number"] = None
-        # Fill defaults for required non-nullable fields to avoid ArrowInvalid in tests/synthetic data
-        # Provide sensible fallbacks so strict schemas (time first) don't break on partial rows
-        # Only fill placeholders when explicitly in test mode; in production, quarantine rows with missing fields
-        try:
-            import time as _time
-            import datetime as _dt
-            for nr in norm_rows:
-                if dataset in ("trades", "book_events", "chainlink_events", "collector_events", "resync_episodes", "markets_log", "book_snapshots_500ms", "book_snapshots_clean"):
-                    if nr.get("ts_received_ns") is None and "ts_received_ns" in (SCHEMAS.get(dataset).names if SCHEMAS.get(dataset) else []):
-                        nr["ts_received_ns"] = _time.time_ns()
-                    if nr.get("ts_source") is None and dataset in ("trades", "book_events", "chainlink_events") and "ts_source" in nr:
-                        # keep nullable, but ensure key exists
-                        pass
-                    if nr.get("ts_utc") is None and dataset == "collector_events" and "ts_utc" in nr:
+            if _needs_ts_fill:
+                try:
+                    if nr.get("ts_received_ns") is None and "ts_received_ns" in _schema_names:
+                        nr["ts_received_ns"] = time.time_ns()
+                    if nr.get("ts_utc") is None and _is_coll and "ts_utc" in nr:
                         nr["ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                    if nr.get("ts_snapshot_utc") is None and dataset in ("book_snapshots_500ms", "book_snapshots_clean"):
+                    if nr.get("ts_snapshot_utc") is None and _is_snap:
                         nr["ts_snapshot_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                    if nr.get("ts_snapshot_ns") is None and dataset in ("book_snapshots_500ms", "book_snapshots_clean"):
-                        nr["ts_snapshot_ns"] = _time.time_ns()
-                    if nr.get("updated_at") is None and dataset == "markets_log":
+                    if nr.get("ts_snapshot_ns") is None and _is_snap:
+                        nr["ts_snapshot_ns"] = time.time_ns()
+                    if nr.get("updated_at") is None and _is_ml:
                         nr["updated_at"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                    if nr.get("recorded_at") is None and dataset == "markets_log":
+                    if nr.get("recorded_at") is None and _is_ml:
                         nr["recorded_at"] = nr.get("updated_at") or _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                    # §3.2 ms alias promotion for markets_log
-                    if dataset == "markets_log":
+                    if _is_ml:
                         if nr.get("market_start_ts_ms") is None and nr.get("market_start_ts"):
                             try:
                                 iso = str(nr["market_start_ts"])
@@ -827,15 +904,13 @@ class ParquetWriter:
                                 nr["market_end_ts_ms"] = int(dt.timestamp()*1000)
                             except Exception:
                                 pass
-                    if nr.get("disconnect_ts_utc") is None and dataset == "resync_episodes":
+                    if nr.get("disconnect_ts_utc") is None and _is_re:
                         nr["disconnect_ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                # Synthetic permanently disabled - never inject test placeholders, quarantine/test values become None
+                except Exception:
+                    pass
                 for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
                     if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
                         nr[fld] = None
-                # Also drop rows that would have been fake test placeholders for required fields - let Arrow error surface (no silent fake data)
-        except Exception:
-            pass
         # sort rows by time then condition_id before writing (time first, condition_id second)
         try:
             sort_ts_key = None

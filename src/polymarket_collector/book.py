@@ -85,7 +85,67 @@ def depth_within(levels: List[Tuple[Optional[float], Optional[float]]], best: Op
     return total if best is not None else None
 
 
-@dataclass
+def depth_all(levels: List[Tuple[Optional[float], Optional[float]]], best: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Single-pass 1c/5c/10c depths — bit-identical to 3x depth_within calls.
+
+    Same None-vs-0, same 1e-9 tolerance, same best-first break assumption.
+    Levels sorted best-first ⇒ distance non-decreasing, so a prefix sum per
+    cutoff equals the per-cutoff loop with its own break.
+    """
+    if best is None:
+        return (None, None, None)
+    t1 = 0.0
+    t5 = 0.0
+    t10 = 0.0
+    for price, size in levels:
+        if price is None or size is None:
+            continue
+        if abs(price - best) - 1e-9 > 0.10:
+            break
+        s = float(size)
+        d = abs(price - best)
+        if d - 1e-9 <= 0.01:
+            t1 += s
+        if d - 1e-9 <= 0.05:
+            t5 += s
+        t10 += s
+    return (t1, t5, t10)
+
+
+def depth_all_levels(levels: List["Level"], best: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Single-pass depths directly over Level objects — identical to depth_all.
+
+    Avoids per-snapshot [(lvl.price, lvl.size)] tuple-list allocs (28 books x
+    2Hz). Same None-skip, same 1e-9 tolerance/break, same float(size) sum.
+    """
+    if best is None:
+        return (None, None, None)
+    t1 = 0.0
+    t5 = 0.0
+    t10 = 0.0
+    for lvl in levels:
+        price = lvl.price
+        size = lvl.size
+        if price is None or size is None:
+            continue
+        if abs(price - best) - 1e-9 > 0.10:
+            break
+        s = float(size)
+        d = abs(price - best)
+        if d - 1e-9 <= 0.01:
+            t1 += s
+        if d - 1e-9 <= 0.05:
+            t5 += s
+        t10 += s
+    return (t1, t5, t10)
+
+
+def _nz(v: Optional[float]) -> Optional[float]:
+    """Null-vs-zero: None or 0/0.0 -> None, else v (§3 E4). Module-level to avoid per-snapshot closure alloc."""
+    return None if v is None or v == 0 else v
+
+
+@dataclass(slots=True)
 class Level:
     price: Optional[float]  # None → null (absent level)
     size: Optional[float]
@@ -94,7 +154,7 @@ class Level:
         return self.price is None
 
 
-@dataclass
+@dataclass(slots=True)
 class SideBook:
     """One side (bid or ask) of one outcome (UP or DOWN)."""
     levels: List[Level] = field(default_factory=list)  # best-first, up to 20
@@ -111,20 +171,30 @@ class SideBook:
                 return lvl.size
         return None
 
+    def best_top(self) -> Tuple[Optional[float], Optional[float]]:
+        """Single-scan (price, size) — identical to (best_price(), best_size())."""
+        for lvl in self.levels:
+            if lvl.price is not None:
+                return (lvl.price, lvl.size)
+        return (None, None)
+
     def is_empty(self) -> bool:
-        return self.best_price() is None
+        for lvl in self.levels:
+            if lvl.price is not None:
+                return False
+        return True
 
     def crossed_with(self, other: "SideBook") -> bool:
         """True if this bid side crossed with other ask side — strictly b > a (equal is not crossed)."""
-        b = self.best_price()
-        a = other.best_price()
+        b, _ = self.best_top()
+        a, _ = other.best_top()
         if b is None or a is None:
             return False
         # 1e-9 tolerance for float equality; crossed only if bid strictly greater than ask
         return (b - a) > 1e-9
 
 
-@dataclass
+@dataclass(slots=True)
 class OutcomeBook:
     bids: SideBook = field(default_factory=SideBook)
     asks: SideBook = field(default_factory=SideBook)
@@ -466,8 +536,10 @@ class OrderBookState:
                 self._note_frame_hash(msg, pc_outcome, pc.get("hash"))
                 # exchange-reported authoritative BBO for this token after the change
                 try:
-                    bb = float(pc["best_bid"]) if pc.get("best_bid") not in (None, "") else None
-                    ba = float(pc["best_ask"]) if pc.get("best_ask") not in (None, "") else None
+                    bb_raw = pc.get("best_bid")
+                    ba_raw = pc.get("best_ask")
+                    bb = float(bb_raw) if bb_raw is not None and bb_raw != "" else None
+                    ba = float(ba_raw) if ba_raw is not None and ba_raw != "" else None
                     if bb is not None or ba is not None:
                         ex_bbo[pc_outcome] = {"bid": bb, "ask": ba}
                 except Exception:
@@ -516,7 +588,7 @@ class OrderBookState:
             # covers it. The refusal is returned as the reason so the collector
             # emits a book_anomaly (no resync storm — content was applied).
             if self.book_state != BookState.live:
-                if book.bids.best_price() is not None and book.asks.best_price() is not None:
+                if book.bids.best_top()[0] is not None and book.asks.best_top()[0] is not None:
                     if self._well_formed_hash(msg.get("hash")):
                         self.mark_live()
                     else:
@@ -529,9 +601,11 @@ class OrderBookState:
     # -- BBO capture for §4 book_events ------------------------------------
     def _bbo(self, outcome: str) -> Dict[str, Optional[float]]:
         book = self.up if outcome == "up" else self.down
+        bid, bid_size = book.bids.best_top()
+        ask, ask_size = book.asks.best_top()
         return {
-            "bid": book.bids.best_price(), "bid_size": book.bids.best_size(),
-            "ask": book.asks.best_price(), "ask_size": book.asks.best_size(),
+            "bid": bid, "bid_size": bid_size,
+            "ask": ask, "ask_size": ask_size,
         }
 
     def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 0.0101) -> None:
@@ -614,18 +688,78 @@ class OrderBookState:
         # Apply single price_change level update (size 0 = remove).
         # E4: price 0 is an empty-side sentinel, never a resting quote — drop it
         # like a removal so 0.0 never ships as a BBO/L1 price (null-vs-zero).
-        price_map = {lvl.price: lvl for lvl in side.levels if lvl.price is not None}
+        # PERF: in-place insert/update + insertion position for n<=10.
+        # Bit-identical to the old dict+sort+pad: exact-float key match (NOT
+        # 1e-9 tolerance — verified 0.1+0.2 != 0.3 stays), same 0-sentinel,
+        # same best-first order, same truncate/pad to l2_levels.
+        # Safety fallback: if the side somehow holds duplicate prices or is
+        # unsorted (never from our writers, only hand-fed tests), use the old
+        # dict+sort path once so the result still matches exactly.
+        try:
+            _reals = [lvl.price for lvl in side.levels if lvl.price is not None]
+            if len(_reals) != len(set(_reals)):
+                raise ValueError("dupes")
+            # sorted check best-first (null tail ignored — pad region is None)
+            _prev = None
+            for _p in _reals:
+                if _prev is not None:
+                    if is_bid and _p > _prev + 1e-12:
+                        raise ValueError("unsorted")
+                    if not is_bid and _p < _prev - 1e-12:
+                        raise ValueError("unsorted")
+                _prev = _p
+        except ValueError:
+            price_map = {lvl.price: lvl for lvl in side.levels if lvl.price is not None}
+            if size == 0 or price == 0:
+                price_map.pop(price, None)
+            else:
+                price_map[price] = Level(price=price, size=size)
+            items = list(price_map.values())
+            items.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
+            filtered = [lvl for lvl in items if lvl.price is not None][: self.l2_levels]
+            while len(filtered) < self.l2_levels:
+                filtered.append(Level(price=None, size=None))
+            side.levels = filtered
+            return
         if size == 0 or price == 0:
-            # size 0 = remove; price 0 = empty-side sentinel (E4), also removed
-            price_map.pop(price, None)
+            # Removal: drop ALL exact matches (dict.pop collapsed dupes).
+            # Order preserved (already sorted), then re-pad null tail.
+            kept = [lvl for lvl in side.levels if not (lvl.price is not None and lvl.price == price)]
+            while len(kept) < self.l2_levels:
+                kept.append(Level(price=None, size=None))
+            side.levels = kept[: self.l2_levels]
+            while len(side.levels) < self.l2_levels:
+                side.levels.append(Level(price=None, size=None))
+            return
+        # Update in place when the exact price rests (no reorder needed).
+        # Dupes impossible here (checked above), so first match == only match.
+        for lvl in side.levels:
+            if lvl.price is not None and lvl.price == price:
+                lvl.size = size
+                return
+        # Insert new level best-first (bids desc, asks asc), n<=10 linear.
+        new_lvl = Level(price=price, size=size)
+        idx = 0
+        n = len(side.levels)
+        for i, lvl in enumerate(side.levels):
+            if lvl.price is None:
+                idx = i
+                break
+            if is_bid:
+                if price > lvl.price:  # type: ignore[operator]
+                    idx = i
+                    break
+            else:
+                if price < lvl.price:  # type: ignore[operator]
+                    idx = i
+                    break
+            idx = i + 1
         else:
-            price_map[price] = Level(price=price, size=size)
-        items = list(price_map.values())
-        items.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
-        filtered = [lvl for lvl in items if lvl.price is not None][: self.l2_levels]
-        while len(filtered) < self.l2_levels:
-            filtered.append(Level(price=None, size=None))
-        side.levels = filtered
+            idx = n
+        side.levels.insert(idx, new_lvl)
+        del side.levels[self.l2_levels :]
+        while len(side.levels) < self.l2_levels:
+            side.levels.append(Level(price=None, size=None))
 
     def _apply_levels(self, side: SideBook, levels: list, is_bid: bool) -> None:
         # Normalize to list of Level, sorted best-first, truncated/padded to l2_levels
@@ -726,11 +860,30 @@ class OrderBookState:
                 return True
         return False
 
+    def tops(self) -> Tuple[Tuple[Optional[float], Optional[float]], Tuple[Optional[float], Optional[float]], Tuple[Optional[float], Optional[float]], Tuple[Optional[float], Optional[float]], bool]:
+        """Single-scan BBO + crossed for the snapshot tick heal/anomaly checks.
+
+        Returns ((up_bid,up_bid_size),(up_ask,up_ask_size),(down_bid,down_bid_size),(down_ask,down_ask_size),crossed).
+        Values are RAW best_top (no _nz); caller applies _nz/size-None exactly
+        like snapshot() so heal/anomaly decisions match snapshot row values.
+        Order preserved: caller must mark_stale BEFORE snapshot() for the
+        crossed bucket to stay stale (gap honesty).
+        """
+        up_bid, up_bid_size = self.up.bids.best_top()
+        up_ask, up_ask_size = self.up.asks.best_top()
+        down_bid, down_bid_size = self.down.bids.best_top()
+        down_ask, down_ask_size = self.down.asks.best_top()
+        crossed = False
+        if up_bid is not None and up_ask is not None and (up_bid - up_ask) > 1e-9:
+            crossed = True
+        elif down_bid is not None and down_ask is not None and (down_bid - down_ask) > 1e-9:
+            crossed = True
+        return ((up_bid, up_bid_size), (up_ask, up_ask_size), (down_bid, down_bid_size), (down_ask, down_ask_size), crossed)
+
     # -- snapshot generation (§3) ------------------------------------------
     def snapshot(self, ts_ms: int | None = None, ts_ns: int | None = None) -> BookSnapshot:
         """Generate a 500ms snapshot row. Call from shared scheduler tick."""
         now_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)
-        now_ns = ts_ns if ts_ns is not None else time.time_ns()
         # bucket alignment for idempotent write key (§1A redundancy)
         bucket_ms = snapshot_bucket_ms(now_ms, 500)
         # PERF #19: reuse the cached bucket string (same for all books/tick).
@@ -746,17 +899,21 @@ class OrderBookState:
         # top-of-book extracts (null-vs-zero: empty → None)
         # E4: belt-and-braces — a 0.0 best is an empty-side sentinel (ingest
         # paths above already drop 0-price levels; this covers legacy RAM).
-        def _nz(v: Optional[float]) -> Optional[float]:
-            return None if v is None or v == 0 else v
-
-        up_bid = _nz(self.up.bids.best_price())
-        up_bid_size = self.up.bids.best_size()
-        up_ask = _nz(self.up.asks.best_price())
-        up_ask_size = self.up.asks.best_size()
-        down_bid = _nz(self.down.bids.best_price())
-        down_bid_size = self.down.bids.best_size()
-        down_ask = _nz(self.down.asks.best_price())
-        down_ask_size = self.down.asks.best_size()
+        # PERF: single scan per side via best_top (was best_price+best_size x8
+        # + depth best x4 + crossed x2 ≈ 15 rescans of the same 10-level lists).
+        # _nz hoisted to module level (was per-snapshot closure).
+        (up_bid_raw, up_bid_size_raw) = self.up.bids.best_top()
+        (up_ask_raw, up_ask_size_raw) = self.up.asks.best_top()
+        (down_bid_raw, down_bid_size_raw) = self.down.bids.best_top()
+        (down_ask_raw, down_ask_size_raw) = self.down.asks.best_top()
+        up_bid = _nz(up_bid_raw)
+        up_bid_size = up_bid_size_raw
+        up_ask = _nz(up_ask_raw)
+        up_ask_size = up_ask_size_raw
+        down_bid = _nz(down_bid_raw)
+        down_bid_size = down_bid_size_raw
+        down_ask = _nz(down_ask_raw)
+        down_ask_size = down_ask_size_raw
 
         # if empty side, ensure sizes are None (not 0) per §3
         if up_bid is None:
@@ -781,23 +938,39 @@ class OrderBookState:
                     l2[p_field] = lvl.price
                     l2[s_field] = lvl.size
                 # if book had fewer than l2_levels (should be padded) still ensure keys exist
-                for i in range(len(side.levels) + 1, self.l2_levels + 1):
-                    l2[f"{outcome_key}_{side_key}_level_{i}_price"] = None
-                    l2[f"{outcome_key}_{side_key}_level_{i}_size"] = None
+                # PERF: guard avoids range+f-strings on the normal padded path.
+                if len(side.levels) < self.l2_levels:
+                    for i in range(len(side.levels) + 1, self.l2_levels + 1):
+                        l2[f"{outcome_key}_{side_key}_level_{i}_price"] = None
+                        l2[f"{outcome_key}_{side_key}_level_{i}_size"] = None
 
         # depth aggregates (§3 precisely defined: within N cents of own best)
+        # PERF: one sorted pass per side via depth_all_levels directly over
+        # Level objects (was 2 dicts + 4 tuple-lists per snapshot). Same
+        # math/tolerance/break as depth_within/depth_all.
+        # NOTE: raw best (pre-_nz) drives depth, matching old code which
+        # used side.best_price() directly (0.0 counted, None→None).
         depths: Dict[str, Optional[float]] = {}
-        for outcome_key, book in (("up", self.up), ("down", self.down)):
-            for side_key, side in (("bid", book.bids), ("ask", book.asks)):
-                best = side.best_price()
-                level_tuples: List[Tuple[Optional[float], Optional[float]]] = [(lvl.price, lvl.size) for lvl in side.levels]
-                for thc in (1, 5, 10):
-                    field = f"{outcome_key}_{side_key}_depth_{thc}c"
-                    depths[field] = depth_within(level_tuples, best, thc)
+        # Single-pass per side with cached raws (no rescans beyond the 4 tops above).
+        for outcome_key, side_key, side, best in (
+            ("up", "bid", self.up.bids, up_bid_raw),
+            ("up", "ask", self.up.asks, up_ask_raw),
+            ("down", "bid", self.down.bids, down_bid_raw),
+            ("down", "ask", self.down.asks, down_ask_raw),
+        ):
+            d1, d5, d10 = depth_all_levels(side.levels, best)
+            depths[f"{outcome_key}_{side_key}_depth_1c"] = d1
+            depths[f"{outcome_key}_{side_key}_depth_5c"] = d5
+            depths[f"{outcome_key}_{side_key}_depth_10c"] = d10
 
         # market_time_remaining
         remaining = max(0, self.market_end_ts_ms - bucket_ms)
-        crossed = self.is_crossed()
+        # crossed from cached raws (identical to is_crossed()).
+        crossed = False
+        if up_bid_raw is not None and up_ask_raw is not None and (up_bid_raw - up_ask_raw) > 1e-9:
+            crossed = True
+        elif down_bid_raw is not None and down_ask_raw is not None and (down_bid_raw - down_ask_raw) > 1e-9:
+            crossed = True
 
         return BookSnapshot(
             snapshot_id=str(uuid.uuid4()),

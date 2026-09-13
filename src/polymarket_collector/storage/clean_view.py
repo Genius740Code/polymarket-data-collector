@@ -173,15 +173,24 @@ def build_clean_view(
             # filter: condition_id not in excluded
             if excluded and "condition_id" in filtered.schema.names:
                 try:
-                    # build mask where condition_id not in excluded
-                    # pyarrow doesn't have is_in with set directly efficiently for small set; use python filter
-                    pylist = filtered.to_pylist()
-                    kept = [r for r in pylist if r.get("condition_id") not in excluded]
-                    if not kept:
+                    # PERF: Arrow-native anti-join (was to_pylist/python/from_pylist
+                    # ~10x RAM per partition for usually 0-1 cids). Same kept set.
+                    excl_arr = pa.array(sorted(excluded))
+                    is_excl = pc.is_in(filtered.column("condition_id"), value_set=excl_arr)
+                    is_excl = pc.fill_null(is_excl, False)
+                    keep = pc.invert(is_excl)
+                    filtered = filtered.filter(keep)
+                    if filtered.num_rows == 0:
                         continue
-                    filtered = pa.Table.from_pylist(kept, schema=filtered.schema)
                 except Exception:
-                    pass
+                    try:
+                        pylist = filtered.to_pylist()
+                        kept = [r for r in pylist if r.get("condition_id") not in excluded]
+                        if not kept:
+                            continue
+                        filtered = pa.Table.from_pylist(kept, schema=filtered.schema)
+                    except Exception:
+                        pass
 
             if filtered.num_rows == 0:
                 continue

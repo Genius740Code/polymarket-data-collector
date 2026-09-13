@@ -15,7 +15,7 @@ import datetime
 import json
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -156,7 +156,10 @@ class Collector:
         self._episode_latest: Dict[str, dict] = {}
         self._episode_persisted: set = set()
         # §6/§6A chainlink: in-RAM rolling store of RTDS events for settlement lookup
-        self._chainlink_events: List[dict] = []
+        # PERF RAM: global deque(maxlen) instead of list + del[:n] memmove.
+        # Same window (last 20000 arrivals across assets), same order, same
+        # linear-scan lookup — only the O(n) memmove is removed.
+        self._chainlink_events: deque = deque(maxlen=20000)
         # markets whose resolution_stuck was already emitted (dedup — was spamming 1/30s)
         self._resolution_stuck_emitted: set = set()
         # §6A lifecycle tracking: markets advanced to closed / resolved in this process
@@ -368,6 +371,21 @@ class Collector:
     def _append_book_event(self, ev: dict, book: "OrderBookState", asset: str, msg: dict) -> None:
         """Persist one §4 book_events row captured by OrderBookState.apply_ws_message."""
         try:
+            # PERF: intern repeated small strings (same values). event_id stays
+            # uuid4 (must be unique); ts_received_ns stays per-event time_ns
+            # (NOT bucket_ts — bucket is in the fallback dedup key).
+            try:
+                import sys as _sys_be
+                _outcome = _sys_be.intern(str(ev.get("outcome") or "unknown"))
+                _etype = _sys_be.intern(str(ev.get("event_type") or "price_change"))
+                _au = _sys_be.intern(asset.upper())
+            except Exception:
+                _outcome = str(ev.get("outcome") or "unknown")
+                _etype = str(ev.get("event_type") or "price_change")
+                try:
+                    _au = asset.upper()
+                except Exception:
+                    _au = asset
             row = {
                 "ts_source": str(ev.get("ts_source")) if ev.get("ts_source") is not None else None,
                 "ts_received_ns": int(time.time_ns()),
@@ -375,11 +393,11 @@ class Collector:
                 "market_id": book.market_id,
                 "series_id": book.series_id,
                 "window_index": int(book.window_index),
-                "asset": asset.upper(),
+                "asset": _au,
                 "event_id": str(uuid.uuid4()),
                 "token_id": str(ev.get("token_id") or ""),
-                "outcome": str(ev.get("outcome") or "unknown"),
-                "event_type": str(ev.get("event_type") or "price_change"),
+                "outcome": _outcome,
+                "event_type": _etype,
                 "old_best_bid": ev.get("old_best_bid"),
                 "new_best_bid": ev.get("new_best_bid"),
                 "old_best_ask": ev.get("old_best_ask"),
@@ -390,7 +408,7 @@ class Collector:
                 "new_ask_size": ev.get("new_ask_size"),
                 "threshold_config_id": self._threshold_config_id,
             }
-            ok = self.writer.append("book_events", row, asset=asset.upper())
+            ok = self.writer.append("book_events", row, asset=_au)
             if not ok:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "book_events", "asset": asset})
         except Exception:
@@ -401,7 +419,8 @@ class Collector:
         Returns True if a trade row was written.
         """
         # heuristic: trade messages have price+size and either event_type last_trade_price/trade or hash
-        event_type = str(msg.get("event_type") or msg.get("type") or msg.get("eventType") or "").lower()
+        _et = msg.get("event_type") or msg.get("type") or msg.get("eventType") or ""
+        event_type = _et.lower() if isinstance(_et, str) else str(_et).lower()
         is_trade = False
         if event_type in ("last_trade_price", "trade", "market_trade", "trade_price"):
             is_trade = True
@@ -589,16 +608,34 @@ class Collector:
         fallback deques were never replayed (P0 2026-09-08, ~110MB/min); an
         escalated episode's buffer is popped + dead and must not re-arm
         (P0 leak hunt session 2).
+        PERF: same scan without list() copy (no await inside → no mutation
+        during iteration) + hoisted upper(). Same first-match result.
         """
         if msg_resync_id:
             return msg_resync_id
-        for rid, ep in list(self.resync._episodes.items()):
-            if (
-                ep.asset == asset.upper()
-                and ep.resync_completed_ts_utc is None
-                and rid in self.resync._buffers
-            ):
-                return rid
+        try:
+            au = asset.upper()
+        except Exception:
+            au = asset
+        try:
+            _episodes = self.resync._episodes
+            if not _episodes:
+                return ""
+            _buffers = self.resync._buffers
+            if not _buffers:
+                return ""
+        except Exception:
+            return ""
+        for rid, ep in _episodes.items():
+            try:
+                if (
+                    ep.asset == au
+                    and ep.resync_completed_ts_utc is None
+                    and rid in _buffers
+                ):
+                    return rid
+            except Exception:
+                continue
         return ""
 
     async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
@@ -802,42 +839,58 @@ class Collector:
 
         Builds CursorState per lane from current rollover state + book
         sequence numbers and saves via CursorStore.
+        PERF: hoist the full books scan once per flush (was per asset/lane),
+        batch per-store writes in one transaction. Same CursorState values.
         """
-        import time as _time
-        now_ms = int(_time.time() * 1000)
+        now_ms = int(time.time() * 1000)
         lanes = self.rollover.enabled_lane_labels()
+        # Hoisted index: (au, lane_series) -> {seqs, cids} in one pass.
+        try:
+            _seqs_by_lane: Dict[tuple, dict] = {}
+            _cids_by_lane: Dict[tuple, list] = {}
+            for _cid, _book in self.books.items():
+                try:
+                    _au = str(getattr(_book, "asset", "")).upper()
+                    _series = str(getattr(_book, "series_id", ""))
+                    _key = (_au, _series)
+                    _d = _seqs_by_lane.get(_key)
+                    if _d is None:
+                        _d = {}
+                        _seqs_by_lane[_key] = _d
+                        _cids_by_lane[_key] = []
+                    _cids_by_lane[_key].append(getattr(_book, "condition_id", _cid))
+                    for tok, seq in getattr(_book, "sequence_numbers", {}).items():
+                        try:
+                            _d[str(tok)] = int(seq)
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            _seqs_by_lane = {}
+            _cids_by_lane = {}
         for asset, store in self.cursor_stores.items():
             try:
                 au = asset.upper()
+                _batch: list = []
                 for tf in lanes:
                     state_obj = self.rollover.state_for(au, tf)
                     cur = state_obj.current if state_obj else None
                     nxt = state_obj.next if state_obj else None
-                    # Aggregate last sequence numbers from books for this asset+lane
-                    # (books carry series_id "{ASSET}-{tf}" — the lane disambiguator)
-                    seqs: dict = {}
-                    last_snap = None
                     lane_series = f"{au}-{tf}"
-                    for cid, book in self.books.items():
-                        if getattr(book, "asset", "").upper() == au and str(getattr(book, "series_id", "")) == lane_series:
-                            # merge book sequence_numbers
-                            for tok, seq in getattr(book, "sequence_numbers", {}).items():
-                                try:
-                                    seqs[str(tok)] = int(seq)
-                                except Exception:
-                                    pass
+                    seqs = _seqs_by_lane.get((au, lane_series), {})
                     # Determine current_condition_id / window_index
                     if cur:
                         cid = cur.condition_id
                         widx = cur.window_index
                         next_cid = nxt.condition_id if nxt else None
                     elif seqs or self.books:
-                        # fallback: pick any book for this asset+lane
-                        fallback_cid = next(
-                            (b.condition_id for b in self.books.values()
-                             if getattr(b, "asset", "").upper() == au and str(getattr(b, "series_id", "")) == lane_series),
-                            None,
-                        )
+                        # fallback: pick any book for this asset+lane (same order as before: dict order)
+                        _cands = _cids_by_lane.get((au, lane_series)) or [
+                            b.condition_id for b in self.books.values()
+                            if getattr(b, "asset", "").upper() == au and str(getattr(b, "series_id", "")) == lane_series
+                        ]
+                        fallback_cid = next(iter(_cands), None)
                         cid = fallback_cid
                         widx = 0
                         next_cid = None
@@ -854,11 +907,23 @@ class Collector:
                         current_window_index=int(widx),
                         current_condition_id=cid,
                         next_condition_id=next_cid,
-                        last_sequence_number_per_token=seqs,
+                        last_sequence_number_per_token=dict(seqs),
                         last_snapshot_written_ts=last_snap,
                         window_label=tf,
                     )
-                    store.save(cs)
+                    _batch.append(cs)
+                try:
+                    if hasattr(store, "save_many"):
+                        store.save_many(_batch)
+                    else:
+                        for _cs in _batch:
+                            store.save(_cs)
+                except Exception:
+                    for _cs in _batch:
+                        try:
+                            store.save(_cs)
+                        except Exception:
+                            pass
                 # ensure WAL checkpoint if shared_wal mode
                 try:
                     store.sync()
@@ -1680,9 +1745,9 @@ class Collector:
                                 pass
                             # emit only last 120 to bound burst, earlier buckets truly lost (still logged)
                             start = cur_bucket - 120 * 500 + 500
-                            buckets = list(range(start, cur_bucket + 1, 500))
+                            buckets = range(start, cur_bucket + 1, 500)
                         else:
-                            buckets = list(range(start, cur_bucket + 1, 500))
+                            buckets = range(start, cur_bucket + 1, 500)
                         if len(buckets) > 1:
                             try:
                                 # R-5: this is scheduler catch-up (the 500ms loop briefly
@@ -1702,12 +1767,52 @@ class Collector:
                             # churn signal (31 connects). The scheduler_lag event above
                             # already carries gap_ms/missed_buckets for audit correlation.
                 _tick_t0 = time.perf_counter()
+                # PERF: hoist per-tick lookups (same values for every bucket in
+                # this catch-up batch — rollover has no await inside the loop,
+                # so states cannot change mid-batch). Same rows, no rescans.
+                # No sleep(0) inside the bucket loop: yielding would let WS
+                # frames interleave mid-catch-up and change catch-up bucket
+                # values vs the frozen-RAM batch (not bit-identical).
+                try:
+                    _assets = list(self.config.assets)
+                except Exception:
+                    _assets = []
+                _markets_by_asset: Dict[str, list] = {}
+                _rollover_flag: Dict[str, bool] = {}
+                _au_by_asset: Dict[str, str] = {}
+                _ws_conn: Dict[str, bool] = {}
+                try:
+                    for _a in _assets:
+                        try:
+                            _au = _a.upper()
+                        except Exception:
+                            _au = _a
+                        _au_by_asset[_a] = _au
+                        try:
+                            _ws_conn[_au] = bool(self._ws_connected.get(_au, False))
+                        except Exception:
+                            _ws_conn[_au] = False
+                        try:
+                            _mlist = self.rollover.active_markets(_a)
+                        except Exception:
+                            _mlist = []
+                        _markets_by_asset[_a] = _mlist
+                        for _m in _mlist:
+                            try:
+                                _cid = _m.condition_id
+                                if _cid not in _rollover_flag:
+                                    _rollover_flag[_cid] = bool(getattr(self.rollover.state_for_market(_m), "is_rollover_window", False))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                _first_bucket = buckets[0] if len(buckets) else cur_bucket
                 for bucket in buckets:
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
                     # This prevents double-writing for next market before its start (was causing 2x duplication)
-                    for asset in self.config.assets:
-                        for m in self.rollover.active_markets(asset):
+                    for asset in _assets:
+                        for m in _markets_by_asset.get(asset, []):
                             # Time-gate: only snapshot if bucket is within this market's window
                             try:
                                 if bucket < m.market_start_ts_ms or bucket >= m.market_end_ts_ms:
@@ -1742,9 +1847,19 @@ class Collector:
                                 self._index_book(book)
                             # If book is still empty (any side empty), bootstrap via REST only (never synthetic)
                             # Only on first bucket of catch-up batch to avoid N REST calls per stall
-                            if bucket == buckets[0]:
+                            # PERF: single tops() scan feeds heal + anomaly (was
+                            # best_price x4 + is_crossed/best_price x4 + snapshot
+                            # rescans). Order preserved: mark_stale BEFORE
+                            # snapshot() so the crossed bucket stays stale.
+                            try:
+                                _tops = book.tops()
+                                (_up_b, _up_b_sz), (_up_a, _up_a_sz), (_dn_b, _dn_b_sz), (_dn_a, _dn_a_sz), _crossed = _tops
+                            except Exception:
+                                _up_b = _up_a = _dn_b = _dn_a = None
+                                _crossed = False
+                            if bucket == _first_bucket:
                                 try:
-                                    if (book.up.bids.best_price() is None or book.up.asks.best_price() is None or book.down.bids.best_price() is None or book.down.asks.best_price() is None) and book.condition_id not in self._heal_inflight:
+                                    if (_up_b is None or _up_a is None or _dn_b is None or _dn_a is None) and book.condition_id not in self._heal_inflight:
                                         self._heal_inflight.add(book.condition_id)
                                         _bt = asyncio.create_task(self._heal_book_bg(book, m))
                                         _bt.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
@@ -1763,11 +1878,12 @@ class Collector:
                                 except Exception:
                                     pass
                             # Pre-snapshot crossed check: if book crossed persists, mark stale and trigger REST resync (fixes 15-26% crossed)
+                            # Uses cached tops() (raw bests, same as best_price()).
                             try:
-                                if book.is_crossed():
+                                if _crossed:
                                     # crossed bid>ask is anomaly — mark stale for next snapshots, emit event, attempt REST bootstrap
                                     try:
-                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "crossed": True, "up_bid": book.up.bids.best_price(), "up_ask": book.up.asks.best_price(), "down_bid": book.down.bids.best_price(), "down_ask": book.down.asks.best_price()})
+                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "crossed": True, "up_bid": _up_b, "up_ask": _up_a, "down_bid": _dn_b, "down_ask": _dn_a})
                                     except Exception:
                                         pass
                                     # keep book_state stale for this snapshot (will be reflected via snapshot)
@@ -1781,8 +1897,11 @@ class Collector:
                             # Build snapshot row via book.snapshot()
                             try:
                                 row = book.snapshot(ts_ms=bucket).to_flat_dict()
-                                # Ensure is_rollover_window reflects current rollover state
-                                row["is_rollover_window"] = getattr(self.rollover.state_for_market(m), "is_rollover_window", False)
+                                # Ensure is_rollover_window reflects current rollover state (hoisted per-tick)
+                                try:
+                                    row["is_rollover_window"] = _rollover_flag.get(m.condition_id, bool(getattr(self.rollover.state_for_market(m), "is_rollover_window", False)))
+                                except Exception:
+                                    row["is_rollover_window"] = False
                             except Exception as e:
                                 # Preserve actual book_state (fixes 5a hard-coded live) and emit full schema row
                                 _bs = getattr(book, "book_state", None)
@@ -1805,7 +1924,7 @@ class Collector:
                                     "up_bid": None, "up_ask": None, "up_bid_size": None, "up_ask_size": None,
                                     "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
                                     "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
-                                    "is_rollover_window": getattr(self.rollover.state_for_market(m), "is_rollover_window", False),
+                                    "is_rollover_window": _rollover_flag.get(m.condition_id, False),
                                     "book_state": _bs_val,
                                     "resync_id": getattr(book, "resync_id", None),
                                     "book_crossed": False,
@@ -1828,7 +1947,8 @@ class Collector:
                             # snapshots — 2026-09-09: 76k live carried rid). Just tag
                             # this row; book.mark_live() already clears book.resync_id.
                             try:
-                                if not self._ws_connected.get(m.asset.upper(), False) and row.get("book_state") == "live":
+                                _m_au = _au_by_asset.get(asset, m.asset.upper() if isinstance(m.asset, str) else m.asset)
+                                if not _ws_conn.get(_m_au, False) and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
                                         rid = getattr(book, "resync_id", None) or str(uuid.uuid4())
@@ -1965,21 +2085,34 @@ class Collector:
 
         The full event is already persisted to the chainlink_events dataset;
         the RAM copy exists only for _nearest_chainlink settlement lookups.
+        deque(maxlen=20000) evicts oldest arrival — identical to the old
+        list + del[:n] window, without the memmove.
         """
-        self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms})
-        if len(self._chainlink_events) > self.CHAINLINK_RAM_CAP:
-            del self._chainlink_events[:len(self._chainlink_events) - self.CHAINLINK_RAM_CAP]
+        try:
+            self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms})
+        except Exception:
+            # deque with maxlen never grows; this is defensive only.
+            pass
 
     def _nearest_chainlink(self, ts_ms: int, asset: str, max_delta_ms: int = 2000) -> Optional[dict]:
         """Nearest stored chainlink event for THIS ASSET to ts_ms (settlement lookup §6A).
 
         The asset filter is essential: without it every market settled against
         whichever symbol happened to be nearest (all six assets got BNB's price).
+        Linear scan preserved (order-agnostic, first-min tie-break) — 140k
+        checks/10s is negligible; bisect would change tie/out-of-order results.
         """
         best = None
         best_delta = None
+        try:
+            au = asset.upper()
+        except Exception:
+            au = asset
         for ev in self._chainlink_events:
-            if (ev.get("asset") or "").upper() != asset.upper():
+            try:
+                if (ev.get("asset") or "").upper() != au:
+                    continue
+            except Exception:
                 continue
             try:
                 ts = int(ev.get("_ts_ms") or 0)

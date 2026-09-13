@@ -230,9 +230,11 @@ class ResyncManager:
         attempt = 0
 
         # mark resyncing
-        for book in books.values():
-            if book.condition_id == condition_id:
-                book.mark_resyncing(resync_id=resync_id)
+        # PERF: single targets list (was 4 full books.values() scans + BxM nest).
+        # Same set/order (dict order), same mark_live/on_book_state_change sequence.
+        targets = [b for b in books.values() if b.condition_id == condition_id]
+        for book in targets:
+            book.mark_resyncing(resync_id=resync_id)
 
         if self.on_event:
             self.on_event(CollectorEventType.resync_started, {"resync_id": resync_id, "asset": asset, "condition_id": condition_id})
@@ -252,9 +254,8 @@ class ResyncManager:
                     raise RuntimeError("REST fetch returned None (endpoint may not expose full L2 — §18 gate)")
 
                 # wholesale replace
-                for book in books.values():
-                    if book.condition_id == condition_id:
-                        book.replace_from_rest_snapshot(snapshot)
+                for book in targets:
+                    book.replace_from_rest_snapshot(snapshot)
 
                 # buffer replay: apply buffered deltas in order, discarding those <= snapshot cursor
                 snapshot_seq = snapshot.get("sequence_number")
@@ -279,16 +280,14 @@ class ResyncManager:
                     # discard if provably older/equal to snapshot cursor
                     if snapshot_seq_int is not None and msg_seq_int is not None and msg_seq_int <= snapshot_seq_int:
                         continue
-                    for book in books.values():
-                        if book.condition_id == condition_id:
-                            book.apply_ws_message(msg)
+                    for book in targets:
+                        book.apply_ws_message(msg)
 
                 # clear stale flag
-                for book in books.values():
-                    if book.condition_id == condition_id:
-                        book.mark_live()
-                        if self.on_book_state_change:
-                            self.on_book_state_change(book, BookState.live)
+                for book in targets:
+                    book.mark_live()
+                    if self.on_book_state_change:
+                        self.on_book_state_change(book, BookState.live)
 
                 ep.resync_completed_ts_utc = _now_iso()
                 if self.on_event:
