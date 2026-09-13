@@ -208,7 +208,7 @@ def test_a1_ts_source_from_frame_timestamp():
     book.apply_ws_message(_live_book_frame(ts="1788649334527"))
     evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
     assert evs, "BBO change must emit a price_change event"
-    assert all(e["ts_source"] == "1788649334527" for e in evs)
+    assert all(e["ts_source"] == 1788649334527 for e in evs)
 
 
 def test_a1_ts_source_carry_forward_within_window():
@@ -221,7 +221,7 @@ def test_a1_ts_source_carry_forward_within_window():
     book.apply_ws_message(f2)
     evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
     assert evs
-    assert all(e["ts_source"] == "1788649334527" for e in evs)
+    assert all(e["ts_source"] == 1788649334527 for e in evs)
 
 
 def test_a1_ts_source_stays_null_without_source():
@@ -246,7 +246,7 @@ def test_a1_bbo_snapped_carries_ts_source():
     evs = book.drain_pending_events()
     snapped = [e for e in evs if e["event_type"] == "bbo_snapped"]
     assert snapped, f"expected bbo_snapped, got {[e['event_type'] for e in evs]}"
-    assert all(e["ts_source"] == "1788649335000" for e in snapped)
+    assert all(e["ts_source"] == 1788649335000 for e in snapped)
 
 
 def test_a4_hash_captured_and_gates_promotion():

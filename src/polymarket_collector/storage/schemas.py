@@ -109,7 +109,7 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
 
 # §4 book_events — time first, condition_id second
 BOOK_EVENTS_SCHEMA = pa.schema([
-    pa.field("ts_source", pa.string(), nullable=True),
+    pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
     pa.field("condition_id", pa.string(), nullable=False),
     # E1: NULL when the numeric Gamma id is unknown (never hex).
@@ -138,7 +138,7 @@ BOOK_EVENTS_SCHEMA = pa.schema([
 # §5 trades — time first, condition_id second, with transaction_hash + wallet fields (no RPC)
 # wallet fields come from CLOB REST/WS (proxyWallet/maker/taker) — no on-chain RPC required
 TRADES_SCHEMA = pa.schema([
-    pa.field("ts_source", pa.string(), nullable=True),
+    pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
     pa.field("condition_id", pa.string(), nullable=False),
     # E1: NULL when the numeric Gamma id is unknown (never hex).
@@ -170,7 +170,7 @@ TRADES_SCHEMA = pa.schema([
 # payload carries none of them (100% null); rolling TWAP is a downstream derived
 # metric, not a stored column. report_id kept as the §6A settlement join key.
 CHAINLINK_SCHEMA = pa.schema([
-    pa.field("ts_source", pa.string(), nullable=True),
+    pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("event_id", pa.string(), nullable=False),

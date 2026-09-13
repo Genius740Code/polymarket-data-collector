@@ -63,7 +63,32 @@ function weatherApp(name, configFile, outLog, errLog) {
     out_file: path.join(cwd, 'logs', outLog),
     error_file: path.join(cwd, 'logs', errLog),
     merge_logs: false,
-    env: { PYTHONUNBUFFERED: '1' },
+    // KAGGLE_API_TOKEN passed through from `pm2 start` env (never hardcoded).
+    // Falls back to ~/.kaggle/kaggle.json when env is absent.
+    env: {
+      PYTHONUNBUFFERED: '1',
+      ...(process.env.KAGGLE_API_TOKEN
+        ? { KAGGLE_API_TOKEN: process.env.KAGGLE_API_TOKEN }
+        : {}),
+    },
+  };
+}
+function compactApp(name, dataDir, outLog, errLog, cron) {
+  return {
+    name,
+    cwd,
+    script: python,
+    args: `-m polymarket_collector.storage.compaction --data-dir ${dataDir}`,
+    interpreter: 'none',
+    exec_mode: 'fork',
+    autorestart: false,
+    cron_restart: cron,
+    watch: false,
+    kill_timeout: 30000,
+    time: true,
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+    out_file: path.join(cwd, 'logs', outLog),
+    error_file: path.join(cwd, 'logs', errLog),
   };
 }
 
@@ -92,6 +117,22 @@ module.exports = {
       'config/collector.weather.low.yaml',
       'weather-low-watchdog-out.log',
       'weather-low-watchdog-error.log'
+    ),
+    // Daily Parquet compaction (§10A, temp + atomic rename), staggered so the
+    // two data dirs never compact at the same minute.
+    compactApp(
+      'polymarket-weather-high-compact',
+      './data-weather-high',
+      'weather-high-compact-out.log',
+      'weather-high-compact-error.log',
+      '10 3 * * *'
+    ),
+    compactApp(
+      'polymarket-weather-low-compact',
+      './data-weather-low',
+      'weather-low-compact-out.log',
+      'weather-low-compact-error.log',
+      '25 3 * * *'
     ),
   ],
 };

@@ -168,3 +168,37 @@ def validate_ws_message(msg: dict) -> List[ValidationError]:
                         if e2:
                             errors.append(e2)
     return errors
+
+
+def coerce_ts_source_ms(value: Any) -> Optional[int]:
+    """Normalize a source timestamp to int epoch-ms (or None).
+
+    CLOB frames carry ms ints (sometimes as strings); RTDS carries ISO-8601.
+    Returns None when unparseable — never raises, never fabricates (real-data
+    policy: a bad timestamp becomes NULL, not a guess).
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            f = float(value)
+            return int(f if f > 1e11 else f * 1000)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except Exception:
+            pass
+        try:
+            import datetime as _dt
+            dt = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+    return None

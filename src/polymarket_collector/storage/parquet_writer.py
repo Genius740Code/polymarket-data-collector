@@ -48,6 +48,35 @@ except Exception:
 _DATE_CACHE: Dict[int, str] = {}
 
 
+def _date_str_from_ts_field(ts_field: Any) -> Optional[str]:
+    """Best-effort date= partition from a timestamp fallback field.
+
+    Accepts int/float epoch-ms (ts_source now), numeric strings (old rows),
+    or ISO-8601 strings. Returns None when unparseable — never raises.
+    """
+    if ts_field is None or ts_field == "" or isinstance(ts_field, bool):
+        return None
+    if isinstance(ts_field, (int, float)):
+        try:
+            f = float(ts_field)
+            ms = f if f > 1e11 else f * 1000
+            return _dt.datetime.fromtimestamp(ms / 1000, tz=_dt.timezone.utc).date().isoformat()
+        except Exception:
+            return None
+    try:
+        s = str(ts_field).strip()
+        if not s:
+            return None
+        try:
+            return _dt.datetime.fromtimestamp(
+                float(s) / 1000, tz=_dt.timezone.utc).date().isoformat()
+        except Exception:
+            pass
+        return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return None
+
+
 def _date_str_from_ns(ns_val: Any) -> Optional[str]:
     try:
         ns_int = int(ns_val)
@@ -169,16 +198,12 @@ class ParquetWriter:
                     date_derived = _date_str_from_ns(ns_val)
                     if date_derived is not None:
                         break
-            # 2) try ISO string fields
+            # 2) try ISO string / ms-int fallback fields (ts_source is int now)
             if date_derived is None:
                 ts_field = (row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
                             or row.get("disconnect_ts_utc"))
                 if ts_field:
-                    try:
-                        dt = _dt.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
-                        date_derived = dt.date().isoformat()
-                    except Exception:
-                        pass
+                    date_derived = _date_str_from_ts_field(ts_field)
             # 3) fallback: ns date already tried, last resort now (should rarely happen; log warn)
             if date_derived is None:
                 # quarantining: log warn so mispartition is visible; use now but flag
@@ -660,13 +685,8 @@ class ParquetWriter:
                                             break
                                 if date_str is None:
                                     ts_field = row.get("ts_snapshot_utc") or row.get("ts_utc") or row.get("ts_source")
-                                    if ts_field:
-                                        try:
-                                            dt = _dt.datetime.fromisoformat(str(ts_field).replace("Z", "+00:00"))
-                                            date_str = dt.date().isoformat()
-                                        except Exception:
-                                            date_str = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
-                                    else:
+                                    date_str = _date_str_from_ts_field(ts_field)
+                                    if date_str is None:
                                         date_str = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
                             self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
                             replayed += 1

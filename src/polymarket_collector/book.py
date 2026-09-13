@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .enums import BookState
-from .validation import validate_ws_message
+from .validation import coerce_ts_source_ms, validate_ws_message
 
 
 # -- helpers ---------------------------------------------------------------
@@ -373,8 +373,8 @@ class OrderBookState:
             self._last_frame_ts_ms = ts
             self._last_frame_rx_ms = int(time.time() * 1000)
 
-    def _resolve_ts_source(self, msg: dict) -> Optional[str]:
-        """Source timestamp for an emitted book_event (string ms epoch).
+    def _resolve_ts_source(self, msg: dict) -> Optional[int]:
+        """Source timestamp for an emitted book_event (int ms epoch).
 
         Preference: the frame's own top-level timestamp → carry-forward of
         the previous frame's timestamp from the SAME connection when fresh
@@ -384,12 +384,13 @@ class OrderBookState:
         raw = msg.get("timestamp")
         if raw is None:
             raw = msg.get("ts")
-        if raw not in (None, ""):
-            return str(raw)
+        coerced = coerce_ts_source_ms(raw)
+        if coerced is not None:
+            return coerced
         if self._last_frame_ts_ms is not None and self._last_frame_rx_ms is not None:
             try:
                 if int(time.time() * 1000) - self._last_frame_rx_ms <= 1500:
-                    return str(self._last_frame_ts_ms)
+                    return int(self._last_frame_ts_ms)
             except Exception:
                 pass
         return None

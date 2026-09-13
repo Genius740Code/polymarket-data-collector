@@ -24,7 +24,7 @@ from polymarket_collector.storage.schemas import SCHEMAS, TRADES_SCHEMA
 # ---------------------------------------------------------------- B-5
 def _trade_row(**over) -> dict:
     base = {
-        "ts_source": str(int(time.time() * 1000)),
+        "ts_source": int(time.time() * 1000),
         "ts_received_ns": time.time_ns(),
         "condition_id": "cid-b5",
         "market_id": "mid-b5",

@@ -14,8 +14,6 @@ from polymarket_collector.storage.export import (
 from polymarket_collector.storage.schemas import (
     MARKETS_SCHEMA,
     MARKETS_SUMMARY_SCHEMA,
-    TRADES_SCHEMA,
-    CHAINLINK_SCHEMA,
 )
 
 
@@ -91,12 +89,13 @@ def hive(tmp_path) -> Path:
         {"ts_source": "2026-09-05T20:41:00Z", "ts_received_ns": 3, "asset": "ETH",
          "event_id": "e3", "symbol": "eth/usd", "source": "chainlink_rtds", "price": 2500.0, "report_id": None},
     ]
+    # old-format string files on disk (pre-int64 schema): readers must handle both
     d = base / "chainlink_events" / "date=2026-09-05" / "asset=BTC"
     d.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist(cl[:2], schema=CHAINLINK_SCHEMA), str(d / "part_0.parquet"))
+    pq.write_table(pa.Table.from_pylist(cl[:2]), str(d / "part_0.parquet"))
     d2 = base / "chainlink_events" / "date=2026-09-05" / "asset=ETH"
     d2.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist(cl[2:], schema=CHAINLINK_SCHEMA), str(d2 / "part_0.parquet"))
+    pq.write_table(pa.Table.from_pylist(cl[2:]), str(d2 / "part_0.parquet"))
 
     # trades: two fills from trader W1, one from W2 (notional = price*size)
     trades = [
@@ -116,9 +115,10 @@ def hive(tmp_path) -> Path:
          "notional": 4.0, "fee": None, "fee_is_estimated": None, "side": "buy", "aggressor_side": "buy",
          "maker_wallet": None, "taker_wallet": None, "wallet": None},
     ]
+    # old-format string files on disk (pre-int64 schema): readers must handle both
     d3 = base / "trades" / "date=2026-09-05" / "asset=BTC"
     d3.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pylist(trades, schema=TRADES_SCHEMA), str(d3 / "part_0.parquet"))
+    pq.write_table(pa.Table.from_pylist(trades), str(d3 / "part_0.parquet"))
     return base
 
 

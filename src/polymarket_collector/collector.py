@@ -41,7 +41,7 @@ from .storage.markets_log import MarketsLog
 from .storage.parquet_io import read_table
 from .storage.parquet_writer import ParquetWriter
 from .storage.raw_archive import RawArchive
-from .validation import validate_ws_message
+from .validation import coerce_ts_source_ms, validate_ws_message
 
 
 def _details_get(details: Any, key: str) -> Any:
@@ -387,7 +387,7 @@ class Collector:
                 except Exception:
                     _au = asset
             row = {
-                "ts_source": str(ev.get("ts_source")) if ev.get("ts_source") is not None else None,
+                "ts_source": coerce_ts_source_ms(ev.get("ts_source")),
                 "ts_received_ns": int(time.time_ns()),
                 "condition_id": book.condition_id,
                 "market_id": book.market_id,
@@ -488,7 +488,9 @@ class Collector:
             tx_hash = str(msg.get("transaction_hash") or msg.get("transactionHash") or msg.get("hash") or "")
             if not tx_hash:
                 tx_hash = None
-            ts_source = str(msg.get("timestamp") or msg.get("ts") or msg.get("ts_source") or now_bucket_ms or int(now_ns // 1_000_000))
+            ts_source = coerce_ts_source_ms(
+                msg.get("timestamp") or msg.get("ts") or msg.get("ts_source")
+                or now_bucket_ms or int(now_ns // 1_000_000))
             seq = msg.get("sequence_number") or msg.get("seq") or msg.get("sequence")
             try:
                 seq_int = int(seq) if seq is not None else None

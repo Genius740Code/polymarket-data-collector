@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from .enums import SettlementSource
+from .validation import coerce_ts_source_ms
 
 
 @dataclass
@@ -24,7 +25,7 @@ class ChainlinkEvent:
     source: Optional[str]
     price: Optional[float]
     report_id: Optional[str]
-    ts_source: Optional[str]
+    ts_source: Optional[int]
     ts_received_ns: int
 
     def to_dict(self) -> Dict[str, Any]:
@@ -57,7 +58,7 @@ def chainlink_event_from_ws(msg: Dict[str, Any], asset: str, schema_version: str
         source=msg.get("source") or "chainlink",
         price=msg.get("price"),
         report_id=report_id,
-        ts_source=str(ts_source) if ts_source else None,
+        ts_source=coerce_ts_source_ms(ts_source),
         ts_received_ns=time.time_ns(),
     )
 
@@ -113,13 +114,12 @@ async def fetch_settlement(
         best_delta = None
         best = None
         for ev in candidates:
-            ts_str = ev.get("ts_source") if isinstance(ev, dict) else getattr(ev, "ts_source", None)
-            if not ts_str:
+            ts_val = ev.get("ts_source") if isinstance(ev, dict) else getattr(ev, "ts_source", None)
+            if ts_val is None or ts_val == "":
                 continue
-            try:
-                dt = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                ts_ms = int(dt.timestamp() * 1000)
-            except Exception:
+            # ts_source is int ms epoch now (ISO in old rows) — coerce handles both
+            ts_ms = coerce_ts_source_ms(ts_val)
+            if ts_ms is None:
                 continue
             delta = abs(ts_ms - market_end_ts_ms)
             if best_delta is None or delta < best_delta:
@@ -132,6 +132,14 @@ async def fetch_settlement(
             else:
                 nearest_price = getattr(best, "price", None)
                 nearest_ts = getattr(best, "ts_source", None)
+            # settlement_ts_utc stays an ISO string — normalize int ms back to ISO
+            try:
+                _ms = coerce_ts_source_ms(nearest_ts)
+                if _ms is not None:
+                    nearest_ts = datetime.datetime.fromtimestamp(
+                        _ms / 1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                pass
 
     now_iso = datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     return SettlementRecord(

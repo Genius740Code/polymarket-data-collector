@@ -131,15 +131,16 @@ def _get_schema(dataset: str, l2_levels: int = 10) -> Optional[pa.Schema]:
 
 
 
-def _api_ts_ms(t: dict) -> str:
+def _api_ts_ms(t: dict) -> Optional[int]:
+    """Data-API trade timestamp (s or ms epoch) → int epoch-ms (None when absent)."""
     ts = t.get("timestamp")
     if ts is None:
-        return ""
+        return None
     try:
         f = float(ts)
-        return str(int(f if f > 1e12 else f * 1000))
+        return int(f if f > 1e11 else f * 1000)
     except Exception:
-        return ""
+        return None
 
 
 def _api_ts_ms_value(t: dict) -> Optional[int]:
@@ -732,6 +733,97 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
         print(f"[export] trade reconciliation: inserted {_inserted[0]} missing fills from data-api (CLOB stream coalesces liquid fills); fee derived for {_fee_derived[0]} rows from the market's exchange-reported rate")
 
 
+_WEATHER_SERIES_IDS = ("WEATHER-HIGH-1D", "WEATHER-LOW-1D")
+
+
+def _is_weather_upload(name) -> bool:
+    """True when a data dir / dataset slug / staging path belongs to a weather lane."""
+    try:
+        return "weather" in str(name).lower()
+    except Exception:
+        return False
+
+
+def _kaggle_title(dataset_prefix: str | None, timeframe_label: str | None) -> str:
+    """Human-readable Kaggle dataset title — weather-aware.
+
+    The title used to be hardcoded `Polymarket {tf} Crypto`, so the weather
+    datasets were created as "Polymarket 1d Crypto". Derive from the slug.
+    """
+    p = str(dataset_prefix or "").lower()
+    if "weather-high" in p:
+        return "Polymarket Weather High 1D"
+    if "weather-low" in p:
+        return "Polymarket Weather Low 1D"
+    return f"Polymarket {timeframe_label} Crypto"
+
+
+def _staging_flavor(dataset_prefix: str | None, timeframe_label: str | None) -> str:
+    """Short mode label for resource descriptions / version notes."""
+    p = str(dataset_prefix or "").lower()
+    if "weather-high" in p:
+        return "weather high 1d"
+    if "weather-low" in p:
+        return "weather low 1d"
+    return f"{timeframe_label} crypto"
+
+
+def _staging_per_asset_datasets(weather: bool) -> list:
+    """Per-asset staging datasets — weather lanes skip chainlink_events.
+
+    Weather settles via the CLOB winner flag (the crypto RTDS task is disabled
+    in cli_weather), so the chainlink hive holds only ~1KB stubs that must not
+    ship to Kaggle.
+    """
+    base = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades"]
+    return base if weather else base + ["chainlink_events"]
+
+
+def _default_staging_datasets(data_dir) -> list:
+    """Default staging dataset list — chainlink excluded for weather data dirs."""
+    return _staging_per_asset_datasets(_is_weather_upload(data_dir)) + [
+        "markets_log", "collector_events", "resync_episodes", "markets_summary",
+    ]
+
+
+def _normalize_ts_source_int(t: "pa.Table") -> "pa.Table":
+    """Cast a string ts_source column to int64 epoch-ms (transition helper).
+
+    New rows are int64; pre-change hive files hold numeric strings (trades /
+    book_events) or ISO strings (chainlink). Numeric strings parse cleanly;
+    anything else (ISO, garbage) is left untouched for the type-branching
+    readers downstream. Never raises.
+    """
+    try:
+        if "ts_source" not in t.schema.names:
+            return t
+        col = t.column("ts_source")
+        if pa.types.is_integer(col.type):
+            return t
+        if not (pa.types.is_string(col.type) or pa.types.is_large_string(col.type)):
+            return t
+        as_int = pc.cast(col, pa.int64(), safe=False)
+        return t.set_column(t.schema.get_field_index("ts_source"), "ts_source", as_int)
+    except Exception:
+        return t
+
+
+def _lane_series_mask(series_col, want: str):
+    """series_id lane filter that also passes weather lanes.
+
+    Crypto lanes use `{ASSET}-{tf}` (e.g. `BTC-5m`); weather lanes use city
+    assets (`HONG-KONG`, ...) with series `WEATHER-HIGH-1D`/`WEATHER-LOW-1D`,
+    so `{asset}-{tf}` never matches a weather row and staging came out empty
+    (hourly Kaggle uploads aborted forever). OR-ing the weather ids is a no-op
+    for crypto hives (those ids never appear there), and each weather data dir
+    holds only its own mode, so there is no cross-mode leakage.
+    """
+    mask = pc.equal(series_col, pa.scalar(want))
+    for _ws in _WEATHER_SERIES_IDS:
+        mask = pc.or_(mask, pc.equal(series_col, pa.scalar(_ws)))
+    return mask
+
+
 def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, *,
                                   deadline_s=None, cutoff_ts=None, io_stats=None) -> int:
     """Bounded-RAM streaming trades staging build (2026-09-11).
@@ -856,7 +948,7 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
             # lane filter mirrors _read_dataset_per_asset (missing col = keep)
             if want is not None and "series_id" in t.schema.names:
                 try:
-                    t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
+                    t = t.filter(_lane_series_mask(t.column("series_id"), want))
                 except Exception:
                     pass
                 if t.num_rows == 0:
@@ -1646,23 +1738,28 @@ def build_markets_summary(
                             if _t2 is not _ct:
                                 del _t2
                             continue
-                        _s = _t2.column("ts_source").cast(pa.string(), safe=False)
-                        _s = pc.replace_substring(_s, pattern="Z", replacement="")
-                        _ms = pc.strptime(_s, format="%Y-%m-%dT%H:%M:%S", unit="ms",
-                                          error_is_null=True)
-                        try:
-                            _nn = int(pc.sum(pc.cast(pc.is_null(_ms), pa.int64())).as_py() or 0)
-                        except Exception:
-                            _nn = 0
-                        if _nn:
+                        # ts_source is int64 ms now (ISO strings in old rows) — branch on type
+                        _ts_col = _t2.column("ts_source")
+                        if pa.types.is_integer(_ts_col.type):
+                            _ms = pc.cast(_ts_col, pa.timestamp("ms"))
+                        else:
+                            _s = _ts_col.cast(pa.string(), safe=False)
+                            _s = pc.replace_substring(_s, pattern="Z", replacement="")
+                            _ms = pc.strptime(_s, format="%Y-%m-%dT%H:%M:%S", unit="ms",
+                                              error_is_null=True)
                             try:
-                                _ms2 = pc.strptime(_s, format="%Y-%m-%dT%H:%M:%S.%f", unit="ms",
-                                                   error_is_null=True)
-                                _ms = pc.case_when(pc.is_null(_ms), _ms2, _ms)
-                                del _ms2
+                                _nn = int(pc.sum(pc.cast(pc.is_null(_ms), pa.int64())).as_py() or 0)
                             except Exception:
-                                pass
-                        del _s
+                                _nn = 0
+                            if _nn:
+                                try:
+                                    _ms2 = pc.strptime(_s, format="%Y-%m-%dT%H:%M:%S.%f", unit="ms",
+                                                       error_is_null=True)
+                                    _ms = pc.case_when(pc.is_null(_ms), _ms2, _ms)
+                                    del _ms2
+                                except Exception:
+                                    pass
+                            del _s
                         _ok = pc.and_(pc.invert(pc.is_null(_ms)),
                                       pc.is_valid(_t2.column("price")))
                         _n_ok = int(pc.sum(pc.cast(_ok, pa.int64())).as_py() or 0)
@@ -1915,6 +2012,7 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             t = read_table(p)
             if t is None:
                 raise IOError(f"unreadable {p.name}")
+            t = _normalize_ts_source_int(t)
             if stats is not None:
                 stats["files_ok"] += 1
                 stats["rows_read"] += t.num_rows
@@ -1967,38 +2065,19 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             print(f"[export] ERROR all {len(patterns)} files failed for {dataset} asset={asset} — aborting read")
         return None
     combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
-    # multi-timeframe lane filter — applied once on the combined table
+    # multi-timeframe lane filter — applied once on the combined table.
+    # _lane_series_mask covers weather lanes too: city assets (HONG-KONG,
+    # ...) carry series WEATHER-HIGH-1D/WEATHER-LOW-1D which `{asset}-{tf}`
+    # never matches (the old `asset == "WEATHER"` branch was dead code).
     if timeframe_label is not None and asset and "series_id" in combined.schema.names:
         try:
-            if asset.upper() == "WEATHER":
-                # Weather series_id format: WEATHER-HIGH-1D / WEATHER-LOW-1D
-                # Match by window_size_seconds==86400 or series_id ending with -1D
-                try:
-                    if "window_size_seconds" in combined.schema.names:
-                        ws_col = combined.column("window_size_seconds")
-                        ws_val = pc.reduce_sum(ws_col).as_py()
-                        if ws_val == 86400:
-                            # Keep all weather rows (window_size_seconds==86400)
-                            pass  # no filter needed - keep all rows
-                        else:
-                            # Fallback: filter by series_id ending with -1D
-                            series_col = combined.column("series_id")
-                            mask = pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D")) | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
-                            combined = combined.filter(mask)
-                    else:
-                        # Fallback: filter by series_id ending with -1D
-                        series_col = combined.column("series_id")
-                        mask = pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D")) | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
-                        combined = combined.filter(mask)
-                except Exception as e:
-                    print(f"[export] WARN weather series filter failed for {dataset} asset={asset}: {e}")
-            else:
-                want = f"{asset.upper()}-{timeframe_label}"
-                try:
-                    mask = pc.equal(combined.column("series_id"), pa.scalar(want))
-                    combined = combined.filter(mask)
-                except Exception as e:
-                    print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
+            want = f"{asset.upper()}-{timeframe_label}"
+            try:
+                mask = _lane_series_mask(combined.column("series_id"), want)
+                combined = combined.filter(mask)
+            except Exception as e:
+                print(f"[export] WARN timeframe filter failed for {dataset} "
+                      f"asset={asset} tf={timeframe_label}: {e}")
         except Exception as e:
             print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
@@ -2405,18 +2484,13 @@ def _stream_export_asset_dataset(
     _excluded = set(excluded_cids or [])
 
     def _transform(t: pa.Table) -> pa.Table:
+        t = _normalize_ts_source_int(t)
         if want and "series_id" in t.schema.names:
             try:
-                if asset_upper == "WEATHER":
-                    # Weather series_id format: WEATHER-HIGH-1D / WEATHER-LOW-1D
-                    # Match by series_id ending with -1D instead of {asset}-{tf}
-                    series_col = t.column("series_id")
-                    t = t.filter(
-                        pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D"))
-                        | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
-                    )
-                else:
-                    t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
+                # _lane_series_mask also passes WEATHER-HIGH/LOW-1D rows, whose
+                # city assets never match `{asset}-{tf}` (old WEATHER branch
+                # was dead code — asset is e.g. HONG-KONG, never "WEATHER").
+                t = t.filter(_lane_series_mask(t.column("series_id"), want))
             except Exception:
                 pass
         if live_only and "book_state" in t.schema.names:
@@ -2880,7 +2954,7 @@ def export_per_asset_single_file(
     out.mkdir(parents=True, exist_ok=True)
 
     if datasets is None:
-        datasets = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events", "markets_log", "collector_events", "resync_episodes", "markets_summary"]
+        datasets = _default_staging_datasets(data_dir)
     if assets is None:
         # Always use the 7 known assets — hardcoded per plan.md §0
         # Do NOT discover dynamically from hive partitions, as this fails
@@ -3703,16 +3777,28 @@ def prepare_kaggle_staging_5m(
     # Ensure markets_latest also available as markets_latest.parquet alias if needed for reference
     # but primary markets file is markets.parquet (from markets_log)
     row_counts = stats
-    # Write dataset-metadata.json
-    resources = [{"path": Path(k).name, "description": f"{Path(k).name} {timeframe_label} crypto — {dataset_prefix}"} for k in stats.keys()]
+    # Write dataset-metadata.json (title is weather-aware: the hardcoded
+    # "Polymarket {tf} Crypto" used to stamp weather datasets as 1d Crypto)
+    _flavor = _staging_flavor(dataset_prefix, timeframe_label)
+    resources = [
+        {"path": Path(k).name, "description": f"{Path(k).name} {_flavor} — {dataset_prefix}"}
+        for k in stats.keys()
+    ]
     # Ensure markets.parquet + per-asset files are all listed; add if missing due to empty
     meta = {
-        "title": f"Polymarket {timeframe_label} Crypto",
+        "title": _kaggle_title(dataset_prefix, timeframe_label),
         "id": dataset_prefix,
         "licenses": [{"name": "CC BY-NC-SA 4.0"}],
         "resources": resources,
     }
     (staging / "dataset-metadata.json").write_text(_json.dumps(meta, indent=2))
+    if _is_weather_upload(dataset_prefix):
+        # Drop stale pre-fix chainlink stubs so they don't ship in the version
+        for _stale in staging.glob("*_chainlink_events.parquet"):
+            try:
+                _stale.unlink()
+            except OSError:
+                pass
     _ret: dict = {"staging_path": str(staging), "files": len(stats), "row_counts": row_counts, "dataset": dataset_prefix}
     if manifests is not None:
         _ret["manifests"] = manifests
@@ -3893,7 +3979,9 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                 exists = False
             else:
                 exists = False
-        version_notes = f"5m 7-asset update UTC {_dt.datetime.now(tz=_dt.timezone.utc).isoformat()} rows via staging {staging.name}"
+        _now = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        version_notes = (f"{dataset} update UTC {_now} "
+                         f"({len(expected_assets)} assets) via staging {staging.name}")
         last_err = None
         for attempt in range(max_retries):
             try:
@@ -3961,7 +4049,10 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                             print(f"[kaggle] poll {_}/60 dataset {dataset} status ERROR: {_msg}")
                         s = ""
                     if s == "ready":
-                        _files_ok = _expected_staging_files(staging) >= len(expected_assets) * 5 + 4
+                        # Weather lanes stage 4 per-asset files (no chainlink_events), crypto 5
+                        _per_asset_n = 4 if _is_weather_upload(dataset) else 5
+                        _files_ok = (_expected_staging_files(staging)
+                                     >= len(expected_assets) * _per_asset_n + 4)
                         _rows_ok = _verify_staging_row_counts(staging, expected_assets, check_monotonic=check_monotonic)
                         # Remote verification: ensure Kaggle actually stores expected files (not just local status)
                         # Kaggle API paginates (20 per page, nextPageToken) — collect all pages
@@ -3999,7 +4090,15 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                 if not next_token:
                                     break
                             # Check remote has at least expected parquets
-                            expected_names = {f"{a}_{ds}.parquet" for a in expected_assets for ds in ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"]} | {"markets.parquet", "collector_events.parquet", "resync_episodes.parquet", "markets_summary.parquet"}
+                            # (weather lanes exclude chainlink_events)
+                            _remote_ds = ["book_snapshots_500ms", "book_snapshots_clean",
+                                            "book_events", "trades"]
+                            if not _is_weather_upload(dataset):
+                                _remote_ds = _remote_ds + ["chainlink_events"]
+                            expected_names = {
+                                f"{a}_{ds}.parquet" for a in expected_assets for ds in _remote_ds
+                            } | {"markets.parquet", "collector_events.parquet",
+                                 "resync_episodes.parquet", "markets_summary.parquet"}
                             if not expected_names.issubset(remote_names):
                                 _remote_ok = False
                             if len(remote_names) < len(expected_names):
@@ -4014,7 +4113,10 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         elif not _rows_ok:
                             print(f"⚓ Kaggle dataset status=ready but staging has empty files; waiting for complete upload")
                         elif not _files_ok:
-                            print(f"⚓ Kaggle dataset status=ready but staging has {_expected_staging_files(staging)} files, expected {len(expected_assets) * 5 + 4}; waiting for complete upload")
+                            _n_have = _expected_staging_files(staging)
+                            _n_want = len(expected_assets) * _per_asset_n + 4
+                            print(f"⚓ Kaggle dataset status=ready but staging has {_n_have} "
+                                  f"files, expected {_n_want}; waiting for complete upload")
                         elif not _remote_ok:
                             print(f"⚓ Kaggle dataset status=ready but remote file list incomplete; waiting")
                     elif s in ("failed", "error"):
@@ -4050,9 +4152,10 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
 def _expected_staging_files(staging: Path) -> int:
     """Count expected parquet files in staging directory for Kaggle version."""
     parquet_files = [p for p in staging.glob("*.parquet") if not p.name.endswith(".tmp")]
-    # 7 assets x 5 per-asset datasets + 3 globals + 1 summary = 39 files
-    # per-asset: book_snapshots_500ms, book_events, trades, chainlink_events
+    # crypto: 7 assets x 5 per-asset datasets + 3 globals + 1 summary = 39 files
+    # per-asset: book_snapshots_500ms, book_snapshots_clean, book_events, trades, chainlink_events
     # globals: markets_log, collector_events, resync_episodes + derived markets_summary
+    # weather: 3 assets x 4 per-asset (no chainlink_events) + 4 = 16 files
     return len(parquet_files)
 
 
@@ -4081,9 +4184,12 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
         except Exception:
             return None
 
-    # Only snapshots are required >0; other per-asset datasets allow 0 (null vs zero fix 4b)
+    # Only snapshots are required >0; other per-asset datasets allow 0 (null vs zero fix 4b).
+    # Weather lanes don't stage chainlink_events at all — don't require the file.
     required_gt_zero = {"book_snapshots_500ms"}
-    optional_per_asset = {"book_events", "trades", "chainlink_events"}
+    optional_per_asset = {"book_events", "trades"}
+    if not _is_weather_upload(staging):
+        optional_per_asset = optional_per_asset | {"chainlink_events"}
     global_file_map = {
         "markets_log": "markets.parquet",
         "collector_events": "collector_events.parquet",

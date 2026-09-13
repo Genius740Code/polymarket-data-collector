@@ -102,7 +102,7 @@ async def test_r1_prewarm_gate_blocks_then_releases_snapshots(tmp_path, monkeypa
 # ---------------------------------------------------------------- R-2 + R-3
 def _trade_row(**over) -> dict:
     base = {
-        "ts_source": str(int((time.time() - 60) * 1000)),
+        "ts_source": int((time.time() - 60) * 1000),
         "ts_received_ns": time.time_ns(),
         "condition_id": "cid-r2",
         "market_id": "mid-r2",
