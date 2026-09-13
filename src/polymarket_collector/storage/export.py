@@ -1970,9 +1970,35 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     # multi-timeframe lane filter — applied once on the combined table
     if timeframe_label is not None and asset and "series_id" in combined.schema.names:
         try:
-            want = f"{asset.upper()}-{timeframe_label}"
-            mask = pc.equal(combined.column("series_id"), pa.scalar(want))
-            combined = combined.filter(mask)
+            if asset.upper() == "WEATHER":
+                # Weather series_id format: WEATHER-HIGH-1D / WEATHER-LOW-1D
+                # Match by window_size_seconds==86400 or series_id ending with -1D
+                try:
+                    if "window_size_seconds" in combined.schema.names:
+                        ws_col = combined.column("window_size_seconds")
+                        ws_val = pc.reduce_sum(ws_col).as_py()
+                        if ws_val == 86400:
+                            # Keep all weather rows (window_size_seconds==86400)
+                            pass  # no filter needed - keep all rows
+                        else:
+                            # Fallback: filter by series_id ending with -1D
+                            series_col = combined.column("series_id")
+                            mask = pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D")) | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
+                            combined = combined.filter(mask)
+                    else:
+                        # Fallback: filter by series_id ending with -1D
+                        series_col = combined.column("series_id")
+                        mask = pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D")) | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
+                        combined = combined.filter(mask)
+                except Exception as e:
+                    print(f"[export] WARN weather series filter failed for {dataset} asset={asset}: {e}")
+            else:
+                want = f"{asset.upper()}-{timeframe_label}"
+                try:
+                    mask = pc.equal(combined.column("series_id"), pa.scalar(want))
+                    combined = combined.filter(mask)
+                except Exception as e:
+                    print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
         except Exception as e:
             print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
@@ -2381,7 +2407,16 @@ def _stream_export_asset_dataset(
     def _transform(t: pa.Table) -> pa.Table:
         if want and "series_id" in t.schema.names:
             try:
-                t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
+                if asset_upper == "WEATHER":
+                    # Weather series_id format: WEATHER-HIGH-1D / WEATHER-LOW-1D
+                    # Match by series_id ending with -1D instead of {asset}-{tf}
+                    series_col = t.column("series_id")
+                    t = t.filter(
+                        pc.equal(series_col, pa.scalar("WEATHER-HIGH-1D"))
+                        | pc.equal(series_col, pa.scalar("WEATHER-LOW-1D"))
+                    )
+                else:
+                    t = t.filter(pc.equal(t.column("series_id"), pa.scalar(want)))
             except Exception:
                 pass
         if live_only and "book_state" in t.schema.names:
