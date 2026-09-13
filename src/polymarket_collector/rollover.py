@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 import re as _re
@@ -249,6 +249,31 @@ class MarketDiscovery:
         # not signals — the fast retry itself is unchanged. Throttled to one
         # per asset per 10s.
         self._last_timeout_emit_ms: Dict[str, int] = {}
+        # PERF CPU: one pooled HTTP client per discovery lane (keep-alive).
+        # Previously a fresh httpx.AsyncClient (new TCP+TLS handshake) was
+        # built per poll per asset — pure CPU. Same GETs, same payloads.
+        self._http: Any = None
+
+    def _get_client(self) -> Any:
+        """Lazy shared httpx.AsyncClient (connection pooling, same timeout)."""
+        if self._http is None:
+            try:
+                import httpx as _httpx
+
+                self._http = _httpx.AsyncClient(timeout=5.0)
+            except Exception:
+                self._http = None
+        return self._http
+
+    async def aclose(self) -> None:
+        """Close the pooled client (best-effort; safe to skip on shutdown)."""
+        try:
+            if self._http is not None:
+                await self._http.aclose()
+        except Exception:
+            pass
+        finally:
+            self._http = None
 
     def _slug_for(self, asset: str, ts_seconds: int) -> str:
         window_label = _window_label_for(self.window_size_seconds)
@@ -343,13 +368,14 @@ class MarketDiscovery:
             candidates = [ts]
         found: Optional[MarketInfo] = None
         transport_abort = False
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+        _shared = self._get_client()
+        if _shared is not None:
+            try:
                 for cand_ts in candidates:
                     cand_slug = self._slug_for(asset, cand_ts)
                     cand_params = {"slug": cand_slug}
                     try:
-                        resp = await client.get(gamma_url, params=cand_params)
+                        resp = await _shared.get(gamma_url, params=cand_params)
                         if resp.status_code == 429:
                             if self.on_event:
                                 self.on_event("rate_limited", {"asset": asset, "status": 429, "url": gamma_url})
@@ -405,8 +431,29 @@ class MarketDiscovery:
                                     self.on_event("discovery_timeout", {"asset": asset, "error": repr(e), "phase": "gamma_poll"})
                             break
                         continue
-        except Exception as e:
-            failures.append({"transport": repr(e)})
+            except Exception as e:
+                failures.append({"transport": repr(e)})
+        else:
+            # httpx unavailable — one-off client preserves old behavior.
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as _client:
+                    for cand_ts in candidates:
+                        cand_slug = self._slug_for(asset, cand_ts)
+                        try:
+                            resp = await _client.get(gamma_url, params={"slug": cand_slug})
+                            resp.raise_for_status()
+                            data = resp.json()
+                            m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+                            if isinstance(m0, dict):
+                                parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                                if parsed is not None:
+                                    found = parsed
+                                    break
+                        except Exception as e:
+                            failures.append({"slug": cand_slug, "error": repr(e)})
+                            continue
+            except Exception as e:
+                failures.append({"transport": repr(e)})
         if transport_abort:
             self._backoff_s = 1.0
             return None
@@ -425,8 +472,12 @@ class MarketDiscovery:
         # Legacy fallback: use configured rest_market_url with old param shape (for tests / mock injectors)
         if self.rest_market_url and self.rest_market_url != gamma_url:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.get(self.rest_market_url, params={"asset": asset, "after": after_ts_ms})
+                _shared2 = self._get_client()
+                if _shared2 is not None:
+                    resp = await _shared2.get(self.rest_market_url, params={"asset": asset, "after": after_ts_ms})
+                else:
+                    async with httpx.AsyncClient(timeout=5.0) as _client:
+                        resp = await _client.get(self.rest_market_url, params={"asset": asset, "after": after_ts_ms})
                     if resp.status_code == 429:
                         if self.on_event:
                             self.on_event("rate_limited", {"asset": asset, "status": 429})
@@ -460,13 +511,14 @@ class MarketDiscovery:
         ws = self.window_size_seconds
         gamma_url = f"{self.GAMMA_BASE}/markets"
         debug: dict = {"asset": asset, "window_ts": window_ts_seconds, "slugs": []}
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+        _shared3 = self._get_client()
+        if _shared3 is not None:
+            try:
                 for cand_ts in (window_ts_seconds, window_ts_seconds + ws):
                     slug = self._slug_for(asset, cand_ts)
                     entry: dict = {"slug": slug, "ts": cand_ts}
                     try:
-                        resp = await client.get(gamma_url, params={"slug": slug})
+                        resp = await _shared3.get(gamma_url, params={"slug": slug})
                         entry["status"] = resp.status_code
                         try:
                             body = resp.text or ""
@@ -491,8 +543,40 @@ class MarketDiscovery:
                         if "status" not in entry:
                             entry["status"] = None
                     debug["slugs"].append(entry)
-        except Exception as e:
-            debug["transport_error"] = repr(e)
+            except Exception as e:
+                debug["transport_error"] = repr(e)
+        else:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as _client:
+                    for cand_ts in (window_ts_seconds, window_ts_seconds + ws):
+                        slug = self._slug_for(asset, cand_ts)
+                        entry = {"slug": slug, "ts": cand_ts}
+                        try:
+                            resp = await _client.get(gamma_url, params={"slug": slug})
+                            entry["status"] = resp.status_code
+                            try:
+                                body = resp.text or ""
+                            except Exception:
+                                body = ""
+                            entry["body_snippet"] = body[:500]
+                            if resp.status_code != 429:
+                                resp.raise_for_status()
+                                data = resp.json()
+                                m0 = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+                                if isinstance(m0, dict):
+                                    parsed = self._parse_gamma_market(asset, m0, cand_ts)
+                                    if parsed is not None and self._passes_liquidity_filter(parsed):
+                                        entry["parsed_condition_id"] = parsed.condition_id
+                                        if cand_ts == window_ts_seconds:
+                                            debug["slugs"].append(entry)
+                                            return parsed, debug
+                        except Exception as e:
+                            entry["error"] = repr(e)
+                            if "status" not in entry:
+                                entry["status"] = None
+                        debug["slugs"].append(entry)
+            except Exception as e:
+                debug["transport_error"] = repr(e)
         return None, debug
 
     def _parse_gamma_market(self, asset: str, data: dict, ts_seconds: int) -> Optional[MarketInfo]:

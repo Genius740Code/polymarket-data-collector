@@ -97,6 +97,11 @@ class Collector:
         # state
         self.books: Dict[str, OrderBookState] = {}  # condition_id -> book
         self.markets: Dict[str, MarketInfo] = {}  # condition_id -> market
+        # PERF CPU: token_id -> book O(1) index. WS hot path previously scanned
+        # all books (511 retained) 2-3x per frame; same lookup result, no scan.
+        # Fallback scan preserved in _lookup_book so a stale index can never
+        # change routing (fail-closed to old behavior, then re-indexes).
+        self._books_by_token: Dict[str, OrderBookState] = {}
         self.rollover = RolloverManager(config, on_event=self._collector_event)
         self.cursor_stores: Dict[str, CursorStore] = {a: CursorStore.for_asset(config, a) for a in config.assets}
         self.writer = ParquetWriter(
@@ -171,6 +176,21 @@ class Collector:
         # dict here killed the chainlink consumer 115 times in one run: KeyError
         # on the first message → crash → reconnect forever, 0 rows written).
         self._rtds_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"rx": 0, "parsed": 0})
+        # PERF CPU: one pooled REST client for CLOB book heals (keep-alive).
+        # Previously every heal built 2-3 fresh AsyncClients (new TCP+TLS each).
+        # Same GETs, same params, same merge logic.
+        self._http_rest: Any = None
+
+    def _get_rest_client(self) -> Any:
+        """Lazy shared httpx.AsyncClient for REST book fetches."""
+        if self._http_rest is None:
+            try:
+                import httpx as _httpx
+
+                self._http_rest = _httpx.AsyncClient(timeout=6)
+            except Exception:
+                self._http_rest = None
+        return self._http_rest
 
     async def _recover_from_cursor(self) -> None:
         """§1B: recover cursor state on startup after crash/restart — recreates books as stale if still active, else coverage_gap.
@@ -213,6 +233,7 @@ class Collector:
                                 )
                                 book.mark_stale(resync_id=str(uuid.uuid4()))
                                 self.books[state.current_condition_id] = book
+                                self._index_book(book)
                                 self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "age_ms": age_ms, "recovered": True})
                                 print(f"[startup] recreated stale book for {asset} [{tf}] {state.current_condition_id}")
                             except Exception as e:
@@ -397,17 +418,16 @@ class Collector:
             token_id = str(msg.get("token_id") or msg.get("asset_id") or msg.get("asset") or msg.get("tokenId") or "")
             if not token_id:
                 return False
-            # resolve market/condition for this token via books scan
+            # resolve market/condition for this token via O(1) index (fallback scan inside)
             market = None
             condition_id = msg.get("condition_id") or msg.get("conditionId")
             if condition_id and condition_id in self.markets:
                 market = self.markets[condition_id]
             else:
-                for b in self.books.values():
-                    if b.up_token_id == token_id or b.down_token_id == token_id:
-                        market = self.markets.get(b.condition_id)
-                        condition_id = b.condition_id
-                        break
+                _b = self._lookup_book(condition_id, token_id)
+                if _b is not None:
+                    market = self.markets.get(_b.condition_id)
+                    condition_id = _b.condition_id
             if market is None:
                 # still need condition_id for row; use token-derived fallback
                 condition_id = condition_id or token_id
@@ -515,6 +535,52 @@ class Collector:
         except Exception:
             return False
 
+    def _index_book(self, book: "OrderBookState") -> None:
+        """Add/replace token->book entries. Same routing as the linear scan."""
+        try:
+            if getattr(book, "up_token_id", None):
+                self._books_by_token[str(book.up_token_id)] = book
+            if getattr(book, "down_token_id", None):
+                self._books_by_token[str(book.down_token_id)] = book
+        except Exception:
+            pass
+
+    def _unindex_book(self, condition_id: str) -> None:
+        """Remove index entries pointing at an evicted book (tokens are unique)."""
+        try:
+            for tok, b in list(self._books_by_token.items()):
+                try:
+                    if getattr(b, "condition_id", None) == condition_id:
+                        self._books_by_token.pop(tok, None)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _lookup_book(self, cid: Any = None, tok: Any = None) -> Optional["OrderBookState"]:
+        """O(1) book lookup with fail-closed fallback scan (identical result)."""
+        try:
+            if cid and cid in self.books:
+                return self.books[cid]
+            if tok:
+                b = self._books_by_token.get(str(tok))
+                if b is not None and b.condition_id in self.books:
+                    return b
+                # Fallback: old linear scan (covers books created before index
+                # or token reuse); re-index on hit so next lookup is O(1).
+                for bb in self.books.values():
+                    try:
+                        if bb.up_token_id == tok or bb.down_token_id == tok:
+                            self._index_book(bb)
+                            return bb
+                    except Exception:
+                        continue
+            if tok:
+                return self.books.get(str(tok))
+        except Exception:
+            pass
+        return None
+
     def _replay_buffer_id(self, asset: str, msg_resync_id: str = "") -> str:
         """Return the resync buffer id for a live WS message, or "" if none.
 
@@ -553,42 +619,98 @@ class Collector:
         import httpx
         m = self.markets.get(condition_id)
         merged: dict = {}
+        def _client():
+            shared = self._get_rest_client()
+            if shared is not None:
+                return shared, False
+            return httpx.AsyncClient(timeout=6), True
         if m:
-            async with httpx.AsyncClient(timeout=6) as client:
-                for outcome, token_id in (("up", m.up_token_id), ("down", m.down_token_id)):
+            _c, _own = _client()
+            try:
+                if _own:
+                    _ctx = _c
+                    async with _ctx as client:
+                        for outcome, token_id in (("up", m.up_token_id), ("down", m.down_token_id)):
+                            try:
+                                resp = await client.get(
+                                    self.config.ws.rest_book_url,
+                                    params={"token_id": token_id},
+                                )
+                                if resp.status_code == 429:
+                                    await asyncio.sleep(1.0)
+                                    continue
+                                if resp.status_code != 200:
+                                    continue
+                                j = resp.json()
+                                if not isinstance(j, dict):
+                                    continue
+                                bids = j.get("bids") or []
+                                asks = j.get("asks") or []
+                                if bids or asks:
+                                    merged[f"{outcome}_bids"] = bids
+                                    merged[f"{outcome}_asks"] = asks
+                            except Exception:
+                                continue
+                else:
+                    client = _c
+                    for outcome, token_id in (("up", m.up_token_id), ("down", m.down_token_id)):
+                        try:
+                            resp = await client.get(
+                                self.config.ws.rest_book_url,
+                                params={"token_id": token_id},
+                            )
+                            if resp.status_code == 429:
+                                await asyncio.sleep(1.0)
+                                continue
+                            if resp.status_code != 200:
+                                continue
+                            j = resp.json()
+                            if not isinstance(j, dict):
+                                continue
+                            bids = j.get("bids") or []
+                            asks = j.get("asks") or []
+                            if bids or asks:
+                                merged[f"{outcome}_bids"] = bids
+                                merged[f"{outcome}_asks"] = asks
+                        except Exception:
+                            continue
+            finally:
+                if _own:
                     try:
-                        resp = await client.get(
-                            self.config.ws.rest_book_url,
-                            params={"token_id": token_id},
-                        )
-                        if resp.status_code == 429:
-                            await asyncio.sleep(1.0)
-                            continue
-                        if resp.status_code != 200:
-                            continue
-                        j = resp.json()
-                        if not isinstance(j, dict):
-                            continue
-                        bids = j.get("bids") or []
-                        asks = j.get("asks") or []
-                        if bids or asks:
-                            merged[f"{outcome}_bids"] = bids
-                            merged[f"{outcome}_asks"] = asks
+                        await _c.aclose()
                     except Exception:
-                        continue
+                        pass
         if merged:
             return merged
         # Fallback legacy params (endpoint contract verified via §18 gate)
         try:
-            async with httpx.AsyncClient(timeout=6) as client:
-                resp = await client.get(
-                    self.config.ws.rest_book_url,
-                    params={"asset": asset, "condition_id": condition_id},
-                )
-                if resp.status_code == 200:
-                    j = resp.json()
-                    if isinstance(j, dict) and ("bids" in j or "asks" in j):
-                        return j
+            _c2, _own2 = _client()
+            try:
+                if _own2:
+                    async with _c2 as client:
+                        resp = await client.get(
+                            self.config.ws.rest_book_url,
+                            params={"asset": asset, "condition_id": condition_id},
+                        )
+                        if resp.status_code == 200:
+                            j = resp.json()
+                            if isinstance(j, dict) and ("bids" in j or "asks" in j):
+                                return j
+                else:
+                    resp = await _c2.get(
+                        self.config.ws.rest_book_url,
+                        params={"asset": asset, "condition_id": condition_id},
+                    )
+                    if resp.status_code == 200:
+                        j = resp.json()
+                        if isinstance(j, dict) and ("bids" in j or "asks" in j):
+                            return j
+            finally:
+                if _own2:
+                    try:
+                        await _c2.aclose()
+                    except Exception:
+                        pass
         except Exception:
             pass
         return None
@@ -599,18 +721,23 @@ class Collector:
         # Try real REST first – fetch BOTH outcomes then apply atomically to avoid wiping other side
         merged: dict = {}
         any_success = False
+        _shared = self._get_rest_client()
+        async def _get(token_id: str):
+            if _shared is not None:
+                return await _shared.get(self.config.ws.rest_book_url, params={"token_id": token_id})
+            async with httpx.AsyncClient(timeout=4) as _client:
+                return await _client.get(self.config.ws.rest_book_url, params={"token_id": token_id})
         for outcome, token_id in [("up", market.up_token_id), ("down", market.down_token_id)]:
             try:
-                async with httpx.AsyncClient(timeout=4) as client:
-                    resp = await client.get(self.config.ws.rest_book_url, params={"token_id": token_id})
-                    if resp.status_code == 200:
-                        j = resp.json()
-                        bids = j.get("bids") or j.get("bids") or []
-                        asks = j.get("asks") or []
-                        if bids or asks:
-                            merged[f"{outcome}_bids"] = bids
-                            merged[f"{outcome}_asks"] = asks
-                            any_success = True
+                resp = await _get(token_id)
+                if resp.status_code == 200:
+                    j = resp.json()
+                    bids = j.get("bids") or j.get("bids") or []
+                    asks = j.get("asks") or []
+                    if bids or asks:
+                        merged[f"{outcome}_bids"] = bids
+                        merged[f"{outcome}_asks"] = asks
+                        any_success = True
             except Exception:
                 continue
         if any_success and merged:
@@ -881,6 +1008,7 @@ class Collector:
                             except Exception:
                                 pass
                             self.books[market.condition_id] = _nb
+                            self._index_book(_nb)
                     await self.rollover.check_and_roll_all(asset, _sub)
                 except Exception:
                     pass
@@ -985,6 +1113,7 @@ class Collector:
                 except Exception:
                     pass
                 self.books[market.condition_id] = _nb3
+                self._index_book(_nb3)
             # subscribe newly discovered market tokens (hot-add via
             # operation:subscribe when connected; no-op while WS is down)
             try:
@@ -1207,23 +1336,13 @@ class Collector:
                                 book = None
                                 cid = single_msg.get("condition_id")
                                 tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
-                                if cid and cid in self.books:
-                                    book = self.books[cid]
-                                elif tok:
-                                    # scan for token match (up/down) — Polymarket price_change uses asset_id==token_id
-                                    for b in self.books.values():
-                                        if b.up_token_id == tok or b.down_token_id == tok:
-                                            book = b
-                                            break
+                                book = self._lookup_book(cid, tok)
                                 if book is None and isinstance(single_msg.get("price_changes"), list):
                                     for pc in single_msg["price_changes"]:
                                         ptok = (pc.get("asset_id") or pc.get("token_id")) if isinstance(pc, dict) else None
                                         if not ptok:
                                             continue
-                                        for b in self.books.values():
-                                            if b.up_token_id == ptok or b.down_token_id == ptok:
-                                                book = b
-                                                break
+                                        book = self._lookup_book(None, ptok)
                                         if book is not None:
                                             break
                                 # fallback token key
@@ -1620,6 +1739,7 @@ class Collector:
                                 except Exception:
                                     pass
                                 self.books[m.condition_id] = book
+                                self._index_book(book)
                             # If book is still empty (any side empty), bootstrap via REST only (never synthetic)
                             # Only on first bucket of catch-up batch to avoid N REST calls per stall
                             if bucket == buckets[0]:
@@ -2159,6 +2279,7 @@ class Collector:
         evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
         for cid in evict_cids:
             self.books.pop(cid, None)
+            self._unindex_book(cid)
             self.markets.pop(cid, None)
             self._closed_cids.discard(cid)
             self._resolved_cids.discard(cid)
