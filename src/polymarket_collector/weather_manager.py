@@ -83,6 +83,27 @@ class WeatherManager:
                 if m.asset.upper() == au
                 and now_ms < m.market_end_ts_ms + 3600 * 1000]
 
+    def prune_ended(self, now_ms: int, grace_ms: int = 6 * 3600 * 1000) -> int:
+        """Drop brackets ended longer than ``grace_ms`` ago from ``_known``.
+
+        Row-neutral by construction: ``active_markets`` already excludes
+        anything ended >1h ago, the snapshot loop only writes buckets inside
+        ``[start, end)``, and the collector evicts books/markets on the same
+        6h cutoff. A pruned bracket rediscovered later via Gamma (12h
+        lookback) is simply re-added and recreates a stale book that writes
+        no rows outside its window. Called from the collector's memory
+        eviction tick; returns the number of entries dropped.
+        """
+        cutoff = now_ms - grace_ms
+        drop = [cid for cid, m in self._known.items()
+                if m.market_end_ts_ms < cutoff]
+        for cid in drop:
+            try:
+                del self._known[cid]
+            except KeyError:
+                pass
+        return len(drop)
+
     # -- discovery -----------------------------------------------------------
     async def check_and_roll_all(self, asset: str, subscribe_fn: Callable,
                                  now_ms: Optional[int] = None) -> Optional[str]:
@@ -169,5 +190,17 @@ def _infer_mode(config) -> str:
                 return "high"
     except Exception:
         pass
+    # Try to infer from kaggle dataset name if prefix is a full dataset slug
+    try:
+        prefix = str(getattr(getattr(config, "kaggle", None),
+                             "dataset_prefix", "") or "").lower()
+        if "weather-high" in prefix or "weather_low" in prefix or "weather-low" in prefix:
+            if "low" in prefix:
+                return "low"
+            if "high" in prefix or "weather-high" in prefix.replace("weather-", ""):
+                return "high"
+    except Exception:
+        pass
     raise ValueError("cannot infer weather mode (high|low) from config — "
-                     "kaggle.dataset_prefix must contain 'high' or 'low'")
+                     "kaggle.dataset_prefix must contain 'high' or 'low', "
+                     "or series_ids must contain 'high' or 'low'")

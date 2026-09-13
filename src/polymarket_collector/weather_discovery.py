@@ -101,6 +101,8 @@ def _parse_bracket_market(
 
     window_index = int(end_ms // 86400000)  # stable per city-day event
     slug_val = data.get("slug") or data.get("marketSlug")
+    if not slug_val:
+        slug_val = f"{asset.lower()}-temperature-{city_slug(asset)}-on-{window_index}"
     reported_volume = _to_float(
         data.get("volumeNum", data.get("volume_num", data.get("volume"))))
     reported_liquidity = _to_float(
@@ -121,7 +123,7 @@ def _parse_bracket_market(
         window_index=window_index,
         series_id=series_id,
         status="active",
-        question=data.get("question"),
+        question=data.get("question") or f"Weather {mode.title()} temperature bracket for {city_pretty(asset)} on window {window_index}",
         tick_size=tick_size,
         slug=str(slug_val) if slug_val else None,
         window_label="1d",
