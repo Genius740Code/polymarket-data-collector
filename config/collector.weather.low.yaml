@@ -121,7 +121,7 @@ rollover_lead_seconds: 120
 max_coverage_gap_seconds: 30
 discovery_poll_interval_seconds: 60
 discovery_backoff_max_seconds: 300
-snapshot_interval_ms: 5000
+snapshot_interval_ms: 15000
 l2_levels: 10
 depth_thresholds_cents:
 - 1
