@@ -27,6 +27,14 @@ class WsConfig(BaseModel):
     url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     rest_book_url: str = "https://clob.polymarket.com/book"
     rest_market_url: str = "https://clob.polymarket.com/markets"
+    # Connection sharding: how many configured cities share one market-channel
+    # WebSocket. 1 = today's one-socket-per-city. N>1 groups cities into
+    # shards of N sharing a single connection carrying the union of their
+    # tokens (hot-added via operation:subscribe). Message routing is already
+    # token-based, so dataset rows are unaffected — this only changes
+    # transport count. Sized so a shard stays well under ~200 tokens/socket
+    # (community-observed silent-stall range starts ~250).
+    cities_per_connection: int = 1
     reconnect_backoff_initial_ms: int = 500
     reconnect_backoff_max_ms: int = 30000
     reconnect_jitter: bool = True
@@ -36,6 +44,13 @@ class WsConfig(BaseModel):
     sequence_gap_detection: bool = True
     full_book_diff_interval_seconds: int = 45
     full_book_diff_tolerance: float = 0.0
+
+    @field_validator("cities_per_connection")
+    @classmethod
+    def shard_size_valid(cls, v: int) -> int:
+        if int(v) < 1:
+            raise ValueError("cities_per_connection must be >= 1")
+        return int(v)
 
 
 class CursorStoreConfig(BaseModel):

@@ -93,9 +93,27 @@ class CursorStore:
         self.db_path = Path(db_path)
         self.wal_mode = wal_mode
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        # PERF: single persistent conn per store (was connect+PRAGMA+
+        # commit+close per asset/lane per flush). Same rows; PRAGMAs run once.
+        # Cursor is a hint (writer WAL is truth §1B), so NORMAL sync here
+        # matches the shared_wal durability callers already relied on.
+        try:
+            if self._conn is not None:
+                try:
+                    self._conn.execute("SELECT 1")
+                    return self._conn
+                except Exception:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+        except Exception:
+            pass
         conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
         if self.wal_mode:
             # WAL mode must be set outside transaction; journal_mode pragma
@@ -103,8 +121,25 @@ class CursorStore:
             conn.execute("PRAGMA synchronous=NORMAL;")
         else:
             conn.execute("PRAGMA journal_mode=DELETE;")
-            conn.execute("PRAGMA synchronous=FULL;")
+            # Cursor is a recoverable hint; NORMAL avoids an fsync per lane
+            # (was FULL per save x lanes). Writer WAL covers power loss.
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn = conn
         return conn
+
+    def close(self) -> None:
+        try:
+            if self._conn is not None:
+                try:
+                    self._conn.commit()
+                except Exception:
+                    pass
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        finally:
+            self._conn = None
 
     def _init_db(self) -> None:
         conn = self._connect()
@@ -141,53 +176,68 @@ class CursorStore:
                     )
             conn.executescript(_DDL)
             conn.commit()
-        finally:
-            conn.close()
+        except Exception:
+            raise
+        # keep persistent conn open (no close here by design)
 
     def save(self, state: CursorState) -> None:
         conn = self._connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO cursor_state
-                  (asset, window_label, current_window_index, current_condition_id, next_condition_id,
-                   last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(asset, window_label) DO UPDATE SET
-                  current_window_index=excluded.current_window_index,
-                  current_condition_id=excluded.current_condition_id,
-                  next_condition_id=excluded.next_condition_id,
-                  last_sequence_number_per_token=excluded.last_sequence_number_per_token,
-                  last_snapshot_written_ts=excluded.last_snapshot_written_ts,
-                  updated_at=excluded.updated_at
-                """,
-                state.to_row(),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute(
+            """
+            INSERT INTO cursor_state
+              (asset, window_label, current_window_index, current_condition_id, next_condition_id,
+               last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset, window_label) DO UPDATE SET
+              current_window_index=excluded.current_window_index,
+              current_condition_id=excluded.current_condition_id,
+              next_condition_id=excluded.next_condition_id,
+              last_sequence_number_per_token=excluded.last_sequence_number_per_token,
+              last_snapshot_written_ts=excluded.last_snapshot_written_ts,
+              updated_at=excluded.updated_at
+            """,
+            state.to_row(),
+        )
+        conn.commit()
+
+    def save_many(self, states: list[CursorState]) -> None:
+        """Batch transaction for one flush (same rows as N save() calls)."""
+        if not states:
+            return
+        conn = self._connect()
+        conn.executemany(
+            """
+            INSERT INTO cursor_state
+              (asset, window_label, current_window_index, current_condition_id, next_condition_id,
+               last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asset, window_label) DO UPDATE SET
+              current_window_index=excluded.current_window_index,
+              current_condition_id=excluded.current_condition_id,
+              next_condition_id=excluded.next_condition_id,
+              last_sequence_number_per_token=excluded.last_sequence_number_per_token,
+              last_snapshot_written_ts=excluded.last_snapshot_written_ts,
+              updated_at=excluded.updated_at
+            """,
+            [s.to_row() for s in states],
+        )
+        conn.commit()
 
     def load(self, asset: str, window_label: str = "5m") -> Optional[CursorState]:
         conn = self._connect()
-        try:
-            cur = conn.execute(
-                "SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state WHERE asset=? AND window_label=?",
-                (asset.upper(), str(window_label).lower()),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            return CursorState.from_row(row)
-        finally:
-            conn.close()
+        cur = conn.execute(
+            "SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state WHERE asset=? AND window_label=?",
+            (asset.upper(), str(window_label).lower()),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return CursorState.from_row(row)
 
     def load_all(self) -> Dict[tuple, CursorState]:
         conn = self._connect()
-        try:
-            cur = conn.execute("SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state")
-            return {(r[0], r[1] or "5m"): CursorState.from_row(r) for r in cur.fetchall()}
-        finally:
-            conn.close()
+        cur = conn.execute("SELECT asset, window_label, current_window_index, current_condition_id, next_condition_id, last_sequence_number_per_token, last_snapshot_written_ts, updated_at FROM cursor_state")
+        return {(r[0], r[1] or "5m"): CursorState.from_row(r) for r in cur.fetchall()}
 
     def sync(self) -> None:
         """Compatibility alias — flush durable state. SQLite is synchronous on save(),
@@ -195,11 +245,8 @@ class CursorStore:
         if self.wal_mode:
             try:
                 conn = self._connect()
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                    conn.commit()
-                finally:
-                    conn.close()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.commit()
             except Exception:
                 pass
 

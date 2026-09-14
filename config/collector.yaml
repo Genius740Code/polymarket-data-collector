@@ -86,7 +86,7 @@ storage:
 synthetic_mode: false
 test_mode:
   enabled: false
-  num_markets: 4
+  num_markets: 2
   window_size_seconds: 300
 watchdog:
   alert_on:
@@ -106,18 +106,18 @@ watchdog:
 window_size_seconds: 300
 # Multi-timeframe lanes. ONLY enable after verify-gate --probe-timeframes
 # reports ENABLE for a lane (probed 2026-09-06: 5m/15m/4h live on all 7 assets;
-# 1h found 2026-09-08 under the ET slug family, NOT the unix-ts scheme).
+# 1h found 2026-09-08 under the ET slug family, NOT the unix-ts scheme;
+# 1d found 2026-09-14 under the ET end-date slug family, 7/7 ENABLE).
 timeframes:
-  # ROLLOUT STEP 2 2026-09-08: 5m+15m (14 lanes). P0 leak fixed+verified flat
-  # (5aa2feb, VPS probe 3849fd9); raw_ws_archive purged (was 894M stale).
-  # 15m validated end-to-end by Task 4 live run. 1h code-ready (ET slugs,
-  # live-validated discovery) but OFF until disk fits 3 lanes; 4h same.
-  # 1d up/down does not exist on Gamma (daily product is the price-touch
-  # ladder, a different market type) — keep OFF.
+  # ROLLOUT STEP 3 2026-09-14: 5m+15m+1h+4h+1d (35 lanes). 1h code-ready
+  # (ET slugs, live-validated discovery); 4h same. 1d live-validated 7/7
+  # via {bitcoin,...}-up-or-down-on-{month}-{day}-{year} end-date slugs
+  # (noon-ET windows); unix-ts 1d slugs are empty on Gamma.
   - 5m
   - 15m
   - 1h
   - 4h
+  - 1d
 
 ws:
   full_book_diff_interval_seconds: 300

@@ -138,7 +138,20 @@ def validate_ws_message(msg: dict) -> List[ValidationError]:
     # also L2 level arrays if present as lists
     errors: List[ValidationError] = []
     for k, v in msg.items():
-        lk = k if isinstance(k, str) and k == k.lower() else (k.lower() if isinstance(k, str) else k)
+        # PERF: exact-match first (common keys already lower, no alloc);
+        # lower() only on miss. Same accept/reject as before — price_changes
+        # inner entries intentionally NOT validated here (same as today;
+        # book.py double-checks bounds on apply without marking stale).
+        if isinstance(k, str):
+            if k in price_keys or k in size_keys or k in _SKIP_WHEN_EMPTY or k in ("bids", "asks") or k.endswith("_price") or k.endswith("_size") or k.endswith("_amount"):
+                lk = k
+            else:
+                try:
+                    lk = k.lower()
+                except Exception:
+                    lk = k
+        else:
+            lk = k
         if lk in _SKIP_WHEN_EMPTY and v in (None, ""):
             continue
         if lk in price_keys or (isinstance(lk, str) and lk.endswith("_price")):

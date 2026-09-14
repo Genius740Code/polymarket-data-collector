@@ -248,6 +248,14 @@ def probe_timeframes(assets: List[str], timeframes: List[str], timeout_s: float 
                     slug = _hs(asset, ts)
                 except Exception:
                     slug = f"{asset.lower()}-updown-{tf}-{ts}"
+            elif tf == "1d":
+                # 1d uses ET slug family naming the window END date
+                # (verified live 2026-09-14 on all 7 assets), not unix-ts
+                try:
+                    from .rollover import _daily_slug_for as _ds
+                    slug = _ds(asset, ts)
+                except Exception:
+                    slug = f"{asset.lower()}-updown-{tf}-{ts}"
             else:
                 slug = f"{asset.lower()}-updown-{tf}-{ts}"
             entry: Dict[str, Any] = {"slug": slug, "found": False}

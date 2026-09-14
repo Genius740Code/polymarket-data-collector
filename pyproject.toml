@@ -17,6 +17,7 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = [
+  "orjson>=3.9",
   "pyarrow>=14.0",
   "pandas>=2.0",
   "httpx>=0.25",

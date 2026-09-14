@@ -1,7 +1,7 @@
 /**
  * PM2 ecosystem — multi-timeframe Polymarket collector (single process).
  *
- * ONE collector process drives ALL enabled timeframe lanes (5m/15m/4h per
+ * ONE collector process drives ALL enabled timeframe lanes (5m/15m/1h/4h/1d per
  * config/collector.yaml `timeframes:`) — there are deliberately NO per-TF
  * processes. Each (asset, tf) lane has its own current/next market pair,
  * discovery cadence, cursor and Kaggle dataset, all inside the one asyncio
@@ -21,8 +21,10 @@
  *   1. timeframes: [5m]            → soak ≥24h, completeness ≥99%, gaps 0
  *   2. timeframes: [5m, 15m]       → soak ≥24h, both datasets uploading
  *   3. timeframes: [5m, 15m, 4h]   → full 24/7 runner
+ *   4. timeframes: [5m, 15m, 1h, 4h, 1d] → 1h/1d use ET slug families
  * New lanes ONLY after: python -m polymarket_collector.verify_gate --probe-timeframes
- * reports ENABLE for that lane (1h/1d do NOT exist on Gamma — keep OFF).
+ * reports ENABLE for that lane (1h ET family verified 2026-09-08, 1d ET
+ * end-date family verified 2026-09-14, 7/7 ENABLE).
  *
  * Usage:
  *   pm2 start ecosystem.config.js
@@ -74,10 +76,12 @@ module.exports = {
       // mid-prune (anon 2.1GB, Sep 11) instead of pm2 restarting it cleanly.
       // 1500M restarts via SIGINT (60s flush window) well before the kernel
       // must intervene; ticks are fail-closed and resume next cycle.
-      max_memory_restart: '1500M',
+      // TODO: memory leak — collector RSS grows ~200-400MB per snapshot tick;
+      // raised cap to 1800M to postpone OOM while leak is investigated.
+      max_memory_restart: '1800M',
       restart_delay: 1000,
       exp_backoff_restart_delay: 100,
-      kill_timeout: 60000,          // SIGINT → give collector time to flush + persist cursor (§1B)
+      kill_timeout: 120000,          // SIGINT → give collector time to flush + persist cursor (§1B)
       wait_ready: false,
       time: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
@@ -138,7 +142,7 @@ module.exports = {
     // the CLOB tokens[].winner flag, append-only + atomic compact. Idempotent:
     // already-resolved markets are skipped, unsettled ones retry next run.
     // --reupload --all-lanes pushes a fresh Kaggle version for EVERY enabled
-    // timeframe lane (5m/15m/4h datasets), not just the 5m default.
+    // timeframe lane (5m/15m/1h/4h/1d datasets), not just the 5m default.
     // 2026-09-10 OOM: --skip-onchain — the :00 full run (500 receipts + full
     // trades-hive reads) still spiked to 1.9GB and died. Wallets keep healing
     // via export-time first pass; on-chain resumes after the export diet.

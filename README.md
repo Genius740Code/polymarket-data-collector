@@ -1,6 +1,6 @@
 # Polymarket Collector — BTC/ETH/SOL 5-min Up/Down Markets
 
-Implements [PLAN.md v3](PLAN.md) — continuous 24/7 collection for BTC, ETH, SOL 5-minute binary markets with zero silent data loss.
+Implements [PLAN.md v3](docs/PLAN.md) — continuous 24/7 collection for BTC, ETH, SOL 5-minute binary markets with zero silent data loss.
 
 > **Default read path for research:** `book_snapshots_clean` (§9B) — `book_state='live'` only. Querying `book_snapshots_500ms` directly includes `stale`/`resyncing` rows intentionally.
 

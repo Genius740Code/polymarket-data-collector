@@ -8,7 +8,7 @@ captured need a secondary source like Dome API).
 from __future__ import annotations
 
 import datetime
-import json
+from .. import jsonfast as json
 import time
 from pathlib import Path
 from typing import Any, Dict

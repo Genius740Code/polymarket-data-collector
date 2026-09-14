@@ -362,3 +362,111 @@ def test_discovery_slug_for_branches_1h():
     assert d5m._slug_for("BTC", 1788890400) == "btc-updown-5m-1788890400"
     d4h = MarketDiscovery(rest_market_url="", window_size_seconds=14400)
     assert d4h._slug_for("BTC", 1788890400) == "btc-updown-4h-1788890400"
+
+
+def test_daily_slug_known_vector():
+    """Live-verified vector: ts=1789344000 (2026-09-14 16:00 UTC = noon ET).
+
+    The slug names the window END date; this exact slug returned the live
+    Sep-14 BTC daily market on Gamma (all 7 assets verified 2026-09-14).
+    """
+    from polymarket_collector.rollover import _daily_slug_for
+    assert _daily_slug_for("BTC", 1789344000) == "bitcoin-up-or-down-on-september-14-2026"
+    assert _daily_slug_for("eth", 1789344000) == "ethereum-up-or-down-on-september-14-2026"
+
+
+def test_daily_slug_all_assets():
+    from polymarket_collector.rollover import _daily_slug_for, HOURLY_SLUG_ASSET_NAMES
+    slugs = [_daily_slug_for(a, 1789344000) for a in HOURLY_SLUG_ASSET_NAMES]
+    assert len(set(slugs)) == 7  # no collisions
+    assert _daily_slug_for("HYPE", 1789344000) == "hype-up-or-down-on-september-14-2026"
+    assert _daily_slug_for("DOGE", 1789344000) == "dogecoin-up-or-down-on-september-14-2026"
+
+
+def test_daily_slug_noon_boundary():
+    """Before noon ET the window ends today; at/after noon ET it ends tomorrow."""
+    from polymarket_collector.rollover import _daily_slug_for
+    # 2026-09-14 15:00 UTC = 11:00 ET -> ends Sep 14
+    assert _daily_slug_for("BTC", 1789398000) == "bitcoin-up-or-down-on-september-14-2026"
+    # 2026-09-14 16:00 UTC = 12:00 ET -> ends Sep 15
+    assert _daily_slug_for("BTC", 1789401600) == "bitcoin-up-or-down-on-september-15-2026"
+    # 2026-09-14 05:00 UTC = 01:00 ET -> ends Sep 14
+    assert _daily_slug_for("BTC", 1789362000) == "bitcoin-up-or-down-on-september-14-2026"
+
+
+def test_discovery_slug_for_branches_1d():
+    """MarketDiscovery._slug_for uses the ET end-date family for the 1d lane."""
+    d1d = MarketDiscovery(rest_market_url="", window_size_seconds=86400)
+    assert d1d._slug_for("BTC", 1789344000) == "bitcoin-up-or-down-on-september-14-2026"
+    d5m = MarketDiscovery(rest_market_url="", window_size_seconds=300)
+    assert d5m._slug_for("BTC", 1789344000) == "btc-updown-5m-1789344000"
+
+
+def test_parse_gamma_market_daily_anchors_on_end_date():
+    """Gamma startDate is listing time (~2d early), not window start.
+
+    The 1d lane must anchor the 24h window on endDate (noon-ET truth) and
+    derive a restart-stable window_index from the anchored end.
+    """
+    d1d = MarketDiscovery(rest_market_url="", window_size_seconds=86400)
+    payload = {
+        "conditionId": "0x" + "ab" * 32,
+        "id": "4499043",
+        "slug": "bitcoin-up-or-down-on-september-14-2026",
+        "clobTokenIds": '["30694285918757873941485813703733714402446210271188710768191039198461428520807", "64122125320917931417429162023528127256262443287048826356144222233615542074831"]',
+        "outcomes": '["Up", "Down"]',
+        "startDate": "2026-09-12T16:07:13Z",  # listing time, NOT window start
+        "endDate": "2026-09-14T16:00:00Z",  # noon-ET window end truth
+    }
+    m = d1d._parse_gamma_market("BTC", payload, 1789344000)
+    assert m is not None
+    # endDate 2026-09-14T16:00:00Z = 1789401600 (noon-ET window-end truth)
+    assert m.market_end_ts_ms == 1789401600 * 1000
+    assert m.market_start_ts_ms == 1789401600 * 1000 - 86400 * 1000
+    # restart-stable index derived from the anchored end, not the unix-day input ts
+    assert m.window_index == 1789401600 // 86400
+    assert m.series_id == "BTC-1d"
+
+
+def _lf_config():
+    from polymarket_collector.config import LiquidityFilterConfig
+    return LiquidityFilterConfig(enabled=True, min_liquidity=500.0, min_volume=50.0)
+
+
+def test_liquidity_filter_unknown_passes():
+    """Unknown (None/NaN) volume/liquidity must PASS, not fail.
+
+    Regression for the weather blind spot: Gamma omits volume on thin
+    near-term brackets — treating 'no data' as 0 silently dropped the
+    most relevant markets (e.g. Shanghai buckets).
+    """
+    from polymarket_collector.rollover import MarketDiscovery
+    d = MarketDiscovery(rest_market_url="", liquidity_filter=_lf_config())
+    base = dict(
+        market_id="1", asset="BTC", up_token_id="u", down_token_id="d",
+        market_start_ts_ms=0, market_end_ts_ms=1, window_index=0,
+        series_id="BTC-5MIN",
+    )
+    assert d._passes_liquidity_filter(MarketInfo(condition_id="a", reported_volume=None, reported_liquidity=None, **base)) is True
+    assert d._passes_liquidity_filter(MarketInfo(condition_id="b", reported_volume=float("nan"), reported_liquidity=float("nan"), **base)) is True
+    assert d._passes_liquidity_filter(MarketInfo(condition_id="c", reported_volume="nan", reported_liquidity="", **base)) is True
+    # known-low still filtered
+    assert d._passes_liquidity_filter(MarketInfo(condition_id="d", reported_volume=10.0, reported_liquidity=100.0, **base)) is False
+    # known-good still passes
+    assert d._passes_liquidity_filter(MarketInfo(condition_id="e", reported_volume=100.0, reported_liquidity=600.0, **base)) is True
+
+
+def test_weather_liquidity_filter_unknown_passes():
+    """Same unknown-passes contract for the weather discovery path."""
+    from polymarket_collector.weather_discovery import WeatherDiscovery
+    from polymarket_collector.rollover import MarketInfo
+    w = WeatherDiscovery(mode="high", liquidity_filter=_lf_config())
+    base = dict(
+        market_id="1", asset="SHANGHAI", up_token_id="u", down_token_id="d",
+        market_start_ts_ms=0, market_end_ts_ms=1, window_index=0,
+        series_id="WEATHER-HIGH-1D",
+    )
+    assert w._passes_liquidity_filter(MarketInfo(condition_id="a", reported_volume=None, reported_liquidity=None, **base)) is True
+    assert w._passes_liquidity_filter(MarketInfo(condition_id="b", reported_volume=float("nan"), reported_liquidity=float("nan"), **base)) is True
+    assert w._passes_liquidity_filter(MarketInfo(condition_id="d", reported_volume=10.0, reported_liquidity=100.0, **base)) is False
+    assert w._passes_liquidity_filter(MarketInfo(condition_id="e", reported_volume=100.0, reported_liquidity=600.0, **base)) is True

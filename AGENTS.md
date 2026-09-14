@@ -1,6 +1,6 @@
 # AGENTS.md — Real Data Only Policy
 
-> Symlink to AGENT.md — both filenames checked by different tooling.
+> Both `AGENT.md` and `AGENTS.md` are kept at repo root — different tooling checks different filenames. Full policy lives in `AGENT.md`.
 
 This repository collects **real Polymarket CLOB** data only.
 

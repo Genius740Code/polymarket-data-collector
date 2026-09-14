@@ -158,12 +158,13 @@ def _write_parquet(path: Path, rows: list, schema_cols: dict) -> None:
     pq.write_table(table, str(path))
 
 
-def _fresh_staging(base: Path, lanes=("5m", "15m", "1h", "4h"), files=("BTC_book_snapshots_500ms.parquet",)) -> None:
+def _fresh_staging(base: Path, lanes=("5m", "15m", "1h", "4h", "1d"), files=("BTC_book_snapshots_500ms.parquet",)) -> None:
     """Coverage-proof evidence: fresh per-(lane, dataset) staging files.
 
     Since 2026-09-12 the prune deletes a hive file only if every lane's
     staging for that dataset is newer (minus slack) than the file — tests
-    exercising deletion must provide that evidence.
+    exercising deletion must provide that evidence. Lanes mirror the prod
+    config timeframes (1d enabled 2026-09-14).
     """
     for lane in lanes:
         for name in files:

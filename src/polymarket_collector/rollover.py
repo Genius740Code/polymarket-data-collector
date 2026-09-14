@@ -92,6 +92,26 @@ def _hourly_slug_for(asset: str, ts_seconds: int) -> str:
     return f"{name}-up-or-down-{dt.strftime('%B').lower()}-{dt.day}-{dt.year}-{h12}{ampm}-et"
 
 
+# Daily up/down markets use a human-readable ET slug family, NOT the unix-ts
+# scheme (verified live 2026-09-14: btc-updown-1d-<ts> is empty, but
+# bitcoin-up-or-down-on-september-14-2026 is a live market on all 7 assets).
+# Daily windows are [noon ET, noon ET next day); the slug names the window END
+# date in America/New_York wall-clock, e.g. ts=1789344000 (2026-09-14 16:00
+# UTC = noon ET) → ``bitcoin-up-or-down-on-september-14-2026``.
+def _daily_slug_for(asset: str, ts_seconds: int) -> str:
+    """Deterministic Gamma slug for the 1d lane.
+
+    Any ts inside the window maps to the same end-date slug: before noon ET
+    the window ends today, at/after noon ET it ends tomorrow.
+    """
+    name = HOURLY_SLUG_ASSET_NAMES.get(asset.upper())
+    if name is None:
+        raise ValueError(f"no daily slug name for asset {asset!r}")
+    dt = _dt_top.datetime.fromtimestamp(ts_seconds, tz=_ET)
+    end_day = dt.date() if dt.hour < 12 else dt.date() + _dt_top.timedelta(days=1)
+    return f"{name}-up-or-down-on-{end_day.strftime('%B').lower()}-{end_day.day}-{end_day.year}"
+
+
 @dataclass
 class MarketInfo:
     condition_id: str
@@ -216,6 +236,11 @@ class MarketDiscovery:
     ``{bitcoin,...}-up-or-down-{month}-{day}-{year}-{h}{am|pm}-et``
     (the unix-ts 1h slugs are empty on Gamma — verified live 2026-09-08).
 
+    Exception: the 1d lane uses the human-readable ET family
+    ``{bitcoin,...}-up-or-down-on-{month}-{day}-{year}`` naming the window
+    END date (the unix-ts 1d slugs are empty on Gamma — verified live
+    2026-09-14 on all 7 assets).
+
     ``window_size_seconds`` determines the market width (300=5min, 900=15min,
     3600=1h, 14400=4h, 86400=1d). The slug suffix is derived from this.
     """
@@ -280,6 +305,9 @@ class MarketDiscovery:
         if self.window_size_seconds == 3600:
             # 1h lane: human-readable ET slug family (unix-ts slugs are empty)
             return _hourly_slug_for(asset, ts_seconds)
+        if self.window_size_seconds == 86400:
+            # 1d lane: human-readable ET slug family (unix-ts slugs are empty)
+            return _daily_slug_for(asset, ts_seconds)
         # asset prefix is lower-case, e.g. btc-updown-5m-1787994000
         return f"{asset.lower()}-updown-{window_label}-{ts_seconds}"
 
@@ -657,8 +685,25 @@ class MarketDiscovery:
             start_ms = ts_seconds * 1000
             end_ms = (ts_seconds + ws) * 1000
 
+        # 1d lane: Gamma startDate is the listing time (often ~1-2d before
+        # end), NOT the window start — anchor the 24h window on endDate
+        # (noon-ET window-end truth, verified live 2026-09-14).
+        if ws == 86400 and end_iso:
+            try:
+                dt_end_fix = datetime.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                end_ms = int(dt_end_fix.timestamp() * 1000)
+                start_ms = end_ms - ws * 1000
+            except Exception:
+                pass
+
         # window_index deterministic from ts (§3 fix: use window, not 300)
-        window_index = ts_seconds // ws  # stable across runs
+        # 1d lane: derive from the anchored end (stable across restarts even
+        # though discovery input ts uses unix-day flooring, which does not
+        # align with noon-ET window boundaries).
+        if ws == 86400:
+            window_index = end_ms // (ws * 1000)
+        else:
+            window_index = ts_seconds // ws  # stable across runs
 
         tick_raw = data.get("orderPriceMinTickSize") or data.get("order_price_min_tick_size") or 0.01
         try:
@@ -822,18 +867,28 @@ class MarketDiscovery:
             return True
         min_liq = getattr(lf, "min_liquidity", 0) or 0
         min_vol = getattr(lf, "min_volume", 0) or 0
-        # treat None as 0 for filtering (unknown liquidity = fail when threshold >0)
-        liq = market.reported_liquidity if market.reported_liquidity is not None else 0
-        vol = market.reported_volume if market.reported_volume is not None else 0
-        try:
-            liq_f = float(liq)
-        except Exception:
-            liq_f = 0
-        try:
-            vol_f = float(vol)
-        except Exception:
-            vol_f = 0
-        if min_liq and liq_f < float(min_liq):
+        # Unknown (None/NaN/unparseable) = PASS, not fail (see weather_discovery:
+        # Gamma omits volume/liquidity on thin near-term brackets — filtering
+        # "no data" blinds collection to the most relevant markets).
+        import math as _math
+
+        def _known(v):
+            if v is None:
+                return None
+            try:
+                f = float(v)
+            except Exception:
+                return None
+            try:
+                if _math.isnan(f):
+                    return None
+            except Exception:
+                pass
+            return f
+
+        liq_f = _known(market.reported_liquidity)
+        vol_f = _known(market.reported_volume)
+        if min_liq and liq_f is not None and liq_f < float(min_liq):
             if self.on_event:
                 try:
                     self.on_event("low_liquidity", {
@@ -847,7 +902,7 @@ class MarketDiscovery:
                 except Exception:
                     pass
             return False
-        if min_vol and vol_f < float(min_vol):
+        if min_vol and vol_f is not None and vol_f < float(min_vol):
             if self.on_event:
                 try:
                     self.on_event("low_liquidity", {

@@ -183,17 +183,29 @@ class WeatherDiscovery:
             min_vol = float(getattr(lf, "min_volume", 0) or 0)
         except Exception:
             return True
-        liq = market.reported_liquidity if market.reported_liquidity is not None else 0
-        vol = market.reported_volume if market.reported_volume is not None else 0
-        try:
-            liq_f = float(liq)
-        except Exception:
-            liq_f = 0
-        try:
-            vol_f = float(vol)
-        except Exception:
-            vol_f = 0
-        if min_liq and liq_f < min_liq:
+        # Unknown (None/NaN/unparseable) = PASS, not fail: Gamma omits
+        # volume/liquidity on thin near-term brackets, and those thin
+        # buckets are the research edge — filtering "no data" blinds
+        # collection to exactly the markets that matter most.
+        import math as _math
+
+        def _known(v) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                f = float(v)
+            except Exception:
+                return None
+            try:
+                if _math.isnan(f):
+                    return None
+            except Exception:
+                pass
+            return f
+
+        liq_f = _known(market.reported_liquidity)
+        vol_f = _known(market.reported_volume)
+        if min_liq and liq_f is not None and liq_f < min_liq:
             if self.on_event:
                 try:
                     self.on_event("low_liquidity", {
@@ -205,7 +217,7 @@ class WeatherDiscovery:
                 except Exception:
                     pass
             return False
-        if min_vol and vol_f < min_vol:
+        if min_vol and vol_f is not None and vol_f < min_vol:
             if self.on_event:
                 try:
                     self.on_event("low_liquidity", {

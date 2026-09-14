@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import json
+from . import jsonfast as json
 import time
 import uuid
 from collections import defaultdict, deque
@@ -815,7 +815,7 @@ class Collector:
         startup/shutdown paths that need an immediate beat.
         """
         import datetime
-        import json
+        from . import jsonfast as json
         import time as _t
         now = _t.monotonic()
         try:
@@ -988,9 +988,21 @@ class Collector:
         except Exception as e:
             print(f"[startup] chainlink seed skipped: {e}")
 
-        # start per-asset WS tasks (stubbed — real WS connect loops)
-        for asset in self.config.assets:
-            t = asyncio.create_task(self._run_asset_loop(asset), name=f"asset-{asset}")
+        # start WS tasks — cities grouped into shards sharing one connection
+        # (ws.cities_per_connection; 1 = legacy one-socket-per-city). Shard
+        # membership only affects transport: discovery, routing and rows are
+        # per-market either way.
+        try:
+            _shard_n = max(1, int(getattr(self.config.ws, "cities_per_connection", 1) or 1))
+        except Exception:
+            _shard_n = 1
+        _assets = list(self.config.assets)
+        _shards = [_assets[i:i + _shard_n] for i in range(0, len(_assets), _shard_n)] or [[]]
+        for _si, _shard in enumerate(_shards):
+            t = asyncio.create_task(
+                self._run_shard_loop(_shard, shard_idx=_si),
+                name=f"shard-{'+'.join(_shard)}",
+            )
             self._tasks.append(t)
 
         # single shared scheduler for 500ms snapshots (§3 — same clock tick)
@@ -1021,15 +1033,65 @@ class Collector:
 
     # -- missing stubs for lifecycle — filled below (keep compat with start/stop) ----
     async def _run_asset_loop(self, asset: str) -> None:
-        """Per-asset WS loop — Gamma discovery + CLOB WS, §1 rollover dual-tracking.
+        """Single-city compat wrapper — a shard of one (identical behavior)."""
+        await self._run_shard_loop([asset], shard_idx=0)
 
-        Connects to wss://ws-subscriptions-clob.polymarket.com/ws/market,
-        applies WS messages via OrderBookState.apply_ws_message, and buffers
-        them into ResyncManager for disconnect/resync support.
-        Falls back to discovery polling when no live WS available.
+    def _resolve_msg_asset(self, single_msg: dict, book: Any, shard: List[str]) -> str:
+        """Attribute one WS message to its city for row/event labels.
+
+        Prefers the resolved book's asset (identical to the old per-city loop
+        label whenever the book is known). Falls back to a token match across
+        the shard's active markets, then to the shard's first city (only
+        reachable for never-discovered orphan tokens, which cannot occur
+        without cross-shard cross-talk since subscriptions derive from
+        discovery — same dead path as before, deterministically labeled).
+        """
+        try:
+            if book is not None and getattr(book, "asset", None):
+                return str(book.asset)
+        except Exception:
+            pass
+        try:
+            toks: set = set()
+            for _k in ("token_id", "asset_id", "asset", "token"):
+                _v = single_msg.get(_k)
+                if _v:
+                    toks.add(str(_v))
+            _pcs = single_msg.get("price_changes")
+            if isinstance(_pcs, list):
+                for _pc in _pcs:
+                    if isinstance(_pc, dict):
+                        for _k in ("asset_id", "token_id"):
+                            _v = _pc.get(_k)
+                            if _v:
+                                toks.add(str(_v))
+            if toks:
+                for _a in shard:
+                    try:
+                        _ml = self.rollover.active_markets(_a)
+                    except Exception:
+                        continue
+                    for _m in _ml:
+                        if _m.up_token_id in toks or _m.down_token_id in toks:
+                            return str(_m.asset)
+        except Exception:
+            pass
+        return shard[0]
+
+    async def _run_shard_loop(self, shard: List[str], shard_idx: int = 0) -> None:
+        """Per-shard WS loop — Gamma discovery + shared CLOB WS connection.
+
+        One connection carries the union of the shard's cities' tokens
+        (initial subscribe + operation:subscribe hot-adds). Discovery,
+        routing, books, snapshots and rows are per-market exactly as in the
+        old per-city loop; only the transport is shared.
         ON RECONNECT: loops with exponential backoff on disconnect, never lets
         the task return on a transient WS disconnect.
         """
+        shard = list(shard)
+        shard_set = {a.upper() if isinstance(a, str) else a for a in shard}
+        # Connection-level log label; for a shard of one this is just the city.
+        _label = "+".join(shard)
         ws_url = self.config.ws.url
         rest_fetcher = self._fetch_rest_book
 
@@ -1076,7 +1138,8 @@ class Collector:
                                 pass
                             self.books[market.condition_id] = _nb
                             self._index_book(_nb)
-                    await self.rollover.check_and_roll_all(asset, _sub)
+                    for _fa in shard:
+                        await self.rollover.check_and_roll_all(_fa, _sub)
                 except Exception:
                     pass
                 await asyncio.sleep(self.config.discovery_poll_interval_seconds)
@@ -1093,23 +1156,29 @@ class Collector:
         ws_holder: dict = {"ws": None, "subscribed_once": False, "subscribed_tokens": set()}
 
         async def _ensure_ws_subscription() -> bool:
-            """Subscribe to all active market tokens for this asset (§1 dual-tracking).
+            """Subscribe to the union of the shard's cities' tokens (§1 dual-tracking).
 
             Returns True when new tokens were subscribed. Safe to call while the
             WS is down — returns False without sending; books already exist and
-            tokens subscribe on the next successful connect.
+            tokens subscribe on the next successful connect. Per-city
+            subscription_started events preserve the old telemetry shape.
             """
             ws = ws_holder["ws"]
             if ws is None:
                 return False
             try:
-                markets = self.rollover.active_markets(asset)
                 tokens: list[str] = []
-                for m in markets:
-                    if m.up_token_id:
-                        tokens.append(m.up_token_id)
-                    if m.down_token_id:
-                        tokens.append(m.down_token_id)
+                per_asset_tokens: dict = {}
+                for _sa in shard:
+                    _at: list[str] = []
+                    for m in self.rollover.active_markets(_sa):
+                        if m.up_token_id:
+                            tokens.append(m.up_token_id)
+                            _at.append(m.up_token_id)
+                        if m.down_token_id:
+                            tokens.append(m.down_token_id)
+                            _at.append(m.down_token_id)
+                    per_asset_tokens[_sa] = _at
                 # dedup + only new tokens
                 subscribed_tokens = ws_holder["subscribed_tokens"]
                 new_tokens = [t for t in tokens if t not in subscribed_tokens]
@@ -1130,17 +1199,19 @@ class Collector:
                 ws_holder["subscribed_once"] = True
                 subscribed_tokens.update(new_tokens)
                 if self.on_event:
-                    try:
-                        self.on_event(CollectorEventType.subscription_started, {"asset": asset, "tokens": tokens})
-                    except Exception:
-                        pass
+                    for _sa in shard:
+                        try:
+                            self.on_event(CollectorEventType.subscription_started, {"asset": _sa, "tokens": per_asset_tokens.get(_sa, [])})
+                        except Exception:
+                            pass
                 return True
             except Exception as e:
                 if self.on_event:
-                    try:
-                        self.on_event(CollectorEventType.subscription_failed, {"asset": asset, "error": repr(e)})
-                    except Exception:
-                        pass
+                    for _sa in shard:
+                        try:
+                            self.on_event(CollectorEventType.subscription_failed, {"asset": _sa, "error": repr(e)})
+                        except Exception:
+                            pass
                 return False
 
         async def _on_market(market: MarketInfo) -> None:
@@ -1188,20 +1259,29 @@ class Collector:
             except Exception:
                 pass
 
-        async def _discovery_poller() -> None:
-            # runs for the whole asset-loop lifetime, WS up OR down — during an
-            # outage this is the ONLY source of discovery observability
-            while self._running:
-                try:
-                    await self.rollover.check_and_roll_all(asset, _on_market)
-                except Exception:
-                    pass
-                await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+        for _da in shard:
+            async def _discovery_poller(_a=_da) -> None:
+                # runs for the whole shard-loop lifetime, WS up OR down — during an
+                # outage this is the ONLY source of discovery observability
+                while self._running:
+                    try:
+                        await self.rollover.check_and_roll_all(_a, _on_market)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(self.config.discovery_poll_interval_seconds)
 
-        disc_task = asyncio.create_task(_discovery_poller(), name=f"discovery-{asset}")
-        # stop() cancels everything in _tasks; never per-connection — the poller
-        # must survive the 150s recycles and every reconnect
-        self._tasks.append(disc_task)
+            _dt = asyncio.create_task(_discovery_poller(), name=f"discovery-{_da}")
+            # stop() cancels everything in _tasks; never per-connection — the poller
+            # must survive the 150s recycles and every reconnect
+            self._tasks.append(_dt)
+
+        # Stagger shard connects so N shards never handshake/resubscribe in the
+        # same second (thundering-herd on the shared IP + REST-heal flood).
+        # Discovery pollers above already run during the wait — no coverage lost.
+        if shard_idx > 0:
+            await asyncio.sleep(min(float(shard_idx) * 2.0, 10.0))
+            if not self._running:
+                return
 
         # Connect with automatic reconnect on disconnect via resync
         # Track tokens already subscribed on this connection to avoid resending duplicates
@@ -1222,19 +1302,21 @@ class Collector:
                     # planned recycle: close is OURS — no disconnect episode, no
                     # REST resync, no backoff; books relive from the fresh full book
                     planned_recycle = False
-                    # Assign per-asset connection_id for collector_events (§8)
+                    # Assign per-city connection_id for collector_events (§8) —
+                    # one shared socket id across the shard (same transport).
                     try:
                         conn_id = str(uuid.uuid4())
-                        self._conn_ids[asset.upper()] = conn_id
-                        self._conn_ids[asset] = conn_id
-                        self._ws_connected[asset.upper()] = True
-                        self._collector_event(CollectorEventType.connected, {"asset": asset.upper(), "connection_id": conn_id})
+                        for _ca in shard:
+                            self._conn_ids[_ca.upper()] = conn_id
+                            self._conn_ids[_ca] = conn_id
+                            self._ws_connected[_ca.upper()] = True
+                            self._collector_event(CollectorEventType.connected, {"asset": _ca.upper(), "connection_id": conn_id})
                     except Exception:
                         pass
                     # Mark any pending disconnect episodes as reconnected (fixes gap_duration null)
                     try:
                         for rid, ep in list(self.resync._episodes.items()):
-                            if ep.asset == asset.upper() and ep.reconnect_ts_utc is None:
+                            if ep.asset in shard_set and ep.reconnect_ts_utc is None:
                                 self.resync.handle_reconnect(rid)
                     except Exception:
                         pass
@@ -1255,7 +1337,8 @@ class Collector:
 
                     # Initial discovery before reading (ensure at least current market)
                     try:
-                        await self.rollover.check_and_roll_all(asset, _on_market)
+                        for _ia in shard:
+                            await self.rollover.check_and_roll_all(_ia, _on_market)
                         await _ensure_ws_subscription()
                     except Exception:
                         pass
@@ -1279,7 +1362,7 @@ class Collector:
                                 except Exception:
                                     return
 
-                    hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{asset}")
+                    hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{_label}")
 
                     async def _staleness_watchdog() -> None:
                         # 30s without any market-data frame → force-abort the socket
@@ -1310,9 +1393,10 @@ class Collector:
                                 if bucket_lag_s > 15:
                                     last_data_ns = time.time_ns()
                                     continue
-                                print(f"[ws:{asset}] data-staleness >30s — forcing reconnect")
+                                print(f"[ws:{_label}] data-staleness >30s — forcing reconnect")
                                 try:
-                                    self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": "data_staleness_30s_forcing_reconnect"})
+                                    for _ea in shard:
+                                        self.on_event(CollectorEventType.book_anomaly, {"asset": _ea, "ws_error": "data_staleness_30s_forcing_reconnect"})
                                 except Exception:
                                     pass
                                 try:
@@ -1323,7 +1407,7 @@ class Collector:
                                     except Exception:
                                         return
 
-                    wd_task = asyncio.create_task(_staleness_watchdog(), name=f"ws-watchdog-{asset}")
+                    wd_task = asyncio.create_task(_staleness_watchdog(), name=f"ws-watchdog-{_label}")
 
                     try:
                         async for message in ws:
@@ -1338,7 +1422,7 @@ class Collector:
                             # (via the ws_connected downgrade in the snapshot loop).
                             if int(time.time() * 1000) - conn_established_ms > 150_000:
                                 planned_recycle = True
-                                print(f"[ws:{asset}] planned 150s recycle — reconnecting")
+                                print(f"[ws:{_label}] planned 150s recycle — reconnecting")
                                 break
                             # §13 raw archive + processing share ONE parse (PERF #4):
                             # previously json.loads ran once for archive and again
@@ -1348,7 +1432,11 @@ class Collector:
                             try:
                                 if isinstance(message, bytes):
                                     try:
-                                        msg = json.loads(message.decode())
+                                        # jsonfast (orjson) parses bytes directly —
+                                        # no decode copy. stdlib fallback accepts
+                                        # bytes too; undecodable input raises into
+                                        # the same skip path as before.
+                                        msg = json.loads(message)
                                     except Exception:
                                         # Undecodable/non-JSON bytes: same as before,
                                         # archive the raw string then skip processing
@@ -1377,19 +1465,24 @@ class Collector:
                             # socket still trips the watchdog)
                             last_data_ns = time.time_ns()
 
-                            # §13 raw archive reuses the single parse above (no 2nd loads).
-                            # Disabled in prod configs; when enabled the line content
-                            # is unchanged ({ts_received_ns, payload}).
-                            try:
-                                if isinstance(msg, dict):
-                                    self.raw_archive.append(asset, msg)
-                                elif isinstance(msg, list):
-                                    self.raw_archive.append(asset, msg)  # type: ignore
-                            except Exception:
-                                pass
-
                             # Handle list payloads (some WS frames are arrays of events)
                             msgs = msg if isinstance(msg, list) else [msg]
+                            # §13 raw archive reuses the single parse above (no 2nd loads).
+                            # Disabled in prod configs; when enabled the line content
+                            # is unchanged ({ts_received_ns, payload}). Partitioned by
+                            # the frame's own city — one shard socket can carry
+                            # several cities in a single batch frame.
+                            try:
+                                if isinstance(msg, (dict, list)):
+                                    _frame_asset = shard[0]
+                                    if self.raw_archive.enabled:
+                                        for _fm in msgs:
+                                            if isinstance(_fm, dict):
+                                                _frame_asset = self._resolve_msg_asset(_fm, None, shard)
+                                                break
+                                    self.raw_archive.append(_frame_asset, msg)  # type: ignore
+                            except Exception:
+                                pass
                             for single_msg in msgs:
                                 if not isinstance(single_msg, dict):
                                     continue
@@ -1415,6 +1508,10 @@ class Collector:
                                 # fallback token key
                                 if book is None:
                                     book = self.books.get(tok) if tok else None
+                                # City attribution for this message's rows/events.
+                                # Equals the old per-city loop label whenever the
+                                # book is known (the common case — identical rows).
+                                msg_asset = self._resolve_msg_asset(single_msg, book, shard)
                                 if book is not None:
                                     try:
                                         applied, reason = book.apply_ws_message(single_msg)
@@ -1422,7 +1519,7 @@ class Collector:
                                         # captured inside apply_ws_message, drained here
                                         try:
                                             for ev in book.drain_pending_events():
-                                                self._append_book_event(ev, book, asset, single_msg)
+                                                self._append_book_event(ev, book, msg_asset, single_msg)
                                         except Exception:
                                             pass
                                         # Emit sequence_gap event when gap detected §1A
@@ -1430,7 +1527,7 @@ class Collector:
                                             if self.on_event:
                                                 self.on_event(
                                                     CollectorEventType.sequence_gap,
-                                                    {"asset": asset, "condition_id": book.condition_id,
+                                                    {"asset": msg_asset, "condition_id": book.condition_id,
                                                      "expected": book.sequence_numbers.get(str(single_msg.get("token_id") or single_msg.get("asset_id")) or "unknown", 0) + 1,
                                                      "received": int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0,
                                                      "reason": reason},
@@ -1438,7 +1535,7 @@ class Collector:
                                             # Trigger resync/disconnect lifecycle on gap
                                             try:
                                                 self.resync.handle_sequence_gap(
-                                                    asset, book.condition_id, self.books, expected=int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0, received=1
+                                                    msg_asset, book.condition_id, self.books, expected=int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0, received=1
                                                 )
                                             except Exception:
                                                 pass
@@ -1448,24 +1545,24 @@ class Collector:
                                             if self.on_event:
                                                 self.on_event(
                                                     CollectorEventType.book_anomaly,
-                                                    {"asset": asset, "condition_id": book.condition_id,
+                                                    {"asset": msg_asset, "condition_id": book.condition_id,
                                                      "reason": reason},
                                                 )
                                         if not applied and self.on_event:
                                             self.on_event(
                                                 CollectorEventType.book_anomaly,
-                                                {"asset": asset, "reason": reason, "msg": str(single_msg)[:500]},
+                                                {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
                                             )
                                     except Exception as e:
                                         if self.on_event:
                                             self.on_event(
                                                 CollectorEventType.book_anomaly,
-                                                {"asset": asset, "ws_error": str(e)},
+                                                {"asset": msg_asset, "ws_error": str(e)},
                                             )
 
                                 # Trade handling — persist with wallet (no RPC) §5
                                 try:
-                                    self._handle_trade_message(single_msg, asset, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
+                                    self._handle_trade_message(single_msg, msg_asset, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
                                 except Exception:
                                     pass
 
@@ -1476,7 +1573,7 @@ class Collector:
                                 # ~22k msgs / 10 min, never replayed, ~110MB/min RSS)
                                 try:
                                     resync_id = self._replay_buffer_id(
-                                        asset, single_msg.get("resync_id", "") or "")
+                                        msg_asset, single_msg.get("resync_id", "") or "")
                                     if resync_id:
                                         self.resync.buffer_message(resync_id, single_msg)
                                 except Exception:
@@ -1506,7 +1603,8 @@ class Collector:
                 # Connection closed — mark stale, request resync, then reconnect
                 # Real gap tracking: close gap on reconnect so gap_duration_ms is populated per AGENT.md honest gaps
                 if self._running:
-                    self._ws_connected[asset.upper()] = False
+                    for _ca in shard:
+                        self._ws_connected[_ca.upper()] = False
                 if planned_recycle:
                     # B-3 light recycle: the swap is ours and takes ~1s — no
                     # disconnect episode, no REST resync; the fresh connection's
@@ -1514,21 +1612,24 @@ class Collector:
                     # downgrades snapshots to stale for the swap window (honest).
                     planned_recycle = False
                     continue
+                resync_ids: dict = {}
                 if self._running:
-                    _cid = None
-                    try:
-                        act = self.rollover.active_markets(asset)
-                        if act:
-                            _cid = act[0].condition_id
-                        else:
-                            for b in self.books.values():
-                                if b.asset.upper() == asset.upper():
-                                    _cid = b.condition_id
-                                    break
-                    except Exception:
-                        pass
-                resync_id = self.resync.handle_disconnect(asset, _cid, reason="ws_connection_close", books=self.books)
-                self._ws_connected[asset.upper()] = False
+                    for _ca in shard:
+                        _cid = None
+                        try:
+                            act = self.rollover.active_markets(_ca)
+                            if act:
+                                _cid = act[0].condition_id
+                            else:
+                                for b in self.books.values():
+                                    if b.asset.upper() == _ca.upper():
+                                        _cid = b.condition_id
+                                        break
+                        except Exception:
+                            pass
+                        resync_ids[_ca] = self.resync.handle_disconnect(_ca, _cid, reason="ws_connection_close", books=self.books)
+                for _ca in shard:
+                    self._ws_connected[_ca.upper()] = False
                 # Do NOT auto-reconnect here — wait for real WS reconnect; gap will be closed on next connect `handle_reconnect` or on stop `ensure_all_reconnected`
                 # This ensures resync_rest_fetch_ts_utc is set only via real resync() REST fetch per AGENT.md
             except asyncio.CancelledError:
@@ -1538,28 +1639,32 @@ class Collector:
                 # fall through to reconnect logic below
             except websockets.exceptions.ConnectionClosed:
                 # Transient disconnect — mark stale, request resync, then reconnect
+                resync_ids = {}
                 if self._running:
-                    _cid2 = None
-                    try:
-                        act2 = self.rollover.active_markets(asset)
-                        if act2:
-                            _cid2 = act2[0].condition_id
-                        else:
-                            for b in self.books.values():
-                                if b.asset.upper() == asset.upper():
-                                    _cid2 = b.condition_id
-                                    break
-                    except Exception:
-                        pass
-                    resync_id = self.resync.handle_disconnect(asset, _cid2, reason="ws_connection_close", books=self.books)
-                    self._ws_connected[asset.upper()] = False
-                    self.resync.buffer_message(resync_id, None)  # marker for replay on reconnect
+                    for _ca in shard:
+                        _cid2 = None
+                        try:
+                            act2 = self.rollover.active_markets(_ca)
+                            if act2:
+                                _cid2 = act2[0].condition_id
+                            else:
+                                for b in self.books.values():
+                                    if b.asset.upper() == _ca.upper():
+                                        _cid2 = b.condition_id
+                                        break
+                        except Exception:
+                            pass
+                        _rid = self.resync.handle_disconnect(_ca, _cid2, reason="ws_connection_close", books=self.books)
+                        resync_ids[_ca] = _rid
+                        self._ws_connected[_ca.upper()] = False
+                        self.resync.buffer_message(_rid, None)  # marker for replay on reconnect
             except Exception as e:
                 if self.on_event:
-                    try:
-                        self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "ws_error": str(e)})
-                    except Exception:
-                        pass
+                    for _ca in shard:
+                        try:
+                            self.on_event(CollectorEventType.book_anomaly, {"asset": _ca, "ws_error": str(e)})
+                        except Exception:
+                            pass
 
             # Exponential backoff reconnect while running
             if not self._running:
@@ -2139,7 +2244,7 @@ class Collector:
         """
         import asyncio as _aio
         import datetime as _dt
-        import json as _json
+        from . import jsonfast as _json
         cfg = self.config.chainlink
         url = cfg.ws_url
         attempt = 0
@@ -2437,6 +2542,19 @@ class Collector:
                     self._episode_persisted.discard(rid)
         if evict_cids:
             print(f"[memory] evicted {len(evict_cids)} ended markets from RAM (books={len(self.books)}, markets={len(self.markets)})")
+        # Weather bracket-set hygiene: WeatherManager._known only ever grows
+        # (every city-day bracket ever discovered). Prune on the same 6h
+        # cutoff as books/markets above — row-neutral (active_markets and the
+        # snapshot time-gate already exclude these). Duck-typed so the crypto
+        # RolloverManager path is untouched.
+        try:
+            prune = getattr(self.rollover, "prune_ended", None)
+            if callable(prune):
+                n = prune(now_ms)
+                if n:
+                    print(f"[memory] pruned {n} ended brackets from discovery set")
+        except Exception:
+            pass
         # per-episode bookkeeping RAM pruning: keep _episode_latest only for
         # episodes that can still change state (open) or were not yet persisted.
         # Final+persisted entries are already in parquet.
@@ -2811,7 +2929,7 @@ class Collector:
         # Persist final list to file already done inside analyse, append kaggle info
         try:
             from pathlib import Path as _P2
-            import json as _js
+            from . import jsonfast as _js
             data_dir = Path(self.config.storage.data_dir)
             out_path = data_dir / "test_analysis.json"
             # ensure data dir exists
