@@ -52,6 +52,9 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     # (PyArrow reads row-group-at-a-time; iter_batches slices do not release
     # the parent), tripping the worker RSS cap and killing uploads.
     total_rows = 0
+    consumed: list = []  # only files actually read — unreadable stubs are
+    # never deleted here (they go to quarantine, not oblivion, per
+    # Real-Data-Only: gaps stay honest instead of vanishing in compaction).
     _writer = None
     try:
         for p in parts:
@@ -63,9 +66,13 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
                 continue
             try:
                 if _writer is None:
-                    _writer = pq.ParquetWriter(str(tmp_path), t.schema, compression="zstd", row_group_size=20000)
-                _writer.write_table(t)
+                    _writer = pq.ParquetWriter(str(tmp_path), t.schema, compression="zstd")
+                # row_group_size lives on write_table, not the constructor
+                # (constructor kwarg raises TypeError on pyarrow 25 and made
+                # compaction a silent no-op returning 0).
+                _writer.write_table(t, row_group_size=20000)
                 total_rows += t.num_rows
+                consumed.append(p)
             finally:
                 try:
                     del t
@@ -91,9 +98,32 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
         except Exception:
             pass
         return 0
+    # fsync tmp before publish (same crash window as the writer flush path).
+    try:
+        with open(str(tmp_path), "rb") as _fh:
+            try:
+                import os as _os
+                _os.fsync(_fh.fileno())
+            except Exception:
+                pass
+    except Exception:
+        pass
     _os_replace_safe(tmp_path, final_path)
-    # remove old parts only after successful new write
-    for p in parts:
+    try:
+        import os as _os2
+        _dfd = _os2.open(str(dataset_path), _os2.O_DIRECTORY)
+        try:
+            _os2.fsync(_dfd)
+        finally:
+            try:
+                _os2.close(_dfd)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # remove only consumed inputs after successful new write — unreadable
+    # stubs stay for quarantine instead of vanishing here.
+    for p in consumed:
         try:
             p.unlink()
         except Exception:

@@ -2834,8 +2834,11 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
                         _res[_rel] = {"tmp": None, "rows": None, "skip": True}
                         continue
                     _res[_rel] = {"tmp": str(_tmp) if _tmp.exists() else None, "rows": _n}
-                    if _io.get("files_failed"):
-                        _read_err_out[_rel] = {"failed": _io.get("files_failed"),
+                    # Report ANY read failure, including 0-byte stubs
+                    # (failed=1, failed_bytes=0) which the old
+                    # `files_failed`-only gate let through to Kaggle.
+                    if _io.get("files_failed") or _io.get("failed_bytes"):
+                        _read_err_out[_rel] = {"failed": _io.get("files_failed", 0),
                                               "failed_bytes": _io.get("failed_bytes", 0),
                                               "ok": _io.get("files_ok", 0)}
                 except Exception as _e:
@@ -3101,11 +3104,14 @@ def export_per_asset_single_file(
                 _rerr = (_built_one.get("__read_errors__") or {}).get(_rel) or {}
                 _mok = bool(_pre_mani and _wmani and _manifests_match(_pre_mani, _wmani))
                 _fb = int(_rerr.get("failed_bytes") or 0)
+                _fc = int(_rerr.get("failed") or 0)
                 _budget = max(1_000_000, int((_pre_mani or {}).get("bytes", 0) * 0.01))
                 if manifests is not None:
                     manifests[_mkey] = {"pre": _pre_mani, "worker": _wmani,
                                         "ok": _mok, "read_errors": _rerr}
-                if not _mok or _fb > _budget:
+                # Fail closed on ANY unreadable input file — a 0-byte stub
+                # has failed=1 but failed_bytes=0 and must not ship either.
+                if not _mok or _fb > _budget or _fc > 0:
                     try:
                         _tmp_bad = Path(_info["tmp"]) if _info.get("tmp") else None
                         if _tmp_bad is not None and _tmp_bad.exists():
@@ -3113,6 +3119,7 @@ def export_per_asset_single_file(
                     except Exception:
                         pass
                     _why_cov = ("manifest mismatch" if not _mok
+                                else f"unreadable inputs {_fc} files/{_fb}B" if _fc
                                 else f"unreadable inputs {_fb}B > {_budget}B budget")
                     print(f"[export] WARN {ds}/{_au_one} coverage check failed ({_why_cov}) "
                           f"— keeping prior staging (fail closed)")
@@ -3369,10 +3376,11 @@ def export_per_asset_single_file(
                 _post_g = None
             _g_ok = bool(_pre_g and _post_g and _manifests_match(_pre_g, _post_g))
             _g_fb = int((_gio.get("failed_bytes") or 0))
+            _g_fc = int((_gio.get("files_failed") or _gio.get("failed") or 0))
             if manifests is not None:
                 manifests[f"{ds}/GLOBAL"] = {"pre": _pre_g, "worker": _post_g,
                                              "ok": _g_ok, "read_errors": _gio}
-            if not _g_ok or _g_fb > max(1_000_000, int((_pre_g or {}).get("bytes", 0) * 0.01)):
+            if not _g_ok or _g_fc > 0 or _g_fb > max(1_000_000, int((_pre_g or {}).get("bytes", 0) * 0.01)):
                 print(f"[export] WARN globals {ds} coverage check failed — keeping prior staging (fail closed)")
                 try:
                     if _tmp_g.exists():
@@ -4780,9 +4788,11 @@ def _export_and_upload_all_kaggle_impl(
         if not _mi.get("ok"):
             lost.append(f"{_mk}: worker inputs != hive at build start")
         _re = _mi.get("read_errors") or {}
-        if int(_re.get("failed_bytes") or 0) > 0:
-            lost.append(f"{_mk}: unreadable inputs {_re.get('failed_bytes')}B "
-                        f"({_re.get('failed', 0)} files)")
+        # Any unreadable input file aborts — including 0-byte stubs
+        # (failed=1, failed_bytes=0) which used to slip through.
+        if int(_re.get("failed_bytes") or 0) > 0 or int(_re.get("failed") or _re.get("files_failed") or 0) > 0:
+            lost.append(f"{_mk}: unreadable inputs {_re.get('failed_bytes', 0)}B "
+                        f"({_re.get('failed', _re.get('files_failed', 0))} files)")
     for a in assets:
         f = staging / f"{a}_book_snapshots_500ms.parquet"
         staging_rows = None

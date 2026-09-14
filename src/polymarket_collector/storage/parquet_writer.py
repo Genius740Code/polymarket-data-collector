@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import datetime as _dt
-import json
+from .. import jsonfast as json
 import os
 import time
 import uuid
@@ -490,7 +490,7 @@ class ParquetWriter:
         WARN fails open toward possible dupes (tolerated downstream) rather
         than OOM-killing the process on huge hives.
         """
-        import json
+        from .. import jsonfast as json
         import time as _time
         replayed = 0
         seen_replay_keys: Set[Tuple] = set()  # track keys replayed in this pass
@@ -1001,7 +1001,46 @@ class ParquetWriter:
                     raise e
             else:
                 raise
+        # Crash-safe publish: fsync tmp content + parent dir BEFORE the
+        # atomic rename so a SIGKILL/power loss can only leave a .tmp
+        # orphan (skipped by readers) — never a footer-less final that
+        # fail-closes every future Kaggle upload (seen 2026-09-13 LOW:
+        # 5 footer-less finals at 1789331692*). Best-effort, never raises.
+        try:
+            with open(str(tmp_path), "rb") as _fh:
+                try:
+                    _fh.flush()
+                except Exception:
+                    pass
+                try:
+                    os.fsync(_fh.fileno())
+                except Exception:
+                    pass
+            try:
+                _dfd = os.open(str(out_dir), os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    try:
+                        os.close(_dfd)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
         _os_replace_safe(tmp_path, final_path)
+        try:
+            _dfd2 = os.open(str(out_dir), os.O_DIRECTORY)
+            try:
+                os.fsync(_dfd2)
+            finally:
+                try:
+                    os.close(_dfd2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Optional: also write to WAL archive dir for recovery
         # (compaction job will merge small files later)
