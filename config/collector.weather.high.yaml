@@ -114,14 +114,14 @@ kaggle:
   datasets:
     1d: gghgg1/polymarket-weather-high
   rolling_window: true
-  local_retention_hours: 12
+  local_retention_hours: 6
   upload_interval_seconds: 3600
   test_upload_interval_seconds: 600
 rollover_lead_seconds: 120
 max_coverage_gap_seconds: 30
 discovery_poll_interval_seconds: 60
 discovery_backoff_max_seconds: 300
-snapshot_interval_ms: 15000
+snapshot_interval_ms: 60000
 l2_levels: 10
 depth_thresholds_cents:
 - 1
