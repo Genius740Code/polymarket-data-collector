@@ -28,3 +28,4 @@ packages/*/dist/
 raw_ws_archive/
 _wal/
 *.log
+_quarantine_*/
