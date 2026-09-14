@@ -29,3 +29,5 @@ raw_ws_archive/
 _wal/
 *.log
 _quarantine_*/
+_quarantine_*/
+hdd-staging/
