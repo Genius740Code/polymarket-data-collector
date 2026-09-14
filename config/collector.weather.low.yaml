@@ -161,8 +161,8 @@ storage:
   data_dir: ./data-weather-low
   disk_space_check_interval_seconds: 30
   disk_space_min_bytes: 1073741824
-  flush_interval_seconds: 210
-  flush_row_count_threshold: 5000
+  flush_interval_seconds: 600
+  flush_row_count_threshold: 50000
   wal_dir: ./data-weather-low/_wal
   wal_enabled: true
 synthetic_mode: false

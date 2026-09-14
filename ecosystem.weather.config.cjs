@@ -38,6 +38,19 @@ for (const [link, target] of [
     if (!fs.existsSync(linkPath)) fs.symlinkSync(target, linkPath);
   } catch (e) { console.error(`[weather] shm setup failed for ${link}: ${e.message}`); }
 }
+// Staging (write-once/read-once for the Kaggle upload) lives on the HDD:
+// it is I/O-latency-tolerant, unlike the hot hive. Survives reboots, so
+// just ensure the shm-side symlink exists (created manually on first move).
+for (const [dir, name] of [
+  ['/dev/shm/pw-weather-high', 'high-kaggle_staging'],
+  ['/dev/shm/pw-weather-low', 'low-kaggle_staging'],
+]) {
+  try {
+    const linkPath = path.join(dir, 'kaggle_staging');
+    const target = path.join(cwd, 'hdd-staging', name);
+    if (fs.existsSync(target) && !fs.existsSync(linkPath)) fs.symlinkSync(target, linkPath);
+  } catch (e) { console.error(`[weather] staging link failed: ${e.message}`); }
+}
 
 function watchdogApp(name, configFile, outLog, errLog) {
   return {
