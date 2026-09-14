@@ -146,7 +146,7 @@ ws:
   sequence_gap_detection: true
   url: wss://ws-subscriptions-clob.polymarket.com/ws/market
 cursor_store:
-  flush_interval_seconds: 5
+  flush_interval_seconds: 60
   mode: per_asset
   path: ./data-weather-low/cursor_state
 chainlink:
@@ -161,8 +161,8 @@ storage:
   data_dir: ./data-weather-low
   disk_space_check_interval_seconds: 30
   disk_space_min_bytes: 1073741824
-  flush_interval_seconds: 30
-  flush_row_count_threshold: 1500
+  flush_interval_seconds: 210
+  flush_row_count_threshold: 5000
   wal_dir: ./data-weather-low/_wal
   wal_enabled: true
 synthetic_mode: false
