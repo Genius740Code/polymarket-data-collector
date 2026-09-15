@@ -17,8 +17,40 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const cwd = __dirname;
 const python = path.join(cwd, '.venv', 'bin', 'python');
+
+// Local hive lives on /dev/shm tmpfs (850 MB/s dsync) instead of the 1TB
+// HDD (3.1 MB/s dsync, journal-bound): at 51-city scale the sync
+// parquet/WAL/cursor fsync storms wedged the asyncio loop in D-state
+// (heartbeat 5s->60s, kaggle 600s sleep never elapsed, no uploads).
+// Kaggle is the durable archive (rolling_window); local is a 12h staging
+// window, so tmpfs volatility (reboot wipes) is by design. Recreated here
+// so `pm2 start`/`pm2 resurrect` self-heals after a reboot wiped /dev/shm.
+for (const [link, target] of [
+  ['data-weather-high', '/dev/shm/pw-weather-high'],
+  ['data-weather-low', '/dev/shm/pw-weather-low'],
+]) {
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    const linkPath = path.join(cwd, link);
+    if (!fs.existsSync(linkPath)) fs.symlinkSync(target, linkPath);
+  } catch (e) { console.error(`[weather] shm setup failed for ${link}: ${e.message}`); }
+}
+// Staging (write-once/read-once for the Kaggle upload) lives on the HDD:
+// it is I/O-latency-tolerant, unlike the hot hive. Survives reboots, so
+// just ensure the shm-side symlink exists (created manually on first move).
+for (const [dir, name] of [
+  ['/dev/shm/pw-weather-high', 'high-kaggle_staging'],
+  ['/dev/shm/pw-weather-low', 'low-kaggle_staging'],
+]) {
+  try {
+    const linkPath = path.join(dir, 'kaggle_staging');
+    const target = path.join(cwd, 'hdd-staging', name);
+    if (fs.existsSync(target) && !fs.existsSync(linkPath)) fs.symlinkSync(target, linkPath);
+  } catch (e) { console.error(`[weather] staging link failed: ${e.message}`); }
+}
 
 function watchdogApp(name, configFile, outLog, errLog) {
   return {

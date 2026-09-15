@@ -768,6 +768,24 @@ def _staging_flavor(dataset_prefix: str | None, timeframe_label: str | None) -> 
     return f"{timeframe_label} crypto"
 
 
+def _staging_resources(stats: dict, staging: "Path", flavor: str, dataset_prefix: str) -> tuple:
+    """Upload manifest entries for staged files that actually exist on disk.
+
+    Returns (resources, missing_names). A stats key with no staged file
+    (city discovered mid-export — no inputs at worker time) is excluded so
+    dataset_create_version never fails with "does not exist"; the next tick
+    rebuilds it once inputs exist. Schema-empty-but-present files still ship.
+    """
+    from pathlib import Path as _P
+    resources = [
+        {"path": _P(k).name, "description": f"{_P(k).name} {flavor} — {dataset_prefix}"}
+        for k in stats.keys()
+        if (staging / _P(k).name).exists()
+    ]
+    missing = [_P(k).name for k in stats.keys() if not (staging / _P(k).name).exists()]
+    return resources, missing
+
+
 def _staging_per_asset_datasets(weather: bool) -> list:
     """Per-asset staging datasets — weather lanes skip chainlink_events.
 
@@ -3788,10 +3806,16 @@ def prepare_kaggle_staging_5m(
     # Write dataset-metadata.json (title is weather-aware: the hardcoded
     # "Polymarket {tf} Crypto" used to stamp weather datasets as 1d Crypto)
     _flavor = _staging_flavor(dataset_prefix, timeframe_label)
-    resources = [
-        {"path": Path(k).name, "description": f"{Path(k).name} {_flavor} — {dataset_prefix}"}
-        for k in stats.keys()
-    ]
+    # Upload manifest must match files on disk: a stats key with no staged
+    # file (e.g. a city first discovered mid-export — no inputs at worker
+    # time, so the worker wrote nothing while stats kept the key) would make
+    # dataset_create_version fail with "does not exist" after 5 retries
+    # (2026-09-14 LOW: WUHAN_book_snapshots_500ms). The next tick rebuilds
+    # it once inputs exist. Schema-empty-but-present files still ship.
+    resources, _missing = _staging_resources(stats, staging, _flavor, dataset_prefix)
+    if _missing:
+        print(f"[export] WARN {len(_missing)} stats entries have no staged file, "
+              f"excluded from upload manifest (next tick rebuilds): {_missing[:8]}")
     # Ensure markets.parquet + per-asset files are all listed; add if missing due to empty
     meta = {
         "title": _kaggle_title(dataset_prefix, timeframe_label),
@@ -3807,7 +3831,7 @@ def prepare_kaggle_staging_5m(
                 _stale.unlink()
             except OSError:
                 pass
-    _ret: dict = {"staging_path": str(staging), "files": len(stats), "row_counts": row_counts, "dataset": dataset_prefix}
+    _ret: dict = {"staging_path": str(staging), "files": len(resources), "row_counts": row_counts, "dataset": dataset_prefix}
     if manifests is not None:
         _ret["manifests"] = manifests
     return _ret

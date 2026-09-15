@@ -28,3 +28,8 @@ packages/*/dist/
 raw_ws_archive/
 _wal/
 *.log
+_quarantine_*/
+_quarantine_*/
+hdd-staging/
+data-weather-high
+data-weather-low

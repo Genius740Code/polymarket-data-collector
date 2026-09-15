@@ -142,6 +142,12 @@ watch for `[test-mode:real] lane restricted to 15m`).
 - **Kaggle upload failures**: fail-closed — local data is retained; the next
   hourly cycle retries. Never delete local data manually; only the verified-upload
   prune path may delete.
+- **Kaggle `"... does not exist" after retries**: the upload manifest
+  (`dataset-metadata.json` resources) once listed stats keys with no staged
+  file (city discovered mid-export — no inputs at worker time, e.g. LOW
+  51-city first build / WUHAN 2026-09-14). Since `63da8d7` resources only
+  list files present on disk (`_staging_resources`); the missing city is
+  rebuilt on the next tick. See `tests/test_staging_manifest.py`.
 - **Crash recovery**: per-lane cursors `(asset, window_label)` resume each lane
   independently on restart (`_recover_from_cursor`).
 - **Rollback**: set `timeframes: [5m]`, `pm2 restart polymarket-collector`.

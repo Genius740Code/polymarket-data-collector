@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import datetime as _dt
-from .. import jsonfast as json
+import json
 import os
 import time
 import uuid
@@ -490,7 +490,7 @@ class ParquetWriter:
         WARN fails open toward possible dupes (tolerated downstream) rather
         than OOM-killing the process on huge hives.
         """
-        from .. import jsonfast as json
+        import json
         import time as _time
         replayed = 0
         seen_replay_keys: Set[Tuple] = set()  # track keys replayed in this pass

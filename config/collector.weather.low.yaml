@@ -1,14 +1,110 @@
-# Weather LOW collector — daily lowest-temperature brackets (phase 1 soak: 3 cities).
+# Weather LOW collector — daily lowest-temperature brackets (full set: 51 cities).
 # Isolated from crypto: own data dir, cursor, WAL, Kaggle dataset. BTC runner untouched.
 # Discovery/manager/settlement wired by cli_weather.py (low mode) — stock cli.py must NOT run with this file.
 assets:
+- AMSTERDAM
+- ANKARA
+- ATLANTA
+- AUSTIN
+- BEIJING
+- BUENOS-AIRES
+- BUSAN
+- CAPE-TOWN
+- CHENGDU
+- CHICAGO
+- CHONGQING
+- DALLAS
+- DENVER
+- GUANGZHOU
+- HELSINKI
 - HONG-KONG
-- SHANGHAI
+- HOUSTON
+- ISTANBUL
+- JEDDAH
+- JINAN
+- KARACHI
+- KUALA-LUMPUR
 - LONDON
+- LOS-ANGELES
+- LUCKNOW
+- MADRID
+- MANILA
+- MEXICO-CITY
+- MIAMI
+- MILAN
+- MOSCOW
+- MUNICH
+- NYC
+- PANAMA-CITY
+- PARIS
+- QINGDAO
+- SAN-FRANCISCO
+- SAO-PAULO
+- SEATTLE
+- SEOUL
+- SHANGHAI
+- SHENZHEN
+- SINGAPORE
+- TAIPEI
+- TEL-AVIV
+- TOKYO
+- TORONTO
+- WARSAW
+- WELLINGTON
+- WUHAN
+- ZHENGZHOU
 series_ids:
+  AMSTERDAM: WEATHER-LOW-1D
+  ANKARA: WEATHER-LOW-1D
+  ATLANTA: WEATHER-LOW-1D
+  AUSTIN: WEATHER-LOW-1D
+  BEIJING: WEATHER-LOW-1D
+  BUENOS-AIRES: WEATHER-LOW-1D
+  BUSAN: WEATHER-LOW-1D
+  CAPE-TOWN: WEATHER-LOW-1D
+  CHENGDU: WEATHER-LOW-1D
+  CHICAGO: WEATHER-LOW-1D
+  CHONGQING: WEATHER-LOW-1D
+  DALLAS: WEATHER-LOW-1D
+  DENVER: WEATHER-LOW-1D
+  GUANGZHOU: WEATHER-LOW-1D
+  HELSINKI: WEATHER-LOW-1D
   HONG-KONG: WEATHER-LOW-1D
-  SHANGHAI: WEATHER-LOW-1D
+  HOUSTON: WEATHER-LOW-1D
+  ISTANBUL: WEATHER-LOW-1D
+  JEDDAH: WEATHER-LOW-1D
+  JINAN: WEATHER-LOW-1D
+  KARACHI: WEATHER-LOW-1D
+  KUALA-LUMPUR: WEATHER-LOW-1D
   LONDON: WEATHER-LOW-1D
+  LOS-ANGELES: WEATHER-LOW-1D
+  LUCKNOW: WEATHER-LOW-1D
+  MADRID: WEATHER-LOW-1D
+  MANILA: WEATHER-LOW-1D
+  MEXICO-CITY: WEATHER-LOW-1D
+  MIAMI: WEATHER-LOW-1D
+  MILAN: WEATHER-LOW-1D
+  MOSCOW: WEATHER-LOW-1D
+  MUNICH: WEATHER-LOW-1D
+  NYC: WEATHER-LOW-1D
+  PANAMA-CITY: WEATHER-LOW-1D
+  PARIS: WEATHER-LOW-1D
+  QINGDAO: WEATHER-LOW-1D
+  SAN-FRANCISCO: WEATHER-LOW-1D
+  SAO-PAULO: WEATHER-LOW-1D
+  SEATTLE: WEATHER-LOW-1D
+  SEOUL: WEATHER-LOW-1D
+  SHANGHAI: WEATHER-LOW-1D
+  SHENZHEN: WEATHER-LOW-1D
+  SINGAPORE: WEATHER-LOW-1D
+  TAIPEI: WEATHER-LOW-1D
+  TEL-AVIV: WEATHER-LOW-1D
+  TOKYO: WEATHER-LOW-1D
+  TORONTO: WEATHER-LOW-1D
+  WARSAW: WEATHER-LOW-1D
+  WELLINGTON: WEATHER-LOW-1D
+  WUHAN: WEATHER-LOW-1D
+  ZHENGZHOU: WEATHER-LOW-1D
 schema_version: 3.2.0
 window_size_seconds: 86400
 timeframes:
@@ -18,14 +114,14 @@ kaggle:
   datasets:
     1d: gghgg1/polymarket-weather-low
   rolling_window: true
-  local_retention_hours: 12
+  local_retention_hours: 6
   upload_interval_seconds: 3600
   test_upload_interval_seconds: 600
 rollover_lead_seconds: 120
 max_coverage_gap_seconds: 30
 discovery_poll_interval_seconds: 60
 discovery_backoff_max_seconds: 300
-snapshot_interval_ms: 5000
+snapshot_interval_ms: 60000
 l2_levels: 10
 depth_thresholds_cents:
 - 1
@@ -50,7 +146,7 @@ ws:
   sequence_gap_detection: true
   url: wss://ws-subscriptions-clob.polymarket.com/ws/market
 cursor_store:
-  flush_interval_seconds: 5
+  flush_interval_seconds: 60
   mode: per_asset
   path: ./data-weather-low/cursor_state
 chainlink:
@@ -65,8 +161,8 @@ storage:
   data_dir: ./data-weather-low
   disk_space_check_interval_seconds: 30
   disk_space_min_bytes: 1073741824
-  flush_interval_seconds: 30
-  flush_row_count_threshold: 1500
+  flush_interval_seconds: 600
+  flush_row_count_threshold: 50000
   wal_dir: ./data-weather-low/_wal
   wal_enabled: true
 synthetic_mode: false
