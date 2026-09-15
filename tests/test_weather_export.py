@@ -15,6 +15,7 @@ from polymarket_collector.storage.export import (
     _load_market_id_map,
     _read_dataset_per_asset,
     _staging_flavor,
+    _staging_resources,
     _stream_export_asset_dataset,
     _verify_staging_row_counts,
 )
@@ -136,3 +137,57 @@ def test_weather_stream_path_matches_table(tmp_path):
     os.replace(str(tmp), str(out))
     streamed = pq.read_table(out)
     assert n == streamed.num_rows == legacy.num_rows == 3
+
+
+def _stream_city(base: Path, tmp_path: Path, city: str) -> pa.Table:
+    """Run the streaming staging build for one city; return the staged table."""
+    import os
+
+    out = tmp_path / f"{city}_book_snapshots_500ms.parquet"
+    tmp = tmp_path / f"{city}.parquet.tmp"
+    mmap = _load_market_id_map(base)
+    n = _stream_export_asset_dataset(
+        base, "book_snapshots_500ms", city, tmp, "1d", 10, mmap)
+    os.replace(str(tmp), str(out))
+    t = pq.read_table(out)
+    assert n == t.num_rows
+    return t
+
+
+def test_stream_export_missing_partition_writes_empty_not_full_hive(tmp_path):
+    """Regression (2026-09-15): a city with no hive partition must stage an
+    empty schema-correct file — not a full-hive dump. iter_source_files falls
+    back to the whole hive and the lane mask passes every WEATHER row, so
+    without the asset filter AMSTERDAM staged 386k rows from 17 other cities.
+    """
+    base = _whive(tmp_path)  # only asset=HONG-KONG partition exists
+    t = _stream_city(base, tmp_path, "AMSTERDAM")
+    assert t.num_rows == 0
+    assert "asset" in t.schema.names  # schema-correct empty file still ships
+
+
+def test_stream_export_present_partition_stays_pure(tmp_path):
+    """Control: a city WITH a partition stages only its own rows."""
+    base = _whive(tmp_path)
+    t = _stream_city(base, tmp_path, "HONG-KONG")
+    assert t.num_rows == 3
+    assert set(t.column("asset").to_pylist()) == {"HONG-KONG"}
+
+
+def test_staging_resources_excludes_tmp_leftovers(tmp_path):
+    """Regression (2026-09-15): a killed worker's `*.tmp.tmp` publish
+    tempfile must never enter the Kaggle upload manifest."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real = staging / "AMSTERDAM_book_snapshots_500ms.parquet"
+    pq.write_table(pa.table({"x": []}), str(real))
+    junk = staging / "ZHENGZHOU_book_snapshots_500ms.parquet.tmp.tmp"
+    pq.write_table(pa.table({"x": []}), str(junk))
+    stats = {
+        "AMSTERDAM_book_snapshots_500ms.parquet": 10,
+        "ZHENGZHOU_book_snapshots_500ms.parquet.tmp.tmp": 73_000_000,
+    }
+    resources, missing = _staging_resources(
+        stats, staging, "weather low 1d", "gghgg1/polymarket-weather-low")
+    assert [r["path"] for r in resources] == ["AMSTERDAM_book_snapshots_500ms.parquet"]
+    assert missing == []
