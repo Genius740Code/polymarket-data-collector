@@ -83,6 +83,17 @@ def build_clean_view(
     except Exception:
         prev_flag = None
     flag = "disputed-in" if opt_in_disputed else "disputed-out"
+    # PIT note: the disputed exclusion is as-of BUILD time (current
+    # markets_latest), not as-of snapshot time — a market disputed later is
+    # excluded retroactively on the next rebuild. Backtests needing strict
+    # point-in-time must query book_snapshots_500ms + as-of markets_log
+    # history and pin the staging version. Include the latest-file mtime in
+    # the gate key so a newly-disputed market triggers a rebuild.
+    try:
+        _latest_mtime = latest_path.stat().st_mtime if latest_path.exists() else 0.0
+    except Exception:
+        _latest_mtime = 0.0
+    flag = f"{flag}|latest={_latest_mtime:.0f}"
     full_rebuild = prev_flag != flag
     if full_rebuild:
         try:
@@ -176,11 +187,14 @@ def build_clean_view(
                 combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
                 del tables
             # filter: book_state == 'live'
+            # Fail CLOSED: a missing/corrupt book_state column must skip the
+            # partition (honest gap), never ship stale/resyncing rows as clean.
             try:
                 mask = pc.equal(combined.column("book_state"), pa.scalar("live"))
                 filtered = combined.filter(mask)
-            except Exception:
-                filtered = combined
+            except Exception as e:
+                print(f"[clean_view] SKIP {date_str}/asset={asset}: no readable book_state ({e}); partition left unbuilt (honest gap)")
+                continue
 
             # filter: condition_id not in excluded
             if excluded and "condition_id" in filtered.schema.names:

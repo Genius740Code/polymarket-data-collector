@@ -628,7 +628,11 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     maker_w = _unambiguous_wallet(leg_pools[1].get(k))
                 rows_to_add.append({
                     "ts_source": ts_ms or None,
-                    "ts_received_ns": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
+                    # No true receive clock exists for Data-API reconciled rows
+                    # (they arrive minutes late via REST). Derive ns from the
+                    # event's own source clock — never export wall-time as
+                    # receive-time (wrong-clock PIT corruption).
+                    "ts_received_ns": int(ts_ms) * 1_000_000 if ts_ms else int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": rs[0].get("market_id") or None,
@@ -748,7 +752,8 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                 maker_w = _unambiguous_wallet(leg_pools[1].get(k))
             _rows_to_add.append({
                 "ts_source": ts_ms or None,
-                "ts_received_ns": int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1e9),
+                # Same source-derived receive clock as the per-table path above.
+                "ts_received_ns": int(ts_ms) * 1_000_000 if ts_ms else int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1e9),
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": _first.get("market_id") or None,
@@ -3800,7 +3805,39 @@ def export_timeframe_aggregates(
                         final_order = ordered + remaining
                         agg_table = agg_table.select(final_order)
 
-                    pq.write_table(agg_table, str(out_path), compression="zstd")
+                    pq.write_table(agg_table, str(out_path) + ".tmp", compression="zstd")
+                    try:
+                        import os as _os_agg
+                        _tmp_agg = str(out_path) + ".tmp"
+                        with open(_tmp_agg, "rb") as _fh_agg:
+                            try:
+                                _fh_agg.flush()
+                            except Exception:
+                                pass
+                            try:
+                                _os_agg.fsync(_fh_agg.fileno())
+                            except Exception:
+                                pass
+                        _os_agg.replace(_tmp_agg, str(out_path))
+                        try:
+                            _dfd_agg = _os_agg.open(str(out_path.parent), _os_agg.O_DIRECTORY)
+                            try:
+                                _os_agg.fsync(_dfd_agg)
+                            finally:
+                                _os_agg.close(_dfd_agg)
+                        except Exception:
+                            pass
+                    except Exception:
+                        # tmp+rename failed — never leave a footer-less final
+                        # in place; surface loudly instead.
+                        try:
+                            from pathlib import Path as _P_agg
+                            _t = _P_agg(str(out_path) + ".tmp")
+                            if _t.exists():
+                                _t.unlink()
+                        except Exception:
+                            pass
+                        raise
                     rows = agg_table.num_rows
                     asset_stats[f"{dset}_{label}"] = rows
                     stats[str(out_path.relative_to(base) if out_path.is_relative_to(base) else out_path)] = rows

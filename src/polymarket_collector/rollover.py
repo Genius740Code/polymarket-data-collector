@@ -16,6 +16,26 @@ from zoneinfo import ZoneInfo as _ZoneInfo
 _ET = _ZoneInfo("America/New_York")
 
 
+def _noon_et_floor(ts_seconds: int) -> int:
+    """Most recent 12:00 America/New_York at or before ts, as unix seconds.
+
+    C6 (audit 2026-09-16): the 1d lane floored timestamps to UNIX midnight,
+    but daily windows are [noon ET, noon ET). From 16:00–24:00 UTC every day
+    the floored ts mapped to the EXPIRED window's slug, so all 7 daily
+    series went dark for 8h/day with honest-but-avoidable coverage_gaps.
+    Noon always exists (no DST transition at 12:00), so the anchor is exact
+    year-round (EST noon = 17:00 UTC handled by the tz, not a constant).
+    """
+    try:
+        ts_seconds = int(ts_seconds)
+    except Exception:
+        ts_seconds = int(time.time())
+    et = _dt_top.datetime.fromtimestamp(ts_seconds, tz=_ET)
+    day = et.date() if et.hour >= 12 else et.date() - _dt_top.timedelta(days=1)
+    noon = _dt_top.datetime(day.year, day.month, day.day, 12, 0, tzinfo=_ET)
+    return int(noon.timestamp())
+
+
 import re as _re
 
 # E1 (2026-09-09): Gamma `id` (numeric market id, e.g. 4349753) must never be
@@ -341,6 +361,13 @@ class MarketDiscovery:
     def _ts_for_after(self, after_ts_ms: int) -> int:
         # floor to configurable window boundary
         # e.g. 5min (300s), 15min (900s), 1h (3600s), 4h (14400s), 1d (86400s)
+        # C6: 1d windows are noon-ET aligned, NOT unix-midnight aligned —
+        # unix flooring queries the expired slug 16:00–24:00 UTC daily.
+        if self.window_size_seconds == 86400:
+            try:
+                return _noon_et_floor(int(after_ts_ms // 1000))
+            except Exception:
+                pass
         return (after_ts_ms // 1000) // self.window_size_seconds * self.window_size_seconds
 
     async def fetch_next_market(self, asset: str, after_ts_ms: int, strict_adjacent: bool = False) -> Optional[MarketInfo]:
@@ -371,7 +398,11 @@ class MarketDiscovery:
         # recovery) — and then candidates jump to the CURRENT window, never
         # blindly to ts+1/ts+2.
         ws = self.window_size_seconds
-        now_ts = int(time.time()) // ws * ws  # current window boundary (seconds)
+        # C6: 1d "current window" boundary is noon-ET, not unix midnight.
+        if ws == 86400:
+            now_ts = _noon_et_floor(int(time.time()))
+        else:
+            now_ts = int(time.time()) // ws * ws  # current window boundary (seconds)
         failures: List[dict] = []
         # Try Gamma first — slug is deterministic but may be indexed ~30-60s late.
         import datetime as _dt
@@ -756,7 +787,10 @@ class MarketDiscovery:
             market_end_ts_ms=end_ms,
             window_index=int(window_index),
             series_id=f"{asset.upper()}-{window_label}",
-            status="active" if data.get("active") else "active",
+            # Respect an explicit Gamma active=False (closed markets must not
+            # be ingested as active); default True preserves live collection
+            # when the legacy payload omits the flag.
+            status="active" if data.get("active", True) else "closed",
             question=data.get("question"),
             tick_size=tick_size,
             slug=str(slug_val) if slug_val else None,
@@ -798,8 +832,14 @@ class MarketDiscovery:
                 up_token = tokens[0].get("token_id") if isinstance(tokens[0], dict) else tokens[0]
             if not down_token and len(tokens) >= 2:
                 down_token = tokens[1].get("token_id") if isinstance(tokens[1], dict) else tokens[1]
-        up_token = up_token or data.get("up_token_id") or f"{condition_id}-UP"
-        down_token = down_token or data.get("down_token_id") or f"{condition_id}-DOWN"
+        # No synthetic fallback: a market without both real CLOB token IDs is
+        # incomplete (maybe not yet fully created) — skip it like
+        # _parse_gamma_market does. Fabricating "<cid>-UP"/"<cid>-DOWN" IDs
+        # poisoned books/snapshots/joins until heal. Missing stays a gap.
+        up_token = up_token or data.get("up_token_id")
+        down_token = down_token or data.get("down_token_id")
+        if not up_token or not down_token:
+            return None
 
         # timestamps (ms) — §3 fix: use window not hardcoded 300s
         ws = self.window_size_seconds
@@ -1096,8 +1136,15 @@ class RolloverManager:
                 # response as evidence (throttled to 1 probe per 30s).
                 if is_initial:
                     state.consecutive_failures += 1
-                    ws_ms = self.discovery.window_size_seconds * 1000
-                    win_start_ms = (now_ms // ws_ms) * ws_ms
+                    # C6: lane-aware window math (was: primary 5m discovery's
+                    # window for ALL lanes + unix flooring, doubly wrong for
+                    # the noon-ET 1d lane's recovery probes).
+                    _lane_ws = int(self.lane_ws.get(tf, self.discovery.window_size_seconds))
+                    ws_ms = _lane_ws * 1000
+                    if _lane_ws == 86400:
+                        win_start_ms = _noon_et_floor(now_ms // 1000) * 1000
+                    else:
+                        win_start_ms = (now_ms // ws_ms) * ws_ms
                     due = (
                         state.consecutive_failures >= 5
                         and now_ms - win_start_ms >= 10_000

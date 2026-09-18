@@ -137,11 +137,33 @@ def validate_ws_message(msg: dict) -> List[ValidationError]:
     # entire full-book snapshot (which also marks the book stale).
     # also L2 level arrays if present as lists
     errors: List[ValidationError] = []
+    # Inner price_changes entries: each entry carries its own price/size (and
+    # per-token best_bid/best_ask). These used to skip validation entirely and
+    # were silently `continue`d in book.py without marking stale — a corrupt
+    # feed never triggered resync. Validate them here so a malformed inner
+    # value marks the frame (stale + anomaly) instead of vanishing.
+    try:
+        _pcs = msg.get("price_changes")
+    except Exception:
+        _pcs = None
+    if isinstance(_pcs, list):
+        for _i, _pc in enumerate(_pcs):
+            if not isinstance(_pc, dict):
+                continue
+            for _k in ("price", "best_bid", "best_ask"):
+                if _k in _pc:
+                    _e = validate_price(f"price_changes[{_i}].{_k}", _pc.get(_k), None)
+                    if _e:
+                        errors.append(_e)
+            for _k in ("size",):
+                if _k in _pc:
+                    _e = validate_size(f"price_changes[{_i}].{_k}", _pc.get(_k), None)
+                    if _e:
+                        errors.append(_e)
     for k, v in msg.items():
         # PERF: exact-match first (common keys already lower, no alloc);
-        # lower() only on miss. Same accept/reject as before — price_changes
-        # inner entries intentionally NOT validated here (same as today;
-        # book.py double-checks bounds on apply without marking stale).
+        # lower() only on miss. Same accept/reject as before (inner entries
+        # handled above; book.py double-checks bounds on apply).
         if isinstance(k, str):
             if k in price_keys or k in size_keys or k in _SKIP_WHEN_EMPTY or k in ("bids", "asks") or k.endswith("_price") or k.endswith("_size") or k.endswith("_amount"):
                 lk = k
@@ -205,7 +227,8 @@ def coerce_ts_source_ms(value: Any) -> Optional[int]:
         if not s:
             return None
         try:
-            return int(float(s))
+            f = float(s)
+            return int(f if f > 1e11 else f * 1000)
         except Exception:
             pass
         try:

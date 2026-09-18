@@ -136,8 +136,17 @@ class RawArchive:
             pass
 
     def prune(self) -> int:
-        """Delete files older than retention_hours. Returns count deleted."""
+        """Delete files older than retention_hours. Returns count deleted.
+
+        Raw JSONL is the ONLY replay source for re-deriving datasets after a
+        logic bug (§13) — pruning destroys that capability permanently. A
+        non-positive retention_hours disables pruning entirely (honest
+        retention). Callers must log the returned count; deletions are by
+        file mtime (write time), not content time.
+        """
         if not self.enabled or not self.base.exists():
+            return 0
+        if self.retention_hours is not None and self.retention_hours <= 0:
             return 0
         # Flush + close handles so mtimes are current and deleted files
         # are not held open.

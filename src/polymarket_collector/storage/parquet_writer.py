@@ -216,14 +216,21 @@ class ParquetWriter:
                             or row.get("disconnect_ts_utc"))
                 if ts_field:
                     date_derived = _date_str_from_ts_field(ts_field)
-            # 3) fallback: ns date already tried, last resort now (should rarely happen; log warn)
+            # 3) fallback: ns date already tried, last resort "unknown" partition
+            # (honest gap — never mispartition to today; readers glob date=*
+            # so date=unknown stays queryable and countable downstream).
             if date_derived is None:
-                # quarantining: log warn so mispartition is visible; use now but flag
+                # quarantining: log warn so mispartition is visible; use unknown but flag
                 try:
-                    print(f"[parquet_writer] WARN date_str fallback to now for dataset={dataset} row keys={list(row.keys())[:5]}")
+                    print(f"[parquet_writer] WARN date_str fallback to unknown for dataset={dataset} row keys={list(row.keys())[:5]}")
                 except Exception:
                     pass
-                date_derived = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
+                try:
+                    if self.on_event:
+                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "date_unknown_partition", "keys": list(row.keys())[:5]})
+                except Exception:
+                    pass
+                date_derived = "unknown"
             _resolved_date_str = date_derived
         if date_str is None:
             date_str = _resolved_date_str
@@ -471,8 +478,18 @@ class ParquetWriter:
     def close(self) -> None:
         try:
             self.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            # Never report a clean shutdown with rows unflushed — the WAL
+            # still holds them, but the caller must know durability failed.
+            try:
+                print(f"[parquet_writer] ERROR close() flush failed ({len(self._buffer)} rows still buffered, WAL retained): {e}")
+            except Exception:
+                pass
+            try:
+                if self.on_event:
+                    self.on_event(CollectorEventType.write_failed, {"reason": "close_flush_failed", "buffered": len(self._buffer), "error": str(e)[:300]})
+            except Exception:
+                pass
         try:
             _fh = getattr(self, "_wal_f", None)
             if _fh is not None:
@@ -805,7 +822,12 @@ class ParquetWriter:
                     row.get("new_best_ask"),
                 )
             if dataset == "trades":
-                return (_is(token), str(row.get("trade_id")))
+                # NULL/empty/"None" trade_ids must never collapse to one dedup
+                # key (false-dupe silent loss). No key = store the row.
+                _tid = row.get("trade_id")
+                if _tid is None or (isinstance(_tid, str) and _tid.strip() in ("", "None")):
+                    return None
+                return (_is(token), str(_tid))
         if dataset == "book_snapshots_500ms":
             # idempotent key for redundant collector (§1A): (asset, condition_id, ts_snapshot_bucket)
             bucket = row.get("ts_snapshot_ns")
@@ -894,9 +916,23 @@ class ParquetWriter:
         elif dataset == "markets_latest":
             out_dir = self.data_dir / dataset
         elif dataset in PER_ASSET_DATASETS:
-            # enforce asset partition; UNKNOWN if missing (should not happen)
+            # enforce asset partition; UNKNOWN if missing (should not happen).
+            # The row keeps an explicit "UNKNOWN" asset too (never NULL here)
+            # so the partition and the row agree and the gap stays countable
+            # instead of failing the non-nullable schema downstream.
             a = asset or rows[0].get("asset") if rows else asset
             a = str(a).upper() if a else "UNKNOWN"
+            if a == "UNKNOWN":
+                for _r in rows:
+                    if not _r.get("asset"):
+                        _r["asset"] = "UNKNOWN"
+                try:
+                    if self.on_event:
+                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "asset_unknown_partition", "rows": len(rows)})
+                    else:
+                        print(f"[parquet_writer] WARN {dataset}: {len(rows)} rows with missing asset → asset=UNKNOWN (honest gap, unjoinable)")
+                except Exception:
+                    pass
             out_dir = self.data_dir / dataset / f"date={date_str}" / f"asset={a}"
         elif asset:
             out_dir = self.data_dir / dataset / f"date={date_str}" / f"asset={asset}"
@@ -963,14 +999,31 @@ class ParquetWriter:
                     nr["sequence_number"] = None
             if _needs_ts_fill:
                 try:
+                    # ts_received_ns is schema-required on live tables; the
+                    # producers always set it at creation. A missing value here
+                    # means an old caller — fill with write time (closest
+                    # available receive clock) and count it so backtests can
+                    # audit how many rows carry an estimated receive time.
                     if nr.get("ts_received_ns") is None and "ts_received_ns" in _schema_names:
                         nr["ts_received_ns"] = time.time_ns()
+                        try:
+                            self._ts_fill_count = getattr(self, "_ts_fill_count", {})
+                            self._ts_fill_count[dataset] = self._ts_fill_count.get(dataset, 0) + 1
+                            _n = self._ts_fill_count[dataset]
+                            if self.on_event and (_n == 1 or _n % 1000 == 0):
+                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "ts_received_ns_estimated", "count": _n})
+                        except Exception:
+                            pass
                     if nr.get("ts_utc") is None and _is_coll and "ts_utc" in nr:
                         nr["ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                    # Snapshot bucket time is event time — never fabricate it at
+                    # flush time (wrong-clock PIT corruption). Rows missing
+                    # both fields are dropped below with a countable event
+                    # (honest gap, never a guessed bucket).
                     if nr.get("ts_snapshot_utc") is None and _is_snap:
-                        nr["ts_snapshot_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                        nr["_drop_missing_snapshot_ts"] = True
                     if nr.get("ts_snapshot_ns") is None and _is_snap:
-                        nr["ts_snapshot_ns"] = time.time_ns()
+                        nr["_drop_missing_snapshot_ts"] = True
                     if nr.get("updated_at") is None and _is_ml:
                         nr["updated_at"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
                     if nr.get("recorded_at") is None and _is_ml:
@@ -997,6 +1050,28 @@ class ParquetWriter:
                 for fld in ("condition_id", "market_id", "series_id", "asset", "trade_id", "event_id", "resync_id"):
                     if fld in nr and nr[fld] in ("test-condition", "test-market", "TEST-5MIN"):
                         nr[fld] = None
+                        try:
+                            if self.on_event:
+                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "test_sentinel_scrubbed", "field": fld})
+                        except Exception:
+                            pass
+        # Honest-gap drop: snapshot rows with no bucket time are unjoinable —
+        # drop with a countable event instead of fabricating a bucket.
+        try:
+            _dropped_ts = [r for r in norm_rows if r.pop("_drop_missing_snapshot_ts", None)]
+        except Exception:
+            _dropped_ts = []
+        if _dropped_ts:
+            try:
+                if self.on_event:
+                    self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "missing_snapshot_ts_dropped", "rows": len(_dropped_ts)})
+                else:
+                    print(f"[parquet_writer] WARN dropped {len(_dropped_ts)} {dataset} rows with missing snapshot ts (honest gap)")
+            except Exception:
+                pass
+            norm_rows = [r for r in norm_rows if r.get("ts_snapshot_ns") is not None and r.get("ts_snapshot_utc") is not None]
+            if not norm_rows:
+                return
         # sort rows by time then condition_id before writing (time first, condition_id second)
         try:
             sort_ts_key = None
@@ -1006,10 +1081,32 @@ class ParquetWriter:
                     break
             if sort_ts_key:
                 has_cond = "condition_id" in norm_rows[0]
-                if has_cond:
-                    norm_rows.sort(key=lambda r: (str(r.get(sort_ts_key) or ""), str(r.get("condition_id") or "")))
-                else:
-                    norm_rows.sort(key=lambda r: str(r.get(sort_ts_key) or ""))
+                # Numeric-aware ordering: mixed int/str timestamps must not
+                # sort lexically ("100" < "20"). NULLs last, then condition_id.
+                def _sort_key(r):
+                    v = r.get(sort_ts_key)
+                    try:
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            return (1, 0.0, str(r.get("condition_id") or "") if has_cond else "")
+                        return (0, float(v) if not isinstance(v, str) or v.strip().lstrip("-").replace(".", "", 1).isdigit() else float("inf"), str(r.get("condition_id") or "") if has_cond else "")
+                    except Exception:
+                        return (1, 0.0, str(r.get("condition_id") or "") if has_cond else "")
+                # String-ISO timestamps (ts_snapshot_utc/ts_utc): lexical order
+                # is chronological for fixed-format ISO, so keep str ordering.
+                try:
+                    _sample = norm_rows[0].get(sort_ts_key)
+                    if isinstance(_sample, str) and ("T" in _sample or "-" in _sample):
+                        if has_cond:
+                            norm_rows.sort(key=lambda r: (str(r.get(sort_ts_key) or "~~~"), str(r.get("condition_id") or "")))
+                        else:
+                            norm_rows.sort(key=lambda r: str(r.get(sort_ts_key) or "~~~"))
+                    else:
+                        norm_rows.sort(key=_sort_key)
+                except Exception:
+                    if has_cond:
+                        norm_rows.sort(key=lambda r: (str(r.get(sort_ts_key) or ""), str(r.get("condition_id") or "")))
+                    else:
+                        norm_rows.sort(key=lambda r: str(r.get(sort_ts_key) or ""))
         except Exception:
             pass
         if dataset in ("book_snapshots_500ms", "book_snapshots_clean"):
@@ -1060,6 +1157,13 @@ class ParquetWriter:
         except Exception as e:
             # fallback: if strict schema caused nullability error, retry with inferred schema
             if "non-nullable but contains nulls" in str(e) or "ArrowInvalid" in str(type(e).__name__):
+                try:
+                    if self.on_event:
+                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "nullable_schema_fallback", "error": str(e)[:300], "rows": len(norm_rows)})
+                    else:
+                        print(f"[parquet_writer] WARN {dataset}: strict schema rejected NULLs ({str(e)[:200]}); writing inferred schema so rows are preserved")
+                except Exception:
+                    pass
                 try:
                     tbl2 = pa.Table.from_pylist(norm_rows)
                     pq.write_table(tbl2, str(tmp_path), compression="zstd")

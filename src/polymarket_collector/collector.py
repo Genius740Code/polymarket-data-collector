@@ -508,9 +508,17 @@ class Collector:
             if _tid_raw:
                 trade_id = str(_tid_raw)
             else:
+                # Deterministic ws- ID from the fullest fill key available.
+                # The old token|price|size|timestamp tuple collided for two
+                # distinct fills in the same ms (false-dupe silent loss), so
+                # include tx hash, side and wallet when the wire carries them.
+                # Prefix marks provenance (wire ID absent — never a wire ID).
                 try:
                     import hashlib as _hl9
-                    _tkey = f"{token_id}|{price}|{size}|{msg.get('timestamp') or msg.get('ts') or msg.get('ts_source') or ''}"
+                    _txh = msg.get("transaction_hash") or msg.get("transactionHash") or msg.get("hash") or ""
+                    _side = msg.get("side") or msg.get("aggressor_side") or ""
+                    _wal = msg.get("proxyWallet") or msg.get("wallet") or msg.get("maker") or msg.get("taker") or ""
+                    _tkey = f"{token_id}|{price}|{size}|{msg.get('timestamp') or msg.get('ts') or msg.get('ts_source') or ''}|{_txh}|{_side}|{_wal}"
                     trade_id = f"ws-{_hl9.sha1(_tkey.encode()).hexdigest()[:16]}"
                 except Exception:
                     trade_id = f"ws-{token_id}-{price}-{size}"
@@ -2303,6 +2311,20 @@ class Collector:
                                     row["resync_id"] = None
                             except Exception:
                                 pass
+                            # Catch-up honesty: deferred buckets are stamped with
+                            # CURRENT RAM levels under OLD bucket times
+                            # (forward-fill). Any bucket older than ~1s carries
+                            # levels that never rested at that time — label it
+                            # stale with a resync_id (honest gap) instead of
+                            # live. The current bucket keeps its real state.
+                            try:
+                                _now_ms_cf = int(time.time() * 1000)
+                                if bucket < _now_ms_cf - 1000 and row.get("book_state") == "live":
+                                    row["book_state"] = "stale"
+                                    if not row.get("resync_id"):
+                                        row["resync_id"] = getattr(book, "resync_id", None) or str(uuid.uuid4())
+                            except Exception:
+                                pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
                             if not result:
                                 try:
@@ -2460,8 +2482,10 @@ class Collector:
             pass
 
     def _nearest_chainlink(self, ts_ms: int, asset: str, max_delta_ms: int = 2000) -> Optional[dict]:
-        """Nearest stored chainlink event for THIS ASSET to ts_ms (settlement lookup §6A).
+        """Nearest stored chainlink event for THIS ASSET at or before ts_ms (settlement lookup §6A).
 
+        Previous-only (point-in-time): a tick after the boundary was not
+        knowable at the boundary and must never decide the settlement label.
         The asset filter is essential: without it every market settled against
         whichever symbol happened to be nearest (all six assets got BNB's price).
         Linear scan preserved (order-agnostic, first-min tie-break) — 140k
@@ -2485,7 +2509,9 @@ class Collector:
                 continue
             if not ts:
                 continue
-            delta = abs(ts - ts_ms)
+            if ts > ts_ms:
+                continue  # future tick — not knowable at the boundary
+            delta = ts_ms - ts
             if best_delta is None or delta < best_delta:
                 best_delta = delta
                 best = ev

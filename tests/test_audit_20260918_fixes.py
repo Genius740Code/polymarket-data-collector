@@ -72,8 +72,11 @@ def test_unresolvable_trade_keeps_null_condition_and_unknown_outcome(tmp_path):
 
 def test_trade_id_deterministic_across_retries(tmp_path):
     c, captured = _collector(tmp_path)
-    assert c._handle_trade_message(_trade_msg(), "BTC", time.time_ns()) is True
-    assert c._handle_trade_message(_trade_msg(), "BTC", time.time_ns()) is True
+    # A retry redelivers the SAME frame — reuse one msg object so the test
+    # asserts determinism given identical input (not same-millisecond luck).
+    m = _trade_msg()
+    assert c._handle_trade_message(m, "BTC", time.time_ns()) is True
+    assert c._handle_trade_message(m, "BTC", time.time_ns()) is True
     assert captured[0][1]["trade_id"] == captured[1][1]["trade_id"]
     assert captured[0][1]["trade_id"].startswith("ws-")
 

@@ -50,13 +50,23 @@ def chainlink_event_from_ws(msg: Dict[str, Any], asset: str, schema_version: str
     """
     ts_source = msg.get("timestamp") or msg.get("ts_source") or msg.get("reportTimestamp")
     report_id = msg.get("report_id") or msg.get("reportId") or msg.get("reportIdHex")
+    # Coerce price to float now — a string/None price used to flow raw into
+    # settlement_price parquet (string in a float64 column). Unparseable
+    # stays NULL (honest gap, never a guess).
+    _raw_price = msg.get("price")
+    try:
+        _price = float(_raw_price) if _raw_price is not None and not isinstance(_raw_price, bool) else None
+        if _price is not None and (not _price == _price or _price in (float("inf"), float("-inf"))):
+            _price = None
+    except Exception:
+        _price = None
     return ChainlinkEvent(
         event_id=str(uuid.uuid4()),
         schema_version=schema_version,
         asset=asset.upper(),
         symbol=msg.get("symbol") or asset.upper(),
         source=msg.get("source") or "chainlink",
-        price=msg.get("price"),
+        price=_price,
         report_id=report_id,
         ts_source=coerce_ts_source_ms(ts_source),
         ts_received_ns=time.time_ns(),
@@ -104,13 +114,18 @@ async def fetch_settlement(
         except Exception:
             pass
 
-    # fallback: nearest chainlink_events row
+    # fallback: nearest chainlink_events row AT OR BEFORE the boundary
+    # (previous-only, point-in-time). The old abs() distance picked a FUTURE
+    # tick after expiry as settlement — lookahead contamination. A market with
+    # no pre-expiry tick honestly settles to NULL (gap, healed when the
+    # resolver is wired), never to a post-expiry price.
     nearest_price = None
     nearest_ts = None
     if chainlink_store:
         # chainlink_store may be a list or a queryable; handle list case
         candidates = chainlink_store if isinstance(chainlink_store, list) else []
-        # find closest ts_source to market_end_ts
+        # find closest ts_source <= market_end_ts (+max lookback guard via
+        # caller's max_delta_ms is a lookback here, not a ± window)
         best_delta = None
         best = None
         for ev in candidates:
@@ -121,7 +136,9 @@ async def fetch_settlement(
             ts_ms = coerce_ts_source_ms(ts_val)
             if ts_ms is None:
                 continue
-            delta = abs(ts_ms - market_end_ts_ms)
+            if ts_ms > market_end_ts_ms:
+                continue  # future tick — not knowable at expiry, never settlement
+            delta = market_end_ts_ms - ts_ms
             if best_delta is None or delta < best_delta:
                 best_delta = delta
                 best = ev

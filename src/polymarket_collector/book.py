@@ -444,10 +444,11 @@ class OrderBookState:
     def _resolve_ts_source(self, msg: dict) -> Optional[int]:
         """Source timestamp for an emitted book_event (int ms epoch).
 
-        Preference: the frame's own top-level timestamp → carry-forward of
-        the previous frame's timestamp from the SAME connection when fresh
-        (received within ~1.5s; batched deltas share a clock) → NULL.
-        Receive-time is used only as a freshness gate, never as the value.
+        Preference: the frame's own top-level timestamp → NULL.
+        A previous frame's timestamp is a DIFFERENT event's clock and must
+        never be stamped as this event's source time (backtest ordering
+        violation: up to 1.5s of fake tick regularity). Missing stays NULL
+        (honest gap); receive-time is never used as the value.
         """
         raw = msg.get("timestamp")
         if raw is None:
@@ -455,12 +456,6 @@ class OrderBookState:
         coerced = coerce_ts_source_ms(raw)
         if coerced is not None:
             return coerced
-        if self._last_frame_ts_ms is not None and self._last_frame_rx_ms is not None:
-            try:
-                if int(time.time() * 1000) - self._last_frame_rx_ms <= 1500:
-                    return int(self._last_frame_ts_ms)
-            except Exception:
-                pass
         return None
 
     # -- A4 book-hash integrity primitive ----------------------------------
@@ -678,12 +673,16 @@ class OrderBookState:
         }
 
     def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 0.0101) -> None:
-        """Snap the book's top-of-book to the exchange-reported best_bid/best_ask.
+        """Compare the book's top-of-book to the exchange-reported best_bid/best_ask.
 
         Every CLOB price_change carries the authoritative post-change BBO for its
         token. If our book's best disagrees by more than a tick (dropped deltas,
-        taker-side artifacts), snap the best level's price IN PLACE (keeping its
-        size — sizes self-heal on the next full `book` event; never fabricate).
+        taker-side artifacts), emit a `bbo_snapped` event and REMOVE the stale
+        best level (size 0 = remove) — never rewrite a resting level's price in
+        place. Rewriting kept the old size under a price that never rested on
+        the wire (fabricated quote); snapshots then shipped it as truth.
+        Removing marks the side empty (NULL BBO downstream) until the next
+        full `book` event refills it: an honest gap instead of a fake quote.
         Removes a book best that the exchange says is gone; marks stale if the
         exchange reports a best on a side we hold empty (cannot invent a size).
         """
@@ -701,15 +700,10 @@ class OrderBookState:
                 # a stale churn on thin books, since deltas arrive before snapshots.)
                 continue
             if abs(my_best - ex_best) > tick:
-                for lvl in side_book.levels:
-                    if lvl.price is not None and abs(lvl.price - my_best) < 1e-9:
-                        lvl.price = ex_best
-                        break
-                # re-sort best-first (null tail stays at the end for both sides)
-                if side == "bid":
-                    side_book.levels.sort(key=lambda l: (l.price is None, -(l.price or 0.0)))
-                else:
-                    side_book.levels.sort(key=lambda l: (l.price is None, l.price if l.price is not None else 0.0))
+                # Honest-gap removal: drop the stale best level instead of
+                # rewriting its price (the old size under a new price never
+                # rested on the wire). The side refills on the next full book.
+                self._apply_price_change_level(side_book, my_best, 0.0, side == "bid")
                 self.pending_events.append({
                     "event_type": "bbo_snapped",
                     "token_id": self.up_token_id if outcome == "up" else self.down_token_id,

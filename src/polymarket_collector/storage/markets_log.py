@@ -85,10 +85,31 @@ class MarketsLog:
                     if existing.get("condition_id") == cid and existing.get("status") == row.get("status", "active") and existing.get("resolution_outcome", "unknown") == row.get("resolution_outcome", "unknown"):
                         return
             # Also check if already exists in committed latest (via writer dedup handled in compact) - still stage update if different, else skip
-            # For exact duplicate active+unknown, skip
+            # Enrichment-aware dedup: repeated discovery polls for the same
+            # active/unknown market must not bloat markets_log, but a second
+            # discovery carrying FRESH enrichment (slug/window/tokens/market_id)
+            # while the first copy is still in _unsent/unflushed buffer must
+            # be staged (the old blanket early-return silently dropped it).
             if row.get("status", "active") == "active" and row.get("resolution_outcome", "unknown") == "unknown":
-                # Check if we've already seen this cid recently - skip duplicate
-                return
+                try:
+                    _enr = (row.get("slug"), row.get("market_id"), row.get("up_token_id"),
+                            row.get("down_token_id"), row.get("window_index"), row.get("series_id"))
+                    _last = getattr(self, "_last_enrichment", {}).get(cid) if cid else None
+                    if _last is not None and _last == _enr:
+                        return  # exact repeat poll — skip (anti-bloat, no loss)
+                    if getattr(self, "_last_enrichment", None) is None:
+                        self._last_enrichment = {}
+                    if cid:
+                        self._last_enrichment[cid] = _enr
+                        # bound alongside _seen_order eviction
+                        if len(self._last_enrichment) > self.MAX_SEEN_CONDITION_IDS:
+                            try:
+                                _old = next(iter(self._last_enrichment))
+                                del self._last_enrichment[_old]
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         if cid and cid not in self._seen_condition_ids:
             self._seen_condition_ids.add(cid)
             self._seen_order.append(cid)

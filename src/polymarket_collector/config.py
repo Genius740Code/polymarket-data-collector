@@ -195,6 +195,15 @@ class CollectorConfig(BaseSettings):
     liquidity_filter: LiquidityFilterConfig = Field(default_factory=LiquidityFilterConfig)
     synthetic_mode: bool = False  # DEPRECATED: synthetic data permanently disabled - always False, kept for backward compat
 
+    @field_validator("synthetic_mode")
+    @classmethod
+    def synthetic_never(cls, v: bool) -> bool:
+        # Policy bypass by config: any YAML setting synthetic_mode=true must
+        # hard-fail instead of silently re-enabling the synthetic path.
+        if v:
+            raise ValueError("synthetic_mode=true is forbidden by AGENT.md real-data-only policy")
+        return v
+
     # optional overrides for tests
     _config_path: Optional[str] = None
 

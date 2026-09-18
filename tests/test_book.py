@@ -212,7 +212,8 @@ def test_a1_ts_source_from_frame_timestamp():
 
 
 def test_a1_ts_source_carry_forward_within_window():
-    # frame without timestamp reuses the previous frame's ts (same connection, fresh)
+    # A previous frame's timestamp is a DIFFERENT event's clock and must never
+    # be stamped as this event's source time — missing stays NULL (honest gap).
     book = make_book()
     book.apply_ws_message(_live_book_frame(ts="1788649334527"))
     book.drain_pending_events()
@@ -221,7 +222,7 @@ def test_a1_ts_source_carry_forward_within_window():
     book.apply_ws_message(f2)
     evs = [e for e in book.drain_pending_events() if e["event_type"] == "price_change"]
     assert evs
-    assert all(e["ts_source"] == 1788649334527 for e in evs)
+    assert all(e["ts_source"] is None for e in evs)
 
 
 def test_a1_ts_source_stays_null_without_source():
