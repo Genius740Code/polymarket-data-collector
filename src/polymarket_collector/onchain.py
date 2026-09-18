@@ -3,8 +3,8 @@
 The Data-API both-legs attribution (export._backfill_trade_wallets) leaves
 maker_wallet NULL (~78% of published rows) whenever the maker leg is not
 indexed or is ambiguous. The chain itself names both sides on every fill via
-``OrderFilled`` (maker/taker indexed topics) on the CTF Exchange contracts —
-no API key needed, plain ``eth_getLogs`` on a public Polygon RPC.
+``OrderFilled`` (maker/taker indexed topics) on the CTF + NegRisk Exchange
+contracts — no API key needed, plain ``eth_getLogs`` on a public Polygon RPC.
 
 Event ground truth (verified 2026-09-08):
 - V1 (0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E): OrderFilled(bytes32,
@@ -28,6 +28,21 @@ from typing import Dict, List, Optional, Tuple
 # "Contract Addresses" page (single source of truth).
 CTF_EXCHANGE_V1 = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 CTF_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
+
+# NegRisk CTF Exchange contracts (multi-outcome / negRisk:true markets such as
+# weather buckets). V1 is legacy, V2 is current per docs.polymarket.com.
+# V2 OrderFilled shares the V2 topic0; V1 NegRisk shares the V1 topic0.
+NEGRISK_EXCHANGE_V1 = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+NEGRISK_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
+NEGRISK_EXCHANGE_V2B = "0xe2222d002000ba0053cef3375333610f64600036"
+
+EXCHANGE_ADDRESSES = frozenset({
+    CTF_EXCHANGE_V1.lower(),
+    CTF_EXCHANGE_V2.lower(),
+    NEGRISK_EXCHANGE_V1.lower(),
+    NEGRISK_EXCHANGE_V2.lower(),
+    NEGRISK_EXCHANGE_V2B.lower(),
+})
 
 # topic0 = keccak256 of the canonical event signatures above (computed with
 # standard keccak256; V2 topic verified live 2026-09-08).
@@ -190,13 +205,13 @@ def fetch_receipt_fills(rpc_url: str, tx_hashes: List[str],
 
     One small call per tx (vs scanning dense ranges: recent blocks carry ~50
     OrderFilled logs/block across ALL Polymarket markets). Logs not from the
-    CTF Exchange contracts or without the OrderFilled topic0 are ignored.
-    Unknown/failed receipts are skipped — the caller retries next run.
+    known exchange contracts (CTF + NegRisk) or without the OrderFilled topic0
+    are ignored. Unknown/failed receipts are skipped — the caller retries next run.
     """
     import httpx
 
     fills: List[dict] = []
-    addrs = {CTF_EXCHANGE_V1.lower(), CTF_EXCHANGE_V2.lower()}
+    addrs = set(EXCHANGE_ADDRESSES)
     with httpx.Client(timeout=timeout) as client:
         for txh in tx_hashes:
             try:

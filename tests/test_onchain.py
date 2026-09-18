@@ -164,3 +164,22 @@ def test_tx_map_from_fills_unanimity():
     m = tx_map_from_fills(fills)
     assert m["0xs"] == ("0x" + "01" * 20, "0x" + "09" * 20)
     assert m["0xm"] == (None, "0x" + "09" * 20)
+
+
+def test_negrisk_exchanges_whitelisted():
+    """Weather (negRisk:true) fills emit from NegRisk exchanges — must not be dropped."""
+    from polymarket_collector import onchain as oc
+    assert oc.NEGRISK_EXCHANGE_V2.lower() in oc.EXCHANGE_ADDRESSES
+    assert oc.NEGRISK_EXCHANGE_V1.lower() in oc.EXCHANGE_ADDRESSES
+    assert oc.CTF_EXCHANGE_V2.lower() in oc.EXCHANGE_ADDRESSES
+    # V2 NegRisk shares the V2 OrderFilled topic0 -> same decoder path
+    logs = [{
+        "transactionHash": "0xneg",
+        "address": oc.NEGRISK_EXCHANGE_V2,
+        "topics": [oc.ORDERFILLED_V2_TOPIC, "0x" + "11" * 32,
+                   "0x" + "00" * 12 + "11" * 20, "0x" + "00" * 12 + "22" * 20],
+        "data": "0x" + format(0, "064x") + format(777, "064x") + "00" * 160,
+    }]
+    assert str(logs[0]["address"]).lower() in oc.EXCHANGE_ADDRESSES
+    fills = oc.parse_order_filled_fills(logs)
+    assert len(fills) == 1 and fills[0]["token_id"] == "777"
