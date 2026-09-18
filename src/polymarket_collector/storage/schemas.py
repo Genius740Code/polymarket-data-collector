@@ -98,7 +98,9 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
         pa.field("is_rollover_window", pa.bool_(), nullable=False),
         pa.field("book_state", pa.string(), nullable=False),
         pa.field("resync_id", pa.string(), nullable=True),
-        pa.field("book_crossed", pa.bool_(), nullable=False),
+        # M8 (audit 2026-09-18): nullable — the snapshot exception-fallback row
+        # emits NULL (unknown) instead of fabricating book_crossed=False.
+        pa.field("book_crossed", pa.bool_(), nullable=True),
         # A4: exchange book-integrity hashes from the last accepted book/price_change
         # frame per outcome (nullable until first frame; None = not yet attested)
         pa.field("up_book_hash", pa.string(), nullable=True),
@@ -111,7 +113,9 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
 BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
-    pa.field("condition_id", pa.string(), nullable=False),
+    # C3 (audit 2026-09-18): nullable — unresolvable frames keep NULL (honest
+    # gap) instead of a fabricated token_id in the join column.
+    pa.field("condition_id", pa.string(), nullable=True),
     # E1: NULL when the numeric Gamma id is unknown (never hex).
     pa.field("market_id", pa.string(), nullable=True),
     pa.field("series_id", pa.string(), nullable=False),
@@ -140,7 +144,9 @@ BOOK_EVENTS_SCHEMA = pa.schema([
 TRADES_SCHEMA = pa.schema([
     pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
-    pa.field("condition_id", pa.string(), nullable=False),
+    # C3 (audit 2026-09-18): nullable — unresolvable trades keep NULL (honest
+    # gap) instead of a fabricated token_id in the join column.
+    pa.field("condition_id", pa.string(), nullable=True),
     # E1: NULL when the numeric Gamma id is unknown (never hex).
     pa.field("market_id", pa.string(), nullable=True),
     pa.field("series_id", pa.string(), nullable=False),
@@ -155,7 +161,10 @@ TRADES_SCHEMA = pa.schema([
     pa.field("size", pa.float64(), nullable=False),
     pa.field("notional", pa.float64(), nullable=True),
     pa.field("fee", pa.float64(), nullable=True),
-    pa.field("fee_is_estimated", pa.bool_(), nullable=True),  # true if fee was 0.07% fallback, false if exchange reported
+    # Tri-state: False = exchange-reported amount; True = derived from the
+    # market's exchange-reported rate (reconciled api- rows); NULL = not
+    # applicable (0-fee market, E7) or unknown (no rate on the wire).
+    pa.field("fee_is_estimated", pa.bool_(), nullable=True),
     pa.field("side", pa.string(), nullable=True),
     pa.field("aggressor_side", pa.string(), nullable=True),
     # sequence_number dropped 2026-09-05: CLOB sends no sequence numbers (100% null)

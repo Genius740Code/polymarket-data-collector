@@ -173,7 +173,10 @@ def test_wal_replay_survives_truncated_line(tmp_path):
     """2026-09-11 DATA-LOSS FIX: one truncated WAL line (SIGKILL mid-append)
     aborted the ENTIRE replay on every startup (same char-469 error each
     boot) — 73MB of WAL sat un-replayed forever. Good lines around the bad
-    one must still replay, and the file must truncate afterwards."""
+    one must still replay.
+    C2 (audit 2026-09-18): the replayed file is RETAINED until the first
+    successful post-replay flush() truncates it — truncating at replay time
+    lost replayed-but-unflushed rows on a second crash."""
     import json as _js
 
     from polymarket_collector.storage.parquet_writer import ParquetWriter
@@ -192,6 +195,10 @@ def test_wal_replay_survives_truncated_line(tmp_path):
                       wal_dir=str(wal_dir), buffer_max_rows=10000)
     n = w._wal_replay()
     assert n == 2, f"good lines must replay around the truncated one, got {n}"
+    # retained (not truncated) until durable...
+    assert (wal_dir / "wal-aaa.jsonl").stat().st_size > 0
+    w.flush()
+    # ...then truncated after the flush succeeds.
     assert (wal_dir / "wal-aaa.jsonl").stat().st_size == 0
 
 

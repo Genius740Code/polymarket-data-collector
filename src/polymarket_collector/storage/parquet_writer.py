@@ -147,6 +147,12 @@ class ParquetWriter:
 
         self._buffer: deque[BufferedRow] = deque()
         self._dropped_rows: Dict[str, int] = defaultdict(int)  # K-3: honest no-loss accounting
+        # M2 (audit 2026-09-16): lag-retry double-appends made duplicate_event
+        # the dominant collector_events row (~8/s, pure noise bloat). Drops
+        # are still exact (dedup key authoritative); only the event is
+        # throttled — first + every Nth carries the running total.
+        self._dupevent_count: Dict[str, int] = defaultdict(int)
+        self._evict_total: Dict[str, int] = defaultdict(int)  # M3: dedup-key evictions per dataset
         self._last_flush_ts = time.monotonic()
         # PERF RAM: single OrderedDict[key]=None per dataset instead of
         # set + deque holding every key twice (100k x 7 datasets).
@@ -175,6 +181,12 @@ class ParquetWriter:
 
         # disk space check
         self._last_disk_check = 0.0
+        # C2 (audit 2026-09-18): pre-restart WAL files whose rows were replayed
+        # into the buffer but not yet flushed. They are truncated only after the
+        # first successful post-replay flush() — truncating at replay time opened
+        # a loss window (crash between replay-truncate and flush lost the rows
+        # the WAL existed to protect).
+        self._replay_dirty: list = []
 
     # -- public API --------------------------------------------------------
     def append(self, dataset: str, row: Dict[str, Any], asset: Optional[str] = None, date_str: Optional[str] = None) -> bool:
@@ -252,8 +264,10 @@ class ParquetWriter:
                     except Exception:
                         pass
                 else:
-                    if self.on_event:
-                        self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key})
+                    self._dupevent_count[dataset] += 1
+                    _n = self._dupevent_count[dataset]
+                    if self.on_event and (_n == 1 or _n % 10_000 == 0):
+                        self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key, "dropped_total": _n, "evicted_total": self._evict_total.get(dataset, 0)})
                     return True
         # reserve key immediately to prevent duplicate WAL entries under concurrency
         # Single OrderedDict (was set+deque double-store). Same FIFO eviction.
@@ -263,15 +277,22 @@ class ParquetWriter:
             except Exception:
                 pass
             # LRU eviction: drop oldest keys when cap exceeded (preserves recent dedup for today)
+            # M3 (audit 2026-09-18): count evictions — a redelivery older than
+            # the window is re-accepted as a new row (dupe bloat, tolerated
+            # downstream). Surfaced in duplicate_event payloads for audit.
             if len(self._seen_keys[dataset]) > self.MAX_DEDUP_KEYS_PER_DATASET:
                 try:
                     evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
                     _od = self._seen_keys[dataset]
+                    _ev = 0
                     for _ in range(evict_count):
                         try:
                             _od.popitem(last=False)
+                            _ev += 1
                         except KeyError:
                             break
+                    if _ev:
+                        self._evict_total[dataset] = self._evict_total.get(dataset, 0) + _ev
                 except Exception:
                     pass
             # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
@@ -372,6 +393,16 @@ class ParquetWriter:
             del groups
         except Exception:
             pass
+        # C7 sister-fix: flush builds transient Arrow/parquet state per group;
+        # glibc holds the freed heap and the long-lived collector's peak
+        # ratchets ~10MB/min toward max_memory_restart. Trimming once per
+        # flush (not per row) returns it for negligible cost.
+        try:
+            from .streaming import malloc_trim as _trim
+
+            _trim()
+        except Exception:
+            pass
         self._last_flush_ts = time.monotonic()
         # truncate WAL after successful flush — fsync directory to ensure durability (fixes 3 duplicate window)
         if self.wal_enabled and flushed:
@@ -405,6 +436,20 @@ class ParquetWriter:
                         os.close(dir_fd)
                 except Exception:
                     pass
+            except Exception:
+                pass
+        # C2: replayed pre-restart WAL rows are durable now — truncate the files
+        # _wal_replay retained. Runs only on the success path (an exception above
+        # re-raises before reaching here, keeping the WAL intact for retry).
+        _dirty = getattr(self, "_replay_dirty", None)
+        if _dirty and flushed:
+            try:
+                for _p in list(_dirty):
+                    try:
+                        open(_p, "w").close()
+                    except Exception:
+                        continue
+                _dirty.clear()
             except Exception:
                 pass
         return flushed
@@ -468,11 +513,11 @@ class ParquetWriter:
     # _dedup_key() actually reads cuts RSS/CPU ~10-20x with identical dedup
     # decisions. Caps unchanged (lowering them would risk dupes).
     _REPLAY_DEDUP_COLS = {
-        "book_events": ["token_id", "sequence_number", "ts_received_ns", "event_type", "new_best_bid", "new_best_ask"],
+        "book_events": ["token_id", "sequence_number", "ts_source", "event_type", "old_best_bid", "new_best_bid", "old_best_ask", "new_best_ask"],
         "trades": ["token_id", "sequence_number", "trade_id"],
         "book_snapshots_500ms": ["asset", "condition_id", "ts_snapshot_ns"],
         "book_snapshots_clean": ["asset", "condition_id", "ts_snapshot_ns"],
-        "chainlink_events": ["report_id", "asset", "event_id", "ts_received_ns", "price"],
+        "chainlink_events": ["report_id", "asset", "event_id", "ts_source", "ts_received_ns", "price"],
         "resync_episodes": ["resync_id"],
         "collector_events": ["event_id"],
     }
@@ -666,11 +711,15 @@ class ParquetWriter:
                                     try:
                                         evict_count = len(self._seen_keys[dataset]) - self.MAX_DEDUP_KEYS_PER_DATASET + 5000
                                         _od2 = self._seen_keys[dataset]
+                                        _ev2 = 0
                                         for _ in range(evict_count):
                                             try:
                                                 _od2.popitem(last=False)
+                                                _ev2 += 1
                                             except KeyError:
                                                 break
+                                        if _ev2:
+                                            self._evict_total[dataset] = self._evict_total.get(dataset, 0) + _ev2
                                     except Exception:
                                         pass
                                 seen_replay_keys.add(dedup_key)
@@ -696,14 +745,20 @@ class ParquetWriter:
                     except Exception:
                         # keep malformed? drop
                         continue
-                # Rewrite WAL: keep only unreplayed (backpressured) lines; truncate otherwise
+                # C2: retain fully-replayed files until the first successful
+                # post-replay flush() truncates them (see flush()). Truncating
+                # here lost replayed-but-unflushed rows on a second crash.
+                # Only backpressured (unreplayed) lines are rewritten back.
                 try:
                     if pending_lines:
                         with open(wal_path, "w") as out:
                             for pl in pending_lines:
                                 out.write(pl + "\n")
-                    else:
-                        open(wal_path, "w").close()
+                    elif raw_lines:
+                        try:
+                            self._replay_dirty.append(str(wal_path))
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             except Exception:
@@ -732,11 +787,21 @@ class ParquetWriter:
                     pass
             # fallback per §4/§5
             if dataset == "book_events":
+                # M2 (audit 2026-09-18): key on EXCHANGE time (ts_source), not
+                # receive time — a redelivered frame gets a new ts_received_ns
+                # and previously never deduped. Old-BBO fields separate genuine
+                # oscillations (same new BBO reached twice); when ts_source is
+                # unknown there is no meaningful key: return None (store the
+                # row) rather than risk false-duping distinct events.
+                if row.get("ts_source") is None:
+                    return None
                 return (
                     _is(token),
-                    row.get("ts_received_ns"),
+                    row.get("ts_source"),
                     row.get("event_type"),
+                    row.get("old_best_bid"),
                     row.get("new_best_bid"),
+                    row.get("old_best_ask"),
                     row.get("new_best_ask"),
                 )
             if dataset == "trades":
@@ -750,15 +815,16 @@ class ParquetWriter:
         if dataset == "chainlink_events":
             # E9: report_id is 100% NULL (reserved — RTDS carries no reportId),
             # so (report_id,) never fires and burst duplicates slip through.
-            # Dedup on (asset, event_id), falling back to (asset, ts, price).
+            # M2 (audit 2026-09-18): (asset, event_id) can never fire either —
+            # event_id is a per-row uuid4 (chainlink.py), unique by
+            # construction. Dedup on (asset, ts_source, price), requiring real
+            # values: a NULL time/price key would false-dupe distinct ticks.
             rid = row.get("report_id")
             if rid:
                 return (_is(rid),)
-            eid = row.get("event_id")
-            if row.get("asset") is not None and eid:
-                return (_is(row.get("asset")), _is(eid))
-            if row.get("asset") is not None and row.get("ts_received_ns") is not None:
-                return (_is(row.get("asset")), row.get("ts_received_ns"), row.get("price"))
+            if (row.get("asset") is not None and row.get("ts_source") is not None
+                    and row.get("price") is not None):
+                return (_is(row.get("asset")), row.get("ts_source"), row.get("price"))
         if dataset == "resync_episodes":
             rid = row.get("resync_id")
             if rid:

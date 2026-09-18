@@ -30,7 +30,9 @@ def test_snapshot_schema_wide():
                 assert schema.field(col).nullable is True
     # state
     assert schema.field("book_state").nullable is False
-    assert schema.field("book_crossed").nullable is False
+    # M8 (audit 2026-09-18): nullable — exception-fallback rows emit NULL
+    # (unknown) instead of fabricating book_crossed=False.
+    assert schema.field("book_crossed").nullable is True
     assert schema.field("resync_id").nullable is True
     # 20-level variant (old hive files keep 20 columns; export tolerates trailing extras)
     schema20 = snapshot_schema(l2_levels=20)

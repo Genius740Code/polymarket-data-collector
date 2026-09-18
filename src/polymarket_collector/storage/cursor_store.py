@@ -32,9 +32,20 @@ class CursorState:
 
     def to_row(self) -> tuple:
         # column order matches the INSERT in save(): window_label second
+        # L1 (audit 2026-09-18): normalize key columns on write — load()
+        # matches (asset.upper(), window_label.lower()), so a mixed-case label
+        # here previously wrote rows that load() could never find.
+        try:
+            _asset = self.asset.upper() if isinstance(self.asset, str) else self.asset
+        except Exception:
+            _asset = self.asset
+        try:
+            _wl = str(self.window_label or "5m").lower()
+        except Exception:
+            _wl = "5m"
         return (
-            self.asset,
-            self.window_label,
+            _asset,
+            _wl,
             self.current_window_index,
             self.current_condition_id,
             self.next_condition_id,
@@ -182,46 +193,63 @@ class CursorStore:
 
     def save(self, state: CursorState) -> None:
         conn = self._connect()
-        conn.execute(
-            """
-            INSERT INTO cursor_state
-              (asset, window_label, current_window_index, current_condition_id, next_condition_id,
-               last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(asset, window_label) DO UPDATE SET
-              current_window_index=excluded.current_window_index,
-              current_condition_id=excluded.current_condition_id,
-              next_condition_id=excluded.next_condition_id,
-              last_sequence_number_per_token=excluded.last_sequence_number_per_token,
-              last_snapshot_written_ts=excluded.last_snapshot_written_ts,
-              updated_at=excluded.updated_at
-            """,
-            state.to_row(),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                """
+                INSERT INTO cursor_state
+                  (asset, window_label, current_window_index, current_condition_id, next_condition_id,
+                   last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset, window_label) DO UPDATE SET
+                  current_window_index=excluded.current_window_index,
+                  current_condition_id=excluded.current_condition_id,
+                  next_condition_id=excluded.next_condition_id,
+                  last_sequence_number_per_token=excluded.last_sequence_number_per_token,
+                  last_snapshot_written_ts=excluded.last_snapshot_written_ts,
+                  updated_at=excluded.updated_at
+                """,
+                state.to_row(),
+            )
+            conn.commit()
+        except Exception:
+            # Persistent conn: a failed statement leaves the transaction open
+            # and poisons every later write on it — roll back so the next
+            # save starts clean, then re-raise (cursor loss must be loud).
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def save_many(self, states: list[CursorState]) -> None:
         """Batch transaction for one flush (same rows as N save() calls)."""
         if not states:
             return
         conn = self._connect()
-        conn.executemany(
-            """
-            INSERT INTO cursor_state
-              (asset, window_label, current_window_index, current_condition_id, next_condition_id,
-               last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(asset, window_label) DO UPDATE SET
-              current_window_index=excluded.current_window_index,
-              current_condition_id=excluded.current_condition_id,
-              next_condition_id=excluded.next_condition_id,
-              last_sequence_number_per_token=excluded.last_sequence_number_per_token,
-              last_snapshot_written_ts=excluded.last_snapshot_written_ts,
-              updated_at=excluded.updated_at
-            """,
-            [s.to_row() for s in states],
-        )
-        conn.commit()
+        try:
+            conn.executemany(
+                """
+                INSERT INTO cursor_state
+                  (asset, window_label, current_window_index, current_condition_id, next_condition_id,
+                   last_sequence_number_per_token, last_snapshot_written_ts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset, window_label) DO UPDATE SET
+                  current_window_index=excluded.current_window_index,
+                  current_condition_id=excluded.current_condition_id,
+                  next_condition_id=excluded.next_condition_id,
+                  last_sequence_number_per_token=excluded.last_sequence_number_per_token,
+                  last_snapshot_written_ts=excluded.last_snapshot_written_ts,
+                  updated_at=excluded.updated_at
+                """,
+                [s.to_row() for s in states],
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def load(self, asset: str, window_label: str = "5m") -> Optional[CursorState]:
         conn = self._connect()

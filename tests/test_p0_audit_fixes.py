@@ -71,18 +71,20 @@ def _chainlink_row(asset="BTC", event_id="e1", price=90000.0, ts=1_000):
 
 
 def test_e9_chainlink_dedup_null_report_id(tmp_path):
+    # M2 (audit 2026-09-18): (asset, event_id) could never fire — event_id is a
+    # per-row uuid4. Key is (asset, ts_source, price), requiring real values.
     w = ParquetWriter(data_dir=str(tmp_path), wal_enabled=False)
     row = _chainlink_row()
     key = w._dedup_key("chainlink_events", row)
-    assert key == ("BTC", "e1"), f"dedup key must be (asset,event_id), got {key}"
+    assert key == ("BTC", "2026-09-09T11:20:19Z", 90000.0), f"dedup key must be (asset,ts_source,price), got {key}"
     assert w.append("chainlink_events", dict(row), asset="BTC", date_str="2026-09-09") is True
-    # burst duplicate (same asset+event_id, NULL report_id) must be dropped
+    # burst duplicate (same asset+ts+price, NULL report_id) must be dropped
     # (idempotent True, but no second buffered row)
     assert w.append("chainlink_events", dict(row), asset="BTC", date_str="2026-09-09") is True
     buffered = [b for b in w._buffer if b.dataset == "chainlink_events"]
     assert len(buffered) == 1, f"duplicate must not buffer twice, got {len(buffered)}"
-    # distinct event_id still flows
-    assert w.append("chainlink_events", dict(_chainlink_row(event_id="e2")), asset="BTC", date_str="2026-09-09") is True
+    # distinct price still flows
+    assert w.append("chainlink_events", dict(_chainlink_row(event_id="e2", price=90001.0)), asset="BTC", date_str="2026-09-09") is True
 
 
 # ---------------------------------------------------------------- E2
@@ -91,7 +93,9 @@ def test_e2_trades_window_index_nullable():
     assert TRADES_SCHEMA.field("market_id").nullable is True
 
 
-def test_e2_export_drops_null_and_zero_window_index(tmp_path):
+def test_m4_export_keeps_null_and_zero_window_index(tmp_path):
+    # M4 (audit 2026-09-18): NULL/0 window_index trades are honest-gap rows and
+    # ship in staging (hive truth) — the old E2 filter hid gaps from consumers.
     from polymarket_collector.storage.export import _read_dataset_per_asset
 
     base = tmp_path / "data"
@@ -127,4 +131,4 @@ def test_e2_export_drops_null_and_zero_window_index(tmp_path):
     out = _read_dataset_per_asset(base, "trades", "BTC")
     assert out is not None
     got = sorted(r["trade_id"] for r in out.to_pylist())
-    assert got == ["t1"], f"only the honest window_index row may ship, got {got}"
+    assert got == ["t1", "t2", "t3"], f"honest-gap rows must ship in staging, got {got}"

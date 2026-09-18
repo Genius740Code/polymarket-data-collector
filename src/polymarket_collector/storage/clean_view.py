@@ -104,6 +104,7 @@ def build_clean_view(
     _MAX_NEW_BYTES_PER_CALL = 30 * 1024 * 1024
 
     written = 0
+    _unreadable = 0
     for date_dir in src_root.glob("date=*"):
         date_str = date_dir.name  # e.g. date=2025-01-01
         for asset_dir in date_dir.glob("asset=*"):
@@ -137,14 +138,20 @@ def build_clean_view(
                     tables = []
                     for part in _capped:
                         try:
-                            tables.append(read_table(part))
+                            _t = read_table(part)
                         except Exception:
                             continue
+                        # M5 (audit 2026-09-18): read_table returns None (never
+                        # raises) — appending None poisoned the concat and aborted
+                        # the whole build. Skip unreadable files per-file instead.
+                        if _t is None:
+                            _unreadable += 1
+                            continue
+                        tables.append(_t)
                     if not tables:
                         continue
                     combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
                     del tables
-                    sidecar = True
                     sidecar = True
                 except Exception:
                     sidecar = False
@@ -156,9 +163,14 @@ def build_clean_view(
                 tables: List[pa.Table] = []
                 for part in asset_dir.glob("*.parquet"):
                     try:
-                        tables.append(read_table(part))
+                        _t2 = read_table(part)
                     except Exception:
                         continue
+                    # M5: see above — never feed None into the concat.
+                    if _t2 is None:
+                        _unreadable += 1
+                        continue
+                    tables.append(_t2)
                 if not tables:
                     continue
                 combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
@@ -211,6 +223,8 @@ def build_clean_view(
             _os_replace_safe(tmp_path, _dest)
             written += filtered.num_rows
 
+    if _unreadable:
+        print(f"[clean_view] skipped {_unreadable} unreadable file(s) (fail open per-file; see quarantine for healing)")
     return written
 
 

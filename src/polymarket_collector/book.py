@@ -343,6 +343,74 @@ class OrderBookState:
         }
 
     # -- A1 frame-timestamp helpers --------------------------------------
+    def heal_market_id(self, market_id: Optional[str]) -> bool:
+        """Fill a missing market_id from later discovery (audit 2026-09-16 M1).
+
+        Long-lived books (esp. *-1d, resurrected from cursor with
+        market_id=None) froze NULL forever because snapshot rows come from
+        the book, not the market — even after markets_latest learned the
+        numeric id. Only fills when currently empty; never overwrites a
+        known id and never stores hex (E1). Returns True if filled.
+        """
+        if self.market_id:
+            return False
+        try:
+            from .rollover import clean_market_id as _clean_mid
+            cleaned = _clean_mid(market_id)
+        except Exception:
+            cleaned = None
+        if cleaned:
+            self.market_id = cleaned
+            return True
+        return False
+
+    def heal_tokens(self, up_token_id: Optional[str], down_token_id: Optional[str]) -> bool:
+        """Replace placeholder/wrong token IDs from later discovery (audit 2026-09-18 C1).
+
+        Cursor recovery (`collector._recover_from_cursor`) creates books with
+        synthetic `"<cid>-UP"/"<cid>-DOWN"` token IDs. Real WS frames carry the
+        numeric CLOB token IDs, so without healing those frames never route to
+        the book (silent delta loss) and snapshots ship fabricated token IDs.
+        Only replaces when the incoming IDs differ and look real (non-empty,
+        not `<cid>-UP` style placeholders); never blanks a known good pair.
+        Returns True if replaced.
+        """
+        try:
+            new_up = str(up_token_id).strip() if up_token_id else ""
+            new_down = str(down_token_id).strip() if down_token_id else ""
+        except Exception:
+            return False
+        if not new_up or not new_down:
+            return False
+        try:
+            cur_up = str(getattr(self, "up_token_id", "") or "")
+            cur_down = str(getattr(self, "down_token_id", "") or "")
+        except Exception:
+            return False
+        if cur_up == new_up and cur_down == new_down:
+            return False
+
+        def _placeholder(tok: str) -> bool:
+            try:
+                return tok.endswith("-UP") or tok.endswith("-DOWN")
+            except Exception:
+                return False
+
+        # Heal placeholders always; heal mismatched real IDs too (token reuse
+        # across windows is impossible — token IDs are unique per market — so a
+        # mismatch means this book holds the wrong pair).
+        if _placeholder(cur_up) or _placeholder(cur_down) or cur_up != new_up or cur_down != new_down:
+            self.up_token_id = new_up
+            self.down_token_id = new_down
+            # sequence state keyed by old tokens is meaningless for the new pair
+            try:
+                self.sequence_numbers.pop(cur_up, None)
+                self.sequence_numbers.pop(cur_down, None)
+            except Exception:
+                pass
+            return True
+        return False
+
     @staticmethod
     def _parse_frame_ts_ms(msg: dict) -> Optional[int]:
         """Extract the exchange frame timestamp as ms epoch, or None.
@@ -812,7 +880,12 @@ class OrderBookState:
             side.levels.append(Level(price=None, size=None))
 
     def replace_from_rest_snapshot(self, snapshot: dict) -> None:
-        """Wholesale replace in-RAM book from REST full snapshot (§1A step 3)."""
+        """Wholesale replace in-RAM book from REST full snapshot (§1A step 3).
+
+        M7 (audit 2026-09-18): REST levels get the same §3A bounds discipline as
+        WS frames (price in [0,1], size >= 0). Out-of-range levels are skipped
+        — a malformed REST response must not poison the book and every
+        subsequent snapshot. (The WS path enforces this in apply_ws_message.)"""
         for outcome_key, book in (("up", self.up), ("down", self.down)):
             for side_key, side in (("bids", book.bids), ("asks", book.asks)):
                 key = f"{outcome_key}_{side_key}"  # e.g. up_bids
@@ -830,6 +903,8 @@ class OrderBookState:
                             continue
                         if p == 0:
                             continue  # E4: 0-price sentinel, not a quote
+                        if not (0.0 <= p <= 1.0) or not (s >= 0):
+                            continue  # M7: §3A bounds, same as WS path
                         new_levels.append(Level(price=p, size=s))
                     elif isinstance(lvl, dict):
                         try:
@@ -838,6 +913,8 @@ class OrderBookState:
                             continue
                         if p == 0:
                             continue  # E4: 0-price sentinel, not a quote
+                        if not (0.0 <= p <= 1.0) or not (s >= 0):
+                            continue  # M7: §3A bounds, same as WS path
                         new_levels.append(Level(price=p, size=s))
                 new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
                 side.levels = new_levels[: self.l2_levels]

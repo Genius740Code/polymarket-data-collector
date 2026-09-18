@@ -179,6 +179,10 @@ class Collector:
         # dict here killed the chainlink consumer 115 times in one run: KeyError
         # on the first message → crash → reconnect forever, 0 rows written).
         self._rtds_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"rx": 0, "parsed": 0})
+        # H2/L5/H3/H4 (audit 2026-09-18): throttled transport-noise counters so new
+        # drop/fan-out telemetry can never flood the writer (the 2026-09-05
+        # book_events flood cost snapshots). First + every 1000th emits.
+        self._ws_noise_throttle: Dict[str, int] = defaultdict(int)
         # PERF CPU: one pooled REST client for CLOB book heals (keep-alive).
         # Previously every heal built 2-3 fresh AsyncClients (new TCP+TLS each).
         # Same GETs, same params, same merge logic.
@@ -279,13 +283,14 @@ class Collector:
             pass
 
     def _persist_resync_episode(self, episode_dict: dict) -> None:
-        """Persist resync episode to ParquetWriter (resync_episodes dataset).
+        """Persist resync episode transitions to ParquetWriter (resync_episodes dataset).
 
-        Exactly one parquet row per episode: state transitions update
-        ``self._episode_latest`` in RAM; the row is appended only when the
-        episode reaches a final state (completed, escalated, or collector
-        stop). Previously every transition appended a row, double-counting
-        episodes and stamping reconnect at shutdown.
+        M1 (audit 2026-09-18): EVERY transition is appended, not just final
+        states. The writer upserts buffered rows per resync_id and the export
+        keeps the latest row per resync_id, so versions collapse downstream —
+        while a crash with an open episode still leaves its trail on disk
+        (previously open episodes lived only in RAM and vanished entirely,
+        leaving gaps with collector_events but no resync_episodes row).
         """
         try:
             rid = episode_dict.get("resync_id")
@@ -299,12 +304,12 @@ class Collector:
             is_final = bool(
                 episode_dict.get("resync_completed_ts_utc") or episode_dict.get("escalated")
             )
-            if is_final and rid not in self._episode_persisted:
+            ok = self.writer.append("resync_episodes", episode_dict, asset=episode_dict.get("asset"))
+            if is_final and ok:
                 self._episode_persisted.add(rid)
-                ok = self.writer.append("resync_episodes", episode_dict, asset=episode_dict.get("asset"))
-                if not ok:
-                    self._episode_persisted.discard(rid)
-                    self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
+            elif not ok:
+                self._episode_persisted.discard(rid)
+                self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
         except Exception:
             pass
 
@@ -436,6 +441,7 @@ class Collector:
         try:
             token_id = str(msg.get("token_id") or msg.get("asset_id") or msg.get("asset") or msg.get("tokenId") or "")
             if not token_id:
+                self._emit_trade_drop("missing_token", asset)
                 return False
             # resolve market/condition for this token via O(1) index (fallback scan inside)
             market = None
@@ -448,8 +454,12 @@ class Collector:
                     market = self.markets.get(_b.condition_id)
                     condition_id = _b.condition_id
             if market is None:
-                # still need condition_id for row; use token-derived fallback
-                condition_id = condition_id or token_id
+                # C3 (audit 2026-09-18): NEVER store the token_id in the
+                # condition_id column — it poisons the condition_id→markets
+                # join with a valid-looking but unjoinable value. Unknown stays
+                # NULL (honest gap); TRADES_SCHEMA.condition_id is nullable.
+                if not condition_id:
+                    condition_id = None
                 # try to find any active market for this asset as fallback
                 for m in self.rollover.active_markets(asset):
                     if m.up_token_id == token_id or m.down_token_id == token_id:
@@ -459,14 +469,17 @@ class Collector:
             price_raw = msg.get("price")
             size_raw = msg.get("size") or msg.get("amount")
             if price_raw is None or size_raw is None:
+                self._emit_trade_drop("missing_price_or_size", asset)
                 return False
             try:
                 price = float(price_raw)
                 size = float(size_raw)
             except Exception:
+                self._emit_trade_drop("unparsable_price_or_size", asset)
                 return False
             # sanity bounds §3A
             if not (0 <= price <= 1) or size < 0:
+                self._emit_trade_drop("bounds_reject", asset)
                 return False
             maker_wallet, taker_wallet, wallet = self._extract_wallets(msg)
             # Wallet extraction is from CLOB fields only (proxyWallet/maker/taker) — no RPC.
@@ -483,14 +496,32 @@ class Collector:
                 elif market and token_id == market.down_token_id:
                     outcome = "down"
                 else:
-                    outcome = "up" if msg.get("asset_id") == token_id else "unknown"
-            trade_id = str(msg.get("trade_id") or msg.get("tradeId") or msg.get("id") or uuid.uuid4())
+                    # C3: unknown stays "unknown". The old
+                    # `"up" if msg.asset_id == token_id` comparison was
+                    # self-true whenever the token came from asset_id —
+                    # a fabricated "up" label.
+                    outcome = "unknown"
+            # M9: deterministic fallback trade_id from the fill key so redelivery
+            # retries dedupe via (token_id, trade_id). A per-retry uuid4 made
+            # every retry a distinct row.
+            _tid_raw = msg.get("trade_id") or msg.get("tradeId") or msg.get("id")
+            if _tid_raw:
+                trade_id = str(_tid_raw)
+            else:
+                try:
+                    import hashlib as _hl9
+                    _tkey = f"{token_id}|{price}|{size}|{msg.get('timestamp') or msg.get('ts') or msg.get('ts_source') or ''}"
+                    trade_id = f"ws-{_hl9.sha1(_tkey.encode()).hexdigest()[:16]}"
+                except Exception:
+                    trade_id = f"ws-{token_id}-{price}-{size}"
             tx_hash = str(msg.get("transaction_hash") or msg.get("transactionHash") or msg.get("hash") or "")
             if not tx_hash:
                 tx_hash = None
+            # M6: source time stays NULL when the wire carries none. Falling back
+            # to receive/bucket time here fabricated ts_source (source-time vs
+            # receive-time confusion downstream). ts_source is nullable.
             ts_source = coerce_ts_source_ms(
-                msg.get("timestamp") or msg.get("ts") or msg.get("ts_source")
-                or now_bucket_ms or int(now_ns // 1_000_000))
+                msg.get("timestamp") or msg.get("ts") or msg.get("ts_source"))
             seq = msg.get("sequence_number") or msg.get("seq") or msg.get("sequence")
             try:
                 seq_int = int(seq) if seq is not None else None
@@ -526,7 +557,8 @@ class Collector:
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
-                "condition_id": str(condition_id),
+                # C3: None stays None (never the string "None", never token_id).
+                "condition_id": str(condition_id) if condition_id else None,
                 # E1: unknown numeric id → NULL (never hex cid); E2: unknown window → NULL.
                 "market_id": market.market_id if (market and market.market_id) else None,
                 "series_id": market.series_id if market else f"{asset.upper()}-5m",
@@ -945,6 +977,13 @@ class Collector:
             n = self.writer._wal_replay()
             if n:
                 print(f"[startup] replayed {n} rows from WAL after crash/restart")
+                # C2: make replayed rows durable immediately — the pre-restart
+                # WAL files are retained until this flush succeeds, but an
+                # immediate flush shrinks the re-replay window to ~zero.
+                try:
+                    self.writer.flush()
+                except Exception as e:
+                    print(f"[startup] post-replay flush err {e}")
         except Exception as e:
             print(f"[startup] WAL replay err {e}")
 
@@ -1078,6 +1117,90 @@ class Collector:
             pass
         return shard[0]
 
+    def _emit_rtds_drop(self, reason: str) -> None:
+        """Throttled RTDS-drop telemetry (H4). First + every 1000th."""
+        try:
+            if not self.on_event:
+                return
+            _k = f"rtds_drop:{reason}"
+            self._ws_noise_throttle[_k] += 1
+            _c = self._ws_noise_throttle[_k]
+            if _c == 1 or _c % 1000 == 0:
+                self.on_event(CollectorEventType.book_anomaly, {"asset": "CHAINLINK", "reason": f"rtds_drop:{reason}", "dropped_total": _c})
+        except Exception:
+            pass
+
+    def _emit_trade_drop(self, reason: str, asset: str) -> None:
+        """Throttled trade-drop telemetry (H3). Drops were silent; a feed sending
+        bad prices must be distinguishable from no feed. First + every 1000th."""
+        try:
+            if not self.on_event:
+                return
+            _k = f"trade_drop:{reason}:{asset}"
+            self._ws_noise_throttle[_k] += 1
+            _c = self._ws_noise_throttle[_k]
+            if _c == 1 or _c % 1000 == 0:
+                self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "reason": f"trade_drop:{reason}", "dropped_total": _c})
+        except Exception:
+            pass
+
+    def _fanout_books(self, single_msg: dict) -> list:
+        """H2: every book owning an entry of a price_changes frame.
+
+        One frame can carry entries for several markets (rollover
+        dual-tracking). Each returned book applies the frame and picks its own
+        entries natively (unknown entries are skipped per-entry in
+        apply_ws_message). Empty when nothing resolves.
+        """
+        targets = []
+        try:
+            pcs = single_msg.get("price_changes")
+            if not isinstance(pcs, list):
+                return targets
+            seen = set()
+            for _pc in pcs:
+                if not isinstance(_pc, dict):
+                    continue
+                _pt = _pc.get("asset_id") or _pc.get("token_id") or _pc.get("asset")
+                if not _pt:
+                    continue
+                _tb = self._lookup_book(None, _pt)
+                if _tb is not None and id(_tb) not in seen:
+                    seen.add(id(_tb))
+                    targets.append(_tb)
+        except Exception:
+            pass
+        return targets
+
+    def _emit_unroutable(self, single_msg: dict, shard: List[str]) -> None:
+        """Throttled anomaly for price_changes frames resolving to no book (H2).
+
+        Previously these frames vanished with no trace. Exactly-once counting
+        via the throttle total; payload capped to 4 token prefixes.
+        """
+        try:
+            if not self.on_event:
+                return
+            self._ws_noise_throttle["_unroutable"] += 1
+            _c = self._ws_noise_throttle["_unroutable"]
+            if _c == 1 or _c % 1000 == 0:
+                toks = []
+                try:
+                    for _pc in single_msg.get("price_changes") or []:
+                        if isinstance(_pc, dict):
+                            _t = _pc.get("asset_id") or _pc.get("token_id")
+                            if _t:
+                                toks.append(str(_t)[:12])
+                except Exception:
+                    pass
+                try:
+                    _a0 = shard[0] if shard else None
+                except Exception:
+                    _a0 = None
+                self.on_event(CollectorEventType.book_anomaly, {"asset": _a0, "reason": "unroutable_price_changes", "tokens": toks[:4], "dropped_total": _c})
+        except Exception:
+            pass
+
     async def _run_shard_loop(self, shard: List[str], shard_idx: int = 0) -> None:
         """Per-shard WS loop — Gamma discovery + shared CLOB WS connection.
 
@@ -1138,6 +1261,20 @@ class Collector:
                                 pass
                             self.books[market.condition_id] = _nb
                             self._index_book(_nb)
+                        else:
+                            # C1: same token/market_id healing as _on_market.
+                            try:
+                                _exb = self.books.get(market.condition_id)
+                                if _exb is not None and _exb.heal_tokens(market.up_token_id, market.down_token_id):
+                                    self._unindex_book(market.condition_id)
+                                    self._index_book(_exb)
+                                if _exb is not None:
+                                    try:
+                                        _exb.heal_market_id(market.market_id)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                     for _fa in shard:
                         await self.rollover.check_and_roll_all(_fa, _sub)
                 except Exception:
@@ -1252,6 +1389,27 @@ class Collector:
                     pass
                 self.books[market.condition_id] = _nb3
                 self._index_book(_nb3)
+            else:
+                # C1 (audit 2026-09-18): a cursor-recovered book may hold
+                # placeholder "<cid>-UP"/"<cid>-DOWN" token IDs. Heal them from
+                # real discovery so WS frames route and snapshots stop
+                # shipping fabricated token IDs. Also fills market_id (M1).
+                try:
+                    _ex = self.books.get(market.condition_id)
+                    if _ex is not None and _ex.heal_tokens(market.up_token_id, market.down_token_id):
+                        self._unindex_book(market.condition_id)
+                        self._index_book(_ex)
+                        try:
+                            self._collector_event(CollectorEventType.book_anomaly, {"asset": market.asset, "condition_id": market.condition_id, "reason": "book_tokens_healed"})
+                        except Exception:
+                            pass
+                    if _ex is not None:
+                        try:
+                            _ex.heal_market_id(market.market_id)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             # subscribe newly discovered market tokens (hot-add via
             # operation:subscribe when connected; no-op while WS is down)
             try:
@@ -1356,7 +1514,7 @@ class Collector:
                         # subscribe earns close 1008 "invalid subscription payload")
                         while self._running:
                             await asyncio.sleep(10)
-                            if subscribed_once:
+                            if ws_holder["subscribed_once"]:
                                 try:
                                     await ws.send("PING")
                                 except Exception:
@@ -1365,6 +1523,7 @@ class Collector:
                     hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{_label}")
 
                     async def _staleness_watchdog() -> None:
+                        nonlocal last_data_ns
                         # 30s without any market-data frame → force-abort the socket
                         # and let the reconnect loop resubscribe with full books.
                         # fail_connection (transport abort) instead of close(): the
@@ -1442,7 +1601,7 @@ class Collector:
                                         # archive the raw string then skip processing
                                         # (plain-text PONG never reaches liveness).
                                         try:
-                                            self.raw_archive.append(asset, message.decode(errors="ignore"))
+                                            self.raw_archive.append(shard[0], message.decode(errors="ignore"))
                                         except Exception:
                                             pass
                                         continue
@@ -1451,7 +1610,7 @@ class Collector:
                                         msg = json.loads(message)
                                     except Exception:
                                         try:
-                                            self.raw_archive.append(asset, message)
+                                            self.raw_archive.append(shard[0], message)
                                         except Exception:
                                             pass
                                         continue
@@ -1497,22 +1656,27 @@ class Collector:
                                 cid = single_msg.get("condition_id")
                                 tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
                                 book = self._lookup_book(cid, tok)
-                                if book is None and isinstance(single_msg.get("price_changes"), list):
-                                    for pc in single_msg["price_changes"]:
-                                        ptok = (pc.get("asset_id") or pc.get("token_id")) if isinstance(pc, dict) else None
-                                        if not ptok:
-                                            continue
-                                        book = self._lookup_book(None, ptok)
-                                        if book is not None:
-                                            break
-                                # fallback token key
-                                if book is None:
-                                    book = self.books.get(tok) if tok else None
-                                # City attribution for this message's rows/events.
-                                # Equals the old per-city loop label whenever the
-                                # book is known (the common case — identical rows).
-                                msg_asset = self._resolve_msg_asset(single_msg, book, shard)
+                                # H2 (audit 2026-09-18): fan price_changes entries
+                                # out to EVERY owning book. One frame can carry
+                                # entries for several markets (rollover
+                                # dual-tracking); resolving only the top-level
+                                # token silently dropped the other markets'
+                                # deltas with no event. Each book applies the
+                                # frame and picks its own entries natively.
+                                _apply_books = []
                                 if book is not None:
+                                    _apply_books = [book]
+                                elif isinstance(single_msg.get("price_changes"), list):
+                                    _apply_books = self._fanout_books(single_msg)
+                                    if not _apply_books:
+                                        try:
+                                            self._emit_unroutable(single_msg, shard)
+                                        except Exception:
+                                            pass
+                                # City attribution per applied book (prefers the
+                                # book's asset — identical to the old label when known).
+                                for book in _apply_books:
+                                    msg_asset = self._resolve_msg_asset(single_msg, book, shard)
                                     try:
                                         applied, reason = book.apply_ws_message(single_msg)
                                         # §4 book_events — threshold-driven BBO changes
@@ -1549,10 +1713,26 @@ class Collector:
                                                      "reason": reason},
                                                 )
                                         if not applied and self.on_event:
-                                            self.on_event(
-                                                CollectorEventType.book_anomaly,
-                                                {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
-                                            )
+                                            _rsn = str(reason or "")
+                                            if "duplicate_event" in _rsn or "out_of_order_duplicate" in _rsn:
+                                                # L5: transport redelivery noise — throttled
+                                                # (was one full anomaly per dupe).
+                                                try:
+                                                    _nk = f"{msg_asset}:{book.condition_id}"
+                                                    self._ws_noise_throttle[_nk] += 1
+                                                    _nc = self._ws_noise_throttle[_nk]
+                                                except Exception:
+                                                    _nc = 0
+                                                if _nc == 1 or _nc % 1000 == 0:
+                                                    self.on_event(
+                                                        CollectorEventType.book_anomaly,
+                                                        {"asset": msg_asset, "reason": reason, "dropped_total": _nc},
+                                                    )
+                                            else:
+                                                self.on_event(
+                                                    CollectorEventType.book_anomaly,
+                                                    {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
+                                                )
                                     except Exception as e:
                                         if self.on_event:
                                             self.on_event(
@@ -1560,9 +1740,20 @@ class Collector:
                                                 {"asset": msg_asset, "ws_error": str(e)},
                                             )
 
+                                # Message-level asset for the trade/resync paths below
+                                # (first applied book's asset, else shard fallback).
+                                try:
+                                    _msg_asset_all = self._resolve_msg_asset(
+                                        single_msg, _apply_books[0] if _apply_books else None, shard)
+                                except Exception:
+                                    try:
+                                        _msg_asset_all = shard[0] if shard else "UNKNOWN"
+                                    except Exception:
+                                        _msg_asset_all = "UNKNOWN"
+
                                 # Trade handling — persist with wallet (no RPC) §5
                                 try:
-                                    self._handle_trade_message(single_msg, msg_asset, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
+                                    self._handle_trade_message(single_msg, _msg_asset_all, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
                                 except Exception:
                                     pass
 
@@ -1573,7 +1764,7 @@ class Collector:
                                 # ~22k msgs / 10 min, never replayed, ~110MB/min RSS)
                                 try:
                                     resync_id = self._replay_buffer_id(
-                                        msg_asset, single_msg.get("resync_id", "") or "")
+                                        _msg_asset_all, single_msg.get("resync_id", "") or "")
                                     if resync_id:
                                         self.resync.buffer_message(resync_id, single_msg)
                                 except Exception:
@@ -1637,7 +1828,19 @@ class Collector:
                 if not self._running:
                     return
                 # fall through to reconnect logic below
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as _cc:
+                # B-3 recycle race: `break` out of `async for` for the planned
+                # 150s recycle can still raise ConnectionClosed/ConnectionClosedOK
+                # when the close handshake races an in-flight data frame (seen
+                # ~every 150s on the high-rate BTC lane as false
+                # ws_disconnected+resync storms). An OUR-close recycle is not a
+                # data gap: same light path as above, no episode, no REST storm.
+                if locals().get("planned_recycle", False):
+                    if self._running:
+                        for _ca in shard:
+                            self._ws_connected[_ca.upper()] = False
+                    planned_recycle = False
+                    continue
                 # Transient disconnect — mark stale, request resync, then reconnect
                 resync_ids = {}
                 if self._running:
@@ -1654,7 +1857,17 @@ class Collector:
                                         break
                         except Exception:
                             pass
-                        _rid = self.resync.handle_disconnect(_ca, _cid2, reason="ws_connection_close", books=self.books)
+                        # Diagnosability: keep the WS close code/reason so the
+                        # next flap names its cause instead of a bare string.
+                        _cc_reason = "ws_connection_close"
+                        try:
+                            _cc_code = getattr(_cc, "code", None)
+                            _cc_msg = getattr(_cc, "reason", None)
+                            if _cc_code is not None:
+                                _cc_reason = f"ws_connection_close:{_cc_code}:{_cc_msg}"
+                        except Exception:
+                            pass
+                        _rid = self.resync.handle_disconnect(_ca, _cid2, reason=_cc_reason, books=self.books)
                         resync_ids[_ca] = _rid
                         self._ws_connected[_ca.upper()] = False
                         self.resync.buffer_message(_rid, None)  # marker for replay on reconnect
@@ -1674,37 +1887,45 @@ class Collector:
                 exponential_backoff(attempt, initial_backoff_ms, max_backoff_ms, jitter=True),
                 60,
             )
+            # SHARD FIX (2026-09-17): this loop is per-SHARD — the bare `asset`
+            # name from the old per-city loop is undefined here. The first WS
+            # failure raised NameError and the shard task died silently (no
+            # reconnect ever, books stale forever). Emit per city in the shard.
             if self.on_event:
-                self.on_event(
-                    CollectorEventType.ws_reconnect_attempt,
-                    {"asset": asset, "attempt": attempt, "backoff_s": backoff_s},
-                )
+                for _ca in shard:
+                    try:
+                        self.on_event(
+                            CollectorEventType.ws_reconnect_attempt,
+                            {"asset": _ca, "attempt": attempt, "backoff_s": backoff_s},
+                        )
+                    except Exception:
+                        pass
             # K-4: stagger across assets — after a shared disconnect all 7 assets
             # would otherwise hit CLOB REST within the same second and rate-limit.
             # B-3: when OTHER assets are still connected this is a single-socket
             # flap — the stagger would just add dead air, so skip it.
             _others = sum(
                 1 for a in self.config.assets
-                if a.upper() != asset.upper() and self._ws_connected.get(a.upper())
+                if a.upper() not in shard_set and self._ws_connected.get(a.upper())
             )
             if _others < 2:
                 import random as _random
                 await asyncio.sleep(_random.uniform(0.0, 2.0))
             # Attempt REST resync for all stale books before reconnecting WS
             try:
-                stale_books = [b for b in self.books.values() if b.asset.upper() == asset.upper() and b.book_state.value == "stale"]
+                stale_books = [b for b in self.books.values() if b.asset.upper() in shard_set and b.book_state.value == "stale"]
                 for book in stale_books:
                     try:
                         # Find the episode for this stale book (created by handle_disconnect)
                         ep_id = None
                         for rid, ep in list(self.resync._episodes.items()):
-                            if ep.asset == asset.upper() and ep.condition_id == book.condition_id and ep.resync_completed_ts_utc is None:
+                            if ep.asset == book.asset.upper() and ep.condition_id == book.condition_id and ep.resync_completed_ts_utc is None:
                                 ep_id = rid
                                 break
                         # Fallback: any pending episode for asset
                         if ep_id is None:
                             for rid, ep in list(self.resync._episodes.items()):
-                                if ep.asset == asset.upper() and ep.resync_completed_ts_utc is None:
+                                if ep.asset == book.asset.upper() and ep.resync_completed_ts_utc is None:
                                     ep_id = rid
                                     break
                         if ep_id is None:
@@ -1715,7 +1936,7 @@ class Collector:
                                 self.resync.handle_reconnect(ep_id)
                         except Exception:
                             pass
-                        res = await self.resync.resync(asset, book.condition_id, self.books, ep_id)
+                        res = await self.resync.resync(book.asset, book.condition_id, self.books, ep_id)
                         if res:
                             break  # resync succeeded for this book
                     except Exception:
@@ -1914,6 +2135,21 @@ class Collector:
                 except Exception:
                     pass
                 _first_bucket = buckets[0] if len(buckets) else cur_bucket
+                # B-4 (2026-09-17): bound work per tick. A 120-bucket catch-up
+                # burst blocks the loop for seconds (p99 tick 6s, max 40s) and
+                # starves WS reads until the server 1013-closes the fattest
+                # lane ("slow consumer: send buffer full" on BTC). Process at
+                # most 6 buckets/tick (~3s of grid — drains faster than the
+                # 2-buckets/sec accrual); the remainder is picked up on
+                # following ticks. Same rows, same grid, scheduler_lag above
+                # already carries the audit signal. The batch stays
+                # yield-free (frozen-RAM bit-identity per the PERF note below).
+                try:
+                    _buckets_all = list(buckets)
+                except Exception:
+                    _buckets_all = [cur_bucket]
+                buckets = _buckets_all[:6] if len(_buckets_all) > 6 else _buckets_all
+                _first_bucket = buckets[0] if buckets else cur_bucket
                 for bucket in buckets:
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
@@ -2034,7 +2270,8 @@ class Collector:
                                     "is_rollover_window": _rollover_flag.get(m.condition_id, False),
                                     "book_state": _bs_val,
                                     "resync_id": getattr(book, "resync_id", None),
-                                    "book_crossed": False,
+                                    # M8: unknown stays NULL (never fabricate False).
+                                    "book_crossed": None,
                                     "up_book_age_ms": None,
                                     "down_book_age_ms": None,
                                 }
@@ -2083,7 +2320,13 @@ class Collector:
                             pass
                     self._beat()
                 self._last_snapshot_tick_ms = (time.perf_counter() - _tick_t0) * 1000
-                self._last_snapshot_bucket_ms = cur_bucket
+                # B-4: advance to the last PROCESSED bucket (not wall-clock) so
+                # a sliced catch-up resumes where it stopped instead of
+                # dropping the deferred buckets.
+                try:
+                    self._last_snapshot_bucket_ms = buckets[-1] if buckets else cur_bucket
+                except Exception:
+                    self._last_snapshot_bucket_ms = cur_bucket
             except Exception as e:
                 if self.on_event:
                     try:
@@ -2152,6 +2395,21 @@ class Collector:
             except Exception as _e:
                 print(f"[mem] report err {_e}", flush=True)
 
+    def _drop_totals_note(self) -> str:
+        """L4: one-line honest loss accounting for the flush log."""
+        try:
+            _d = dict(getattr(self.writer, "_dropped_rows", {}) or {})
+            _u = len(getattr(self.markets_log, "_unsent", []) or [])
+            _ud = int(getattr(self.markets_log, "_unsent_dropped", 0) or 0)
+        except Exception:
+            return ""
+        _parts = [f"{k}={v}" for k, v in sorted(_d.items()) if v]
+        if _u:
+            _parts.append(f"markets_unsent={_u}")
+        if _ud:
+            _parts.append(f"markets_unsent_dropped={_ud}")
+        return (" dropped: " + ",".join(_parts)) if _parts else ""
+
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.config.storage.flush_interval_seconds)
@@ -2161,7 +2419,7 @@ class Collector:
                     async with self._kaggle_lock:
                         n = self.writer.flush()
                         if n:
-                            print(f"[flush] {n} rows")
+                            print(f"[flush] {n} rows{self._drop_totals_note()}")
                         try:
                             self.markets_log.flush_staging()
                         except Exception:
@@ -2173,7 +2431,7 @@ class Collector:
                 try:
                     n = self.writer.flush()
                     if n:
-                        print(f"[flush] {n} rows")
+                        print(f"[flush] {n} rows{self._drop_totals_note()}")
                     try:
                         self.markets_log.flush_staging()
                     except Exception:
@@ -2347,10 +2605,12 @@ class Collector:
                             #  "timestamp": <ms>, "type": "update"}
                             price_raw = body.get("value") or body.get("price") or body.get("p")
                             if price_raw is None:
+                                self._emit_rtds_drop("missing_price")
                                 continue
                             try:
                                 price = float(price_raw)
                             except Exception:
+                                self._emit_rtds_drop("unparsable_price")
                                 continue
                             symbol = str(body.get("symbol") or body.get("asset") or "")
                             sym_norm = symbol.lower().replace("-", "").replace("/", "").replace("_", "")
@@ -2360,6 +2620,7 @@ class Collector:
                                     asset = a.upper()
                                     break
                             if asset is None:
+                                self._emit_rtds_drop("unknown_symbol")
                                 continue
                             self._rtds_counts[asset]["rx"] += 1
                             # normalize ts_source (ms epoch / s epoch / ISO)
@@ -2371,10 +2632,13 @@ class Collector:
                                     ts_ms = int(tf if tf > 1e11 else tf * 1000)
                             except Exception:
                                 ts_ms = None
-                            now_iso = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                            # M6: missing exchange time stays NULL in the stored row
+                            # (coerce→None). Receive time is NOT stamped as
+                            # source time; the RAM lookup below still uses the
+                            # true receive time for settlement proximity.
                             ts_source_iso = (
                                 _dt.datetime.fromtimestamp(ts_ms / 1000, tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
-                                if ts_ms else now_iso
+                                if ts_ms else None
                             )
                             from .chainlink import chainlink_event_from_ws
                             ev = chainlink_event_from_ws({

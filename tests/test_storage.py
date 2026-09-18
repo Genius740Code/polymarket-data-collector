@@ -28,12 +28,21 @@ def test_parquet_writer_batching_and_dedup():
         # duplicate → deduped, not appended
         assert writer.append("trades", row, asset="BTC", date_str="2025-01-01") is True
         assert len(writer._buffer) == 1  # second was deduped
-        # fallback dedup: book_events without seq
-        ev1 = {"token_id": "tok1", "ts_received_ns": 123, "event_type": "spread_change", "new_best_bid": 0.5, "new_best_ask": 0.6, "asset": "BTC"}
+        # fallback dedup: book_events without seq keys on EXCHANGE time
+        # (M2 audit 2026-09-18) — same ts_source redelivery dedupes...
+        ev1 = {"token_id": "tok1", "ts_source": 1700000000000, "ts_received_ns": 123, "event_type": "spread_change", "old_best_bid": 0.4, "new_best_bid": 0.5, "old_best_ask": 0.7, "new_best_ask": 0.6, "asset": "BTC"}
         ev2 = dict(ev1)
+        ev2["ts_received_ns"] = 456  # redelivery gets a new receive stamp
         writer.append("book_events", ev1, asset="BTC", date_str="2025-01-01")
         writer.append("book_events", ev2, asset="BTC", date_str="2025-01-01")
         assert len([b for b in writer._buffer if b.dataset == "book_events"]) == 1
+        # ...but rows with unknown exchange time have no meaningful key and are
+        # both kept (never false-dupe distinct events sharing NULL time).
+        ev3 = {"token_id": "tok1", "ts_received_ns": 789, "event_type": "spread_change", "new_best_bid": 0.5, "new_best_ask": 0.6, "asset": "BTC"}
+        ev4 = dict(ev3)
+        writer.append("book_events", ev3, asset="BTC", date_str="2025-01-01")
+        writer.append("book_events", ev4, asset="BTC", date_str="2025-01-01")
+        assert len([b for b in writer._buffer if b.dataset == "book_events"]) == 3
 
         # flush threshold
         for i in range(5):
@@ -250,3 +259,46 @@ def test_dedup_correctness_production_write_path():
         assert len(writer._buffer) == 0
 
         print("test_dedup_correctness_production_write_path PASSED")
+
+
+def test_compact_coalesces_row_groups_and_repairs_monsters():
+    """C8 (audit 2026-09-16): compaction must coalesce ~100-row flush groups
+    into full ~20k groups (old code concatenated 1:1 -> 6k-group monsters
+    whose footer parse cost ~700MB/worker), and must accept legacy
+    part-compacted-*.parquet inputs for repair."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dp = Path(tmp)
+        for i in range(8):
+            pq.write_table(
+                pa.table({"a": list(range(i * 100, i * 100 + 100)), "b": ["x"] * 100}),
+                str(dp / f"ds_{1000 + i}.parquet"),
+            )
+        # legacy monster: many tiny groups, old naming
+        w = pq.ParquetWriter(
+            str(dp / "part-compacted-abc12345.parquet"),
+            pa.schema([("a", pa.int64()), ("b", pa.string())]),
+            compression="zstd",
+        )
+        for _ in range(4):
+            w.write_table(pa.table({"a": list(range(50)), "b": ["y"] * 50}))
+        w.close()
+        pq.write_table(
+            pa.table({"a": [1, 2, 3], "b": ["z"] * 3}), str(dp / "ds_9999.parquet")
+        )
+        assert compact_dataset(dp) == 800 + 200 + 3
+        outs = [p for p in dp.iterdir() if p.name.startswith("part-compacted-")]
+        assert len(outs) == 1
+        m = pq.read_metadata(str(outs[0]))
+        assert (m.num_rows, m.num_row_groups) == (1003, 1)
+        assert len([p for p in dp.iterdir() if p.suffix == ".parquet"]) == 1
+        # single file -> no-op
+        assert compact_dataset(dp) == 0
+
+
+def test_malloc_trim_is_safe_noop_or_better():
+    from polymarket_collector.storage.streaming import malloc_trim
+
+    malloc_trim()  # must never raise, on any platform/libc

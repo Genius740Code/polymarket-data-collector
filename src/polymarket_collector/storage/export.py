@@ -429,6 +429,51 @@ def _apply_leg_pools(pylist: list, idxs: list, buy_pool: dict, sell_pool: dict,
     return filled_wallet, filled_outcome
 
 
+def _fee_rate_vote(fee, fee_is_estimated, notional):
+    """One market-rate vote from a streamed row, or None (abstain).
+
+    Exchange-reported rows (flag False) always vote fee/notional. E7
+    zero-fee rows (fee 0.0, flag NULL = not-applicable) vote 0.0 so
+    zero-fee markets still infer a rate instead of leaving every
+    reconciled row NULL. Anything else (NULL fee, derived rows, or a
+    nonzero fee with N/A flag — unknown provenance) abstains: a rate is
+    only ever inferred from exchange-reported data, never fabricated.
+    """
+    try:
+        if fee is None or notional is None:
+            return None
+        if fee_is_estimated is False:
+            return round(float(fee) / float(notional), 8)
+        if fee_is_estimated is None and float(fee) == 0.0:
+            return 0.0
+    except Exception:
+        return None
+    return None
+
+
+def _api_trade_id(txh: str, price, size) -> str:
+    """Deterministic reconciled-row id from the fill key.
+
+    Same fill → same id across reruns/builds (the old per-build counter
+    suffix made ids order-dependent). Distinct fills never share a
+    (tx_hash, price, size) key, so this cannot merge distinct rows.
+    """
+    import hashlib as _hl
+    try:
+        key = f"{(txh or '').lower()}|{round(float(price), 6)}|{round(float(size), 6)}"
+    except Exception:
+        key = f"{(txh or '').lower()}|{price}|{size}"
+    return f"api-{_hl.sha1(key.encode()).hexdigest()[:16]}"
+
+
+def _lane_series_fallback(asset) -> str:
+    """Fallback series_id matching the collector convention ({ASSET}-5m)."""
+    try:
+        return f"{(asset or 'X').upper()}-5m"
+    except Exception:
+        return "X-5m"
+
+
 def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[str] = None, reconcile: bool = True, deadline_s: Optional[float] = None, pool_cache: Optional[dict] = None) -> pa.Table:
     """Fill maker_wallet/taker_wallet/wallet and missing outcome on trades.
 
@@ -541,11 +586,9 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
             fee_rate: Optional[float] = None
             rates: set = set()
             for r in rs:
-                if r.get("fee") is not None and r.get("fee_is_estimated") is False and r.get("notional"):
-                    try:
-                        rates.add(round(float(r["fee"]) / float(r["notional"]), 8))
-                    except Exception:
-                        pass
+                _v = _fee_rate_vote(r.get("fee"), r.get("fee_is_estimated"), r.get("notional"))
+                if _v is not None:
+                    rates.add(_v)
             if len(rates) == 1:
                 fee_rate = rates.pop()
             oldest_needed_ms = min((_row_ts_ms(r) for r in rs), default=None)
@@ -587,11 +630,12 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     "ts_source": ts_ms or None,
                     "ts_received_ns": int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
                     "condition_id": cid,
-                    "market_id": rs[0].get("market_id") or cid,
-                    "series_id": series_mode or f"{asset or 'X'}-5MIN",
+                    # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
+                    "market_id": rs[0].get("market_id") or None,
+                    "series_id": series_mode or _lane_series_fallback(asset),
                     "window_index": int(widx) if widx is not None else 0,
                     "asset": (asset or rs[0].get("asset") or "").upper(),
-                    "trade_id": f"api-{txh[:16]}-{inserted}",
+                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size")),
                     "transaction_hash": txh or None,
                     "token_id": str(t.get("asset_id") or t.get("asset") or ""),
                     "outcome": _api_outcome_label(t) or "unknown",
@@ -705,12 +749,13 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
             _rows_to_add.append({
                 "ts_source": ts_ms or None,
                 "ts_received_ns": int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1e9),
-                "condition_id": cid,
-                "market_id": _first.get("market_id") or cid,
-                "series_id": _series_mode or f"{asset or 'X'}-5MIN",
-                "window_index": int(widx) if widx is not None else 0,
-                "asset": (asset or _first.get("asset") or "").upper(),
-                "trade_id": f"api-{txh[:16]}-{_inserted[0]}",
+                    "condition_id": cid,
+                    # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
+                    "market_id": _first.get("market_id") or None,
+                    "series_id": _series_mode or _lane_series_fallback(asset),
+                    "window_index": int(widx) if widx is not None else 0,
+                    "asset": (asset or _first.get("asset") or "").upper(),
+                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size")),
                 "transaction_hash": txh or None,
                 "token_id": str(t.get("asset_id") or t.get("asset") or ""),
                 "outcome": _api_outcome_label(t) or "unknown",
@@ -871,6 +916,7 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     import time as _time_s
 
     from .streaming import _order_key, write_batches
+    from .streaming import malloc_trim as _malloc_trim  # C7: untrimmed heap over thousands of tiny files
 
     _deadline = (_time_s.time() + deadline_s) if deadline_s else None
     want = f"{asset_upper}-{timeframe_label}" if timeframe_label else None
@@ -934,7 +980,19 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     # FileMetaData.schema, which pins ~250KB/call in pyarrow 25).
     _union_fields: dict = {}
     _union_order: list = []
-    for p in files:
+    for _pre_i, p in enumerate(files):
+        # C7 follow-up: the pre-pass opens every hive file (3526 tiny BTC
+        # trades files) with no heap return — same 2MB/file untrimmed growth
+        # that tripped the rss-cap before stream_batches got its trim.
+        if _pre_i and _pre_i % 100 == 0:
+            try:
+                _gc_s.collect()
+            except Exception:
+                pass
+            try:
+                _malloc_trim()
+            except Exception:
+                pass
         try:
             try:
                 _sch = pq.read_schema(str(p))
@@ -996,9 +1054,9 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                     except Exception:
                         pass
                 try:
-                    if (r.get("fee") is not None and r.get("fee_is_estimated") is False
-                            and r.get("notional")):
-                        fee_rates[cid].add(round(float(r.get("fee")) / float(r.get("notional")), 8))
+                    _vote = _fee_rate_vote(r.get("fee"), r.get("fee_is_estimated"), r.get("notional"))
+                    if _vote is not None:
+                        fee_rates[cid].add(_vote)
                 except Exception:
                     pass
                 if _need_row(r):
@@ -1130,7 +1188,7 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
         except Exception as e:
             print(f"[export] WARN trades global reconcile failed: {e}")
 
-    n = write_batches(_gen(), tmp_path, schema=_union_schema)
+    n = write_batches(_gen(), tmp_path, schema=_union_schema, stats=io_stats)
     del pool_cache, taker_cache, seen_dd, have, ctx_by_cid, markets_order
     _gc_s.collect()
     # single narrow write-back at the end (NULLs filled only, atomic per file)
@@ -1938,7 +1996,8 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
         mids = table.column("market_id").to_pylist()  # one narrow column only
     except Exception:
         return table
-    idx = [i for i, m in enumerate(mids) if isinstance(m, str) and bool(hex_re.match(m.strip()))]
+    idx = [i for i, m in enumerate(mids)
+           if m is None or (isinstance(m, str) and bool(hex_re.match(m.strip())))]
     if not idx:
         return table
     mapping: dict = {}
@@ -1964,7 +2023,7 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
             else:
                 nulled += 1
         if healed or nulled:
-            print(f"[export] market_id heal: {healed} hex→numeric, {nulled} hex→NULL (E1)")
+            print(f"[export] market_id heal: {healed} hex/NULL→numeric, {nulled} hex/NULL→NULL (E1+M1)")
         pos = table.schema.get_field_index("market_id")
         return table.set_column(pos, "market_id", pa.array(new_mids, type=pa.string()))
     except Exception as e:
@@ -2023,7 +2082,20 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         stats.setdefault("files_failed", 0)
         stats.setdefault("failed_bytes", 0)
         stats.setdefault("rows_read", 0)
-    for p in patterns:
+    for _ri, p in enumerate(patterns):
+        # C7 follow-up: same periodic heap return as stream_batches — group
+        # builds re-read hundreds of tiny files per cycle.
+        if _ri and _ri % 100 == 0:
+            try:
+                import gc as _gc_r
+                _gc_r.collect()
+            except Exception:
+                pass
+            try:
+                from .streaming import malloc_trim as _mt_r
+                _mt_r()
+            except Exception:
+                pass
         if p.name.endswith(".tmp"):
             continue
         try:
@@ -2250,6 +2322,10 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             combined = _heal_hex_market_ids(combined, Path(data_dir))
         except Exception as e:
             print(f"[export] WARN market_id heal failed for {dataset}: {e}")
+    # M4 (audit 2026-09-18): NULL/0 window_index trades are honest-gap rows
+    # (unresolvable market at ingest) and are KEPT in staging — the hive's
+    # truth. The old E2 filter dropped them from the published dataset, hiding
+    # gaps from consumers. Count loudly instead so the gap stays visible.
     if dataset == "trades" and combined.num_rows > 0 and "window_index" in combined.schema.names:
         try:
             col = combined.column("window_index")
@@ -2258,12 +2334,11 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             mask = pc.and_(not_null, not_zero)
             if mask.null_count > 0:
                 mask = pc.fill_null(mask, False)
-            dropped = combined.num_rows - int(pc.sum(mask).as_py() or 0)
-            if dropped:
-                print(f"[export] trades window_index filter: dropped {dropped} NULL/0 rows (E2 honest-gap)")
-            combined = combined.filter(mask)
+            kept_gap = int(pc.sum(pc.invert(mask)).as_py() or 0)
+            if kept_gap:
+                print(f"[export] trades window_index: keeping {kept_gap} NULL/0 honest-gap rows in staging (M4)")
         except Exception as e:
-            print(f"[export] WARN window_index filter failed: {e}")
+            print(f"[export] WARN window_index gap count failed: {e}")
     # E5: lowercase legacy uppercase aggressor sides at staging-read (hive is
     # migrated by the write-back below; staging must never ship mixed case).
     # 2026-09-10 OOM: Arrow kernels on narrow columns (never to_pylist).
@@ -2442,7 +2517,11 @@ def _apply_market_id_map(table: pa.Table, mapping: Dict[str, str]) -> pa.Table:
 
         hex_re = _re.compile(r"0[xX][0-9a-fA-F]{64}\Z")
         mids = table.column("market_id").to_pylist()
-        idx = [i for i, m in enumerate(mids) if isinstance(m, str) and bool(hex_re.match(m.strip()))]
+        # M1 (audit 2026-09-16): backfill NULLs too, not just hex. Long-lived
+        # 1d books emitted market_id=None for every row even though
+        # markets_latest knows the numeric id; unknown cids keep NULL.
+        idx = [i for i, m in enumerate(mids)
+               if m is None or (isinstance(m, str) and bool(hex_re.match(m.strip())))]
         if not idx:
             return table
         cids = table.column("condition_id").to_pylist()
@@ -2545,7 +2624,7 @@ def _stream_export_asset_dataset(
             yield b
 
     healed_note = ""
-    rows = write_batches(_gen(), tmp_path, schema=schema)
+    rows = write_batches(_gen(), tmp_path, schema=schema, stats=io_stats)
     if dedup is not None and (dedup.dupes or ds == "book_snapshots_500ms"):
         healed_note = f" (dedup dropped {dedup.dupes})" if dedup.dupes else ""
     if healed_note:
@@ -2855,10 +2934,15 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
                     # Report ANY read failure, including 0-byte stubs
                     # (failed=1, failed_bytes=0) which the old
                     # `files_failed`-only gate let through to Kaggle.
-                    if _io.get("files_failed") or _io.get("failed_bytes"):
+                    # H5: staging-write drops ride along so the pre-upload gate
+                    # fails closed on short staging files too.
+                    if (_io.get("files_failed") or _io.get("failed_bytes")
+                            or _io.get("write_dropped_rows")):
                         _read_err_out[_rel] = {"failed": _io.get("files_failed", 0),
-                                              "failed_bytes": _io.get("failed_bytes", 0),
-                                              "ok": _io.get("files_ok", 0)}
+                                               "failed_bytes": _io.get("failed_bytes", 0),
+                                               "ok": _io.get("files_ok", 0),
+                                               "write_dropped_rows": _io.get("write_dropped_rows", 0),
+                                               "write_dropped_batches": _io.get("write_dropped_batches", 0)}
                 except Exception as _e:
                     try:
                         if _tmp.exists():
@@ -3732,9 +3816,15 @@ def export_timeframe_aggregates(
 # Test mode uploads every 10 min (600s) gated on full closed markets only, safe delete after ready.
 
 try:
-    import kaggle  # type: ignore
-    KAGGLE_AVAILABLE = True
-except ImportError:
+    # C5 (audit 2026-09-16): NEVER import kaggle at module level. The package
+    # (kagglesdk + numpy + urllib3) cost ~500MB RSS, pushing every fresh
+    # _build_worker subprocess (700MB rss-cap) over the cap at import time —
+    # all snapshot/clean staging workers aborted for days while the code
+    # looked innocent. find_spec only scans paths (KBs, no import); the real
+    # import happens function-locally at the upload call sites.
+    import importlib.util as _ilu
+    KAGGLE_AVAILABLE = _ilu.find_spec("kaggle") is not None
+except Exception:
     KAGGLE_AVAILABLE = False
 
 import datetime as _dt
@@ -3996,6 +4086,27 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
     import random
     if expected_assets is None:
         expected_assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
+    # Janitor (audit 2026-09-15): the Kaggle SDK folder-upload ships EVERY
+    # file in staging — including aborted-worker tmp litter
+    # (X.parquet.tmp, X.parquet.tmp.tmp, X.parquet.tmp.<pid>.tmp), which
+    # then lands on the public dataset as junk files. Tmp files are never
+    # valid outputs (published files always end .parquet), so sweep them
+    # here, immediately pre-upload. A worker actively writing into a swept
+    # tmp fails that build only — the monotonic guard keeps prior and the
+    # next tick rebuilds (fail-closed).
+    try:
+        _swept = 0
+        for _p in staging.rglob("*"):
+            try:
+                if _p.is_file() and ".tmp" in _p.name:
+                    _p.unlink()
+                    _swept += 1
+            except OSError:
+                pass
+        if _swept:
+            print(f"[kaggle] swept {_swept} tmp litter files from staging pre-upload")
+    except Exception as _e:
+        print(f"[kaggle] WARN tmp sweep failed: {_e!r}")
     try:
         # kaggle uses ~/.kaggle/kaggle.json or env KAGGLE_USERNAME/KEY
         api = __import__("kaggle").api  # type: ignore
@@ -4817,6 +4928,11 @@ def _export_and_upload_all_kaggle_impl(
         if int(_re.get("failed_bytes") or 0) > 0 or int(_re.get("failed") or _re.get("files_failed") or 0) > 0:
             lost.append(f"{_mk}: unreadable inputs {_re.get('failed_bytes', 0)}B "
                         f"({_re.get('failed', _re.get('files_failed', 0))} files)")
+        # H5: batches dropped at staging-write time abort too — the read side
+        # was clean but the published file is short.
+        if int(_re.get("write_dropped_rows") or 0) > 0:
+            lost.append(f"{_mk}: staging write dropped {_re.get('write_dropped_rows')} rows "
+                        f"({_re.get('write_dropped_batches', 0)} batches)")
     for a in assets:
         f = staging / f"{a}_book_snapshots_500ms.parquet"
         staging_rows = None

@@ -51,6 +51,15 @@ class MarketsLog:
         # vs row defaults active/unknown) — index stores raw .get() values
         # so the comparison stays exact.
         self._staging_index: Dict[str, set] = {}
+        # H1 (audit 2026-09-18): rows the writer refused (backpressure WAL
+        # failure) wait here for retry instead of being dropped when
+        # flush_staging() clears _staging. Bounded (oldest dropped with a
+        # count) so a permanently-dead writer cannot grow RAM unboundedly.
+        # No event emission from this path: the writer's on_event callback
+        # routes back through here (append_event) and must not recurse.
+        self._unsent: List[tuple] = []  # (dataset, row, asset, date_str)
+        self._unsent_dropped: int = 0
+        self.MAX_UNSENT = 10_000
 
     def append(self, market: Dict, updated_at: Optional[str] = None) -> None:
         """Append a new state snapshot for a market (condition_id)."""
@@ -145,13 +154,9 @@ class MarketsLog:
             date_str = _dt_top.datetime.now(tz=_dt_top.timezone.utc).date().isoformat()
             ok = self.writer.append("markets_log", row, asset=None, date_str=date_str)
             if not ok:
-                # Backpressure: staging already holds row, writer WAL-persisted if enabled;
-                # do NOT drop — will be retried on next flush_staging if writer was WAL-disabled
-                try:
-                    # Keep in staging for retry; writer will be retried via flush_staging fallback
-                    pass
-                except Exception:
-                    pass
+                # Backpressure: keep the ORIGINAL date_str for retry so the row
+                # stays in its honest date= partition (never re-date on retry).
+                self._stage_unsent("markets_log", row, None, date_str)
 
     def append_event(
         self,
@@ -194,9 +199,23 @@ class MarketsLog:
             date_str = _dt_top.datetime.now(tz=_dt_top.timezone.utc).date().isoformat()
             ok = self.writer.append("collector_events", row, asset=asset, date_str=date_str)
             if not ok:
-                pass  # staged already, will be retried
+                self._stage_unsent("collector_events", row, asset, date_str)
         # also enqueue markets_log schema rows (mixed markets + events) when no separate writer
         # markets_log rows are handled via append(market) path; collector_events are separate
+
+    def _stage_unsent(self, dataset: str, row: Dict, asset: Optional[str], date_str: str) -> None:
+        """Queue a writer-refused row for retry (H1). Bounded; oldest dropped
+        with an exact count and a loud print (never silent)."""
+        try:
+            self._unsent.append((dataset, dict(row), asset, date_str))
+            if len(self._unsent) > self.MAX_UNSENT:
+                _drop = len(self._unsent) - self.MAX_UNSENT
+                del self._unsent[:_drop]
+                self._unsent_dropped += _drop
+                print(f"[markets_log] WARN unsent overflow: dropped {_drop} oldest rows "
+                      f"(total dropped={self._unsent_dropped}); writer backpressure unresolved")
+        except Exception:
+            pass
 
     def _normalize_rows(self, rows: List[Dict]) -> List[Dict]:
         """Ensure all rows have union of keys (pyarrow from_pylist drops cols not in first row)."""
@@ -216,6 +235,19 @@ class MarketsLog:
 
     def flush_staging(self) -> int:
         """Flush staging to writer or direct parquet (for tests without writer)."""
+        # H1: retry writer-refused rows FIRST (original date_str preserved).
+        # Rows are cleared from _unsent only once the writer accepts them, so a
+        # refused row is never dropped by the staging clear below.
+        if self._unsent and self.writer:
+            _still: List[tuple] = []
+            for _ds, _row, _asset, _date in self._unsent:
+                try:
+                    _ok = self.writer.append(_ds, _row, asset=_asset, date_str=_date)
+                except Exception:
+                    _ok = False
+                if not _ok:
+                    _still.append((_ds, _row, _asset, _date))
+            self._unsent = _still
         if not self._staging:
             return 0
         if self.writer:

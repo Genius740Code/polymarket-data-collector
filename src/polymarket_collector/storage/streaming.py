@@ -140,6 +140,31 @@ class DedupState:
         return table.filter(mask)
 
 
+_TRIM_EVERY_FILES = 100
+
+_libc_trim = None
+
+
+def malloc_trim() -> None:
+    """Best-effort glibc heap return (C7 audit 2026-09-16).
+
+    The parquet C++ reader leaves ~2MB/file of freed-but-untrimmed heap;
+    over ~1500 tiny flush files the worker balloons 75MB -> 934MB+ and
+    trips the 700MB rss-cap although live objects stay flat (Arrow pool
+    0MB, Python objs flat). Periodic trim holds RSS ~75MB indefinitely.
+    Safe anywhere: no-op on non-glibc / failure.
+    """
+    global _libc_trim
+    try:
+        if _libc_trim is None:
+            import ctypes as _ct
+
+            _libc_trim = _ct.CDLL("libc.so.6", use_errno=True)
+        _libc_trim.malloc_trim(0)
+    except Exception:
+        pass
+
+
 def stream_batches(
     data_dir: str | Path,
     dataset: str,
@@ -182,7 +207,16 @@ def stream_batches(
         stats["files_failed"] = 0
         stats["failed_bytes"] = 0
         stats["rows_read"] = 0
-    for p in files:
+    for _fi, p in enumerate(files):
+        # C7: return glibc heap before thousands of tiny opens pin ~1GB.
+        if _fi and _fi % _TRIM_EVERY_FILES == 0:
+            try:
+                import gc as _gc
+
+                _gc.collect()
+            except Exception:
+                pass
+            malloc_trim()
         try:
             _pf = _pq.ParquetFile(str(p))
         except Exception:
@@ -244,6 +278,7 @@ def write_batches(
     schema: Optional[pa.Schema] = None,
     compression: str = "zstd",
     row_group_rows: int = 20000,
+    stats: Optional[Dict] = None,
 ) -> int:
     """Append batches to one parquet file with a FIXED schema. Returns rows.
 
@@ -253,10 +288,23 @@ def write_batches(
     group buffered the whole staging file until close (encode ~1GB transient
     at close on the BTC lane, tripping the worker RSS cap every cycle).
     Peak transient here stays ~one row group regardless of total rows.
+
+    stats (optional dict): filled with write_dropped_batches /
+    write_dropped_rows — batches that failed schema normalization are counted
+    loudly here instead of vanishing (H5 audit 2026-09-18).
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    # Tmp discipline: callers pass EITHER the final path (we append one
+    # .tmp) OR an already-tmp staging path (X.parquet.tmp — use a unique
+    # sibling instead of stacking a second suffix, which used to leave
+    # X.parquet.tmp.tmp litter on every aborted worker).
+    if out_path.suffix == ".tmp" or out_path.name.endswith(".tmp"):
+        import os as _os_tmp
+
+        tmp_path = out_path.parent / f"{out_path.name}.{_os_tmp.getpid()}.tmp"
+    else:
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
     def _writable_schema(s: pa.Schema) -> pa.Schema:
         # pq.ParquetWriter enforces nullable flags (pq.write_table, used by the
@@ -314,7 +362,16 @@ def write_batches(
                         else:
                             cols.append(pa.array([None] * t.num_rows, type=f.type))
                     t = pa.table(cols, schema=writer.schema)
-                except Exception:
+                except Exception as e:
+                    # H5: never drop silently — count loudly so the staging
+                    # coverage gate can fail closed instead of shipping short.
+                    if stats is not None:
+                        stats["write_dropped_batches"] = stats.get("write_dropped_batches", 0) + 1
+                        try:
+                            stats["write_dropped_rows"] = stats.get("write_dropped_rows", 0) + t.num_rows
+                        except Exception:
+                            pass
+                    print(f"[streaming] WARN dropped batch ({t.num_rows} rows): schema normalize failed: {e}")
                     continue
             pending.append(t)
             pending_rows += t.num_rows
