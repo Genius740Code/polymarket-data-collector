@@ -44,6 +44,12 @@ class WsConfig(BaseModel):
     sequence_gap_detection: bool = True
     full_book_diff_interval_seconds: int = 45
     full_book_diff_tolerance: float = 0.0
+    # F10 (Sep 2026): thin one-sided books (asks only, no bids — the norm for
+    # far-future weather buckets) never satisfy the both-sides promotion gate
+    # and sit stale forever (0% live). When true, a hash-attested frame with
+    # ANY side present promotes. Default False (crypto books are two-sided;
+    # unknown-unknown there). Enabled in the weather yaml only.
+    promotion_one_sided: bool = False
 
     @field_validator("cities_per_connection")
     @classmethod

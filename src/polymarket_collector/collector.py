@@ -245,6 +245,7 @@ class Collector:
                                     market_end_ts_ms=None,
                                     schema_version=self.config.schema_version,
                                     l2_levels=self.config.l2_levels,
+                                    one_sided_promotion=self._one_sided_promotion(),
                                 )
                                 book.mark_stale(resync_id=str(uuid.uuid4()))
                                 self.books[state.current_condition_id] = book
@@ -713,6 +714,13 @@ class Collector:
             await self._fetch_and_apply_rest_book(book, market)
         except Exception:
             pass
+
+    def _one_sided_promotion(self) -> bool:
+        """F10 flag, exception-safe (fallback constructors run in except paths)."""
+        try:
+            return bool(self.config.ws.promotion_one_sided)
+        except Exception:
+            return False
 
     async def _fetch_rest_book(self, asset: str, condition_id: str) -> Optional[dict]:
         """Fetch a full order-book snapshot via REST for resync — merged both outcomes.
@@ -1301,6 +1309,7 @@ class Collector:
                                     market_end_ts_ms=market.market_end_ts_ms,
                                     schema_version=self.config.schema_version,
                                     l2_levels=self.config.l2_levels,
+                                    one_sided_promotion=self._one_sided_promotion(),
                                 )
                             except Exception:
                                 _nb = OrderBookState(
@@ -1309,6 +1318,7 @@ class Collector:
                                     window_index=market.window_index,
                                     up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                                     market_end_ts_ms=market.market_end_ts_ms,
+                                    one_sided_promotion=self._one_sided_promotion(),
                                 )
                             try:
                                 _nb.mark_stale(resync_id=str(uuid.uuid4()))
@@ -1434,6 +1444,7 @@ class Collector:
                         market_end_ts_ms=market.market_end_ts_ms,
                         schema_version=self.config.schema_version,
                         l2_levels=self.config.l2_levels,
+                        one_sided_promotion=self._one_sided_promotion(),
                     )
                 except Exception:
                     _nb3 = OrderBookState(
@@ -1442,6 +1453,7 @@ class Collector:
                         window_index=market.window_index,
                         up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                         market_end_ts_ms=market.market_end_ts_ms,
+                        one_sided_promotion=self._one_sided_promotion(),
                     )
                 try:
                     _nb3.mark_stale(resync_id=str(uuid.uuid4()))
@@ -2302,6 +2314,7 @@ class Collector:
                                         up_token_id=m.up_token_id, down_token_id=m.down_token_id,
                                         market_end_ts_ms=m.market_end_ts_ms,
                                         schema_version=self.config.schema_version, l2_levels=self.config.l2_levels,
+                                        one_sided_promotion=self._one_sided_promotion(),
                                     )
                                 except Exception:
                                     book = OrderBookState(
@@ -2310,6 +2323,7 @@ class Collector:
                                         window_index=m.window_index,
                                         up_token_id=m.up_token_id, down_token_id=m.down_token_id,
                                         market_end_ts_ms=m.market_end_ts_ms,
+                                        one_sided_promotion=self._one_sided_promotion(),
                                     )
                                 # New books start stale until first real data (fixes 5b live-with-nulls)
                                 try:
