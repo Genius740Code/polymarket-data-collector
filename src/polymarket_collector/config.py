@@ -115,11 +115,18 @@ class LiquidityFilterConfig(BaseModel):
     No RPC — uses Gamma reported_volume/reported_liquidity only.
     If market's liquidity < min_liquidity OR volume < min_volume, skip collection
     for that window (emit low_liquidity event) and try next window's market.
+    Two P0 carve-outs (weather thin-bucket fix, Sep 2026):
+    - Unknown (None/NaN/unparseable) = INCLUDE, never reject ("no data" is not
+      "low data" — Gamma omits aggregates on fresh near-term brackets).
+    - Near-term bypass: events ending within near_term_bypass_hours skip the
+      floor entirely (today/tomorrow brackets are the hunting ground; the floor
+      only throttles far-future discovery cost).
     """
     enabled: bool = False  # off by default — collect all unless user opts in
     min_liquidity: float = 0.0  # e.g. 500 means require liquidityNum >= 500
     min_volume: float = 0.0  # e.g. 1000 means require volumeNum >= 1000
     min_spread_liquidity_check: bool = False  # if true, check spread via book snapshot too
+    near_term_bypass_hours: float = 36.0  # events ending within this: no floor
 
 
 class CapacityConfig(BaseModel):

@@ -183,6 +183,24 @@ class WeatherDiscovery:
             min_vol = float(getattr(lf, "min_volume", 0) or 0)
         except Exception:
             return True
+        # Near-term bypass (P0, Sep 2026): today/near-term brackets are the
+        # hunting ground — never filter them on stale Gamma aggregates. The
+        # floor only throttles far-future (2-3 days out) discovery cost.
+        # Already-ended events (negative ends_in_h, 12h grace) bypass too —
+        # their books still print late trades.
+        try:
+            bypass_h = float(getattr(lf, "near_term_bypass_hours", 0) or 0)
+        except Exception:
+            bypass_h = 0.0
+        ends_in_h = None
+        try:
+            end_ms = getattr(market, "market_end_ts_ms", None)
+            if end_ms is not None:
+                ends_in_h = (float(end_ms) - time.time() * 1000) / 3600000.0
+        except Exception:
+            ends_in_h = None
+        if bypass_h and ends_in_h is not None and ends_in_h <= bypass_h:
+            return True
         # Unknown (None/NaN/unparseable) = PASS, not fail: Gamma omits
         # volume/liquidity on thin near-term brackets, and those thin
         # buckets are the research edge — filtering "no data" blinds
@@ -211,7 +229,7 @@ class WeatherDiscovery:
                     self.on_event("low_liquidity", {
                         "asset": market.asset, "condition_id": market.condition_id,
                         "slug": market.slug, "reported_liquidity": liq_f,
-                        "required": min_liq,
+                        "required": min_liq, "ends_in_h": ends_in_h,
                         "reason": f"liquidity {liq_f} < {min_liq}",
                     })
                 except Exception:
@@ -223,7 +241,7 @@ class WeatherDiscovery:
                     self.on_event("low_liquidity", {
                         "asset": market.asset, "condition_id": market.condition_id,
                         "slug": market.slug, "reported_volume": vol_f,
-                        "required": min_vol,
+                        "required": min_vol, "ends_in_h": ends_in_h,
                         "reason": f"volume {vol_f} < {min_vol}",
                     })
                 except Exception:
