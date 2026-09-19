@@ -154,6 +154,13 @@ class ParquetWriter:
         self._dupevent_count: Dict[str, int] = defaultdict(int)
         self._evict_total: Dict[str, int] = defaultdict(int)  # M3: dedup-key evictions per dataset
         self._last_flush_ts = time.monotonic()
+        # C1/C2 (audit 2026-09-19): collision-proof file naming + flush failure
+        # accounting. Counter + pid disambiguate same-ns flushes; fail counts
+        # drive dead-letter instead of wedging the loop forever.
+        self._file_counter = 0
+        self._flush_fail_counts: Dict[Tuple[str, str, str], int] = defaultdict(int)
+        self._wal_malformed_total = 0
+        self._ts_fill_count: Dict[str, int] = defaultdict(int)
         # PERF RAM: single OrderedDict[key]=None per dataset instead of
         # set + deque holding every key twice (100k x 7 datasets).
         # Same membership + FIFO eviction (popitem(last=False)); keys keep
@@ -369,7 +376,15 @@ class ParquetWriter:
         return True
 
     def flush(self) -> int:
-        """Flush buffered rows to Parquet. Returns number of rows flushed."""
+        """Flush buffered rows to Parquet. Returns number of rows flushed.
+
+        C1 (audit 2026-09-19): group failures no longer lose unprocessed
+        groups. Rows stay tracked until durable; on failure the failing
+        group AND every unprocessed group are requeued front-first, and the
+        WAL is retained (truncate runs only on full success). A group
+        failing 5 consecutive flushes is dead-lettered (JSONL + event)
+        instead of wedging the loop forever.
+        """
         if not self._buffer:
             return 0
         # group by (dataset, date_str, asset)
@@ -379,16 +394,58 @@ class ParquetWriter:
             groups[(br.dataset, br.date_str, br.asset)].append(br.row)
 
         flushed = 0
-        for (dataset, date_str, asset), rows in groups.items():
+        items = list(groups.items())
+        for idx, ((dataset, date_str, asset), rows) in enumerate(items):
             try:
                 self._write_group(dataset, date_str, asset, rows)
                 flushed += len(rows)
+                # success resets the consecutive-failure counter for this key
+                try:
+                    self._flush_fail_counts.pop((dataset, date_str, str(asset)), None)
+                except Exception:
+                    pass
             except Exception as e:
                 if self.on_event:
-                    self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
-                # re-queue at front for retry (don't lose data)
-                for r in reversed(rows):
-                    self._buffer.appendleft(BufferedRow(dataset=dataset, asset=asset, date_str=date_str, row=r))
+                    try:
+                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
+                    except Exception:
+                        pass
+                # consecutive-failure tracking -> dead-letter after 5
+                _fkey = (dataset, date_str, str(asset))
+                try:
+                    self._flush_fail_counts[_fkey] = self._flush_fail_counts.get(_fkey, 0) + 1
+                    _fails = self._flush_fail_counts[_fkey]
+                except Exception:
+                    _fails = 1
+                if _fails >= 5:
+                    # dead-letter: preserve rows on disk outside the hive + event, then CONTINUE
+                    try:
+                        _dl_dir = self.data_dir / "_dead_letter" / dataset / f"date={date_str}"
+                        _dl_dir.mkdir(parents=True, exist_ok=True)
+                        _dl_path = _dl_dir / f"dead-{int(time.time_ns())}-{os.getpid()}.jsonl"
+                        with open(_dl_path, "a", encoding="utf-8") as _df:
+                            for _r in rows:
+                                _df.write(json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": _r}) + "\n")
+                    except Exception:
+                        pass
+                    try:
+                        if self.on_event:
+                            self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails})
+                    except Exception:
+                        pass
+                    try:
+                        self._flush_fail_counts.pop(_fkey, None)
+                    except Exception:
+                        pass
+                    # requeue ONLY the unprocessed later groups, skip the poison group
+                    for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
+                        for r in reversed(r2):
+                            self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                    continue
+                # re-queue failing group AND every unprocessed group front-first (no loss)
+                for (d2, ds2, a2), r2 in reversed(items[idx:]):
+                    for r in reversed(r2):
+                        self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
                 raise
             finally:
                 # PERF RAM: release per-group Arrow/Py list peak promptly.
@@ -430,8 +487,10 @@ class ParquetWriter:
                     pass
                 # Ensure all parquet renames are durable before truncating WAL
                 self._wal_truncate()
+                # M1 (audit 2026-09-19): use top-level os (a local `import os`
+                # here shadowed the global and made os.fsync above raise
+                # UnboundLocalError). WAL fsync now actually runs.
                 try:
-                    import os
                     with open(self._wal_path, "a") as f:
                         f.flush()
                         os.fsync(f.fileno())
@@ -586,6 +645,11 @@ class ParquetWriter:
                         try:
                             entry = json.loads(line)
                         except Exception:
+                            # M11 (audit 2026-09-19): count malformed pre-scan lines instead of dropping silently
+                            try:
+                                self._wal_malformed_total += 1
+                            except Exception:
+                                pass
                             continue
                         if entry.get("dataset"):
                             _datasets_seen.add(entry["dataset"])
@@ -757,10 +821,17 @@ class ParquetWriter:
                             self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
                             replayed += 1
                         else:
-                            # malformed entry — drop
-                            pass
+                            # malformed entry — count (M11), never silent
+                            try:
+                                self._wal_malformed_total += 1
+                            except Exception:
+                                pass
                     except Exception:
-                        # keep malformed? drop
+                        # malformed line — count (M11), never silent
+                        try:
+                            self._wal_malformed_total += 1
+                        except Exception:
+                            pass
                         continue
                 # C2: retain fully-replayed files until the first successful
                 # post-replay flush() truncates them (see flush()). Truncating
@@ -780,6 +851,12 @@ class ParquetWriter:
                     pass
             except Exception:
                 continue
+        # M11: surface malformed-line drops (never silent)
+        try:
+            if self._wal_malformed_total and self.on_event:
+                self.on_event(CollectorEventType.write_failed, {"reason": "wal_malformed_dropped", "rows": self._wal_malformed_total})
+        except Exception:
+            pass
         return replayed
 
     # -- internals ---------------------------------------------------------
@@ -810,12 +887,15 @@ class ParquetWriter:
                 # oscillations (same new BBO reached twice); when ts_source is
                 # unknown there is no meaningful key: return None (store the
                 # row) rather than risk false-duping distinct events.
+                # H6 (audit 2026-09-19): include side — bid-snapped and
+                # ask-snapped in one frame previously collapsed to one row.
                 if row.get("ts_source") is None:
                     return None
                 return (
                     _is(token),
                     row.get("ts_source"),
                     row.get("event_type"),
+                    row.get("side"),
                     row.get("old_best_bid"),
                     row.get("new_best_bid"),
                     row.get("old_best_ask"),
@@ -988,6 +1068,9 @@ class ParquetWriter:
                         nr["notional"] = float(nr["price"]) * float(nr["size"])
                     except Exception:
                         pass
+                # H4: default source to live when absent (old callers)
+                if nr.get("source") is None and "source" in _schema_names:
+                    nr["source"] = "live"
             if "sequence_number" in nr and nr["sequence_number"] is not None:
                 try:
                     s = str(nr["sequence_number"]).strip()
@@ -999,21 +1082,27 @@ class ParquetWriter:
                     nr["sequence_number"] = None
             if _needs_ts_fill:
                 try:
-                    # ts_received_ns is schema-required on live tables; the
-                    # producers always set it at creation. A missing value here
-                    # means an old caller — fill with write time (closest
-                    # available receive clock) and count it so backtests can
-                    # audit how many rows carry an estimated receive time.
-                    if nr.get("ts_received_ns") is None and "ts_received_ns" in _schema_names:
+                    # M2: flush-time fill is estimated — flag it per row so
+                    # backtests can exclude estimated receive times.
+                    # H4 trades may honestly carry NULL (api_reconciled): only
+                    # fill live rows (source is None/live); reconciled rows keep
+                    # NULL + ts_backfilled_ns.
+                    _is_reconciled = _is_tr and nr.get("source") == "api_reconciled"
+                    if nr.get("ts_received_ns") is None and "ts_received_ns" in _schema_names and not _is_reconciled:
                         nr["ts_received_ns"] = time.time_ns()
+                        if "ts_received_ns_estimated" in _schema_names:
+                            nr["ts_received_ns_estimated"] = True
                         try:
-                            self._ts_fill_count = getattr(self, "_ts_fill_count", {})
                             self._ts_fill_count[dataset] = self._ts_fill_count.get(dataset, 0) + 1
                             _n = self._ts_fill_count[dataset]
                             if self.on_event and (_n == 1 or _n % 1000 == 0):
                                 self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "ts_received_ns_estimated", "count": _n})
                         except Exception:
                             pass
+                    elif "ts_received_ns_estimated" in _schema_names and nr.get("ts_received_ns_estimated") is None:
+                        # explicit False when the producer supplied a real clock
+                        if nr.get("ts_received_ns") is not None and not _is_reconciled:
+                            nr["ts_received_ns_estimated"] = False
                     if nr.get("ts_utc") is None and _is_coll and "ts_utc" in nr:
                         nr["ts_utc"] = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
                     # Snapshot bucket time is event time — never fabricate it at
@@ -1146,11 +1235,33 @@ class ParquetWriter:
             # Python sort (downstream readers sort anyway per E13).
 
         # Write atomically: temp file + rename (§10A compaction same pattern)
-        # Use meaningful filename: {dataset}_{timestamp_ms}.parquet instead of part-<random>
-        ts_ms = int(time.time() * 1000)
-        part_name = f"{dataset}_{ts_ms}.parquet"
+        # C2 (audit 2026-09-19): collision-proof names {dataset}_{ns}_{pid}_{ctr}.
+        # The old {dataset}_{ms} name let two asset groups in one flush (same
+        # ms, same date-only dir) overwrite each other via os.replace.
+        # Refuse to overwrite: bump the counter while the candidate exists.
+        try:
+            self._file_counter += 1
+        except Exception:
+            self._file_counter = 1
+        try:
+            _pid = os.getpid()
+        except Exception:
+            _pid = 0
+        _ns = time.time_ns()
+        part_name = f"{dataset}_{_ns}_{_pid}_{self._file_counter}.parquet"
         tmp_path = out_dir / f"{part_name}.tmp"
         final_path = out_dir / part_name
+        try:
+            while final_path.exists():
+                try:
+                    self._file_counter += 1
+                except Exception:
+                    break
+                part_name = f"{dataset}_{time.time_ns()}_{_pid}_{self._file_counter}.parquet"
+                tmp_path = out_dir / f"{part_name}.tmp"
+                final_path = out_dir / part_name
+        except Exception:
+            pass
         # If a previous part exists for same date/asset, we append as new file (not overwrite)
         try:
             pq.write_table(table, str(tmp_path), compression="zstd")
@@ -1197,6 +1308,22 @@ class ParquetWriter:
                         pass
             except Exception:
                 pass
+        except Exception:
+            pass
+        # C2: never overwrite an existing part file. Names are unique
+        # (ns+pid+counter) so this is defense-in-depth only.
+        try:
+            if final_path.exists():
+                try:
+                    self._file_counter += 1
+                except Exception:
+                    pass
+                part_name = f"{dataset}_{time.time_ns()}_{_pid}_{self._file_counter}.parquet"
+                final_path = out_dir / part_name
+                if final_path.exists():
+                    raise FileExistsError(str(final_path))
+        except FileExistsError:
+            raise
         except Exception:
             pass
         _os_replace_safe(tmp_path, final_path)

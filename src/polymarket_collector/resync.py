@@ -33,6 +33,8 @@ class ResyncEpisode:
     gap_duration_ms: Optional[int] = None
     snapshots_missed_estimate: Optional[int] = None
     resync_attempt_count: int = 0
+    # H3: detection time vs last-frame time (disconnect_ts is backdated to last frame)
+    detected_ts_utc: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -47,6 +49,7 @@ class ResyncEpisode:
             "gap_duration_ms": self.gap_duration_ms,
             "snapshots_missed_estimate": self.snapshots_missed_estimate,
             "resync_attempt_count": self.resync_attempt_count,
+            "detected_ts_utc": self.detected_ts_utc,
         }
 
 
@@ -75,6 +78,14 @@ class ResyncManager:
     # counts them (honest accounting) — the REST snapshot supplies the base book,
     # so replay correctness is preserved for the retained tail.
     MAX_BUFFERED_MSGS_PER_EPISODE = 50_000
+    # C4 (audit 2026-09-16): max age of an episode's replay buffer. A resync
+    # that never completes (expired-window 404 loop) kept every live WS
+    # message feeding a dead deque for hours — 1.36M drops in one XRP
+    # episode. Past this age the buffer is retired: new messages are no
+    # longer appended (one `resync_buffer_retired` event, then silence) so
+    # live traffic flows to books directly instead of loss-theater.
+    # Multiple of the REST-escalation horizon so healthy slow resyncs fit.
+    BUFFER_AGE_FACTOR = 5
 
     def __init__(
         self,
@@ -96,6 +107,33 @@ class ResyncManager:
         # bookkeeping so finished-episode eviction can classify them
         self._escalated: set = set()
         self._buffer_dropped_total: Dict[str, int] = {}
+        # C4: monotonic deadlines per buffer (retire zombie feeds) + retired set
+        self._buffer_deadline: Dict[str, float] = {}
+        self._buffer_retired: set = set()
+
+    def _buffer_age_limit_s(self) -> float:
+        try:
+            base = float(getattr(getattr(self.config, "ws", self.config), "max_resync_duration_seconds", 60))
+        except Exception:
+            base = 60.0
+        return max(60.0, base * self.BUFFER_AGE_FACTOR)
+
+    def buffer_live(self, resync_id: str) -> bool:
+        """True if resync_id may still receive buffered WS messages."""
+        try:
+            if resync_id in self._escalated or resync_id in self._buffer_retired:
+                return False
+            if resync_id not in self._buffers:
+                return False
+            ep = self._episodes.get(resync_id)
+            if ep is not None and ep.resync_completed_ts_utc is not None:
+                return False
+            dl = self._buffer_deadline.get(resync_id)
+            if dl is not None and time.monotonic() > dl:
+                return False
+            return True
+        except Exception:
+            return False
 
     def is_finished(self, resync_id: str) -> bool:
         ep = self._episodes.get(resync_id)
@@ -122,23 +160,38 @@ class ResyncManager:
                 self._buffers.pop(rid, None)
                 self._escalated.discard(rid)
                 self._buffer_dropped_total.pop(rid, None)
+                self._buffer_deadline.pop(rid, None)
+                self._buffer_retired.discard(rid)
                 evicted += 1
 
     # -- disconnect --------------------------------------------------------
-    def handle_disconnect(self, asset: str, condition_id: Optional[str], reason: str, books: Dict[str, OrderBookState]) -> str:
-        """Mark books stale, create episode, return resync_id."""
+    def handle_disconnect(self, asset: str, condition_id: Optional[str], reason: str, books: Dict[str, OrderBookState], last_frame_ms: Optional[int] = None) -> str:
+        """Mark books stale, create episode, return resync_id.
+
+        H3: disconnect_ts_utc is backdated to the last frame time when known
+        (gap_duration honest); detected_ts_utc carries wall-clock detection.
+        """
         resync_id = str(uuid.uuid4())
         now_iso = _now_iso()
+        try:
+            _disc_iso = now_iso
+            if last_frame_ms is not None:
+                import datetime as _dtm
+                _disc_iso = _dtm.datetime.fromtimestamp(last_frame_ms / 1000, tz=_dtm.timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            _disc_iso = now_iso
         ep = ResyncEpisode(
             resync_id=resync_id,
             asset=asset.upper(),
             condition_id=condition_id,
-            disconnect_ts_utc=now_iso,
+            disconnect_ts_utc=_disc_iso,
             disconnect_reason=reason,
             resync_attempt_count=0,
+            detected_ts_utc=now_iso,
         )
         self._episodes[resync_id] = ep
         self._buffers[resync_id] = deque()
+        self._buffer_deadline[resync_id] = time.monotonic() + self._buffer_age_limit_s()
         self._evict_finished_episodes()  # after insert: guarantees len(_episodes) <= cap
         # mark each affected book
         for key, book in books.items():
@@ -171,10 +224,9 @@ class ResyncManager:
             ep.snapshots_missed_estimate = gap_ms // 500
         except Exception:
             pass
-        # ensure rest_fetch timestamp not 100% null: mark fetch attempt time on reconnect (honest gap even if REST not yet tried)
+        # M2: rest_fetch stays NULL until a real REST fetch is attempted in
+        # resync() (was set here at reconnect even when no fetch happened).
         # Do NOT auto-mark completed for quick gaps — require real REST resync via resync() for honest gap per AGENT.md
-        if ep.resync_rest_fetch_ts_utc is None:
-            ep.resync_rest_fetch_ts_utc = now_iso
         if self.on_event:
             self.on_event(CollectorEventType.ws_reconnected, ep.to_dict())
         if self.on_episode_persist:
@@ -186,6 +238,23 @@ class ResyncManager:
     # -- buffering during REST fetch ---------------------------------------
     def buffer_message(self, resync_id: str, msg: dict) -> None:
         if resync_id in self._buffers:
+            # C4: retired/dead buffers refuse silently after one honest event.
+            if not self.buffer_live(resync_id):
+                if resync_id not in self._buffer_retired and resync_id in self._episodes:
+                    self._buffer_retired.add(resync_id)
+                    if self.on_event:
+                        try:
+                            _ep = self._episodes.get(resync_id)
+                            self.on_event(CollectorEventType.book_anomaly, {
+                                "resync_id": resync_id,
+                                "asset": _ep.asset if _ep is not None else None,
+                                "reason": "resync_buffer_retired",
+                                "dropped_total": self._buffer_dropped_total.get(resync_id, 0),
+                                "cap": self.MAX_BUFFERED_MSGS_PER_EPISODE,
+                            })
+                        except Exception:
+                            pass
+                return
             q = self._buffers[resync_id]
             if len(q) >= self.MAX_BUFFERED_MSGS_PER_EPISODE:
                 # honest overflow: count every drop, emit an event (throttled) —
@@ -195,8 +264,10 @@ class ResyncManager:
                 if dropped == 1 or dropped % 1000 == 0:
                     if self.on_event:
                         try:
+                            _ep = self._episodes.get(resync_id)
                             self.on_event(CollectorEventType.book_anomaly, {
                                 "resync_id": resync_id,
+                                "asset": _ep.asset if _ep is not None else None,
                                 "reason": "resync_buffer_overflow",
                                 "dropped_total": dropped,
                                 "cap": self.MAX_BUFFERED_MSGS_PER_EPISODE,
@@ -214,6 +285,12 @@ class ResyncManager:
         """
         ep = self._episodes.get(resync_id)
         if not ep:
+            return False
+        # Audit 2026-09-16: an escalated episode is final (buffer dead, REST
+        # target gone/refused). Re-driving it burns 60s of retries per call
+        # and re-escalates forever — no-op so books stay honestly stale until
+        # a genuinely new disconnect opens a fresh episode.
+        if resync_id in self._escalated:
             return False
 
         # Ensure reconnect timestamp is set before first REST fetch (fixes 100% null gap_duration)
@@ -299,6 +376,8 @@ class ResyncManager:
                         pass
                 # cleanup buffer
                 self._buffers.pop(resync_id, None)
+                self._buffer_deadline.pop(resync_id, None)
+                self._buffer_retired.discard(resync_id)
                 return True
 
             except Exception as e:
@@ -335,7 +414,7 @@ class ResyncManager:
                         except Exception:
                             pass
                     if self.on_event:
-                        self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed})
+                        self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed, "asset": ep.asset, "condition_id": ep.condition_id})
                     # P0 leak hunt session 2: an escalated episode must stop
                     # consuming buffers. It can never complete (its REST target is
                     # gone or refused), so leaving it open + buffered meant
@@ -343,6 +422,8 @@ class ResyncManager:
                     # asset into a never-consumed deque — unbounded (leak #2).
                     # The episode record itself is kept (honest, already persisted).
                     self._buffers.pop(resync_id, None)
+                    self._buffer_deadline.pop(resync_id, None)
+                    self._buffer_retired.discard(resync_id)
                     self._escalated.add(resync_id)
                     return False
                 # backoff before retry (independent of WS reconnect backoff)
@@ -386,6 +467,47 @@ class ResyncManager:
 
     def get_episode(self, resync_id: str) -> Optional[ResyncEpisode]:
         return self._episodes.get(resync_id)
+
+    def supersede_episode(self, resync_id: str, reason: str, extra: Optional[dict] = None) -> bool:
+        """Close an open episode that can never complete (audit 2026-09-16 C2).
+
+        Used when the episode's market window already ended: REST resync of
+        an expired condition 404s forever, so re-driving it every recycle
+        burns a full max_duration retry loop for nothing. Closes the gap
+        honestly (reconnect timestamp set, resync_failed with
+        superseded=True) and frees the buffer. Returns False if there was
+        no open episode to close.
+        """
+        ep = self._episodes.get(resync_id)
+        if ep is None or self.is_finished(resync_id):
+            return False
+        try:
+            if ep.reconnect_ts_utc is None:
+                self.handle_reconnect(resync_id)
+        except Exception:
+            pass
+        if self.on_event:
+            try:
+                payload = {"resync_id": resync_id, "superseded": True, "reason": reason,
+                           "asset": ep.asset, "condition_id": ep.condition_id}
+                if extra:
+                    payload.update(extra)
+                self.on_event(CollectorEventType.resync_failed, payload)
+            except Exception:
+                pass
+        if self.on_episode_persist:
+            try:
+                d = ep.to_dict()
+                d["superseded"] = True
+                d["supersede_reason"] = reason
+                self.on_episode_persist(d)
+            except Exception:
+                pass
+        self._buffers.pop(resync_id, None)
+        self._buffer_deadline.pop(resync_id, None)
+        self._buffer_retired.discard(resync_id)
+        self._escalated.add(resync_id)
+        return True
 
     def all_episodes(self) -> List[ResyncEpisode]:
         return list(self._episodes.values())

@@ -41,7 +41,10 @@ kaggle:
   # 2026-09-09: 48h -> 12h — 28 lanes burn ~500MB/h (every lane ticks 500ms
   # + clean-view duplicate + 4x staging); 48h retention = ~24GB > 14GB free.
   # 12h steady state ~= 6GB. Kaggle versions are rolling windows by design.
-  local_retention_hours: 12
+  # 2026-09-18: 12h -> 6h — 19GB box, 4.7GB free; 6h ~= 3GB fits. Floor with
+  # 5 lanes x 1h round-robin (lane cycle ~5h); do not go lower without
+  # dropping lanes or shortening upload_interval.
+  local_retention_hours: 6
   test_upload_interval_seconds: 600
   # 2026-09-10: restored 3600 — streaming export bounds staging peak to
   # ~one source file, verified 186k rows at 392MB peak (was 2.2GB+ death).

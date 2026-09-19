@@ -228,7 +228,7 @@ class BookSnapshot:
     # depth aggregates
     depths: Dict[str, Optional[float]]
     # state
-    market_time_remaining_ms: int
+    market_time_remaining_ms: Optional[int]
     up_book_age_ms: Optional[int]
     down_book_age_ms: Optional[int]
     is_rollover_window: bool
@@ -289,7 +289,7 @@ class OrderBookState:
         window_index: int,
         up_token_id: str,
         down_token_id: str,
-        market_end_ts_ms: int,
+        market_end_ts_ms: Optional[int],
         schema_version: str = "3.0.0",
         l2_levels: int = 10,
     ):
@@ -305,9 +305,15 @@ class OrderBookState:
         self.window_index = window_index
         self.up_token_id = up_token_id
         self.down_token_id = down_token_id
+        # H1 (audit 2026-09-19): may be None on cursor recovery (honest
+        # unknown, never now+lane fabrication). Healed from the market object.
         self.market_end_ts_ms = market_end_ts_ms
         self.schema_version = schema_version
         self.l2_levels = l2_levels
+        # H2: hold full depth in RAM (truncate only on snapshot write).
+        # L2 output stays at l2_levels columns; RAM keeps up to 100 levels so
+        # level 11+ survives top-of-book removals.
+        self._ram_levels = max(l2_levels, 100)
 
         self.up = OutcomeBook()
         self.down = OutcomeBook()
@@ -342,7 +348,22 @@ class OrderBookState:
             "size_change_threshold_pct": 0.10,
         }
 
-    # -- A1 frame-timestamp helpers --------------------------------------
+    def heal_market_end(self, market_end_ts_ms: Optional[int]) -> bool:
+        """Fill a missing market_end_ts_ms from discovery (audit 2026-09-19 H1).
+
+        Cursor recovery leaves it None (honest unknown); the live market
+        object carries the real end time. Only fills when currently None.
+        """
+        if self.market_end_ts_ms is not None:
+            return False
+        if market_end_ts_ms is None:
+            return False
+        try:
+            self.market_end_ts_ms = int(market_end_ts_ms)
+            return True
+        except Exception:
+            return False
+
     def heal_market_id(self, market_id: Optional[str]) -> bool:
         """Fill a missing market_id from later discovery (audit 2026-09-16 M1).
 
@@ -695,9 +716,14 @@ class OrderBookState:
                     self._apply_price_change_level(side_book, my_best, 0.0, side == "bid")
                 continue
             if my_best is None:
-                # exchange reports a best on a side we hold empty — leave it; the
-                # next full `book` event fills the side. (Marking stale here caused
-                # a stale churn on thin books, since deltas arrive before snapshots.)
+                # H2: exchange reports a best on a side we hold empty while
+                # RAM holds full depth -> our view is missing real liquidity.
+                # Mark stale so snapshots don't read as empty-but-live; the
+                # next full `book` frame or REST heal refills the side.
+                try:
+                    self.mark_stale()
+                except Exception:
+                    pass
                 continue
             if abs(my_best - ex_best) > tick:
                 # Honest-gap removal: drop the stale best level instead of
@@ -779,19 +805,20 @@ class OrderBookState:
                 price_map[price] = Level(price=price, size=size)
             items = list(price_map.values())
             items.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
-            filtered = [lvl for lvl in items if lvl.price is not None][: self.l2_levels]
-            while len(filtered) < self.l2_levels:
+            filtered = [lvl for lvl in items if lvl.price is not None][: self._ram_levels]
+            while len(filtered) < self._ram_levels:
                 filtered.append(Level(price=None, size=None))
             side.levels = filtered
             return
         if size == 0 or price == 0:
             # Removal: drop ALL exact matches (dict.pop collapsed dupes).
             # Order preserved (already sorted), then re-pad null tail.
+            # H2: RAM keeps full depth; snapshot truncates to l2_levels.
             kept = [lvl for lvl in side.levels if not (lvl.price is not None and lvl.price == price)]
-            while len(kept) < self.l2_levels:
+            while len(kept) < self._ram_levels:
                 kept.append(Level(price=None, size=None))
-            side.levels = kept[: self.l2_levels]
-            while len(side.levels) < self.l2_levels:
+            side.levels = kept[: self._ram_levels]
+            while len(side.levels) < self._ram_levels:
                 side.levels.append(Level(price=None, size=None))
             return
         # Update in place when the exact price rests (no reorder needed).
@@ -820,8 +847,8 @@ class OrderBookState:
         else:
             idx = n
         side.levels.insert(idx, new_lvl)
-        del side.levels[self.l2_levels :]
-        while len(side.levels) < self.l2_levels:
+        del side.levels[self._ram_levels :]
+        while len(side.levels) < self._ram_levels:
             side.levels.append(Level(price=None, size=None))
 
     def _apply_levels(self, side: SideBook, levels: list, is_bid: bool) -> None:
@@ -868,9 +895,10 @@ class OrderBookState:
         # sort best-first
         new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
         # FULL REPLACE (book events are complete side snapshots from the exchange)
-        side.levels = new_levels[: self.l2_levels]
-        # pad with null levels to l2_levels for snapshot uniformity
-        while len(side.levels) < self.l2_levels:
+        # H2: RAM keeps full depth; snapshot() truncates to l2_levels on write.
+        side.levels = new_levels[: self._ram_levels]
+        # pad with null levels to _ram_levels for uniformity
+        while len(side.levels) < self._ram_levels:
             side.levels.append(Level(price=None, size=None))
 
     def replace_from_rest_snapshot(self, snapshot: dict) -> None:
@@ -911,8 +939,8 @@ class OrderBookState:
                             continue  # M7: §3A bounds, same as WS path
                         new_levels.append(Level(price=p, size=s))
                 new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
-                side.levels = new_levels[: self.l2_levels]
-                while len(side.levels) < self.l2_levels:
+                side.levels = new_levels[: self._ram_levels]
+                while len(side.levels) < self._ram_levels:
                     side.levels.append(Level(price=None, size=None))
         # update sequence if snapshot carries cursor
         for tok_key in (self.up_token_id, self.down_token_id):
@@ -1035,8 +1063,12 @@ class OrderBookState:
             depths[f"{outcome_key}_{side_key}_depth_5c"] = d5
             depths[f"{outcome_key}_{side_key}_depth_10c"] = d10
 
-        # market_time_remaining
-        remaining = max(0, self.market_end_ts_ms - bucket_ms)
+        # market_time_remaining — H1: None when end unknown (cursor recovery
+        # before heal), never fabricated now+lane.
+        try:
+            remaining = max(0, self.market_end_ts_ms - bucket_ms) if self.market_end_ts_ms is not None else None
+        except Exception:
+            remaining = None
         # crossed from cached raws (identical to is_crossed()).
         crossed = False
         if up_bid_raw is not None and up_ask_raw is not None and (up_bid_raw - up_ask_raw) > 1e-9:

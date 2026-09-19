@@ -251,14 +251,17 @@ def stream_batches(
                 yielded_any = True
                 yield t
             if stats is not None:
-                # Failed only when batches errored AND nothing usable came
-                # out. Clean reads (fully lane-filtered, schema-empty) are ok.
-                if transform_errored and not yielded_any:
+                # M4: fail CLOSED — any errored batch fails the file even when
+                # other batches yielded (was: ok unless EVERY batch failed, so
+                # one bad batch silently dropped up to 20k rows from coverage).
+                if transform_errored:
                     stats["files_failed"] += 1
                     try:
                         stats["failed_bytes"] += p.stat().st_size
                     except OSError:
                         pass
+                elif yielded_any or read_any:
+                    stats["files_ok"] += 1
                 else:
                     stats["files_ok"] += 1
             _ = read_any  # documents the loop ran; kept for clarity

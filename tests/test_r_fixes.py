@@ -298,3 +298,41 @@ def test_r2_partial_fallback_ambiguous_stays_null(monkeypatch):
     streamed = [r for r in rows if r["trade_id"] == "t-amb"][0]
     assert streamed["maker_wallet"] == "0xmaker"
     assert streamed["taker_wallet"] is None, "ambiguous tx pool must stay NULL, never guessed"
+
+
+def test_r3_zero_fee_market_reconciled_rows_keep_zero_fee(monkeypatch):
+    """Zero-fee markets (E7: streamed fee 0.0 with flag NULL) must still
+    infer rate 0.0 — reconciled api- rows get fee 0.0, not NULL.
+
+    Regression: the rate gate required flag False, so on current markets
+    (all streamed rows flag NULL) the rate set stayed empty and every
+    reconciled row came out fee=NULL next to streamed 0.0 rows."""
+    taker_rows = [
+        {"transactionHash": "0xe" * 8, "proxyWallet": "0xw9", "side": "BUY",
+         "asset": "up-tok", "price": 0.6, "size": 5.0, "timestamp": time.time() - 50,
+         "outcome": "Up"},
+    ]
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResp(taker_rows)
+
+    import httpx
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    # streamed exactly as the collector writes zero-fee markets today
+    streamed_row = _trade_row(trade_id="t-z", transaction_hash="0xb" * 8,
+                              fee=0.0, fee_is_estimated=None)
+    table = pa.Table.from_pylist([streamed_row], schema=TRADES_SCHEMA)
+    out = _backfill_trade_wallets(table, Path("."), asset="BTC")
+    rows = out.to_pylist()
+    api_rows = [r for r in rows if str(r["trade_id"]).startswith("api-")]
+    assert len(api_rows) == 1, f"expected 1 reconciled row, got {len(api_rows)}"
+    assert api_rows[0]["fee"] == 0.0, "zero-fee market reconcile must keep 0.0, not NULL"
+    assert api_rows[0]["fee_is_estimated"] is None  # E7: 0-fee flag N/A
+    # E1: reconciled rows never carry the hex condition_id as market_id
+    assert api_rows[0]["market_id"] in ("mid-r2", None)
+    assert api_rows[0]["market_id"] != "cid-r2"
+    # deterministic ids: same fill re-reconciled → same trade_id
+    out2 = _backfill_trade_wallets(table, Path("."), asset="BTC")
+    ids2 = sorted(r["trade_id"] for r in out2.to_pylist() if str(r["trade_id"]).startswith("api-"))
+    assert sorted(r["trade_id"] for r in api_rows) == ids2

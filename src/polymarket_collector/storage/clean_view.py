@@ -31,7 +31,7 @@ def _os_replace_safe(src, dst):
     _os.replace(str(src), str(dst))
 
 
-from .parquet_io import read_table, concat as _concat_tables
+from .parquet_io import read_table, read_files, concat as _concat_tables
 import pyarrow.compute as pc
 
 
@@ -131,7 +131,17 @@ def build_clean_view(
                         (p for p in asset_dir.glob("*.parquet")),
                         key=lambda p: p.stat().st_mtime,
                     )
-                    _new_files = [p for p in _src_files if p.stat().st_mtime > _out_mtime]
+                    # M3: manifest of already-processed sources (the old pure-mtime
+                    # check orphaned the uncapped remainder: after a capped sidecar
+                    # write, remaining sources were OLDER than the new sidecar mtime
+                    # and never picked up again -> permanent loss).
+                    try:
+                        import json as _js_m
+                        _manifest_p = out_dir / "_clean_manifest.json"
+                        _done = set(_js_m.loads(_manifest_p.read_text())) if _manifest_p.exists() else set()
+                    except Exception:
+                        _done = set()
+                    _new_files = [p for p in _src_files if p.stat().st_mtime > _out_mtime or p.name not in _done]
                     if not _new_files:
                         continue  # fresh — skip rebuild of this partition
                     # byte-capped oldest-first slice; the rest converge later
@@ -236,6 +246,27 @@ def build_clean_view(
             pq.write_table(filtered, str(tmp_path), compression="zstd")
             _os_replace_safe(tmp_path, _dest)
             written += filtered.num_rows
+            # M3: record processed sources so capped remainders converge next call
+            try:
+                import json as _js_w
+                _manifest_p = out_dir / "_clean_manifest.json"
+                _prev = set()
+                try:
+                    if _manifest_p.exists():
+                        _prev = set(_js_w.loads(_manifest_p.read_text()))
+                except Exception:
+                    _prev = set()
+                try:
+                    for _cp in locals().get("_capped", []):
+                        try:
+                            _prev.add(_cp.name)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                _manifest_p.write_text(_js_w.dumps(sorted(_prev)))
+            except Exception:
+                pass
 
     if _unreadable:
         print(f"[clean_view] skipped {_unreadable} unreadable file(s) (fail open per-file; see quarantine for healing)")

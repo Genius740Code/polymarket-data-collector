@@ -451,18 +451,22 @@ def _fee_rate_vote(fee, fee_is_estimated, notional):
     return None
 
 
-def _api_trade_id(txh: str, price, size) -> str:
-    """Deterministic reconciled-row id from the fill key.
+def _api_trade_id(txh: str, price, size, ordinal: int = 0) -> str:
+    """Deterministic reconciled-row id from the fill key + occurrence ordinal.
 
-    Same fill → same id across reruns/builds (the old per-build counter
-    suffix made ids order-dependent). Distinct fills never share a
-    (tx_hash, price, size) key, so this cannot merge distinct rows.
+    H4: identical maker fills in one tx previously merged (same tx/price/size
+    key). The ordinal (0-based occurrence within the tx key) disambiguates them
+    while staying deterministic across rebuilds. Ordinal 0 keeps the legacy
+    id format so existing api- rows don't duplicate on first rebuild.
     """
     import hashlib as _hl
     try:
-        key = f"{(txh or '').lower()}|{round(float(price), 6)}|{round(float(size), 6)}"
+        if int(ordinal or 0) == 0:
+            key = f"{(txh or '').lower()}|{round(float(price), 6)}|{round(float(size), 6)}"
+        else:
+            key = f"{(txh or '').lower()}|{round(float(price), 6)}|{round(float(size), 6)}|{int(ordinal)}"
     except Exception:
-        key = f"{(txh or '').lower()}|{price}|{size}"
+        key = f"{(txh or '').lower()}|{price}|{size}|{ordinal}"
     return f"api-{_hl.sha1(key.encode()).hexdigest()[:16]}"
 
 
@@ -583,6 +587,19 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 for r in rs if r.get("transaction_hash") and r.get("price") is not None and r.get("size") is not None
             )
             series_mode = collections.Counter(r.get("series_id") for r in rs).most_common(1)[0][0] if rs else None
+            # H4: lane-aware window size for widx (was hardcoded //300 = 5m only)
+            try:
+                _wsec = None
+                for _rr in rs:
+                    _wsec = _rr.get("window_size_seconds")
+                    if _wsec:
+                        break
+                if not _wsec and series_mode:
+                    _sfx = str(series_mode).rsplit("-", 1)[-1].lower()
+                    _wsec = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(_sfx, 300)
+                _wsec = int(_wsec) if _wsec else 300
+            except Exception:
+                _wsec = 300
             fee_rate: Optional[float] = None
             rates: set = set()
             for r in rs:
@@ -593,6 +610,8 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 fee_rate = rates.pop()
             oldest_needed_ms = min((_row_ts_ms(r) for r in rs), default=None)
             api_rows = _fetch_market_trades(cid, taker_only=True, oldest_needed_ms=oldest_needed_ms)
+            # H4: occurrence ordinal per (tx,price,size) so identical maker fills don't merge
+            _ord_seen: dict = {}
             for t in api_rows:
                 txh = (t.get("transactionHash") or "").lower()
                 try:
@@ -605,7 +624,7 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 w = t.get("proxyWallet") or t.get("wallet")
                 ts_ms = _api_ts_ms(t)
                 try:
-                    widx = int(ts_ms) // 1000 // 300 if ts_ms else (rs[0].get("window_index") or 0)
+                    widx = int(ts_ms) // 1000 // _wsec if ts_ms else (rs[0].get("window_index") or 0)
                 except Exception:
                     widx = rs[0].get("window_index") or 0
                 price_f = t.get("price"); size_f = t.get("size")
@@ -626,20 +645,27 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 leg_pools = legs_by_cid.get(cid)
                 if leg_pools:
                     maker_w = _unambiguous_wallet(leg_pools[1].get(k))
+                try:
+                    _ord = int(_ord_seen.get(k, 0))
+                    _ord_seen[k] = _ord + 1
+                except Exception:
+                    _ord = 0
                 rows_to_add.append({
                     "ts_source": ts_ms or None,
-                    # No true receive clock exists for Data-API reconciled rows
-                    # (they arrive minutes late via REST). Derive ns from the
-                    # event's own source clock — never export wall-time as
-                    # receive-time (wrong-clock PIT corruption).
-                    "ts_received_ns": int(ts_ms) * 1_000_000 if ts_ms else int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1e9),
+                    # H4: reconciled rows were never received live — NULL receive
+                    # clock + backfilled ns + source tag (DATA_CARD sort key stays honest).
+                    # Missing ts_ms stays NULL (never wall-clock: non-deterministic rebuilds).
+                    "ts_received_ns": None,
+                    "ts_received_ns_estimated": None,
+                    "source": "api_reconciled",
+                    "ts_backfilled_ns": int(ts_ms) * 1_000_000 if ts_ms else None,
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": rs[0].get("market_id") or None,
                     "series_id": series_mode or _lane_series_fallback(asset),
                     "window_index": int(widx) if widx is not None else 0,
                     "asset": (asset or rs[0].get("asset") or "").upper(),
-                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size")),
+                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size"), _ord),
                     "transaction_hash": txh or None,
                     "token_id": str(t.get("asset_id") or t.get("asset") or ""),
                     "outcome": _api_outcome_label(t) or "unknown",
@@ -657,8 +683,15 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                 })
                 inserted += 1
         if rows_to_add:
+            # H4 new cols (source/ts_backfilled_ns/estimated) survive even when
+            # the hive predates them: build without schema + promote (was:
+            # from_pylist(..., schema=combined.schema) which dropped extras).
+            try:
+                _add = pa.Table.from_pylist(rows_to_add)
+            except Exception:
+                _add = pa.Table.from_pylist(rows_to_add, schema=combined.schema)
             combined = pa.concat_tables(
-                [combined, pa.Table.from_pylist(rows_to_add, schema=combined.schema)],
+                [combined, _add],
                 **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True}),
             )
             print(f"[export] trade reconciliation: inserted {inserted} missing fills from data-api (CLOB stream coalesces liquid fills); fee derived for {fee_derived} rows from the market's exchange-reported rate")
@@ -716,7 +749,17 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
         _fee_rate = _ctx.get("fee_rate")
         _series_mode = _ctx.get("series_mode")
         _first = _ctx.get("first") or {}
+        # H4 lane-aware window (was hardcoded 5m)
+        try:
+            _wsec2 = _ctx.get("window_size_seconds") or _first.get("window_size_seconds")
+            if not _wsec2 and _series_mode:
+                _sfx2 = str(_series_mode).rsplit("-", 1)[-1].lower()
+                _wsec2 = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(_sfx2, 300)
+            _wsec2 = int(_wsec2) if _wsec2 else 300
+        except Exception:
+            _wsec2 = 300
         _rows_to_add = []
+        _ord_seen2: dict = {}
         for t in _taker:
             txh = (t.get("transactionHash") or "").lower()
             try:
@@ -729,7 +772,7 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
             w = t.get("proxyWallet") or t.get("wallet")
             ts_ms = _api_ts_ms(t)
             try:
-                widx = int(ts_ms) // 1000 // 300 if ts_ms else (_first.get("window_index") or 0)
+                widx = int(ts_ms) // 1000 // _wsec2 if ts_ms else (_first.get("window_index") or 0)
             except Exception:
                 widx = _first.get("window_index") or 0
             price_f = t.get("price"); size_f = t.get("size")
@@ -750,17 +793,25 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
             leg_pools = (pool_cache.get(cid) if pool_cache is not None else None)
             if leg_pools:
                 maker_w = _unambiguous_wallet(leg_pools[1].get(k))
+            try:
+                _ord2 = int(_ord_seen2.get(k, 0))
+                _ord_seen2[k] = _ord2 + 1
+            except Exception:
+                _ord2 = 0
             _rows_to_add.append({
                 "ts_source": ts_ms or None,
-                # Same source-derived receive clock as the per-table path above.
-                "ts_received_ns": int(ts_ms) * 1_000_000 if ts_ms else int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1e9),
+                # H4: NULL receive clock + source tag (never wall-clock).
+                "ts_received_ns": None,
+                "ts_received_ns_estimated": None,
+                "source": "api_reconciled",
+                "ts_backfilled_ns": int(ts_ms) * 1_000_000 if ts_ms else None,
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": _first.get("market_id") or None,
                     "series_id": _series_mode or _lane_series_fallback(asset),
                     "window_index": int(widx) if widx is not None else 0,
                     "asset": (asset or _first.get("asset") or "").upper(),
-                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size")),
+                    "trade_id": _api_trade_id(txh, t.get("price"), t.get("size"), _ord2),
                 "transaction_hash": txh or None,
                 "token_id": str(t.get("asset_id") or t.get("asset") or ""),
                 "outcome": _api_outcome_label(t) or "unknown",
@@ -1214,6 +1265,11 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
 def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: pa.Table) -> int:
     """B-5: persist export-time enrichment back into the hive trades partitions.
 
+    H4 (audit 2026-09-19): DISABLED by default — rewriting primary part files
+    makes the same trade differ between Kaggle versions (non-reproducible
+    history). Set ALLOW_HIVE_WRITEBACK=1 to opt back in. Enrichment lives in
+    staging only by default.
+
     Without this, anyone reading data/trades/ sees 100% NULL wallets — the
     enrichment only lived in the Kaggle staging build. Rules: fill NULLs ONLY
     (never overwrite a non-NULL value), rewrite only part files that actually
@@ -1221,6 +1277,12 @@ def _writeback_enriched_trades(data_dir: Path, asset: Optional[str], enriched: p
     complete and re-running is idempotent. api- rows (staging-only inserts)
     have no hive counterpart and are skipped. Returns files rewritten.
     """
+    try:
+        import os as _os_wb
+        if _os_wb.environ.get("ALLOW_HIVE_WRITEBACK") != "1":
+            return 0
+    except Exception:
+        return 0
     if enriched.num_rows == 0 or "trade_id" not in enriched.schema.names:
         return 0
     # field updates keyed by trade_id — only rows where a NULL got filled.
@@ -2036,7 +2098,7 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
         return table
 
 
-def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None, stats: Optional[dict] = None, deadline_s: Optional[float] = None, files: Optional[list] = None, reconcile: bool = True, pool_cache: Optional[dict] = None, writeback: bool = True) -> Optional[pa.Table]:
+def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None, stats: Optional[dict] = None, deadline_s: Optional[float] = None, files: Optional[list] = None, reconcile: bool = True, pool_cache: Optional[dict] = None, writeback: bool = False) -> Optional[pa.Table]:
     """Read all parquet files for dataset (+ optional asset filter).
 
     timeframe_label: when set, keep only rows whose series_id matches
@@ -2052,8 +2114,9 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     reconcile / pool_cache / writeback: trades-enrichment controls —
     reconcile=False skips api- inserts (the streaming driver inserts them
     once globally from a complete have-set); pool_cache shares per-market
-    leg pools across calls; writeback=False defers the hive write-back
-    (the driver does one narrow write-back at the end).
+    leg pools across calls; writeback=True OPT-IN hive write-back (H4: default
+    False — rewriting primary part files makes the same trade differ between
+    Kaggle versions; enrichment lives in staging only).
     """
     base = data_dir / dataset
     if not base.exists():
@@ -2593,20 +2656,21 @@ def _stream_export_asset_dataset(
                 # city assets never match `{asset}-{tf}` (old WEATHER branch
                 # was dead code — asset is e.g. HONG-KONG, never "WEATHER").
                 t = t.filter(_lane_series_mask(t.column("series_id"), want))
-            except Exception:
-                pass
+            except Exception as e:
+                # M4: fail CLOSED — a filter failure must not leak other-lane rows
+                raise RuntimeError(f"lane filter failed: {e}")
         if live_only and "book_state" in t.schema.names:
             try:
                 t = t.filter(pc.equal(t.column("book_state"), pa.scalar("live")))
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"live_only filter failed: {e}")
         if live_only and _excluded and "condition_id" in t.schema.names:
             # disputed exclusion (small set; per-batch mask, no pylist)
             try:
                 _bad = pc.is_in(t.column("condition_id"), value_set=pa.array(sorted(_excluded)))
                 t = t.filter(pc.invert(pc.fill_null(_bad, False)))
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(f"exclusion filter failed: {e}")
         # E1: heal hex market_ids (clean staging included — it must match
         # the raw staging file row-for-row on identity columns).
         if ds in ("book_snapshots_500ms", "book_snapshots_clean", "book_events") and market_id_map:
@@ -4284,7 +4348,8 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                             if len(remote_names) < len(expected_names):
                                 _remote_ok = False
                         except Exception:
-                            _remote_ok = True
+                            # C3: fail CLOSED (was True — any listing error authorized deletion)
+                            _remote_ok = False
                         if _rows_ok and _files_ok and _remote_ok:
                             print(f"✓ Kaggle dataset ready: {dataset} (local files={_expected_staging_files(staging)}, remote verified)")
                             _write_kaggle_state(staging, dataset, version_notes,
@@ -4705,12 +4770,22 @@ def cleanup_local_data(
         if dry_run:
             print(f"[prune] dry-run would delete {rel} ({rows} rows, {reason})")
             return
+        # C3: quarantine before delete (was direct unlink — a bad pass was
+        # unrecoverable with raw_archive disabled). Moves preserve the relpath
+        # under _quarantine/ for manual review/recovery.
         try:
-            p.unlink()
+            _q = base / "_quarantine" / rel
+            _q.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                import shutil as _sh_q
+                _sh_q.move(str(p), str(_q))
+            except Exception:
+                p.unlink()
             stats[rel] = rows
             pruned_rows += rows
+            print(f"[prune] quarantined {rel} ({rows} rows, {reason})")
         except Exception as e:
-            print(f"[prune] WARN could not delete {rel}: {e}")
+            print(f"[prune] WARN could not quarantine {rel}: {e}")
 
     import re as _re_prune
     _writer_pat = _re_prune.compile(r".+_\d+\.parquet$")

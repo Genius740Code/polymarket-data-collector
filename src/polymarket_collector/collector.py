@@ -183,6 +183,12 @@ class Collector:
         # drop/fan-out telemetry can never flood the writer (the 2026-09-05
         # book_events flood cost snapshots). First + every 1000th emits.
         self._ws_noise_throttle: Dict[str, int] = defaultdict(int)
+        # H3 (audit 2026-09-19): per-book last-frame clock (ns). A shard-level
+        # watchdog (30s no frames on the whole shard) leaves a single stalled
+        # token reading live for 30s (~60-70 phantom live rows). Books older
+        # than _BOOK_STALE_AFTER_S are marked stale with backdated disconnect.
+        self._last_frame_ns_per_book: Dict[str, int] = {}
+        self._BOOK_STALE_AFTER_S = 10
         # PERF CPU: one pooled REST client for CLOB book heals (keep-alive).
         # Previously every heal built 2-3 fresh AsyncClients (new TCP+TLS each).
         # Same GETs, same params, same merge logic.
@@ -234,7 +240,9 @@ class Collector:
                                     window_index=state.current_window_index or 0,
                                     up_token_id=f"{state.current_condition_id}-UP",
                                     down_token_id=f"{state.current_condition_id}-DOWN",
-                                    market_end_ts_ms=now_ms + ws_lane * 1000,
+                                    # H1: honest NULL (healed from the market object on
+                                    # discovery via heal_market_end) — never now+lane fabrication.
+                                    market_end_ts_ms=None,
                                     schema_version=self.config.schema_version,
                                     l2_levels=self.config.l2_levels,
                                 )
@@ -394,15 +402,22 @@ class Collector:
             row = {
                 "ts_source": coerce_ts_source_ms(ev.get("ts_source")),
                 "ts_received_ns": int(time.time_ns()),
+                "ts_received_ns_estimated": False,
                 "condition_id": book.condition_id,
                 "market_id": book.market_id,
                 "series_id": book.series_id,
-                "window_index": int(book.window_index),
+                # H6: window_index may be None on cursor-recovered books — fall
+                # back to 0 but never drop the event silently.
+                "window_index": int(book.window_index) if book.window_index is not None else 0,
                 "asset": _au,
                 "event_id": str(uuid.uuid4()),
                 "token_id": str(ev.get("token_id") or ""),
                 "outcome": _outcome,
                 "event_type": _etype,
+                # H6: preserve bbo_snapped payload (was all-NULL + dedup collapse)
+                "side": ev.get("side"),
+                "book_best": ev.get("book_best"),
+                "exchange_best": ev.get("exchange_best"),
                 "old_best_bid": ev.get("old_best_bid"),
                 "new_best_bid": ev.get("new_best_bid"),
                 "old_best_ask": ev.get("old_best_ask"),
@@ -416,8 +431,12 @@ class Collector:
             ok = self.writer.append("book_events", row, asset=_au)
             if not ok:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "book_events", "asset": asset})
-        except Exception:
-            pass
+        except Exception as e:
+            # H7: never swallow book-event failures silently
+            try:
+                self._collector_event(CollectorEventType.write_failed, {"dataset": "book_events", "error": str(e)[:200]})
+            except Exception:
+                pass
 
     def _handle_trade_message(self, msg: dict, asset: str, now_ns: int, now_bucket_ms: int | None = None) -> bool:
         """Parse a CLOB trade WS message and persist to trades with wallet — no RPC.
@@ -496,11 +515,8 @@ class Collector:
                 elif market and token_id == market.down_token_id:
                     outcome = "down"
                 else:
-                    # C3: unknown stays "unknown". The old
-                    # `"up" if msg.asset_id == token_id` comparison was
-                    # self-true whenever the token came from asset_id —
-                    # a fabricated "up" label.
-                    outcome = "unknown"
+                    # M6: unknown stays NULL (was "unknown" sentinel).
+                    outcome = None
             # M9: deterministic fallback trade_id from the fill key so redelivery
             # retries dedupe via (token_id, trade_id). A per-retry uuid4 made
             # every retry a distinct row.
@@ -552,8 +568,8 @@ class Collector:
             elif fee_rate_bps is not None and notional is not None:
                 try:
                     fee = round(notional * float(fee_rate_bps) / 10_000.0, 6)
-                    # amount derived from the exchange-reported rate — not a fallback guess
-                    fee_is_estimated = False
+                    # M9: derived from the rate -> True (exchange-reported amount is False only)
+                    fee_is_estimated = True
                 except Exception:
                     fee = None
                     fee_is_estimated = None
@@ -565,17 +581,22 @@ class Collector:
             row = {
                 "ts_source": ts_source,
                 "ts_received_ns": now_ns,
+                "ts_received_ns_estimated": False,
+                "source": "live",
+                "ts_backfilled_ns": None,
                 # C3: None stays None (never the string "None", never token_id).
                 "condition_id": str(condition_id) if condition_id else None,
                 # E1: unknown numeric id → NULL (never hex cid); E2: unknown window → NULL.
                 "market_id": market.market_id if (market and market.market_id) else None,
-                "series_id": market.series_id if market else f"{asset.upper()}-5m",
+                # M6: NULL when unresolvable (was f"{ASSET}-5m" fabrication)
+                "series_id": market.series_id if market else None,
                 "window_index": market.window_index if market else None,
                 "asset": asset.upper(),
                 "trade_id": trade_id,
                 "transaction_hash": tx_hash,
-                "token_id": token_id,
-                "outcome": str(outcome).lower() if outcome else "unknown",
+                # M6: NULL when unresolvable (was "" / "unknown" sentinels)
+                "token_id": token_id or None,
+                "outcome": str(outcome).lower() if outcome else None,
                 "price": price,
                 "size": size,
                 "notional": notional,
@@ -593,7 +614,13 @@ class Collector:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "trades", "asset": asset})
             # (trade rows are counted in the trades dataset — do NOT emit market_added here)
             return ok
-        except Exception:
+        except Exception as e:
+            # H7: never swallow trade failures silently — countable event
+            try:
+                self._emit_trade_drop("exception", asset if isinstance(asset, str) else "UNKNOWN")
+                self._collector_event(CollectorEventType.write_failed, {"dataset": "trades", "error": str(e)[:200]})
+            except Exception:
+                pass
             return False
 
     def _index_book(self, book: "OrderBookState") -> None:
@@ -819,7 +846,10 @@ class Collector:
                         any_success = True
             except Exception:
                 continue
-        if any_success and merged:
+        # M8: require BOTH outcomes — a single-sided heal leaves the other side
+        # on pre-disconnect levels while the book reads live.
+        _outcomes_ok = all(f"{_o}_bids" in merged and f"{_o}_asks" in merged for _o in ("up", "down"))
+        if any_success and merged and _outcomes_ok:
             try:
                 book.replace_from_rest_snapshot(merged)
             except Exception:
@@ -1123,7 +1153,8 @@ class Collector:
                             return str(_m.asset)
         except Exception:
             pass
-        return shard[0]
+        # M6: UNKNOWN when unresolvable (was shard[0] misattribution)
+        return "UNKNOWN"
 
     def _emit_rtds_drop(self, reason: str) -> None:
         """Throttled RTDS-drop telemetry (H4). First + every 1000th."""
@@ -1140,7 +1171,9 @@ class Collector:
 
     def _emit_trade_drop(self, reason: str, asset: str) -> None:
         """Throttled trade-drop telemetry (H3). Drops were silent; a feed sending
-        bad prices must be distinguishable from no feed. First + every 1000th."""
+        bad prices must be distinguishable from no feed. First + every 1000th.
+        H7: per-reason counters kept in _ws_noise_throttle; final totals emitted
+        at shutdown via _emit_drop_totals_final."""
         try:
             if not self.on_event:
                 return
@@ -1149,6 +1182,20 @@ class Collector:
             _c = self._ws_noise_throttle[_k]
             if _c == 1 or _c % 1000 == 0:
                 self.on_event(CollectorEventType.book_anomaly, {"asset": asset, "reason": f"trade_drop:{reason}", "dropped_total": _c})
+        except Exception:
+            pass
+
+    def _emit_drop_totals_final(self) -> None:
+        """H7: emit one final total per drop counter at shutdown (no sampling loss)."""
+        try:
+            if not self.on_event:
+                return
+            for _k, _c in list(getattr(self, "_ws_noise_throttle", {}).items()):
+                try:
+                    if _c and ("drop" in _k or "unroutable" in _k):
+                        self.on_event(CollectorEventType.book_anomaly, {"reason": f"final_{_k}", "dropped_total": int(_c)})
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -1279,6 +1326,11 @@ class Collector:
                                 if _exb is not None:
                                     try:
                                         _exb.heal_market_id(market.market_id)
+                                    except Exception:
+                                        pass
+                                    # H1: heal cursor-NULL end time from the market object
+                                    try:
+                                        _exb.heal_market_end(getattr(market, "market_end_ts_ms", None))
                                     except Exception:
                                         pass
                             except Exception:
@@ -1414,6 +1466,11 @@ class Collector:
                     if _ex is not None:
                         try:
                             _ex.heal_market_id(market.market_id)
+                        except Exception:
+                            pass
+                        # H1: heal cursor-NULL end time from the market object
+                        try:
+                            _ex.heal_market_end(getattr(market, "market_end_ts_ms", None))
                         except Exception:
                             pass
                 except Exception:
@@ -1687,6 +1744,12 @@ class Collector:
                                     msg_asset = self._resolve_msg_asset(single_msg, book, shard)
                                     try:
                                         applied, reason = book.apply_ws_message(single_msg)
+                                        # H3: per-book liveness clock (shard watchdog is 30s whole-shard)
+                                        if applied:
+                                            try:
+                                                self._last_frame_ns_per_book[book.condition_id] = time.time_ns()
+                                            except Exception:
+                                                pass
                                         # §4 book_events — threshold-driven BBO changes
                                         # captured inside apply_ws_message, drained here
                                         try:
@@ -1705,9 +1768,12 @@ class Collector:
                                                      "reason": reason},
                                                 )
                                             # Trigger resync/disconnect lifecycle on gap
+                                            # M12: pass the real wire seq (was hardcoded received=1)
                                             try:
+                                                _seq_raw = single_msg.get("sequence_number") or single_msg.get("seq")
+                                                _seq_int = int(_seq_raw) if _seq_raw is not None else 0
                                                 self.resync.handle_sequence_gap(
-                                                    msg_asset, book.condition_id, self.books, expected=int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0, received=1
+                                                    msg_asset, book.condition_id, self.books, expected=_seq_int, received=_seq_int
                                                 )
                                             except Exception:
                                                 pass
@@ -1741,6 +1807,28 @@ class Collector:
                                                     CollectorEventType.book_anomaly,
                                                     {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
                                                 )
+                                                # M10: sanity/crossed failures mint an orphan
+                                                # resync_id inside the book with no episode row.
+                                                # Link it honestly: create the episode when missing.
+                                                try:
+                                                    _rsn_l = str(reason or "").lower()
+                                                    if ("sanity" in _rsn_l or "crossed" in _rsn_l or "sequence_gap" in _rsn_l):
+                                                        _brid = getattr(book, "resync_id", None)
+                                                        try:
+                                                            _has_ep = _brid in getattr(self.resync, "_episodes", {})
+                                                        except Exception:
+                                                            _has_ep = False
+                                                        if not _has_ep:
+                                                            try:
+                                                                _new_rid = self.resync.handle_disconnect(msg_asset, book.condition_id, f"book_{reason}", {book.condition_id: book})
+                                                                try:
+                                                                    book.resync_id = _new_rid
+                                                                except Exception:
+                                                                    pass
+                                                            except Exception:
+                                                                pass
+                                                except Exception:
+                                                    pass
                                     except Exception as e:
                                         if self.on_event:
                                             self.on_event(
@@ -1805,10 +1893,25 @@ class Collector:
                     for _ca in shard:
                         self._ws_connected[_ca.upper()] = False
                 if planned_recycle:
-                    # B-3 light recycle: the swap is ours and takes ~1s — no
-                    # disconnect episode, no REST resync; the fresh connection's
-                    # full book relives the books. ws_connected=False already
-                    # downgrades snapshots to stale for the swap window (honest).
+                    # H3: planned recycles leave a trade gap in the swap window.
+                    # Emit a planned_recycle episode per asset (honest gap) — the
+                    # fresh connection's full book relives the books. ws_connected
+                    # =False already downgrades snapshots to stale for the window.
+                    try:
+                        for _ca in shard:
+                            _cid0 = None
+                            try:
+                                _act0 = self.rollover.active_markets(_ca)
+                                if _act0:
+                                    _cid0 = _act0[0].condition_id
+                            except Exception:
+                                pass
+                            try:
+                                self.resync.handle_disconnect(_ca, _cid0, reason="planned_recycle", books=self.books)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     planned_recycle = False
                     continue
                 resync_ids: dict = {}
@@ -1847,6 +1950,22 @@ class Collector:
                     if self._running:
                         for _ca in shard:
                             self._ws_connected[_ca.upper()] = False
+                    # H3: record the recycle as an episode (trade-gap honest)
+                    try:
+                        for _ca in shard:
+                            try:
+                                _cidr = None
+                                try:
+                                    _actr = self.rollover.active_markets(_ca)
+                                    if _actr:
+                                        _cidr = _actr[0].condition_id
+                                except Exception:
+                                    pass
+                                self.resync.handle_disconnect(_ca, _cidr, reason="planned_recycle", books=self.books)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     planned_recycle = False
                     continue
                 # Transient disconnect — mark stale, request resync, then reconnect
@@ -2004,11 +2123,14 @@ class Collector:
                                      "reason": reason},
                                 )
                             # Trigger resync/disconnect lifecycle on gap
+                            # M12: pass the real wire seq (was hardcoded received=1)
                             try:
+                                _seq_raw2 = msg.get("sequence_number") or msg.get("seq")
+                                _seq_int2 = int(_seq_raw2) if _seq_raw2 is not None else 0
                                 self.resync.handle_sequence_gap(
                                     asset, book.condition_id, self.books,
-                                    expected=int(seq) if (seq := msg.get("sequence_number") or msg.get("seq")) else 0,
-                                    received=1
+                                    expected=_seq_int2,
+                                    received=_seq_int2
                                 )
                             except Exception:
                                 pass
@@ -2196,6 +2318,32 @@ class Collector:
                                     pass
                                 self.books[m.condition_id] = book
                                 self._index_book(book)
+                            # H3: per-book staleness — a single stalled token must
+                            # not read live for 30s waiting for the shard watchdog.
+                            # Backdate the disconnect to the last frame time.
+                            try:
+                                _last_ns = self._last_frame_ns_per_book.get(m.condition_id)
+                                if _last_ns is not None and getattr(book.book_state, "value", "") == "live":
+                                    _age_s = (time.time_ns() - _last_ns) / 1e9
+                                    if _age_s > float(getattr(self, "_BOOK_STALE_AFTER_S", 10)):
+                                        _last_ms = int(_last_ns // 1_000_000)
+                                        try:
+                                            _rid = self.resync.handle_disconnect(
+                                                m.asset, m.condition_id, "book_stalled",
+                                                {m.condition_id: book},
+                                                last_frame_ms=_last_ms,
+                                            )
+                                        except TypeError:
+                                            # old signature fallback
+                                            _rid = self.resync.handle_disconnect(m.asset, m.condition_id, "book_stalled", {m.condition_id: book})
+                                        except Exception:
+                                            _rid = None
+                                        try:
+                                            book.mark_stale(resync_id=_rid or str(uuid.uuid4()))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
                             # If book is still empty (any side empty), bootstrap via REST only (never synthetic)
                             # Only on first bucket of catch-up batch to avoid N REST calls per stall
                             # PERF: single tops() scan feeds heal + anomaly (was
@@ -2254,12 +2402,25 @@ class Collector:
                                 except Exception:
                                     row["is_rollover_window"] = False
                             except Exception as e:
-                                # Preserve actual book_state (fixes 5a hard-coded live) and emit full schema row
+                                # H8: snapshot() raised — systematic error, never
+                                # emit empty-but-live. Force stale + countable event.
+                                # Preserve real state only if already stale/resyncing.
                                 _bs = getattr(book, "book_state", None)
                                 try:
                                     _bs_val = _bs.value if hasattr(_bs, "value") else str(_bs) if _bs else "stale"
                                 except Exception:
                                     _bs_val = "stale"
+                                if _bs_val == "live":
+                                    _bs_val = "stale"
+                                try:
+                                    self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "reason": "snapshot_error", "error": str(e)[:200]})
+                                except Exception:
+                                    pass
+                                try:
+                                    _m_end = getattr(m, "market_end_ts_ms", None)
+                                    _remain = max(0, _m_end - bucket) if _m_end is not None else None
+                                except Exception:
+                                    _remain = None
                                 # Build minimal but schema-complete fallback (l2/depths/book_crossed as NULLs)
                                 row = {
                                     "ts_snapshot_utc": datetime.datetime.fromtimestamp(bucket/1000, tz=datetime.timezone.utc).isoformat().replace("+00:00","Z"),
@@ -2274,10 +2435,10 @@ class Collector:
                                     "down_token_id": m.down_token_id,
                                     "up_bid": None, "up_ask": None, "up_bid_size": None, "up_ask_size": None,
                                     "down_bid": None, "down_ask": None, "down_bid_size": None, "down_ask_size": None,
-                                    "market_time_remaining_ms": max(0, m.market_end_ts_ms - bucket),
+                                    "market_time_remaining_ms": _remain,
                                     "is_rollover_window": _rollover_flag.get(m.condition_id, False),
                                     "book_state": _bs_val,
-                                    "resync_id": getattr(book, "resync_id", None),
+                                    "resync_id": getattr(book, "resync_id", None) or str(uuid.uuid4()),
                                     # M8: unknown stays NULL (never fabricate False).
                                     "book_crossed": None,
                                     "up_book_age_ms": None,
@@ -2311,15 +2472,13 @@ class Collector:
                                     row["resync_id"] = None
                             except Exception:
                                 pass
-                            # Catch-up honesty: deferred buckets are stamped with
-                            # CURRENT RAM levels under OLD bucket times
-                            # (forward-fill). Any bucket older than ~1s carries
-                            # levels that never rested at that time — label it
-                            # stale with a resync_id (honest gap) instead of
-                            # live. The current bucket keeps its real state.
+                            # Catch-up honesty (M5): deferred buckets carry CURRENT RAM
+                            # levels under OLD bucket times (forward-fill) — never
+                            # knowable at that time. Label ALL deferred buckets
+                            # stale (no 1s grace lookahead window).
                             try:
                                 _now_ms_cf = int(time.time() * 1000)
-                                if bucket < _now_ms_cf - 1000 and row.get("book_state") == "live":
+                                if bucket < _now_ms_cf and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
                                         row["resync_id"] = getattr(book, "resync_id", None) or str(uuid.uuid4())
@@ -2859,6 +3018,11 @@ class Collector:
 
     async def stop(self) -> None:
         self._running = False
+        # H7: final drop totals (first+every-1000th during run, full totals here)
+        try:
+            self._emit_drop_totals_final()
+        except Exception:
+            pass
         for t in self._tasks:
             t.cancel()
         for attr in ["_snapshot_task","_clock_task","_flush_task","_resolution_task","_kaggle_task","_chainlink_task"]:

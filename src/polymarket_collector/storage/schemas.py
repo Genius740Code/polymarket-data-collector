@@ -16,6 +16,8 @@ SCHEMA_VERSION_FIELD = pa.field("schema_version", pa.string(), nullable=False)
 MARKETS_SCHEMA = pa.schema([
     pa.field("updated_at", pa.string(), nullable=False),
     pa.field("recorded_at", pa.string(), nullable=True),  # alias of updated_at for Kaggle JSON (§3.2)
+    # H5 (audit 2026-09-19): first time this condition_id was seen (PIT as-of join key)
+    pa.field("first_seen_at", pa.string(), nullable=True),
     pa.field("market_start_ts", pa.string(), nullable=True),  # ISO8601
     pa.field("market_end_ts", pa.string(), nullable=True),
     pa.field("market_start_ts_ms", pa.int64(), nullable=True),  # epoch ms alias (§3.2)
@@ -92,7 +94,8 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
                 fields.append(pa.field(f"{outcome}_{side}_depth_{thc}c", pa.float64(), nullable=True))
     # state
     fields.extend([
-        pa.field("market_time_remaining_ms", pa.int64(), nullable=False),
+        # H1: nullable — cursor-recovered books before heal carry NULL, never fabricated now+lane
+        pa.field("market_time_remaining_ms", pa.int64(), nullable=True),
         pa.field("up_book_age_ms", pa.int64(), nullable=True),
         pa.field("down_book_age_ms", pa.int64(), nullable=True),
         pa.field("is_rollover_window", pa.bool_(), nullable=False),
@@ -113,6 +116,8 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
 BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
+    # M2 (audit 2026-09-19): True when ts_received_ns was filled at flush time (estimated, not wire time)
+    pa.field("ts_received_ns_estimated", pa.bool_(), nullable=True),
     # C3 (audit 2026-09-18): nullable — unresolvable frames keep NULL (honest
     # gap) instead of a fabricated token_id in the join column.
     pa.field("condition_id", pa.string(), nullable=True),
@@ -125,6 +130,10 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("token_id", pa.string(), nullable=False),
     pa.field("outcome", pa.string(), nullable=False),
     pa.field("event_type", pa.string(), nullable=False),
+    # H6 (audit 2026-09-19): bbo_snapped payload (was dropped -> all-NULL + dedup collapse)
+    pa.field("side", pa.string(), nullable=True),
+    pa.field("book_best", pa.float64(), nullable=True),
+    pa.field("exchange_best", pa.float64(), nullable=True),
     # sequence_number dropped 2026-09-06: CLOB market channel sends none; the old
     # local tick counter value was NOT a wire sequence (audit 2026-09-06, issue #3)
     pa.field("old_best_bid", pa.float64(), nullable=True),
@@ -141,22 +150,31 @@ BOOK_EVENTS_SCHEMA = pa.schema([
 
 # §5 trades — time first, condition_id second, with transaction_hash + wallet fields (no RPC)
 # wallet fields come from CLOB REST/WS (proxyWallet/maker/taker) — no on-chain RPC required
+# M6: token_id/outcome/series_id nullable (was non-nullable with "", "unknown", "-5m" sentinels)
 TRADES_SCHEMA = pa.schema([
     pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string pre-2026-09-13)
-    pa.field("ts_received_ns", pa.int64(), nullable=False),
+    pa.field("ts_received_ns", pa.int64(), nullable=True),  # H4: NULL for API-reconciled rows (never delivered live)
+    # M2: True when ts_received_ns was flush-time estimated
+    pa.field("ts_received_ns_estimated", pa.bool_(), nullable=True),
+    # H4: live | api_reconciled (+ ts_backfilled_ns for reconciled event time)
+    pa.field("source", pa.string(), nullable=True),
+    pa.field("ts_backfilled_ns", pa.int64(), nullable=True),
     # C3 (audit 2026-09-18): nullable — unresolvable trades keep NULL (honest
     # gap) instead of a fabricated token_id in the join column.
     pa.field("condition_id", pa.string(), nullable=True),
     # E1: NULL when the numeric Gamma id is unknown (never hex).
     pa.field("market_id", pa.string(), nullable=True),
-    pa.field("series_id", pa.string(), nullable=False),
+    # M6: NULL when unresolvable (was f"{ASSET}-5m" fabrication)
+    pa.field("series_id", pa.string(), nullable=True),
     # E2: NULL when the trade arrived with no resolvable market (honest gap, never 0).
     pa.field("window_index", pa.int64(), nullable=True),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("trade_id", pa.string(), nullable=False),
     pa.field("transaction_hash", pa.string(), nullable=True),
-    pa.field("token_id", pa.string(), nullable=False),
-    pa.field("outcome", pa.string(), nullable=False),
+    # M6: NULL when unresolvable (was "" sentinel)
+    pa.field("token_id", pa.string(), nullable=True),
+    # M6: NULL when unresolvable (was "unknown" sentinel)
+    pa.field("outcome", pa.string(), nullable=True),
     pa.field("price", pa.float64(), nullable=False),
     pa.field("size", pa.float64(), nullable=False),
     pa.field("notional", pa.float64(), nullable=True),
@@ -181,6 +199,7 @@ TRADES_SCHEMA = pa.schema([
 CHAINLINK_SCHEMA = pa.schema([
     pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string)
     pa.field("ts_received_ns", pa.int64(), nullable=False),
+    pa.field("ts_received_ns_estimated", pa.bool_(), nullable=True),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("event_id", pa.string(), nullable=False),
     pa.field("symbol", pa.string(), nullable=True),
@@ -193,6 +212,7 @@ CHAINLINK_SCHEMA = pa.schema([
 COLLECTOR_EVENTS_SCHEMA = pa.schema([
     pa.field("ts_utc", pa.string(), nullable=False),
     pa.field("ts_received_ns", pa.int64(), nullable=False),
+    pa.field("ts_received_ns_estimated", pa.bool_(), nullable=True),
     pa.field("condition_id", pa.string(), nullable=True),
     pa.field("asset", pa.string(), nullable=True),
     pa.field("event_id", pa.string(), nullable=False),
@@ -207,6 +227,8 @@ COLLECTOR_EVENTS_SCHEMA = pa.schema([
 # §1A resync_episodes — time first, condition_id second
 RESYNC_EPISODES_SCHEMA = pa.schema([
     pa.field("disconnect_ts_utc", pa.string(), nullable=False),
+    # H3: wall-clock detection time (disconnect_ts is backdated to last frame)
+    pa.field("detected_ts_utc", pa.string(), nullable=True),
     pa.field("reconnect_ts_utc", pa.string(), nullable=True),
     pa.field("resync_rest_fetch_ts_utc", pa.string(), nullable=True),
     pa.field("resync_completed_ts_utc", pa.string(), nullable=True),

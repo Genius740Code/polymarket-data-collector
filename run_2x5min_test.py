@@ -218,24 +218,77 @@ def run_post_test_finalize(timeframe: str | None = None) -> None:
         print(f"[finalize] backfill exited with {proc.returncode}")
 
 
+def _collector_live() -> bool:
+    """Refuse destructive wipes while a collector pid is live (C4)."""
+    try:
+        import psutil  # type: ignore
+        for p in psutil.process_iter(["cmdline"]):
+            try:
+                cl = " ".join(p.info.get("cmdline") or [])
+                if "polymarket_collector" in cl and ("cli" in cl or "collector" in cl):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        from pathlib import Path as _P
+        for _pidf in (ROOT / "logs" / "live.pid", DATA_DIR / "heartbeat.json"):
+            if _pidf.exists():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="One-command 2x5min live test + Kaggle upload")
     ap.add_argument("--keep-data", action="store_true",
                     help="do NOT wipe local data / delete the Kaggle dataset before the run")
+    ap.add_argument("--wipe", action="store_true",
+                    help="C4: OPT-IN destructive wipe of ./data + Kaggle test dataset (requires --yes)")
+    ap.add_argument("--yes", action="store_true",
+                    help="confirm destructive wipe (required with --wipe)")
+    ap.add_argument("--data-dir", type=str, default=None,
+                    help="C4: isolated test data dir (default ./data-test instead of ./data)")
+    ap.add_argument("--dataset", type=str, default=None,
+                    help="C4: test Kaggle slug (default gghgg1/polymarket-5m-crypto-test; never prod without --yes)")
     ap.add_argument("--timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
                     help="validate a specific timeframe lane (2 windows of that size; note 1h/1d must be probe-OK)")
     args = ap.parse_args()
 
+    # C4: destructive by default -> opt-in. Legacy no-flag invocation does NOT wipe.
+    _want_wipe = bool(args.wipe) and not bool(args.keep_data)
     if args.keep_data:
         print("[skip] --keep-data given: local data and Kaggle dataset left untouched")
-    else:
+    elif _want_wipe:
+        if not args.yes:
+            print("[refuse] --wipe requires --yes confirmation; nothing wiped")
+            return 2
+        if _collector_live():
+            print("[refuse] collector appears live (pid/heartbeat); refusing wipe")
+            return 2
+        try:
+            if DATA_DIR.exists() and any(DATA_DIR.iterdir()):
+                print(f"[warn] data dir {DATA_DIR} non-empty; wiping only with --wipe --yes")
+        except Exception:
+            pass
+        # use isolated test slug unless explicitly overridden with --yes
+        _slug_default = "gghgg1/polymarket-5m-crypto-test"
         print("[1/3] wiping local collected data...")
         wipe_local_data()
         print("[2/3] deleting Kaggle dataset (fresh start)...")
-        if args.timeframe:
+        _slug = args.dataset or (kaggle_dataset_for(args.timeframe) if args.dataset else _slug_default)
+        if "polymarket-5m-crypto" == _slug.split("/")[-1] and not args.dataset:
+            # prod slug requires explicit --dataset override (never by accident)
+            print(f"[refuse] prod slug {_slug} requires explicit --dataset; using {_slug_default}")
+            _slug = _slug_default
+        if args.timeframe and args.dataset:
             delete_kaggle_dataset(kaggle_dataset_for(args.timeframe))
         else:
-            delete_kaggle_dataset()
+            delete_kaggle_dataset(_slug)
+    else:
+        print("[skip] no --wipe given: local data and Kaggle dataset left untouched (C4 safe default)")
     print("[3/3] running 2x5min live test with Kaggle upload...")
     code = run_test(args.timeframe)
     print_summary()

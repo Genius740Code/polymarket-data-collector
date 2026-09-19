@@ -118,9 +118,28 @@ class MarketsLog:
                 del self._seen_order[:len(self._seen_order) - self.MAX_SEEN_CONDITION_IDS]
                 self._seen_condition_ids.difference_update(evict)
         row["updated_at"] = updated_at or _dt_top.datetime.now(tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
-        # §3.1 alias: recorded_at mirrors updated_at for Kaggle JSON
-        if not row.get("recorded_at"):
-            row["recorded_at"] = row["updated_at"]
+        # H5: always stamp recorded_at=now (was: keep old value on backfill ->
+        # as-of join saw the winner before the market opened). first_seen_at
+        # preserves the original discovery time for PIT joins.
+        try:
+            if not row.get("first_seen_at"):
+                # carry forward the earliest known first_seen, else this write time
+                _prev_first = None
+                try:
+                    _prev_first = getattr(self, "_first_seen", {}).get(cid)
+                except Exception:
+                    _prev_first = None
+                row["first_seen_at"] = _prev_first or row.get("recorded_at") or row["updated_at"]
+            try:
+                if not hasattr(self, "_first_seen"):
+                    self._first_seen = {}
+                if cid and cid not in self._first_seen:
+                    self._first_seen[cid] = row["first_seen_at"]
+            except Exception:
+                pass
+        except Exception:
+            pass
+        row["recorded_at"] = row["updated_at"]
         # §3.2 ms aliases: derive ISO <-> ms if one side missing
         # market_start_ts_ms / market_end_ts_ms <-> market_start_ts / market_end_ts
         if row.get("market_start_ts_ms") is not None and not row.get("market_start_ts"):
@@ -310,7 +329,10 @@ class MarketsLog:
         latest_dir.mkdir(parents=True, exist_ok=True)
 
         # collect all rows (including in-memory staging)
-        all_rows: List[Dict] = list(self._staging)
+        # M7: _staging holds BOTH markets rows (append) and collector_events
+        # rows (append_event) — only markets rows (status-bearing) may enter
+        # markets_latest.
+        all_rows: List[Dict] = [r for r in self._staging if "status" in r]
         if log_root.exists():
             for part in log_root.rglob("*.parquet"):
                 try:
