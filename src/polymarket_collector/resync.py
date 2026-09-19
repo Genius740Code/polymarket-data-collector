@@ -305,6 +305,12 @@ class ResyncManager:
         max_duration_s = cfg.max_resync_duration_seconds
         start_ts = time.monotonic()
         attempt = 0
+        # F9 (Sep 2026 forensics): per-attempt failures were fully silent —
+        # 19/19 run-3 resyncs failed with no evidence of which phase broke.
+        # Track the failing phase per attempt and report the last one on
+        # escalation so one capture run answers it definitively.
+        last_fail_branch: Optional[str] = None
+        last_fail_error: Optional[str] = None
 
         # mark resyncing
         # PERF: single targets list (was 4 full books.values() scans + BxM nest).
@@ -325,12 +331,18 @@ class ResyncManager:
                     self.on_episode_persist(ep.to_dict())
                 except Exception:
                     pass
+            phase = "fetch"
+            attempt_branch: Optional[str] = None
+            attempt_error: Optional[str] = None
             try:
                 snapshot = await self.rest_fetcher(asset, condition_id)
                 if snapshot is None:
-                    raise RuntimeError("REST fetch returned None (endpoint may not expose full L2 — §18 gate)")
+                    attempt_branch = "fetch_none"
+                    attempt_error = "REST fetch returned None (endpoint may not expose full L2 — §18 gate)"
+                    raise RuntimeError(attempt_error)
 
                 # wholesale replace
+                phase = "replace"
                 for book in targets:
                     book.replace_from_rest_snapshot(snapshot)
 
@@ -344,6 +356,7 @@ class ResyncManager:
                     snapshot_seq_int = None
 
                 buffered = list(self._buffers.get(resync_id, []))
+                phase = "replay"
                 for msg in buffered:
                     if not isinstance(msg, dict):
                         continue  # connection markers (None) — nothing to replay
@@ -385,6 +398,15 @@ class ResyncManager:
                 # (resync_attempt_count) — emitting a resync_failed event per
                 # attempt turned rate-limited recoveries into alert noise.
                 # Only the escalation path (below) raises resync_failed.
+                # F9: one stdout line per attempt (attempts are seconds apart
+                # via backoff) + last-failure branch carried to escalation.
+                if attempt_branch is None:
+                    attempt_branch = {"fetch": "fetch_err", "replace": "replace_err",
+                                      "replay": "replay_err"}.get(phase, "unknown")
+                    attempt_error = f"{type(e).__name__}: {e}"[:200]
+                last_fail_branch, last_fail_error = attempt_branch, attempt_error
+                print(f"[resync] attempt {ep.resync_attempt_count} {asset} {condition_id} "
+                      f"failed at {attempt_branch}: {attempt_error}")
                 # persist attempt state for honest episode bookkeeping
                 if self.on_episode_persist:
                     try:
@@ -414,7 +436,7 @@ class ResyncManager:
                         except Exception:
                             pass
                     if self.on_event:
-                        self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed, "asset": ep.asset, "condition_id": ep.condition_id})
+                        self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed, "asset": ep.asset, "condition_id": ep.condition_id, "fail_branch": last_fail_branch, "fail_error": last_fail_error, "attempts": ep.resync_attempt_count})
                     # P0 leak hunt session 2: an escalated episode must stop
                     # consuming buffers. It can never complete (its REST target is
                     # gone or refused), so leaving it open + buffered meant
