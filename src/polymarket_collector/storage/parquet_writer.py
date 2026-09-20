@@ -159,6 +159,10 @@ class ParquetWriter:
         # drive dead-letter instead of wedging the loop forever.
         self._file_counter = 0
         self._flush_fail_counts: Dict[Tuple[str, str, str], int] = defaultdict(int)
+        # N2: first-failure wall-clock per group key. Dead-letter requires BOTH
+        # min failures AND min age so 5 fast appends (~0.1s at write rate) can
+        # never trip it — only a sustained fault over minutes does.
+        self._flush_first_fail_ts: Dict[Tuple[str, str, str], float] = {}
         self._wal_malformed_total = 0
         self._ts_fill_count: Dict[str, int] = defaultdict(int)
         # PERF RAM: single OrderedDict[key]=None per dataset instead of
@@ -404,21 +408,47 @@ class ParquetWriter:
                     self._flush_fail_counts.pop((dataset, date_str, str(asset)), None)
                 except Exception:
                     pass
+                try:
+                    self._flush_first_fail_ts.pop((dataset, date_str, str(asset)), None)
+                except Exception:
+                    pass
             except Exception as e:
                 if self.on_event:
                     try:
                         self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
                     except Exception:
                         pass
-                # consecutive-failure tracking -> dead-letter after 5
+                # N2: dead-letter only after a SUSTAINED fault (min failures AND
+                # min age). 5 fast appends must not trip it; backoff stays in
+                # buffer-retry until the age gate passes.
                 _fkey = (dataset, date_str, str(asset))
+                try:
+                    _now_m = time.monotonic()
+                except Exception:
+                    _now_m = 0.0
                 try:
                     self._flush_fail_counts[_fkey] = self._flush_fail_counts.get(_fkey, 0) + 1
                     _fails = self._flush_fail_counts[_fkey]
                 except Exception:
                     _fails = 1
-                if _fails >= 5:
-                    # dead-letter: preserve rows on disk outside the hive + event, then CONTINUE
+                try:
+                    _first = self._flush_first_fail_ts.get(_fkey)
+                    if _first is None:
+                        self._flush_first_fail_ts[_fkey] = _now_m
+                        _first = _now_m
+                    _age_s = max(0.0, _now_m - _first)
+                except Exception:
+                    _age_s = 0.0
+                _MIN_FAILS = 5
+                _MIN_AGE_S = 300.0  # 5 minutes of continuous failure
+                if _fails >= _MIN_FAILS and _age_s >= _MIN_AGE_S:
+                    # dead-letter: preserve rows on disk outside the hive + event.
+                    # N2 fixes: (a) requeue later groups then BREAK — `continue`
+                    # re-processed items[idx+1:] from the stale `items` list AND
+                    # left them requeued, writing every later group twice;
+                    # (b) a failed dead-letter write must NOT drop rows with a
+                    # false `dead_lettered` event — requeue everything instead.
+                    _dl_ok = False
                     try:
                         _dl_dir = self.data_dir / "_dead_letter" / dataset / f"date={date_str}"
                         _dl_dir.mkdir(parents=True, exist_ok=True)
@@ -426,22 +456,44 @@ class ParquetWriter:
                         with open(_dl_path, "a", encoding="utf-8") as _df:
                             for _r in rows:
                                 _df.write(json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": _r}) + "\n")
-                    except Exception:
-                        pass
-                    try:
-                        if self.on_event:
-                            self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails})
-                    except Exception:
-                        pass
-                    try:
-                        self._flush_fail_counts.pop(_fkey, None)
-                    except Exception:
-                        pass
-                    # requeue ONLY the unprocessed later groups, skip the poison group
-                    for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
+                            try:
+                                _df.flush()
+                                os.fsync(_df.fileno())
+                            except Exception:
+                                pass
+                        _dl_ok = True
+                    except Exception as _dle:
+                        _dl_ok = False
+                        try:
+                            if self.on_event:
+                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_letter_failed", "rows": len(rows), "error": str(_dle)[:200]})
+                        except Exception:
+                            pass
+                    if _dl_ok:
+                        try:
+                            if self.on_event:
+                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails, "age_s": round(_age_s, 1)})
+                        except Exception:
+                            pass
+                        try:
+                            self._flush_fail_counts.pop(_fkey, None)
+                        except Exception:
+                            pass
+                        try:
+                            self._flush_first_fail_ts.pop(_fkey, None)
+                        except Exception:
+                            pass
+                        # requeue ONLY the unprocessed later groups, skip poison group,
+                        # then BREAK so the stale `items` tail is not written twice.
+                        for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
+                            for r in reversed(r2):
+                                self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                        break
+                    # dead-letter write failed — requeue failing + later groups (no loss)
+                    for (d2, ds2, a2), r2 in reversed(items[idx:]):
                         for r in reversed(r2):
                             self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
-                    continue
+                    raise
                 # re-queue failing group AND every unprocessed group front-first (no loss)
                 for (d2, ds2, a2), r2 in reversed(items[idx:]):
                     for r in reversed(r2):
@@ -519,6 +571,60 @@ class ParquetWriter:
             except Exception:
                 pass
         return flushed
+
+    def replay_dead_letters(self, limit: int = 100_000) -> dict:
+        """N2: requeue _dead_letter/*.jsonl rows back through append().
+
+        Nothing in the repo read _dead_letter/ so good dead-letters never
+        returned. Returns {"requeued": n, "files": m, "errors": [...]}.
+        Callers delete a .jsonl file only when every row in it requeues
+        (append True); partial files stay for the next pass. No hive writes
+        happen here — rows flow through the normal WAL-before-buffer path.
+        """
+        import json as _js_dl
+        stats: dict = {"requeued": 0, "files": 0, "errors": []}
+        try:
+            _root = self.data_dir / "_dead_letter"
+            if not _root.exists():
+                return stats
+            for _fp in sorted(_root.rglob("*.jsonl")):
+                try:
+                    _lines = _fp.read_text(encoding="utf-8").splitlines()
+                except Exception as _e:
+                    stats["errors"].append(f"{_fp}: { _e}")
+                    continue
+                _ok_all = True
+                for _ln in _lines:
+                    if not _ln.strip():
+                        continue
+                    try:
+                        _obj = _js_dl.loads(_ln)
+                        _ok = bool(self.append(
+                            _obj.get("dataset"),
+                            _obj.get("row") or {},
+                            asset=_obj.get("asset"),
+                        ))
+                    except Exception as _e2:
+                        _ok = False
+                        stats["errors"].append(f"{_fp}: {str(_e2)[:120]}")
+                    if _ok:
+                        stats["requeued"] += 1
+                    else:
+                        _ok_all = False
+                        break  # backpressure — retry file next pass
+                    if stats["requeued"] >= limit:
+                        break
+                if _ok_all:
+                    try:
+                        _fp.unlink()
+                    except Exception:
+                        pass
+                    stats["files"] += 1
+                if stats["requeued"] >= limit:
+                    break
+        except Exception as _e:
+            stats["errors"].append(str(_e)[:200])
+        return stats
 
     def check_disk_space(self, min_bytes: int = 1_073_741_824) -> Optional[dict]:
         """§10A disk space monitoring. Returns alert details if below threshold, else None."""

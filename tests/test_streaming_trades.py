@@ -14,6 +14,7 @@ from polymarket_collector.storage.schemas import TRADES_SCHEMA
 def _row(i, cid="cid-x", side="buy", wallet=None, outcome="unknown", tx="0xabc123"):
     return {
         "ts_source": int(time.time() * 1000), "ts_received_ns": time.time_ns(),
+        "ts_received_ns_estimated": None, "source": "live", "ts_backfilled_ns": None,
         "condition_id": cid, "market_id": "m", "series_id": "BTC-5m", "window_index": 1,
         "asset": "BTC", "trade_id": f"t-{i}", "transaction_hash": tx,
         "token_id": "tok", "outcome": outcome, "price": 0.5, "size": 2.0,

@@ -66,7 +66,9 @@ def test_unresolvable_trade_keeps_null_condition_and_unknown_outcome(tmp_path):
     assert c._handle_trade_message(_trade_msg(), "BTC", time.time_ns()) is True
     row = captured[0][1]
     assert row["condition_id"] is None  # C3: never token_id
-    assert row["outcome"] == "unknown"  # C3: no tautological "up"
+    # N10/M6: honest NULL (was "unknown" sentinel that defeated IS NOT NULL
+    # filters and polluted group-bys with a fake third outcome).
+    assert row["outcome"] is None  # C3: no tautological "up"
     assert row["ts_source"] is not None  # wire ts present here
 
 

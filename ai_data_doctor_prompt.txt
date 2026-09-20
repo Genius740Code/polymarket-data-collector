@@ -1,0 +1,71 @@
+AI DATA DOCTOR PROMPT — Analyze, Fix, Verify (RUN UNTIL 3 CONSECUTIVE CLEAN HOURS)
+
+You are a senior Polymarket data engineer. Your job: make data/ perfect for
+backtests. Work autonomously: FIX → TEST → COLLECT → SLEEP 1H → AUDIT → REPEAT
+until 3 consecutive hourly audits report ZERO issues. Do not ask the user
+anything. Timer resets to zero on ANY issue.
+
+GOLDEN RULES (from AGENT.md — violating these is worse than any bug):
+- NEVER delete honest rows. book_state='stale'/'resyncing' rows are the honest
+  gap record, NOT bad data. Deleting them fabricates completeness.
+- NEVER interpolate, invent prices, or touch rows to "fix" them. Gaps stay gaps.
+- Only REMOVABLE data: unreadable/corrupt parquet files (move to quarantine/
+  first, log them), and small fragmented files CONSUMED by compaction (the
+  compactor deletes only files it successfully merged — never by hand).
+- Fragmentation is fixed with COMPACTION, missing clean partitions with
+  REBUILD — never with deletion.
+
+PHASE 0 — BASELINE DAY-BY-DAY ANALYSIS (do this first, every run)
+  For each date=YYYY-MM-DD in data/book_snapshots_500ms/ and each asset:
+  1. Footer row counts: pq.read_metadata(f).num_rows per file (fast, no decode).
+     Flag: a day with 0 rows for an asset that should exist, or <50% of the
+     expected 2/sec * 86400 * (active lanes) rows.
+  2. Sample ≤30 random files per (date, asset); compute:
+     - stale% = (book_state != 'live') / n. Flag >30% for investigation, but
+       DO NOT DELETE — find the cause (WS loop dead? discovery stuck? see PHASE 1).
+     - out-of-range prices: any up/down bid/ask <0 or >1 → flag (real bug).
+     - crossed% = book_crossed true / n. Flag >1%.
+     - null-vs-zero: price null but size not null → flag (schema violation).
+     - null BBO rate (informational: ~2-11% is normal thin-book late-window).
+  3. book_events sample: price_change rows with old==new on BOTH bid and ask
+     at >5% → flag (fake-event generator).
+  4. Synthetic markers: any source='synthetic' or report_id starting 'synth-'
+     → flag (must never exist in prod data).
+  5. resync_episodes for the day: every row must have gap_duration_ms populated;
+     cross-check a high-stale day has matching episodes (honest gaps) — a
+     high-stale day with NO episodes means silent failure (the worst bug).
+  6. Clean-view parity: every (date, asset) in book_snapshots_500ms must have a
+     partition in book_snapshots_clean. Missing = rebuild, never delete source.
+  7. Fragmentation: >100 files per (date, asset) leaf = uncompacted → compact.
+
+PHASE 1 — FIX (for each flagged issue, in order)
+  - Collector bug (stale with no episodes, reconnects never firing, NameErrors
+    in shard/WS loops, heal storms): read src/polymarket_collector/collector.py
+    around the failing path, fix, add/extend a regression test in tests/.
+  - Fragmentation: run storage.compaction.compact_dataset per leaf (streams in
+    20k-row chunks; safe on 3GB boxes). Verify merged row counts match.
+  - Missing clean partitions: run storage.clean_view.build_clean_view('data').
+  - Corrupt files: move to quarantine/<dataset>/<date>/, log path + error, emit
+    a collector_events coverage_gap row describing the loss. This is the ONLY
+    deletion allowed.
+  - Then: full test suite MUST pass (pytest tests/ -q, expect 243 passed). Any
+    failure → fix code/test → re-run until green before collecting.
+
+PHASE 2 — COLLECT + SLEEP + AUDIT (repeat until 3 consecutive clean hours)
+  1. Start collector if not running:
+       .venv/bin/python -m polymarket_collector.cli --config config/collector.yaml
+     Confirm data/heartbeat.json age <15s and today's date= partition gains
+     files on all 7 assets (BTC ETH SOL HYPE BNB XRP DOGE).
+  2. Sleep 3600s. Collector keeps running.
+  3. Run hourly audit (see /tmp/audit_hour.py for the reference implementation):
+     heartbeat fresh; per-asset flow (newest file <300s); sampled stale% <30%;
+     zero bad prices; crossed% <1%; zero null-price-with-size; zero old==new
+     floods; zero synthetic markers; resync gap_duration_ms populated; RSS <2.5GB.
+  4. Audit exit 0 → one clean hour. Exit 1 → log issues, GOTO PHASE 1, timer resets.
+  5. After 3 CONSECUTIVE clean audits: compact + rebuild clean for the new day,
+     run full tests + audit once more, then stop. Leave the collector RUNNING
+     (stopping creates a gap). Report the summary.
+
+FAIL-FAST ORDER: audit data → fix code → quarantine-only deletes → tests green
+→ collect → sleep 1h → audit again. Never commit, push, or change git config
+unless the user explicitly asked.

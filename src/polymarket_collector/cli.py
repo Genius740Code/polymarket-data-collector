@@ -40,10 +40,16 @@ def main() -> None:
     ap.add_argument("--series-id", type=str, default=None, help="override series ID per asset (format: ASSET-WINDOW, e.g. BTC-1H)")
     ap.add_argument("--test-timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
                     help="test mode: which timeframe lane to validate (sets the test window size; the run collects 2 windows of that lane)")
+    # N10: isolated test data dir (run_2x5min_test.py --data-dir forwards here;
+    # without it every test run touched prod ./data).
+    ap.add_argument("--data-dir", type=str, default=None,
+                    help="override storage data dir (isolated test runs use ./data-test)")
     args = ap.parse_args()
 
     cfg = CollectorConfig.load(args.config)
     # CLI overrides config
+    if args.data_dir is not None:
+        cfg.storage.data_dir = args.data_dir
     if args.test_mode:
         cfg.test_mode.enabled = True
     if args.test_markets is not None:

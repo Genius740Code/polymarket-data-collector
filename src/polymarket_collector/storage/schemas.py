@@ -127,8 +127,10 @@ BOOK_EVENTS_SCHEMA = pa.schema([
     pa.field("window_index", pa.int64(), nullable=False),
     pa.field("asset", pa.string(), nullable=False),
     pa.field("event_id", pa.string(), nullable=False),
-    pa.field("token_id", pa.string(), nullable=False),
-    pa.field("outcome", pa.string(), nullable=False),
+    # N10: NULL when unresolvable (was "" / "unknown" sentinels that defeated
+    # the honest-gap `IS NOT NULL` filter and polluted group-bys).
+    pa.field("token_id", pa.string(), nullable=True),
+    pa.field("outcome", pa.string(), nullable=True),
     pa.field("event_type", pa.string(), nullable=False),
     # H6 (audit 2026-09-19): bbo_snapped payload (was dropped -> all-NULL + dedup collapse)
     pa.field("side", pa.string(), nullable=True),

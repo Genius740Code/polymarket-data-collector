@@ -26,6 +26,9 @@ def _trade_row(**over) -> dict:
     base = {
         "ts_source": int(time.time() * 1000),
         "ts_received_ns": time.time_ns(),
+        "ts_received_ns_estimated": None,
+        "source": "live",
+        "ts_backfilled_ns": None,
         "condition_id": "cid-b5",
         "market_id": "mid-b5",
         "series_id": "BTC-5MIN",
@@ -42,7 +45,6 @@ def _trade_row(**over) -> dict:
         "fee_is_estimated": None,
         "side": "BUY",
         "aggressor_side": "BUY",
-        "sequence_number": 1,
         "maker_wallet": None,
         "taker_wallet": None,
         "wallet": None,
@@ -51,8 +53,11 @@ def _trade_row(**over) -> dict:
     return base
 
 
-def test_b5_writeback_fills_nulls_only_and_is_idempotent(tmp_path):
+def test_b5_writeback_fills_nulls_only_and_is_idempotent(tmp_path, monkeypatch):
     from polymarket_collector.storage.parquet_io import read_table as pio_read
+    # H4: hive write-back is opt-in (ALLOW_HIVE_WRITEBACK=1); the unit test
+    # exercises the write-back path itself, so opt in explicitly.
+    monkeypatch.setenv("ALLOW_HIVE_WRITEBACK", "1")
     hive = tmp_path / "trades" / "date=2026-09-05" / "asset=BTC"
     hive.mkdir(parents=True)
     part = hive / "trades_1.parquet"

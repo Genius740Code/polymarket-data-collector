@@ -731,8 +731,19 @@ class OrderBookState:
                 # RAM holds full depth -> our view is missing real liquidity.
                 # Mark stale so snapshots don't read as empty-but-live; the
                 # next full `book` frame or REST heal refills the side.
+                # N5: 0 (and 1 for asks) is the exchange empty-side sentinel,
+                # not a real best — a legitimately emptied side must not flap
+                # stale. Also avoid minting a fresh orphan resync_id on every
+                # call when already stale (episode churn).
                 try:
-                    self.mark_stale()
+                    _ex = float(ex_best)
+                except Exception:
+                    _ex = None
+                if _ex is not None and (_ex <= 0.0 or (side == "ask" and _ex >= 1.0)):
+                    continue
+                try:
+                    if getattr(self.book_state, "value", "") != "stale":
+                        self.mark_stale()
                 except Exception:
                     pass
                 continue

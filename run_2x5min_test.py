@@ -66,12 +66,14 @@ def kaggle_dataset_for(timeframe: str | None) -> str:
     return KAGGLE_DATASET
 
 
-def wipe_local_data() -> None:
-    if not DATA_DIR.exists():
-        print("[wipe] no local data dir — nothing to wipe")
+def wipe_local_data(data_dir: Path | None = None) -> None:
+    # N10: --data-dir was accepted but never read — the wipe always hit ./data.
+    target = Path(data_dir) if data_dir else DATA_DIR
+    if not target.exists():
+        print(f"[wipe] no local data dir {target} — nothing to wipe")
         return
     removed = 0
-    for p in sorted(DATA_DIR.iterdir()):
+    for p in sorted(target.iterdir()):
         try:
             if p.is_dir():
                 shutil.rmtree(p)
@@ -80,7 +82,7 @@ def wipe_local_data() -> None:
             removed += 1
         except Exception as e:
             print(f"[wipe] WARN could not remove {p.name}: {e}")
-    print(f"[wipe] removed {removed} items from {DATA_DIR}")
+    print(f"[wipe] removed {removed} items from {target}")
 
 
 def delete_kaggle_dataset(kaggle_dataset: str = KAGGLE_DATASET) -> None:
@@ -100,7 +102,7 @@ def delete_kaggle_dataset(kaggle_dataset: str = KAGGLE_DATASET) -> None:
         print(f"[kaggle] dataset delete skipped ({tail or 'not present'}) — continuing")
 
 
-def run_test(timeframe: str | None = None) -> int:
+def run_test(timeframe: str | None = None, data_dir: Path | None = None) -> int:
     log_path = ROOT / f"test_run_{time.strftime('%Y%m%d_%H%M%S')}.log"
     cmd = [
         sys.executable, "-m", "polymarket_collector.cli",
@@ -109,6 +111,10 @@ def run_test(timeframe: str | None = None) -> int:
     ]
     if timeframe:
         cmd += ["--test-timeframe", timeframe]
+    # N10: forward --data-dir so the test run never touches prod ./data
+    # (cli.py --data-dir overrides storage.data_dir).
+    if data_dir:
+        cmd += ["--data-dir", str(data_dir)]
     print(f"[run] {' '.join(cmd)}")
     print(f"[run] log -> {log_path.name}")
     env = _child_env()  # live log lines + hermetic repo imports
@@ -256,6 +262,9 @@ def main() -> int:
     ap.add_argument("--timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
                     help="validate a specific timeframe lane (2 windows of that size; note 1h/1d must be probe-OK)")
     args = ap.parse_args()
+    # N10: default to an ISOLATED dir so a bare `--wipe --yes` never nukes prod
+    # ./data (the old code ignored --data-dir entirely and always wiped ./data).
+    _data_dir = Path(args.data_dir) if args.data_dir else (ROOT / "data-test")
 
     # C4: destructive by default -> opt-in. Legacy no-flag invocation does NOT wipe.
     _want_wipe = bool(args.wipe) and not bool(args.keep_data)
@@ -269,14 +278,22 @@ def main() -> int:
             print("[refuse] collector appears live (pid/heartbeat); refusing wipe")
             return 2
         try:
-            if DATA_DIR.exists() and any(DATA_DIR.iterdir()):
-                print(f"[warn] data dir {DATA_DIR} non-empty; wiping only with --wipe --yes")
+            if _data_dir.exists() and any(_data_dir.iterdir()):
+                print(f"[warn] data dir {_data_dir} non-empty; wiping only with --wipe --yes")
+        except Exception:
+            pass
+        # N10: refuse to wipe PROD ./data even with --yes unless --data-dir
+        # explicitly points at it (isolated default is ./data-test).
+        try:
+            if _data_dir.resolve() == DATA_DIR.resolve() and not args.data_dir:
+                print(f"[refuse] refusing to wipe prod {DATA_DIR} via default; pass --data-dir explicitly if you truly mean it")
+                return 2
         except Exception:
             pass
         # use isolated test slug unless explicitly overridden with --yes
         _slug_default = "gghgg1/polymarket-5m-crypto-test"
         print("[1/3] wiping local collected data...")
-        wipe_local_data()
+        wipe_local_data(_data_dir)
         print("[2/3] deleting Kaggle dataset (fresh start)...")
         _slug = args.dataset or (kaggle_dataset_for(args.timeframe) if args.dataset else _slug_default)
         if "polymarket-5m-crypto" == _slug.split("/")[-1] and not args.dataset:
@@ -290,7 +307,7 @@ def main() -> int:
     else:
         print("[skip] no --wipe given: local data and Kaggle dataset left untouched (C4 safe default)")
     print("[3/3] running 2x5min live test with Kaggle upload...")
-    code = run_test(args.timeframe)
+    code = run_test(args.timeframe, _data_dir)
     print_summary()
     run_post_test_finalize(args.timeframe)
     return code

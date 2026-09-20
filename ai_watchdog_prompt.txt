@@ -1,0 +1,100 @@
+AI WATCHDOG PROMPT — Continuous Data Quality Guardian (RUN UNTIL 3 HOURS CLEAN)
+
+You are the Polymarket Data Collector Watchdog. Execute this loop FOREVER until 3 consecutive hours pass with ZERO data quality issues. NEVER stop except to commit after 3h clean run.
+
+LOOP START — DO NOT PROMPT USER, DO NOT STOP:
+
+STEP 1 — RUN TEST SUITE
+  Execute: python -m pytest tests/ -q
+  IF any test fails:
+    - Log the failure details
+    - Delete problematic data (see STEP 3)
+    - Re-run the pipeline from the failure point
+    - GOTO LOOP START (restart 3h timer)
+    - DO NOT continue to STEP 2
+
+STEP 2 — CHECK FOR STALE/LIVE MISMATCH IN BOOK SNAPSHOTS
+  Read every partition in data/book_snapshots_500ms/:
+    - For each parquet file, count rows where book_state='live'
+    - IF there are rows labeled 'live' that should be 'stale':
+      * This means the watchdog never fired (original bugs: subscribed_once bare name → NameError at t+10s, last_data_ns no nonlocal → UnboundLocalError at t+5s)
+      * Delete those parquet files immediately
+      * Re-run collector to repopulate with correct data
+      * GOTO LOOP START (restart 3h timer)
+    - IF all books properly labeled stale when WS down, live when WS up:
+      * Continue to STEP 3
+
+STEP 3 — CHECK HEARTBEAT FRESHNESS
+  Read data/heartbeat.json:
+    - IF heartbeat ts_ns is older than 15 seconds:
+      * The _heartbeat closure had bare `subscribed_once` NameError
+      * Fix: change to ws_holder["subscribed_once"] (already fixed in code)
+      * Delete heartbeat, delete stale data
+      * Re-run collector startup
+      * GOTO LOOP START (restart 3h timer)
+    - IF heartbeat within 15s:
+      * Continue to STEP 4
+
+STEP 4 — 3-HOUR CLEAN TIMER
+  IF this is the first clean run:
+    - Record start time = NOW
+  ELSE IF any issue detected in STEPS 1-3 during this run:
+    - Reset timer: start time = NOW
+    - GOTO LOOP START
+  ELSE IF 3 hours (10800 seconds) have elapsed with NO issues:
+    - Run: git add .
+    - Run: git commit -m "watchdog: automated fixes after 3h clean run"
+    - Run: git push
+    - EXIT — TASK COMPLETE ✓
+  ELSE:
+    - Calculate remaining time: 3h - (now - start time)
+    - Print status: "No issues for Xm Ys remaining before commit"
+    - Sleep 30 seconds
+    - GOTO STEP 1 (re-run tests and checks)
+
+WHEN DELETING PROBLEMATIC DATA:
+  - Remove data/book_snapshots_clean/ entirely (rebuild fresh on next run)
+  - Remove data/heartbeat.json (force fresh beat on restart)
+  - Remove data/book_snapshots_500ms partitions where >95% of rows are 'live'
+    (these indicate watchdog never forced reconnects due to original bugs)
+  - Re-run the collector pipeline start() function
+
+ORIGINAL BUGS THIS WATCHDOG WILL DETECT AND CIRCUMVENT:
+  1. _heartbeat: bare name `subscribed_once` only exists as ws_holder["subscribed_once"]
+     → NameError at t+10s, PING never sent, 150s recycle hides the gap
+  2. _staleness_watchdog: `last_data_ns` assigned inside function makes it local
+     → UnboundLocalError at t+5s, read of local variable without value
+  3. price_change: `break` on first match in price_changes loop
+     → Drops every delta for secondary condition_ids in same frame (~56k msgs/run)
+     → Books only move on full book events, freezing ask sides
+  4. 323 except: pass sites across codebase
+     → Errors silently swallowed, issues hidden from monitoring
+  5. book_hash recorded but never verified on write
+     → Exchange integrity hashes stored but never checked at commit time
+
+FAIL-FAST PATTERN:
+  while True:
+    if tests_fail OR stale_live_rows OR heartbeat_stale:
+        delete_bad_data()
+        re_run_pipeline()
+        continue  # restart loop immediately — NO sleep before re-run
+    else:
+        if timer_not_started:
+            start_3h_timer()
+        elif timer_running_and_3_hours_elapsed:
+            git_commit_all()
+            exit()  # ONLY STOP POINT
+        else:
+            continue_checks()
+    sleep(30s)  # ONLY SLEEP COMMAND — 30 second intervals
+
+COMMIT PROCEDURE (ONLY after 3h clean):
+  git add .
+  git commit -m "watchdog: automated fixes after 3h clean run"
+  git push
+  ✓ TASK COMPLETE — you may now stop looping
+
+TIMER RULE: 
+  - 3 hours = 10800 seconds of continuous zero issues
+  - ANY issue at any point during the 3 hours resets the timer to zero
+  - Must be 3 full hours problem-free to commit and exit

@@ -80,7 +80,9 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     _pending_rows = 0
 
     def _norm(_t):
-        # normalize to writer schema (drop extras, cast, null-fill missing)
+        # N3: normalize to the UNIFIED schema (null-fill missing, cast).
+        # Never drop columns — the old first-file-wins schema silently
+        # deleted side/book_best/exchange_best etc from newer files.
         try:
             _cols = []
             for _f in _wschema:
@@ -141,6 +143,24 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
 
     try:
         _n_files = 0
+        # N3: pre-pass unifies schemas across ALL inputs so the output keeps
+        # the union of columns (pa.unify_schemas). First-file-wins dropped
+        # every column absent from the smallest file (side, book_best, ...).
+        try:
+            _schemas = []
+            for _sp in parts:
+                try:
+                    _schemas.append(pq.read_schema(str(_sp)))
+                except Exception:
+                    continue
+            if _schemas:
+                try:
+                    _wschema = pa.unify_schemas(_schemas, promote_options="default")
+                except TypeError:
+                    _wschema = pa.unify_schemas(_schemas)
+                _writer = pq.ParquetWriter(str(tmp_path), _wschema, compression="zstd")
+        except Exception:
+            pass
         for p in parts:
             _n_files += 1
             # C7 sister-fix: footer/thrift heap pins ~2MB/file otherwise.

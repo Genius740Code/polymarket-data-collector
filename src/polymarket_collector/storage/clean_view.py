@@ -123,6 +123,11 @@ def build_clean_view(
             out_dir = dst_root / date_str / f"asset={asset}"
             final_path = out_dir / f"part-{asset}-{date_str.replace('date=','')}.parquet"
             sidecar = False
+            # N9: names of source files consumed for THIS partition write, so
+            # the manifest is seeded on full rebuilds too (was: only _capped
+            # from the sidecar branch, so the first incremental after a full
+            # rebuild reprocessed every old file -> ~1000 duplicate rows).
+            _processed_names: list = []
             if not full_rebuild and final_path.exists():
                 try:
                     _outs = [p for p in out_dir.glob("*.parquet") if not p.name.endswith(".tmp")]
@@ -174,6 +179,10 @@ def build_clean_view(
                     combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
                     del tables
                     sidecar = True
+                    try:
+                        _processed_names = [p.name for p in _capped]
+                    except Exception:
+                        _processed_names = []
                 except Exception:
                     sidecar = False
             if not sidecar:
@@ -182,6 +191,7 @@ def build_clean_view(
                 if not full_rebuild and final_path.exists():
                     continue
                 tables: List[pa.Table] = []
+                _full_parts: list = []
                 for part in asset_dir.glob("*.parquet"):
                     try:
                         _t2 = read_table(part)
@@ -192,10 +202,17 @@ def build_clean_view(
                         _unreadable += 1
                         continue
                     tables.append(_t2)
+                    try:
+                        _full_parts.append(part.name)
+                    except Exception:
+                        pass
                 if not tables:
                     continue
                 combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
                 del tables
+                # N9: seed the manifest on full rebuilds so the next
+                # incremental does not reprocess these files as "new".
+                _processed_names = list(_full_parts)
             # filter: book_state == 'live'
             # Fail CLOSED: a missing/corrupt book_state column must skip the
             # partition (honest gap), never ship stale/resyncing rows as clean.
@@ -247,6 +264,8 @@ def build_clean_view(
             _os_replace_safe(tmp_path, _dest)
             written += filtered.num_rows
             # M3: record processed sources so capped remainders converge next call
+            # N9: _processed_names covers BOTH sidecar (_capped) and full-rebuild
+            # (all parts) writes — the manifest is seeded at full rebuild.
             try:
                 import json as _js_w
                 _manifest_p = out_dir / "_clean_manifest.json"
@@ -257,9 +276,9 @@ def build_clean_view(
                 except Exception:
                     _prev = set()
                 try:
-                    for _cp in locals().get("_capped", []):
+                    for _nm in list(_processed_names):
                         try:
-                            _prev.add(_cp.name)
+                            _prev.add(_nm)
                         except Exception:
                             pass
                 except Exception:
