@@ -6,7 +6,7 @@
  *   3. weather-paper-trader — weather_bots_paper_trader.py (METAR/NWS/Polymarket consensus bots)
  *
  * Usage:
- *   pm2 start ecosystem.bots.config.js
+ *   pm2 start ecosystem.bots.config.cjs
  *   pm2 logs btc5m-paper-bot --lines 50
  *   pm2 logs weather-paper-trader --lines 50
  */

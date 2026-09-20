@@ -44,6 +44,12 @@ class WsConfig(BaseModel):
     sequence_gap_detection: bool = True
     full_book_diff_interval_seconds: int = 45
     full_book_diff_tolerance: float = 0.0
+    # F10 (Sep 2026): thin one-sided books (asks only, no bids — the norm for
+    # far-future weather buckets) never satisfy the both-sides promotion gate
+    # and sit stale forever (0% live). When true, a hash-attested frame with
+    # ANY side present promotes. Default False (crypto books are two-sided;
+    # unknown-unknown there). Enabled in the weather yaml only.
+    promotion_one_sided: bool = False
 
     @field_validator("cities_per_connection")
     @classmethod
@@ -115,11 +121,18 @@ class LiquidityFilterConfig(BaseModel):
     No RPC — uses Gamma reported_volume/reported_liquidity only.
     If market's liquidity < min_liquidity OR volume < min_volume, skip collection
     for that window (emit low_liquidity event) and try next window's market.
+    Two P0 carve-outs (weather thin-bucket fix, Sep 2026):
+    - Unknown (None/NaN/unparseable) = INCLUDE, never reject ("no data" is not
+      "low data" — Gamma omits aggregates on fresh near-term brackets).
+    - Near-term bypass: events ending within near_term_bypass_hours skip the
+      floor entirely (today/tomorrow brackets are the hunting ground; the floor
+      only throttles far-future discovery cost).
     """
     enabled: bool = False  # off by default — collect all unless user opts in
     min_liquidity: float = 0.0  # e.g. 500 means require liquidityNum >= 500
     min_volume: float = 0.0  # e.g. 1000 means require volumeNum >= 1000
     min_spread_liquidity_check: bool = False  # if true, check spread via book snapshot too
+    near_term_bypass_hours: float = 36.0  # events ending within this: no floor
 
 
 class CapacityConfig(BaseModel):

@@ -296,3 +296,55 @@ def test_a4_price_change_entry_hash_captured():
     applied, _ = book.apply_ws_message(pc)
     assert applied is True
     assert book.book_hash["up"] == "entryhash001"
+
+
+def _one_sided_book_frame(ts=None):
+    """Hashed `book` frame with asks only (thin far-future bucket norm)."""
+    m = {"event_type": "book", "asset_id": "up-123", "market": "0xm",
+         "asks": [{"price": "0.52", "size": "10"}],
+         "hash": "0df9ed199b15f73551ec79f2b0d43cb805c0dafa"}
+    if ts is not None:
+        m["timestamp"] = ts
+    return m
+
+
+def _make_f10_book(one_sided):
+    from polymarket_collector.book import OrderBookState
+    import time as _t
+    return OrderBookState(
+        asset="LONDON", condition_id="cid-f10", market_id="mid-1",
+        series_id="WEATHER-HIGH-1D", window_index=42,
+        up_token_id="up-123", down_token_id="down-456",
+        market_end_ts_ms=int(_t.time() * 1000) + 300_000,
+        l2_levels=20, one_sided_promotion=one_sided,
+    )
+
+
+def test_f10_one_sided_promotes_with_flag():
+    book = _make_f10_book(True)
+    book.mark_stale("r1")
+    applied, reason = book.apply_ws_message(_one_sided_book_frame(ts="1788649334527"))
+    assert applied is True
+    assert reason is None
+    assert book.book_state == BookState.live
+
+
+def test_f10_one_sided_stays_stale_without_flag():
+    book = _make_f10_book(False)
+    book.mark_stale("r1")
+    applied, _ = book.apply_ws_message(_one_sided_book_frame(ts="1788649334527"))
+    assert applied is True
+    assert book.book_state == BookState.stale
+    # content still applied — label only
+    assert book.up.asks.best_price() == 0.52
+
+
+def test_f10_hash_gate_survives_flag():
+    book = _make_f10_book(True)
+    book.mark_stale("r1")
+    f = _one_sided_book_frame(ts="1788649334527")
+    del f["hash"]
+    applied, reason = book.apply_ws_message(f)
+    assert applied is True
+    assert book.book_state == BookState.stale
+    assert reason is not None and "book_hash_missing_on_promotion" in reason

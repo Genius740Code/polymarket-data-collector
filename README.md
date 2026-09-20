@@ -94,6 +94,29 @@ Empty book side → `null`, never `0`. `0` is a real zero-size level (rare). App
 
 `depth_1c/5c/10c` = cumulative size within 1¢/5¢/10¢ of **that side's own best price** (not mid, not opposite side). Computed from stored L2 levels.
 
+## Paper-trading bots (no real orders)
+
+Two BTC 5-min Up/Down paper bots plus weather bots, managed via
+`ecosystem.bots.config.cjs` (`.cjs` because `package.json` sets
+`"type": "module"`, which breaks `require` in the legacy `.js` file):
+
+```bash
+pm2 start ecosystem.bots.config.cjs            # all paper bots
+pm2 logs btc5m-momentum-impulse --lines 50
+```
+
+- `paper_bot.py` → `trades.csv` / `windows.csv` (model-probability edge bot).
+- `paper_momentum_impulse.py` → `trades_momentum.csv` / `windows_momentum.csv`:
+  late momentum continuation — at age 180–240s (≈T-120s) require
+  |chainlink − strike| ≥ `$MOM_IMPULSE_MIN` (default 80) **and** crowd
+  agreement (impulse side mid > 0.5); size 5% risk capped at 50% notional;
+  $1.50 micro-hedge when dominant mid ≥ 0.95; hold to settlement.
+  Knobs via `MOM_*` env vars. Tests: `tests/test_momentum_decision.py`.
+- `weather_bots_paper_trader.py` → `weather_bot_trades.csv`.
+
+All bots are real-data-only (AGENT.md): live CLOB book-walk fills, Chainlink
+strikes/settlement, windows joined late are skipped — never estimated.
+
 ## Testing (§19)
 
 ```bash

@@ -136,6 +136,8 @@ ws:
   full_book_diff_interval_seconds: 300
   full_book_diff_tolerance: 0.01
   max_resync_duration_seconds: 60
+  # F10: thin one-sided weather buckets promote on any hashed side (see config.py)
+  promotion_one_sided: true
   reconnect_backoff_initial_ms: 500
   reconnect_backoff_max_ms: 30000
   reconnect_jitter: true

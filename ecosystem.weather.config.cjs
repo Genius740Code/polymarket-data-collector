@@ -85,7 +85,7 @@ function weatherApp(name, configFile, outLog, errLog) {
     instances: 1,
     autorestart: true,
     watch: false,
-    max_memory_restart: '1000M',
+    max_memory_restart: '2500M',
     restart_delay: 5000,
     exp_backoff_restart_delay: 100,
     kill_timeout: 60000,

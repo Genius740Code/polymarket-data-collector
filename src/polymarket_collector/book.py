@@ -292,6 +292,10 @@ class OrderBookState:
         market_end_ts_ms: Optional[int],
         schema_version: str = "3.0.0",
         l2_levels: int = 10,
+        # F10: one-sided promotion for thin books (weather far-future buckets
+        # are routinely asks-only). Wired from WsConfig.promotion_one_sided;
+        # default False preserves the strict both-sides gate elsewhere.
+        one_sided_promotion: bool = False,
     ):
         self.asset = asset
         self.condition_id = condition_id
@@ -314,6 +318,7 @@ class OrderBookState:
         # L2 output stays at l2_levels columns; RAM keeps up to 100 levels so
         # level 11+ survives top-of-book removals.
         self._ram_levels = max(l2_levels, 100)
+        self.one_sided_promotion = bool(one_sided_promotion)
 
         self.up = OutcomeBook()
         self.down = OutcomeBook()
@@ -672,8 +677,14 @@ class OrderBookState:
             # but must not promote: the book stays stale and the REST-heal path
             # covers it. The refusal is returned as the reason so the collector
             # emits a book_anomaly (no resync storm — content was applied).
+            # F10: with one_sided_promotion (weather thin buckets), a hashed
+            # frame with ANY side present promotes — asks-only books are the
+            # norm far-future, not broken. Without it, both sides required.
             if self.book_state != BookState.live:
-                if book.bids.best_top()[0] is not None and book.asks.best_top()[0] is not None:
+                has_bid = book.bids.best_top()[0] is not None
+                has_ask = book.asks.best_top()[0] is not None
+                promotable = (has_bid and has_ask) or (self.one_sided_promotion and (has_bid or has_ask))
+                if promotable:
                     if self._well_formed_hash(msg.get("hash")):
                         self.mark_live()
                     else:

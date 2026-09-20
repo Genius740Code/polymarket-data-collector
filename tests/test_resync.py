@@ -181,3 +181,54 @@ def test_replay_buffer_id_no_fallback_leak(tmp_path):
     c.resync._episodes[rid].resync_completed_ts_utc = "done"
     assert c._replay_buffer_id("BTC") == ""
     assert "asset-BTC" not in c.resync._buffers
+
+
+@pytest.mark.asyncio
+async def test_resync_failed_carries_fetch_none_branch():
+    """F9 (Sep 2026 forensics): escalation details must say which phase kept
+    failing. Fetcher returning None every attempt -> fail_branch fetch_none."""
+    cfg = CollectorConfig()
+    cfg.ws.max_resync_duration_seconds = 0  # escalate on first failed attempt
+    cfg.ws.resync_rest_backoff_initial_ms = 10
+    cfg.ws.resync_rest_backoff_max_ms = 20
+    books = {"cid-1": make_book("cid-1")}
+    events = []
+
+    async def none_fetch(asset, cid):
+        return None
+
+    mgr = ResyncManager(cfg, rest_fetcher=none_fetch,
+                        on_event=lambda t, d: events.append((str(t), d)))
+    rid = mgr.handle_disconnect("BTC", "cid-1", reason="test", books=books)
+    mgr.handle_reconnect(rid)
+    ok = await mgr.resync("BTC", "cid-1", books, rid)
+    assert ok is False
+    failed = [d for t, d in events if "resync_failed" in t]
+    assert len(failed) == 1
+    assert failed[0]["fail_branch"] == "fetch_none"
+    assert failed[0]["attempts"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_resync_failed_carries_fetch_err_branch():
+    """Same contract when the fetcher itself raises -> fail_branch fetch_err."""
+    cfg = CollectorConfig()
+    cfg.ws.max_resync_duration_seconds = 0
+    cfg.ws.resync_rest_backoff_initial_ms = 10
+    cfg.ws.resync_rest_backoff_max_ms = 20
+    books = {"cid-1": make_book("cid-1")}
+    events = []
+
+    async def boom_fetch(asset, cid):
+        raise RuntimeError("boom")
+
+    mgr = ResyncManager(cfg, rest_fetcher=boom_fetch,
+                        on_event=lambda t, d: events.append((str(t), d)))
+    rid = mgr.handle_disconnect("BTC", "cid-1", reason="test", books=books)
+    mgr.handle_reconnect(rid)
+    ok = await mgr.resync("BTC", "cid-1", books, rid)
+    assert ok is False
+    failed = [d for t, d in events if "resync_failed" in t]
+    assert len(failed) == 1
+    assert failed[0]["fail_branch"] == "fetch_err"
+    assert "boom" in failed[0]["fail_error"]

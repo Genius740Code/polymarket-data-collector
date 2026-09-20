@@ -889,14 +889,21 @@ def _staging_resources(stats: dict, staging: "Path", flavor: str, dataset_prefix
     (city discovered mid-export — no inputs at worker time) is excluded so
     dataset_create_version never fails with "does not exist"; the next tick
     rebuilds it once inputs exist. Schema-empty-but-present files still ship.
+    Crash leftovers (`*.tmp`, `*.tmp.tmp` — e.g. a killed worker's publish
+    tempfile leaking into stats keys, shipped once 2026-09-15) are never
+    valid resources and are excluded outright.
     """
     from pathlib import Path as _P
+    names = [_P(k).name for k in stats.keys() if ".tmp" not in _P(k).name]
+    skipped_tmp = sum(1 for k in stats.keys() if ".tmp" in _P(k).name)
+    if skipped_tmp:
+        print(f"[export] WARN excluded {skipped_tmp} tmp-named stats keys from upload manifest")
     resources = [
-        {"path": _P(k).name, "description": f"{_P(k).name} {flavor} — {dataset_prefix}"}
-        for k in stats.keys()
-        if (staging / _P(k).name).exists()
+        {"path": n, "description": f"{n} {flavor} — {dataset_prefix}"}
+        for n in names
+        if (staging / n).exists()
     ]
-    missing = [_P(k).name for k in stats.keys() if not (staging / _P(k).name).exists()]
+    missing = [n for n in names if not (staging / n).exists()]
     return resources, missing
 
 
@@ -2779,6 +2786,18 @@ def _stream_export_asset_dataset(
             except Exception as e:
                 # M4: fail CLOSED — a filter failure must not leak other-lane rows
                 raise RuntimeError(f"lane filter failed: {e}")
+        if "asset" in t.schema.names:
+            # Per-asset staging must never carry other cities' rows. When the
+            # hive holds no partition for this asset, iter_source_files falls
+            # back to the whole hive ("filter later by column") and the lane
+            # mask above passes every WEATHER row by design — without this
+            # filter the full hive flowed into each city's file (2026-09-15:
+            # 34 LOW cities shipped byte-identical full-hive dumps labeled as
+            # one city). Zero-row results stage as schema-empty files.
+            try:
+                t = t.filter(pc.equal(t.column("asset"), pa.scalar(asset_upper)))
+            except Exception:
+                pass
         if live_only and "book_state" in t.schema.names:
             try:
                 t = t.filter(pc.equal(t.column("book_state"), pa.scalar("live")))

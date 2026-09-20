@@ -458,12 +458,18 @@ def test_liquidity_filter_unknown_passes():
 
 def test_weather_liquidity_filter_unknown_passes():
     """Same unknown-passes contract for the weather discovery path."""
+    import time
     from polymarket_collector.weather_discovery import WeatherDiscovery
     from polymarket_collector.rollover import MarketInfo
     w = WeatherDiscovery(mode="high", liquidity_filter=_lf_config())
+    # Far-future end: outside the 36h near-term bypass, so the confirmed-low
+    # case below actually exercises the floor (end_ts=1 would bypass via the
+    # just-ended grace path and can't occur post-discovery-screening anyway).
+    far_ms = int(time.time() * 1000) + 48 * 3600 * 1000
     base = dict(
         market_id="1", asset="SHANGHAI", up_token_id="u", down_token_id="d",
-        market_start_ts_ms=0, market_end_ts_ms=1, window_index=0,
+        market_start_ts_ms=far_ms - 86400 * 1000, market_end_ts_ms=far_ms,
+        window_index=0,
         series_id="WEATHER-HIGH-1D",
     )
     assert w._passes_liquidity_filter(MarketInfo(condition_id="a", reported_volume=None, reported_liquidity=None, **base)) is True
