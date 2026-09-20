@@ -44,14 +44,20 @@ kaggle:
   # 2026-09-18: 12h -> 6h — 19GB box, 4.7GB free; 6h ~= 3GB fits. Floor with
   # 5 lanes x 1h round-robin (lane cycle ~5h); do not go lower without
   # dropping lanes or shortening upload_interval.
+  # 2026-09-21: 5 lanes -> 2 (5m, 1h) — retention guard UNDERPROVISIONED
+  # (5 x 3600s = 5h cadence vs 6h retention, needs 2x headroom). 2-lane
+  # cadence = 2h, needs >=4h headroom; 6h leaves margin. Dropped 15m/4h/1d
+  # until a bigger box; re-add only after retention_cadence_check() is silent.
   local_retention_hours: 6
   # 2026-09-20 disk-full fix: the prune MOVES files to data/_quarantine/
   # (same filesystem) instead of unlinking — without a bound every "prune"
   # frees 0 bytes. reap_quarantine() deletes quarantined files past the
   # review grace, then oldest-first over the size cap. Only already-uploaded
   # or unreadable data is ever removed, never the live hive.
-  quarantine_retention_hours: 72
-  quarantine_max_bytes: 1073741824
+  # 2026-09-21: 72h -> 24h, 1GiB -> ~300MB — 19GB box cannot afford 72h of
+  # quarantine buffer; 24h is enough review grace on a tight disk.
+  quarantine_retention_hours: 24
+  quarantine_max_bytes: 314572800
   test_upload_interval_seconds: 600
   # 2026-09-10: restored 3600 — streaming export bounds staging peak to
   # ~one source file, verified 186k rows at 392MB peak (was 2.2GB+ death).
@@ -88,7 +94,9 @@ storage:
   compaction_temp_suffix: .tmp
   data_dir: ./data
   disk_space_check_interval_seconds: 30
-  disk_space_min_bytes: 1073741824
+  # 2026-09-21: 1GiB -> ~500MB floor — 1GiB is a third of a 3-5GB budget
+  # without buying safety (the guard reaps+prunes on breach either way).
+  disk_space_min_bytes: 524288000
   flush_interval_seconds: 30
   flush_row_count_threshold: 1500
   wal_dir: ./data/_wal
@@ -119,15 +127,17 @@ window_size_seconds: 300
 # 1h found 2026-09-08 under the ET slug family, NOT the unix-ts scheme;
 # 1d found 2026-09-14 under the ET end-date slug family, 7/7 ENABLE).
 timeframes:
-  # ROLLOUT STEP 3 2026-09-14: 5m+15m+1h+4h+1d (35 lanes). 1h code-ready
-  # (ET slugs, live-validated discovery); 4h same. 1d live-validated 7/7
-  # via {bitcoin,...}-up-or-down-on-{month}-{day}-{year} end-date slugs
-  # (noon-ET windows); unix-ts 1d slugs are empty on Gamma.
+  # 2026-09-21: cut to 5m+1h (was 5m+15m+1h+4h+1d, 35 lanes) — retention
+  # guard failed (5h cadence vs 6h retention, needs 2x headroom) and the
+  # slowest-lane checkpoint stalled the prune until ENOSPC. 5m is the
+  # highest-value data, 1h the slower-moving check. Re-add lanes only with
+  # retention headroom to match (guard must print nothing). Lane slug notes
+  # (validated 2026-09-06/08/14): 1h lives under the ET slug family (NOT the
+  # unix-ts scheme); 1d under the ET end-date slug family
+  # ({bitcoin,...}-up-or-down-on-{month}-{day}-{year}, noon-ET windows);
+  # unix-ts 1d slugs are empty on Gamma.
   - 5m
-  - 15m
   - 1h
-  - 4h
-  - 1d
 
 ws:
   full_book_diff_interval_seconds: 300

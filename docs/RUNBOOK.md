@@ -124,14 +124,16 @@ watch for `[test-mode:real] lane restricted to 15m`).
 
 ## 8. Local-disk safety (rolling-window prune)
 
-- Prod runs with `kaggle.rolling_window: true`, `local_retention_hours: 48`.
+- Prod runs with `kaggle.rolling_window: true`, `local_retention_hours: 6`
+  (2026-09-21: 48 → 12 → 6 as the box shrank; 2 lanes × 1h interval = 2h
+  cadence, needs ≥4h headroom — the guard below must print nothing).
 - `cleanup_local_data` deletes a local parquet file **only if** every
-  `condition_id` in it ended before `checkpoint − 48h` **AND** its upload was
+  `condition_id` in it ended before `checkpoint − retention_hours` **AND** its upload was
   verified. `chainlink_events`/`collector_events` use a timestamp fallback.
   Cumulative mode never deletes.
 - Safety gate before prod: dry-run first —
-  `cleanup_local_data(..., timeframe_labels=["5m"], rolling_window=True, retention_hours=48, dry_run=True)`
-  must list only files whose markets all ended >48h ago. **Nothing is deleted in dry-run.**
+  `cleanup_local_data(..., timeframe_labels=["5m"], rolling_window=True, retention_hours=6, dry_run=True)`
+  must list only files whose markets all ended >6h ago. **Nothing is deleted in dry-run.**
 - **Quarantine is bounded, not an archive (2026-09-20 disk-full fix):** the
   prune MOVES files to `data/_quarantine/` (same filesystem — frees 0 bytes
   by itself). `reap_quarantine()` deletes quarantined files past

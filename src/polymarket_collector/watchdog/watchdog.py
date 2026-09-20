@@ -155,10 +155,20 @@ class Watchdog:
                 seen = self._ce_seen.setdefault(key, set())
                 for et, eid in zip(et_col, id_col):
                     if et in alert_on:
-                        # Avoid re-alerting on old events: only alert if within last heartbeat_stale window
-                        # For simplicity, alert once per scan; real system would track seen event_ids
+                        # Fire once per new event (deduped by event_id). Rows
+                        # without an id re-fire only when the file grows: files
+                        # unchanged since the last poll are skipped by the
+                        # mtime+size gate above, so this cannot spam.
                         if eid is None or eid not in seen:
-                            pass
+                            try:
+                                self.on_alert(et, {
+                                    "event_type": et,
+                                    "event_id": eid,
+                                    "source_file": part.name,
+                                })
+                            except Exception:
+                                pass
+                            fired.append(et)
                         if eid is not None:
                             # bound per-file memory: keep latest 50k ids
                             if len(seen) > 50000:

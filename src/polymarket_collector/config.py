@@ -86,7 +86,12 @@ class StorageConfig(BaseModel):
 
 
 class RawArchiveConfig(BaseModel):
-    enabled: bool = True
+    # Disabled by default (2026-09-21 audit §7): raw WS frames grow ~1.8GB/h
+    # with no working safety valve — prune() is a plain age-unlink with no
+    # quarantine/upload gate and nothing calls it in prod. Matches
+    # config/collector.yaml (disabled since 2026-09-07); opt in explicitly
+    # on a >=25GB box only.
+    enabled: bool = False
     retention_hours: int = 36
     path: str = "./data/raw_ws_archive"
     format: Literal["jsonl"] = "jsonl"
