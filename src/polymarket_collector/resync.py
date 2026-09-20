@@ -110,6 +110,43 @@ class ResyncManager:
         # C4: monotonic deadlines per buffer (retire zombie feeds) + retired set
         self._buffer_deadline: Dict[str, float] = {}
         self._buffer_retired: set = set()
+        # P1 fix: episode-persist failures must never be silent (AGENT.md:
+        # "high-stale-day with zero resync_episodes = P0 silent failure").
+        # Counts every on_episode_persist exception; each also fires a
+        # write_failed event so the blind spot is operationally visible.
+        self._persist_fail_total: int = 0
+
+    def _safe_persist(self, payload: dict, where: str) -> None:
+        """Persist an episode via on_episode_persist with loud failure accounting.
+
+        Success path is unchanged. On exception: increment
+        _persist_fail_total and fire write_failed (never silent). Used at
+        every episode transition (disconnect/reconnect/attempt/completed/
+        escalated/superseded).
+        """
+        cb = self.on_episode_persist
+        if cb is None:
+            return
+        try:
+            cb(payload)
+        except Exception as e:
+            try:
+                self._persist_fail_total += 1
+            except Exception:
+                pass
+            if self.on_event:
+                try:
+                    _rid = payload.get("resync_id") if isinstance(payload, dict) else None
+                    self.on_event(CollectorEventType.write_failed, {
+                        "dataset": "resync_episodes",
+                        "reason": "episode_persist_failed",
+                        "where": where,
+                        "resync_id": _rid,
+                        "fail_total": self._persist_fail_total,
+                        "error": f"{type(e).__name__}: {e}"[:200],
+                    })
+                except Exception:
+                    pass
 
     def _buffer_age_limit_s(self) -> float:
         try:
@@ -201,11 +238,7 @@ class ResyncManager:
                     self.on_book_state_change(book, BookState.stale)
         if self.on_event:
             self.on_event(CollectorEventType.ws_disconnected, ep.to_dict())
-        if self.on_episode_persist:
-            try:
-                self.on_episode_persist(ep.to_dict())
-            except Exception:
-                pass
+        self._safe_persist(ep.to_dict(), "handle_disconnect")
         return resync_id
 
     def handle_reconnect(self, resync_id: str) -> None:
@@ -229,11 +262,7 @@ class ResyncManager:
         # Do NOT auto-mark completed for quick gaps — require real REST resync via resync() for honest gap per AGENT.md
         if self.on_event:
             self.on_event(CollectorEventType.ws_reconnected, ep.to_dict())
-        if self.on_episode_persist:
-            try:
-                self.on_episode_persist(ep.to_dict())
-            except Exception:
-                pass
+        self._safe_persist(ep.to_dict(), "handle_reconnect")
 
     # -- buffering during REST fetch ---------------------------------------
     def buffer_message(self, resync_id: str, msg: dict) -> None:
@@ -326,11 +355,7 @@ class ResyncManager:
             ep.resync_attempt_count += 1
             ep.resync_rest_fetch_ts_utc = _now_iso()
             # persist attempt timestamp even on failure (ensures not 100% null)
-            if self.on_episode_persist:
-                try:
-                    self.on_episode_persist(ep.to_dict())
-                except Exception:
-                    pass
+            self._safe_persist(ep.to_dict(), "resync_attempt")
             phase = "fetch"
             attempt_branch: Optional[str] = None
             attempt_error: Optional[str] = None
@@ -382,11 +407,7 @@ class ResyncManager:
                 ep.resync_completed_ts_utc = _now_iso()
                 if self.on_event:
                     self.on_event(CollectorEventType.resync_completed, ep.to_dict())
-                if self.on_episode_persist:
-                    try:
-                        self.on_episode_persist(ep.to_dict())
-                    except Exception:
-                        pass
+                self._safe_persist(ep.to_dict(), "resync_completed")
                 # cleanup buffer
                 self._buffers.pop(resync_id, None)
                 self._buffer_deadline.pop(resync_id, None)
@@ -408,11 +429,7 @@ class ResyncManager:
                 print(f"[resync] attempt {ep.resync_attempt_count} {asset} {condition_id} "
                       f"failed at {attempt_branch}: {attempt_error}")
                 # persist attempt state for honest episode bookkeeping
-                if self.on_episode_persist:
-                    try:
-                        self.on_episode_persist(ep.to_dict())
-                    except Exception:
-                        pass
+                self._safe_persist(ep.to_dict(), "resync_attempt_failed")
                 # check escalation timeout
                 elapsed = time.monotonic() - start_ts
                 if elapsed >= max_duration_s:
@@ -429,12 +446,9 @@ class ResyncManager:
                             ep.gap_duration_ms = int(elapsed * 1000)
                             ep.snapshots_missed_estimate = ep.gap_duration_ms // 500
                     if self.on_episode_persist:
-                        try:
-                            d = ep.to_dict()
-                            d["escalated"] = True
-                            self.on_episode_persist(d)
-                        except Exception:
-                            pass
+                        d = ep.to_dict()
+                        d["escalated"] = True
+                        self._safe_persist(d, "resync_escalated")
                     if self.on_event:
                         self.on_event(CollectorEventType.resync_failed, {"resync_id": resync_id, "escalation": True, "elapsed_s": elapsed, "asset": ep.asset, "condition_id": ep.condition_id, "fail_branch": last_fail_branch, "fail_error": last_fail_error, "attempts": ep.resync_attempt_count})
                     # P0 leak hunt session 2: an escalated episode must stop
@@ -518,13 +532,10 @@ class ResyncManager:
             except Exception:
                 pass
         if self.on_episode_persist:
-            try:
-                d = ep.to_dict()
-                d["superseded"] = True
-                d["supersede_reason"] = reason
-                self.on_episode_persist(d)
-            except Exception:
-                pass
+            d = ep.to_dict()
+            d["superseded"] = True
+            d["supersede_reason"] = reason
+            self._safe_persist(d, "supersede_episode")
         self._buffers.pop(resync_id, None)
         self._buffer_deadline.pop(resync_id, None)
         self._buffer_retired.discard(resync_id)

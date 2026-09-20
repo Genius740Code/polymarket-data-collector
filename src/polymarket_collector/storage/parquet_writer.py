@@ -398,6 +398,10 @@ class ParquetWriter:
             groups[(br.dataset, br.date_str, br.asset)].append(br.row)
 
         flushed = 0
+        # P0 fix: track partial-batch state. A dead-letter BREAK requeues
+        # unprocessed later groups to _buffer (memory-only) — WAL must be
+        # retained so a crash before the next flush cannot lose them.
+        _batch_incomplete = False
         items = list(groups.items())
         for idx, ((dataset, date_str, asset), rows) in enumerate(items):
             try:
@@ -485,6 +489,8 @@ class ParquetWriter:
                             pass
                         # requeue ONLY the unprocessed later groups, skip poison group,
                         # then BREAK so the stale `items` tail is not written twice.
+                        # P0: mark batch incomplete so WAL is retained below.
+                        _batch_incomplete = True
                         for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
                             for r in reversed(r2):
                                 self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
@@ -521,7 +527,10 @@ class ParquetWriter:
             pass
         self._last_flush_ts = time.monotonic()
         # truncate WAL after successful flush — fsync directory to ensure durability (fixes 3 duplicate window)
-        if self.wal_enabled and flushed:
+        # P0: truncate ONLY on full success. A dead-letter BREAK above leaves
+        # requeued rows in _buffer (memory-only); truncating the WAL then would
+        # leave them with no durable copy until the next flush.
+        if self.wal_enabled and flushed and not _batch_incomplete:
             try:
                 # Batched WAL durability: flush + fsync the reused handle once
                 # per flush (not per row) so every buffered row's WAL entry is
@@ -559,8 +568,9 @@ class ParquetWriter:
         # C2: replayed pre-restart WAL rows are durable now — truncate the files
         # _wal_replay retained. Runs only on the success path (an exception above
         # re-raises before reaching here, keeping the WAL intact for retry).
+        # P0: same full-success gate — a partial batch keeps replay files too.
         _dirty = getattr(self, "_replay_dirty", None)
-        if _dirty and flushed:
+        if _dirty and flushed and not _batch_incomplete:
             try:
                 for _p in list(_dirty):
                     try:
