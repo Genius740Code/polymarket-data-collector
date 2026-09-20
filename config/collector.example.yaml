@@ -21,6 +21,11 @@ kaggle:
   upload_interval_seconds: 3600
   test_upload_interval_seconds: 600
   dataset_prefix: "gghgg1/polymarket-5m-crypto"
+  # Quarantine bound (2026-09-20 disk-full fix): the verified-upload prune
+  # moves files to <data_dir>/_quarantine/ (same filesystem); reap deletes
+  # past the review grace, then oldest-first over the cap. Live hive untouched.
+  quarantine_retention_hours: 72
+  quarantine_max_bytes: 1073741824  # 1 GiB
 
 # §1 — rollover
 rollover_lead_seconds: 30

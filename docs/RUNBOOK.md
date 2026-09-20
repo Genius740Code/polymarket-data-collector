@@ -132,6 +132,29 @@ watch for `[test-mode:real] lane restricted to 15m`).
 - Safety gate before prod: dry-run first —
   `cleanup_local_data(..., timeframe_labels=["5m"], rolling_window=True, retention_hours=48, dry_run=True)`
   must list only files whose markets all ended >48h ago. **Nothing is deleted in dry-run.**
+- **Quarantine is bounded, not an archive (2026-09-20 disk-full fix):** the
+  prune MOVES files to `data/_quarantine/` (same filesystem — frees 0 bytes
+  by itself). `reap_quarantine()` deletes quarantined files past
+  `kaggle.quarantine_retention_hours` (default 72h review grace), then
+  oldest-first over `kaggle.quarantine_max_bytes` (default 1GiB). It runs
+  automatically at the start of every `cleanup_local_data` call (even when
+  the prune itself early-returns) and on low disk. Only already-uploaded
+  (prune-moved) data and unreadable stubs are ever removed — never the live
+  hive. Manual equivalent: `python -m polymarket_collector.storage.quarantine
+  ./data --reap --dry-run`.
+- **Low-disk emergency drain (2026-09-20):** the flush loop now honors
+  `storage.disk_space_check_interval_seconds/min_bytes`. When free space
+  drops below the minimum it immediately reaps the quarantine and runs one
+  verified prune with zero retention leeway (cutoff = slowest verified
+  upload; all end/unknown/coverage gates stay on, so only already-uploaded
+  rows can go). Watch for `[disk-guard]` lines.
+- **Retention must fit the lane cadence (2026-09-19 incident):** the loop
+  uploads ONE lane per tick, so a full round takes `upload_interval_seconds
+  × len(timeframes)` and each lane uploads only that often. If that exceeds
+  `local_retention_hours`, the slowest-lane checkpoint stalls, the prune
+  deletes ~nothing, and the disk fills (5 lanes × 1h vs 6h retention =
+  death). Startup prints `[retention-guard]` when underprovisioned — fix by
+  dropping lanes, shortening the interval, or raising retention (needs disk).
 
 ## 9. Incident basics
 

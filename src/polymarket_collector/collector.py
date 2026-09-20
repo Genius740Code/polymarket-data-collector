@@ -30,10 +30,12 @@ from .clock import check_clock_drift, is_clock_issue
 from .config import CollectorConfig
 from .enums import BookState, CollectorEventType, MarketStatus, ResolutionOutcome
 from .storage.export import (
+    cleanup_local_data,
     export_and_upload_all_kaggle,
     prepare_kaggle_staging_5m,
     _validate_kaggle_config,
 )
+from .storage.quarantine import reap_quarantine
 from .rollover import MarketInfo, RolloverManager
 from .resync import ResyncManager, exponential_backoff
 from .storage.cursor_store import CursorState, CursorStore
@@ -85,6 +87,52 @@ def _next_kaggle_lane(data_dir: str | Path, lanes: List[str]) -> Optional[str]:
     except Exception:
         pass
     return lane
+
+
+def retention_cadence_check(config: CollectorConfig) -> str | None:
+    """Warn when the upload cadence cannot keep up with retention (2026-09-20).
+
+    The Kaggle loop uploads ONE lane per tick, so a full round takes
+    ``upload_interval_seconds × len(timeframes)``. When that exceeds
+    ``local_retention_hours`` (rolling-window mode), each lane's data ages
+    past the prune leeway before its next verified upload — the slowest-lane
+    checkpoint stalls, the prune deletes ~nothing, and the disk grows until
+    ENOSPC (observed 2026-09-19: 5 lanes × 1h interval vs 6h retention).
+    Returns the warning message, or None when the math fits / not applicable.
+    Pure function (no I/O) for testability; callers print it loudly.
+    """
+    try:
+        rolling = bool(getattr(getattr(config, "kaggle", None), "rolling_window", False))
+        if not rolling:
+            return None
+        lanes = list(getattr(config, "timeframes", None) or ["5m"])
+        interval = int(getattr(getattr(config, "kaggle", None),
+                               "upload_interval_seconds", 3600) or 3600)
+        retention_h = float(getattr(getattr(config, "kaggle", None),
+                                    "local_retention_hours", 48) or 48)
+        if len(lanes) <= 1:
+            return None
+        cadence_s = interval * len(lanes)
+        retention_s = retention_h * 3600.0
+        # 2x headroom heuristic: staging builds overrun the interval (a 4h
+        # lane build took 74 min on 2026-09-19), so a cadence that merely
+        # "fits" inside retention still stalls the slowest-lane checkpoint
+        # and the prune deletes ~nothing until ENOSPC. Observed incident:
+        # 5 lanes x 1h = 5h cadence vs 6h retention (no headroom) = death.
+        if cadence_s * 2 > retention_s:
+            return (
+                f"[retention-guard] UNDERPROVISIONED: {len(lanes)} lanes × "
+                f"{interval}s upload interval = {cadence_s / 3600:.1f}h lane cadence "
+                f"vs {retention_h}h local_retention_hours (needs 2x headroom for "
+                f"build overruns). Per-lane uploads lag retention, the "
+                f"slowest-lane prune checkpoint stalls, and the disk WILL fill. "
+                f"Fix one: fewer timeframes, shorter "
+                f"upload_interval_seconds, or larger local_retention_hours "
+                f"(needs disk headroom)."
+            )
+    except Exception:
+        return None
+    return None
 
 
 class Collector:
@@ -143,6 +191,15 @@ class Collector:
         # kaggle lock ensures flush/export/prune never races with snapshot append (§10A lossless)
         self._kaggle_lock = asyncio.Lock()
         self._last_snapshot_bucket_ms: Optional[int] = None
+        # 2026-09-20 disk-full fix: the storage disk guard (check_disk_space +
+        # disk_space_check_interval_seconds) was configured but never called —
+        # the box filled with zero warning until ENOSPC killed collection.
+        # The flush loop now honors it (see _flush_loop) with throttled
+        # emergency reclaim (quarantine reap + immediate verified prune).
+        self._last_disk_check_monotonic: float = 0.0
+        self._last_emergency_prune_monotonic: float = 0.0
+        self._emergency_prune_running: bool = False
+        self._emergency_prune_requested: bool = False
         # CRITICAL: the per-asset WS task and the resync manager call `self.on_event`
         # in the disconnect/reconnect path. It was never defined — the first
         # AttributeError killed the whole task silently, so reconnects never ran
@@ -389,11 +446,12 @@ class Collector:
             # (NOT bucket_ts — bucket is in the fallback dedup key).
             try:
                 import sys as _sys_be
-                _outcome = _sys_be.intern(str(ev.get("outcome") or "unknown"))
+                _outcome_raw = ev.get("outcome") or None
+                _outcome = _sys_be.intern(str(_outcome_raw)) if _outcome_raw else None
                 _etype = _sys_be.intern(str(ev.get("event_type") or "price_change"))
                 _au = _sys_be.intern(asset.upper())
             except Exception:
-                _outcome = str(ev.get("outcome") or "unknown")
+                _outcome = ev.get("outcome") or None
                 _etype = str(ev.get("event_type") or "price_change")
                 try:
                     _au = asset.upper()
@@ -411,7 +469,8 @@ class Collector:
                 "window_index": int(book.window_index) if book.window_index is not None else 0,
                 "asset": _au,
                 "event_id": str(uuid.uuid4()),
-                "token_id": str(ev.get("token_id") or ""),
+                # N10: honest NULLs (was "" / "unknown" sentinels).
+                "token_id": (str(ev.get("token_id")) if ev.get("token_id") else None),
                 "outcome": _outcome,
                 "event_type": _etype,
                 # H6: preserve bbo_snapped payload (was all-NULL + dedup collapse)
@@ -871,6 +930,14 @@ class Collector:
                 book.mark_live()
             except Exception:
                 pass
+            # N4: a REST heal is fresh data — refresh the per-book frame clock
+            # so the book does not flip stale again on the very next tick
+            # (flapping opened one resync episode per asset per tick).
+            try:
+                import time as _t_h
+                self._last_frame_ns_per_book[book.condition_id] = _t_h.time_ns()
+            except Exception:
+                pass
             return True
         # REST failed or empty — never fabricate data (synthetic permanently disabled)
         # Book remains in its current state (likely stale/null) - downstream should handle
@@ -971,9 +1038,18 @@ class Collector:
                         cid = None
                         widx = 0
                         next_cid = None
-                    # last snapshot ts: use most recent book update or now
-                    # Prefer rollover state's last_discovery or now
-                    last_snap = now_ms
+                    # last snapshot ts: real last bucket when books exist, else
+                    # None (honest unknown → recovery treats as coverage_gap).
+                    # Was: always now_ms, which made an hours-dead market look
+                    # 0s old and recreated stale books instead of gap events.
+                    try:
+                        _lb = getattr(self, "_last_snapshot_bucket_ms", None)
+                    except Exception:
+                        _lb = None
+                    if cid is not None and _lb:
+                        last_snap = int(_lb)
+                    else:
+                        last_snap = None
                     cs = CursorState(
                         asset=au,
                         current_window_index=int(widx),
@@ -1024,6 +1100,16 @@ class Collector:
                     print(f"[startup] post-replay flush err {e}")
         except Exception as e:
             print(f"[startup] WAL replay err {e}")
+
+        # 2026-09-20 disk-full fix: fail LOUD at startup when the lane
+        # cadence outruns retention (warn-only: never block collection or
+        # tests on this heuristic).
+        try:
+            _rc_warn = retention_cadence_check(self.config)
+            if _rc_warn:
+                print(_rc_warn)
+        except Exception:
+            pass
 
         # K-2: seed the in-RAM chainlink store from parquet so resolution works for
         # windows that opened before this process (restart mid-window, first window)
@@ -2321,11 +2407,22 @@ class Collector:
                             # H3: per-book staleness — a single stalled token must
                             # not read live for 30s waiting for the shard watchdog.
                             # Backdate the disconnect to the last frame time.
+                            # N4: quiet books (thin weather brackets, late-window,
+                            # slow lanes) are event-driven — no frame for 10s is
+                            # "no change", not "no data". Scale the threshold by
+                            # lane so slow lanes do not flap stale->heal->stale
+                            # (each flap opened a resync episode).
                             try:
                                 _last_ns = self._last_frame_ns_per_book.get(m.condition_id)
                                 if _last_ns is not None and getattr(book.book_state, "value", "") == "live":
                                     _age_s = (time.time_ns() - _last_ns) / 1e9
-                                    if _age_s > float(getattr(self, "_BOOK_STALE_AFTER_S", 10)):
+                                    try:
+                                        _sid = str(getattr(m, "series_id", "") or "")
+                                        _sfx = _sid.rsplit("-", 1)[-1].lower() if "-" in _sid else ""
+                                        _thr = {"1d": 120.0, "4h": 90.0, "1h": 60.0, "15m": 30.0}.get(_sfx, float(getattr(self, "_BOOK_STALE_AFTER_S", 10)))
+                                    except Exception:
+                                        _thr = float(getattr(self, "_BOOK_STALE_AFTER_S", 10))
+                                    if _age_s > _thr:
                                         _last_ms = int(_last_ns // 1_000_000)
                                         try:
                                             _rid = self.resync.handle_disconnect(
@@ -2412,8 +2509,18 @@ class Collector:
                                     _bs_val = "stale"
                                 if _bs_val == "live":
                                     _bs_val = "stale"
+                                # N10: exception-path events are unthrottled — a
+                                # systematic snapshot bug emits 2/s/asset forever.
+                                # First + every 100th carries the running total.
                                 try:
-                                    self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "reason": "snapshot_error", "error": str(e)[:200]})
+                                    _sk = f"snapshot_error:{m.asset}"
+                                    self._ws_noise_throttle[_sk] += 1
+                                    _sn = self._ws_noise_throttle[_sk]
+                                except Exception:
+                                    _sn = 1
+                                try:
+                                    if _sn == 1 or _sn % 100 == 0:
+                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": m.asset, "condition_id": m.condition_id, "reason": "snapshot_error", "error": str(e)[:200], "count": _sn})
                                 except Exception:
                                     pass
                                 try:
@@ -2474,11 +2581,14 @@ class Collector:
                                 pass
                             # Catch-up honesty (M5): deferred buckets carry CURRENT RAM
                             # levels under OLD bucket times (forward-fill) — never
-                            # knowable at that time. Label ALL deferred buckets
+                            # knowable at that time. Label deferred buckets
                             # stale (no 1s grace lookahead window).
+                            # N1: compare against the current bucket grid, not wall-clock.
+                            # bucket is the 500ms boundary; wall-clock is always a few
+                            # ms later so `bucket < now_ms` downgraded EVERY live row
+                            # (~98% stale). Only genuinely deferred buckets go stale.
                             try:
-                                _now_ms_cf = int(time.time() * 1000)
-                                if bucket < _now_ms_cf and row.get("book_state") == "live":
+                                if bucket < cur_bucket and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
                                         row["resync_id"] = getattr(book, "resync_id", None) or str(uuid.uuid4())
@@ -2591,6 +2701,113 @@ class Collector:
             _parts.append(f"markets_unsent_dropped={_ud}")
         return (" dropped: " + ",".join(_parts)) if _parts else ""
 
+    def _disk_guard_tick(self) -> None:
+        """Honor storage.disk_space_check_interval_seconds / min_bytes.
+
+        2026-09-20 disk-full fix: this guard was configured but never called —
+        the box filled with zero warning. Now, throttled by the configured
+        interval: check free space (check_disk_space already emits a
+        write_failed event when low); when low, immediately reclaim what is
+        provably safe instead of waiting for the next hourly upload tick:
+        (1) reap the quarantine (bounded by its own age/cap policy, never
+        touches the live hive), (2) schedule one emergency verified prune
+        with ZERO retention leeway (cutoff = slowest verified upload — every
+        deleted row is already on Kaggle; all end/unknown/coverage gates stay
+        intact, so this cannot delete un-uploaded data, it just drops the
+        "just in case" leeway when the alternative is ENOSPC death).
+        Sync part only does the cheap check + reap; the full prune scan runs
+        in a worker thread with an overlap guard (see _flush_loop).
+        Returns None; never raises.
+        """
+        try:
+            import time as _t_dg
+            now_m = _t_dg.monotonic()
+            try:
+                interval = float(getattr(self.config.storage,
+                                         "disk_space_check_interval_seconds", 30) or 30)
+            except Exception:
+                interval = 30
+            if (now_m - getattr(self, "_last_disk_check_monotonic", 0.0)) < interval:
+                return
+            self._last_disk_check_monotonic = now_m
+            try:
+                min_bytes = int(getattr(self.config.storage,
+                                        "disk_space_min_bytes", 1_073_741_824)
+                                or 1_073_741_824)
+            except Exception:
+                min_bytes = 1_073_741_824
+            alert = None
+            try:
+                alert = self.writer.check_disk_space(min_bytes=min_bytes)
+            except Exception:
+                return
+            if not alert:
+                return
+            try:
+                free = int((alert or {}).get("free_bytes", 0))
+            except Exception:
+                free = 0
+            print(f"[disk-guard] LOW DISK: {free}B free < {min_bytes}B minimum — "
+                  f"emergency reclaim (quarantine reap + verified prune, zero leeway)")
+            # (1) reap is cheap (walks only _quarantine/) and safe to run inline.
+            try:
+                _kq = getattr(self.config, "kaggle", None)
+                _ret = float(getattr(_kq, "quarantine_retention_hours", 72) or 72)
+                _cap = int(getattr(_kq, "quarantine_max_bytes", 1_073_741_824)
+                           or 1_073_741_824)
+            except Exception:
+                _ret, _cap = 72, 1_073_741_824
+            try:
+                reap_quarantine(self.config.storage.data_dir, max_age_hours=_ret,
+                                max_total_bytes=_cap, dry_run=False)
+            except Exception as _re:
+                print(f"[disk-guard] reap err {_re}")
+            # (2) full verified prune is a slow hive scan — flag it for the
+            # async loop, which runs it in a thread (overlap + hourly throttle).
+            try:
+                if (not getattr(self, "_emergency_prune_running", False)
+                        and (now_m - getattr(self, "_last_emergency_prune_monotonic", 0.0)) > 1800):
+                    self._last_emergency_prune_monotonic = now_m
+                    self._emergency_prune_running = True
+                else:
+                    print("[disk-guard] emergency prune already running or throttled — "
+                          "reap done, prune deferred")
+                    return
+            except Exception:
+                return
+            # hand off: the caller (async _flush_loop) awaits the thread run
+            # and clears the flag. Set a marker the loop checks.
+            self._emergency_prune_requested = True
+        except Exception:
+            try:
+                self._emergency_prune_running = False
+            except Exception:
+                pass
+
+    async def _run_emergency_prune(self) -> None:
+        """Worker-thread emergency prune requested by _disk_guard_tick."""
+        try:
+            res = await asyncio.to_thread(
+                cleanup_local_data,
+                self.config.storage.data_dir,
+                self.config.assets,
+                [str(t).lower() for t in (self.rollover.enabled_lane_labels() or ["5m"])],
+                # zero leeway: cutoff = slowest verified upload. Every gate
+                # (all-ended, unknown-keep, per-dataset coverage) stays on —
+                # only already-uploaded rows can go.
+                retention_hours=0,
+            )
+            print(f"[disk-guard] emergency prune done: {len(res)} files "
+                  f"({sum(res.values()) if res else 0} rows)")
+        except Exception as e:
+            print(f"[disk-guard] emergency prune err {e}")
+        finally:
+            try:
+                self._emergency_prune_running = False
+                self._emergency_prune_requested = False
+            except Exception:
+                pass
+
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.config.storage.flush_interval_seconds)
@@ -2620,6 +2837,14 @@ class Collector:
                     self._persist_cursor_sync()
                 except Exception:
                     pass
+            # 2026-09-20: disk guard OUTSIDE the kaggle lock (the prune scan
+            # is slow; never stall flush/export on it). Never raises.
+            try:
+                self._disk_guard_tick()
+                if getattr(self, "_emergency_prune_requested", False):
+                    await self._run_emergency_prune()
+            except Exception:
+                pass
 
     # in-RAM rolling store cap — settlement only ever looks back max_resolution_wait_seconds
     # (120s) plus the 10s open-price tolerance; 20000 events ≈ 35+ min of all 7
@@ -3015,6 +3240,15 @@ class Collector:
             ):
                 self._episode_latest.pop(rid, None)
                 self._episode_persisted.discard(rid)
+        # N4: _last_frame_ns_per_book is never pruned — evicted markets pin it
+        # forever and stale cids accumulate. Drop entries with no live book.
+        try:
+            _live = set(getattr(self, "books", {}).keys())
+            for _cid in list(self._last_frame_ns_per_book.keys()):
+                if _cid not in _live:
+                    self._last_frame_ns_per_book.pop(_cid, None)
+        except Exception:
+            pass
 
     async def stop(self) -> None:
         self._running = False

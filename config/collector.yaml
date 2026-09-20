@@ -45,6 +45,13 @@ kaggle:
   # 5 lanes x 1h round-robin (lane cycle ~5h); do not go lower without
   # dropping lanes or shortening upload_interval.
   local_retention_hours: 6
+  # 2026-09-20 disk-full fix: the prune MOVES files to data/_quarantine/
+  # (same filesystem) instead of unlinking — without a bound every "prune"
+  # frees 0 bytes. reap_quarantine() deletes quarantined files past the
+  # review grace, then oldest-first over the size cap. Only already-uploaded
+  # or unreadable data is ever removed, never the live hive.
+  quarantine_retention_hours: 72
+  quarantine_max_bytes: 1073741824
   test_upload_interval_seconds: 600
   # 2026-09-10: restored 3600 — streaming export bounds staging peak to
   # ~one source file, verified 186k rows at 392MB peak (was 2.2GB+ death).

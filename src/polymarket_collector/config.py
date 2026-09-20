@@ -151,6 +151,15 @@ class KaggleConfig(BaseModel):
     # mode) local data is never pruned and the monotonic row-count check applies.
     rolling_window: bool = False
     local_retention_hours: int = 48  # leeway before local prune after verified upload
+    # Quarantine bound (2026-09-20 disk-full fix): the verified-upload prune
+    # MOVES files to <data_dir>/_quarantine/ (same filesystem) instead of
+    # unlinking. Without a bound that move frees 0 bytes and the disk fills
+    # until ENOSPC kills collection. reap_quarantine() deletes quarantined
+    # files past the review grace, then oldest-first over the size cap.
+    # Only already-uploaded (prune-moved) data and unreadable stubs are ever
+    # removed — the live hive and all event evidence are untouched.
+    quarantine_retention_hours: float = 72  # review grace before age-deletion
+    quarantine_max_bytes: int = 1_073_741_824  # 1 GiB cap, oldest-first
 
 
 # ------------------------------------------------------------------ top-level
@@ -170,7 +179,11 @@ class CollectorConfig(BaseSettings):
     # behavior; enable more ONLY after verify-gate --probe-timeframes confirms
     # the Gamma series actually exists (plan.md §7 gate).
     timeframes: List[str] = Field(default_factory=lambda: ["5m"])
-    schema_version: str = "3.2.0"
+    # N9: 3.3.0 — depth_5c/10c now sum full RAM depth (100 levels) within the
+    # window, not just the published 10 L2 levels; book_events token_id/outcome
+    # are honest NULLs (were ""/"unknown"); trades reconciled series_id honest
+    # NULL (was "{ASSET}-5m"). Compare depth across versions with care.
+    schema_version: str = "3.3.0"
 
     rollover_lead_seconds: int = 30
     max_coverage_gap_seconds: int = 5

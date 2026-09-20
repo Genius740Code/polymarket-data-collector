@@ -623,10 +623,12 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     continue
                 w = t.get("proxyWallet") or t.get("wallet")
                 ts_ms = _api_ts_ms(t)
+                # E2/N10: unknown window stays NULL (was 0 sentinel merging
+                # unresolvable fills into window 0's OHLC/volume).
                 try:
-                    widx = int(ts_ms) // 1000 // _wsec if ts_ms else (rs[0].get("window_index") or 0)
+                    widx = int(ts_ms) // 1000 // _wsec if ts_ms else rs[0].get("window_index")
                 except Exception:
-                    widx = rs[0].get("window_index") or 0
+                    widx = rs[0].get("window_index")
                 price_f = t.get("price"); size_f = t.get("size")
                 notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
                 fee: Optional[float] = None
@@ -662,13 +664,19 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": rs[0].get("market_id") or None,
-                    "series_id": series_mode or _lane_series_fallback(asset),
-                    "window_index": int(widx) if widx is not None else 0,
+                    # N7/N10: honest NULLs (was f"{ASSET}-5m" / "" / "unknown"
+                    # sentinels that merged unresolvable fills into the wrong
+                    # lane and defeated IS NOT NULL filters). Lane filter
+                    # tolerates None as honest gap; _lane_series_fallback stays
+                    # for explicit backfill-only use, never silent default.
+                    "series_id": series_mode or None,
+                    # E2: unknown window stays NULL (was 0 sentinel).
+                    "window_index": int(widx) if widx is not None else None,
                     "asset": (asset or rs[0].get("asset") or "").upper(),
                     "trade_id": _api_trade_id(txh, t.get("price"), t.get("size"), _ord),
                     "transaction_hash": txh or None,
-                    "token_id": str(t.get("asset_id") or t.get("asset") or ""),
-                    "outcome": _api_outcome_label(t) or "unknown",
+                    "token_id": (str(t.get("asset_id") or t.get("asset")) if (t.get("asset_id") or t.get("asset")) else None),
+                    "outcome": _api_outcome_label(t) or None,
                     "price": float(price_f) if price_f is not None else None,
                     "size": float(size_f) if size_f is not None else None,
                     "notional": notional,
@@ -676,7 +684,9 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     "fee_is_estimated": fee_is_estimated,
                     "side": (t.get("side") or "").lower() or None,
                     "aggressor_side": (t.get("side") or "").lower() or None,
-                    "sequence_number": None,
+                    # sequence_number dropped (schema has no such column; the
+                    # old insert reintroduced it via promote and broke
+                    # legacy-vs-stream parity).
                     "maker_wallet": maker_w,
                     "taker_wallet": w,
                     "wallet": w or maker_w,
@@ -771,10 +781,11 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                 continue
             w = t.get("proxyWallet") or t.get("wallet")
             ts_ms = _api_ts_ms(t)
+            # E2/N10: unknown window stays NULL (was 0 sentinel).
             try:
-                widx = int(ts_ms) // 1000 // _wsec2 if ts_ms else (_first.get("window_index") or 0)
+                widx = int(ts_ms) // 1000 // _wsec2 if ts_ms else _first.get("window_index")
             except Exception:
-                widx = _first.get("window_index") or 0
+                widx = _first.get("window_index")
             price_f = t.get("price"); size_f = t.get("size")
             notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
             fee = None
@@ -808,13 +819,15 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                     "condition_id": cid,
                     # E1: NULL when the numeric Gamma id is unknown — never the hex condition_id.
                     "market_id": _first.get("market_id") or None,
-                    "series_id": _series_mode or _lane_series_fallback(asset),
-                    "window_index": int(widx) if widx is not None else 0,
+                    # N7/N10: honest NULLs (see site 1 above).
+                    "series_id": _series_mode or None,
+                    # E2: unknown window stays NULL (was 0 sentinel).
+                    "window_index": int(widx) if widx is not None else None,
                     "asset": (asset or _first.get("asset") or "").upper(),
                     "trade_id": _api_trade_id(txh, t.get("price"), t.get("size"), _ord2),
                 "transaction_hash": txh or None,
-                "token_id": str(t.get("asset_id") or t.get("asset") or ""),
-                "outcome": _api_outcome_label(t) or "unknown",
+                "token_id": (str(t.get("asset_id") or t.get("asset")) if (t.get("asset_id") or t.get("asset")) else None),
+                "outcome": _api_outcome_label(t) or None,
                 "price": float(price_f) if price_f is not None else None,
                 "size": float(size_f) if size_f is not None else None,
                 "notional": notional,
@@ -822,7 +835,7 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                 "fee_is_estimated": fee_is_estimated,
                 "side": (t.get("side") or "").lower() or None,
                 "aggressor_side": (t.get("side") or "").lower() or None,
-                "sequence_number": None,
+                # sequence_number dropped (see site 1 above).
                 "maker_wallet": maker_w,
                 "taker_wallet": w,
                 "wallet": w or maker_w,
@@ -936,11 +949,79 @@ def _lane_series_mask(series_col, want: str):
     (hourly Kaggle uploads aborted forever). OR-ing the weather ids is a no-op
     for crypto hives (those ids never appear there), and each weather data dir
     holds only its own mode, so there is no cross-mode leakage.
+
+    N7: NULL series_id never matches (pc.equal NULL -> NULL -> dropped).
+    Callers backfill NULLs via _backfill_null_series_ids() first; residual
+    NULLs are counted separately so unroutable-but-real trades are visible
+    instead of silently vanishing from every lane.
     """
     mask = pc.equal(series_col, pa.scalar(want))
     for _ws in _WEATHER_SERIES_IDS:
         mask = pc.or_(mask, pc.equal(series_col, pa.scalar(_ws)))
     return mask
+
+
+def _backfill_null_series_ids(table, data_dir, dataset: str = ""):
+    """N7: fill NULL series_id from markets_latest condition_id map.
+
+    Token-to-market is static, so a trade snapshotted before its market row
+    was discovered can be resolved at export time. Returns (table, filled_n).
+    Only fills NULL/empty series_id where condition_id has a known series;
+    truly unresolvable rows keep NULL (honest gap, counted by callers).
+    """
+    try:
+        import pyarrow.compute as _pc_bf
+        names = table.schema.names
+        if "series_id" not in names or "condition_id" not in names:
+            return table, 0
+        try:
+            if table.column("series_id").null_count == 0:
+                return table, 0
+        except Exception:
+            pass
+        try:
+            _base = Path(data_dir)
+            _latest = _base / "markets_latest" / "markets_latest.parquet"
+            if not _latest.exists():
+                return table, 0
+            import pyarrow.parquet as _pq_bf
+            try:
+                _lt = _pq_bf.read_table(str(_latest), columns=["condition_id", "series_id"])
+            except Exception:
+                return table, 0
+            _map: dict = {}
+            try:
+                _cids = _lt.column("condition_id").to_pylist()
+                _sids = _lt.column("series_id").to_pylist()
+                for _c, _s in zip(_cids, _sids):
+                    if _c and _s and str(_c) not in _map:
+                        _map[str(_c)] = str(_s)
+            except Exception:
+                return table, 0
+            if not _map:
+                return table, 0
+            try:
+                _series = table.column("series_id").to_pylist()
+                _cids_t = table.column("condition_id").to_pylist()
+            except Exception:
+                return table, 0
+            _filled = 0
+            _new_series = []
+            for _s, _c in zip(_series, _cids_t):
+                if (_s is None or _s == "") and _c and str(_c) in _map:
+                    _new_series.append(_map[str(_c)])
+                    _filled += 1
+                else:
+                    _new_series.append(_s)
+            if not _filled:
+                return table, 0
+            _pos = table.schema.get_field_index("series_id")
+            table = table.set_column(_pos, "series_id", pa.array(_new_series, type=pa.string()))
+            return table, _filled
+        except Exception:
+            return table, 0
+    except Exception:
+        return table, 0
 
 
 def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, *,
@@ -2179,7 +2260,18 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                 # if file path already guaranteed asset, skip filter; else filter
                 if f"asset={asset.upper()}" not in str(p):
                     try:
-                        mask = pc.equal(t.column("asset"), pa.scalar(asset.upper()))
+                        # N7: keep UNKNOWN/NULL-asset rows in every per-asset
+                        # read (they may belong to this asset; dropping them
+                        # everywhere is silent loss). Downstream dedups by id.
+                        _eq = pc.equal(t.column("asset"), pa.scalar(asset.upper()))
+                        _eq = pc.fill_null(_eq, False)
+                        try:
+                            _unk = pc.or_(pc.is_null(t.column("asset")),
+                                          pc.equal(t.column("asset"), pa.scalar("UNKNOWN")))
+                            _unk = pc.fill_null(_unk, False)
+                            mask = pc.or_(_eq, _unk)
+                        except Exception:
+                            mask = _eq
                         t = t.filter(mask)
                         if t.num_rows == 0:
                             continue
@@ -2231,7 +2323,35 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
         try:
             want = f"{asset.upper()}-{timeframe_label}"
             try:
+                # N7: resolve NULL series via markets_latest before filtering
+                # so honest-NULL trades are not silently dropped from lanes.
+                try:
+                    combined, _nbf = _backfill_null_series_ids(combined, data_dir, dataset)
+                    if _nbf:
+                        print(f"[export] backfilled {_nbf} NULL series_id via markets_latest for {dataset} asset={asset}")
+                except Exception:
+                    pass
                 mask = _lane_series_mask(combined.column("series_id"), want)
+                # N7: keep residual NULL-series rows (fail open, counted) —
+                # they are real trades that would otherwise vanish from every
+                # lane file. Downstream dedups by trade_id across lanes.
+                try:
+                    _nulls = pc.is_null(combined.column("series_id"))
+                    _null_n = int(pc.sum(_nulls).as_py() or 0)
+                except Exception:
+                    _null_n = 0
+                    _nulls = None
+                if _null_n and _nulls is not None:
+                    try:
+                        mask = pc.or_(pc.fill_null(mask, False), _nulls)
+                        print(f"[export] kept {_null_n} NULL-series rows in lane {want} for {dataset} (unroutable, honest gap)")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        mask = pc.fill_null(mask, False)
+                    except Exception:
+                        pass
                 combined = combined.filter(mask)
             except Exception as e:
                 print(f"[export] WARN timeframe filter failed for {dataset} "
@@ -4303,6 +4423,7 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                         _remote_ok = True
                         try:
                             remote_names = set()
+                            remote_sizes: dict = {}
                             next_token = None
                             for _page in range(5):  # 5*20=100 >31 expected
                                 kwargs = {}
@@ -4327,10 +4448,17 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                 for f in files_list:
                                     if isinstance(f, dict):
                                         n = f.get("ref") or f.get("name") or f.get("fileName")
+                                        _sz = f.get("size") or f.get("totalBytes")
                                     else:
                                         n = getattr(f, "ref", None) or getattr(f, "name", None) or getattr(f, "fileName", None)
+                                        _sz = getattr(f, "size", None) or getattr(f, "totalBytes", None)
                                     if n:
                                         remote_names.add(Path(str(n)).name)
+                                        try:
+                                            if _sz is not None:
+                                                remote_sizes[Path(str(n)).name] = int(_sz)
+                                        except Exception:
+                                            pass
                                 if not next_token:
                                     break
                             # Check remote has at least expected parquets
@@ -4347,6 +4475,21 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                 _remote_ok = False
                             if len(remote_names) < len(expected_names):
                                 _remote_ok = False
+                            # N6: filename-only gate cannot prove CONTENT. When the
+                            # API exposes sizes, fail closed on zero-byte remotes
+                            # and WARN that row-count/hash parity is local-only
+                            # (Kaggle list-files exposes no hashes).
+                            try:
+                                _zero = [n for n in expected_names if n in remote_sizes and int(remote_sizes[n]) <= 0]
+                                if _zero:
+                                    _remote_ok = False
+                                    print(f"[kaggle] WARN remote zero-byte files: {_zero[:4]}")
+                                if remote_sizes:
+                                    print(f"[kaggle] note: remote content verified by name+nonzero-size only ({len(remote_sizes)} sizes); row-count parity is local staging (_verify_staging_row_counts)")
+                                else:
+                                    print("[kaggle] note: remote API exposed no sizes — content verification is filename-only; prune still requires local row-count monotonicity + market-end cutoff")
+                            except Exception:
+                                pass
                         except Exception:
                             # C3: fail CLOSED (was True — any listing error authorized deletion)
                             _remote_ok = False
@@ -4550,6 +4693,9 @@ def cleanup_local_data(
     retention_hours: int | None = None,
     dry_run: bool = False,
     skip_datasets: list | tuple | None = None,
+    reap_quarantine: bool | None = None,
+    quarantine_retention_hours: float | None = None,
+    quarantine_max_bytes: int | None = None,
 ) -> dict:
     """Post-upload local prune — rolling-window mode (market-end aware, fail closed).
 
@@ -4577,6 +4723,16 @@ def cleanup_local_data(
     cutoff and the NEXT staging rebuild would publish truncated event files).
 
     Returns stats {relative_path: rows_deleted} (empty when nothing was deleted).
+
+    Quarantine bound (2026-09-20 disk-full fix): the prune MOVES files to
+    <data_dir>/_quarantine/ (same filesystem) instead of unlinking, so without
+    a bound every "prune" frees 0 bytes. This function therefore reaps the
+    quarantine FIRST (aged past quarantine_retention_hours, then oldest-first
+    over quarantine_max_bytes) — even when the prune below early-returns
+    (no verified upload yet, cumulative mode), because the reaper only ever
+    removes already-uploaded or unreadable data, never the live hive.
+    Pass reap_quarantine=False to skip (tests); dry_run reports without
+    deleting anything.
     """
     import datetime as _dt2
     if timeframe_labels is None:
@@ -4585,6 +4741,33 @@ def cleanup_local_data(
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     base = Path(data_dir)
     tf_label = str(timeframe_labels[0]).lower()
+
+    # Bound the quarantine first (see docstring): the _quarantine/ dir lives
+    # on the same filesystem, so un-reaped it cancels every byte the prune
+    # "deletes". Runs even on early-return paths below — the reaper's own
+    # age/cap policy is the only gate, independent of upload checkpoints.
+    if reap_quarantine is None:
+        reap_quarantine = True
+    if reap_quarantine:
+        if quarantine_retention_hours is None or quarantine_max_bytes is None:
+            try:
+                from ..config import CollectorConfig as _CCq
+                _kq = _CCq.load().kaggle
+                if quarantine_retention_hours is None:
+                    quarantine_retention_hours = float(getattr(_kq, "quarantine_retention_hours", 72))
+                if quarantine_max_bytes is None:
+                    quarantine_max_bytes = int(getattr(_kq, "quarantine_max_bytes", 1_073_741_824))
+            except Exception:
+                if quarantine_retention_hours is None:
+                    quarantine_retention_hours = 72
+                if quarantine_max_bytes is None:
+                    quarantine_max_bytes = 1_073_741_824
+        try:
+            from .quarantine import reap_quarantine as _reap
+            _reap(base, max_age_hours=quarantine_retention_hours,
+                  max_total_bytes=quarantine_max_bytes, dry_run=dry_run)
+        except Exception as _reap_e:
+            print(f"[prune] WARN quarantine reap failed (prune continues): {_reap_e}")
 
     # Resolve rolling-window policy: explicit arg > config > legacy no-op
     if rolling_window is None:
@@ -4893,9 +5076,81 @@ def cleanup_local_data(
                         d.rmdir()
                 except Exception:
                     pass
+        # N6: quarantine lives on the same filesystem so nothing is reclaimed
+        # until it expires. Bound it by age + total bytes (defaults 72h / 5GB).
+        try:
+            _expire_quarantine(base)
+        except Exception as _qe:
+            print(f"[prune] WARN quarantine expiry failed: {_qe}")
 
     if stats or pruned_rows:
         print(f"[prune:{tf_label}] deleted {len(stats)} files / {pruned_rows} rows older than {retention_hours}h leeway (cutoff {cutoff_ms})")
+    return stats
+
+
+def _expire_quarantine(base: Path, ttl_hours: float = 72.0, max_bytes: int = 5_000_000_000) -> dict:
+    """N6: expire data/_quarantine/ by age then by size (oldest first).
+
+    Quarantine is a safety buffer, not an archive — without expiry the box
+    drifts back to the ENOSPC that triggers dead-letter/loss (N2). Returns
+    {"expired_files": n, "expired_bytes": b, "remaining_bytes": r}.
+    """
+    import time as _t_q
+    stats = {"expired_files": 0, "expired_bytes": 0, "remaining_bytes": 0}
+    try:
+        _qroot = base / "_quarantine"
+        if not _qroot.exists():
+            return stats
+        try:
+            _now = _t_q.time()
+        except Exception:
+            _now = 0.0
+        _files: list = []
+        for _p in _qroot.rglob("*.parquet"):
+            try:
+                _st = _p.stat()
+                _files.append((_st.st_mtime, _st.st_size, _p))
+            except OSError:
+                continue
+        _ttl_s = float(ttl_hours) * 3600.0
+        for _mt, _sz, _p in sorted(_files):
+            try:
+                if _now - float(_mt) > _ttl_s:
+                    _p.unlink()
+                    stats["expired_files"] += 1
+                    stats["expired_bytes"] += int(_sz)
+            except OSError:
+                continue
+        _remaining = []
+        for _mt, _sz, _p in sorted(_files):
+            try:
+                if _p.exists():
+                    _remaining.append((_mt, _sz, _p))
+            except OSError:
+                continue
+        try:
+            _total = sum(int(_s) for _, _s, _ in _remaining)
+        except Exception:
+            _total = 0
+        if _total > int(max_bytes):
+            for _mt, _sz, _p in sorted(_remaining):
+                try:
+                    _p.unlink()
+                    stats["expired_files"] += 1
+                    stats["expired_bytes"] += int(_sz)
+                    _total -= int(_sz)
+                except OSError:
+                    continue
+                if _total <= int(max_bytes):
+                    break
+        try:
+            stats["remaining_bytes"] = max(0, _total - stats["expired_bytes"] if stats["expired_files"] else _total)
+        except Exception:
+            pass
+        if stats["expired_files"]:
+            print(f"[quarantine] expired {stats['expired_files']} files / {stats['expired_bytes']}B (TTL {ttl_hours}h, cap {max_bytes}B)")
+    except Exception:
+        pass
     return stats
 
 
