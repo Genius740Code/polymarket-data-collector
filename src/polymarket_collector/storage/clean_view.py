@@ -250,6 +250,21 @@ def build_clean_view(
 
             out_dir = dst_root / date_str / f"asset={asset}"
             out_dir.mkdir(parents=True, exist_ok=True)
+            if full_rebuild and not sidecar:
+                # HIGH fix (audit 2026-09-21): a filter-flag/mtime full rebuild
+                # rewrote part-* but left the inc-* sidecars in place, so
+                # load_clean() (which reads every *.parquet) returned duplicate
+                # rows. A full rebuild owns the partition: drop sidecars first
+                # (the manifest is reseeded with the rebuilt sources below, so
+                # the next incremental does not reprocess them).
+                try:
+                    for _inc in out_dir.glob("inc-*.parquet"):
+                        try:
+                            _inc.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if sidecar:
                 # append-only sidecar (never rewrite the partition output)
                 import uuid as _uuid

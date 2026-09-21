@@ -198,6 +198,36 @@ class ParquetWriter:
         # a loss window (crash between replay-truncate and flush lost the rows
         # the WAL existed to protect).
         self._replay_dirty: list = []
+        # Re-entrancy guard (audit 2026-09-21 HIGH): on_event routes
+        # writer -> markets_log.append_event -> writer.append. Emitting a
+        # backpressure/write_failed event while already inside an emission
+        # recursed unboundedly (RecursionError at depth ~333 under a full
+        # buffer). Nested emissions are suppressed + counted, never recursed.
+        self._emitting = False
+        self._nested_event_dropped = 0
+        # Throttle for threshold-flush failure events (one per 60s max).
+        self._flush_fail_event_ts = 0.0
+
+    def _emit_event(self, event_type, details: dict) -> None:
+        """on_event choke point: re-entrancy safe, never raises."""
+        if self.on_event is None:
+            return
+        if self._emitting:
+            try:
+                self._nested_event_dropped += 1
+            except Exception:
+                pass
+            return
+        self._emitting = True
+        try:
+            self.on_event(event_type, details)
+        except Exception:
+            pass
+        finally:
+            try:
+                self._emitting = False
+            except Exception:
+                pass
 
     # -- public API --------------------------------------------------------
     def append(self, dataset: str, row: Dict[str, Any], asset: Optional[str] = None, date_str: Optional[str] = None) -> bool:
@@ -238,7 +268,7 @@ class ParquetWriter:
                     pass
                 try:
                     if self.on_event:
-                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "date_unknown_partition", "keys": list(row.keys())[:5]})
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "date_unknown_partition", "keys": list(row.keys())[:5]})
                 except Exception:
                     pass
                 date_derived = "unknown"
@@ -285,7 +315,7 @@ class ParquetWriter:
                     self._dupevent_count[dataset] += 1
                     _n = self._dupevent_count[dataset]
                     if self.on_event and (_n == 1 or _n % 10_000 == 0):
-                        self.on_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key, "dropped_total": _n, "evicted_total": self._evict_total.get(dataset, 0)})
+                        self._emit_event(CollectorEventType.duplicate_event, {"dataset": dataset, "key": dedup_key, "dropped_total": _n, "evicted_total": self._evict_total.get(dataset, 0)})
                     return True
         # reserve key immediately to prevent duplicate WAL entries under concurrency
         # Single OrderedDict (was set+deque double-store). Same FIFO eviction.
@@ -319,7 +349,7 @@ class ParquetWriter:
         # backpressure check — §10A never drops without WAL spill + fsync
         if len(self._buffer) >= self.buffer_max:
             if self.on_event:
-                self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "dropped_total": self._dropped_rows.get(dataset, 0)})
+                self._emit_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "dropped_total": self._dropped_rows.get(dataset, 0)})
             else:
                 import warnings
                 warnings.warn(
@@ -345,6 +375,24 @@ class ParquetWriter:
                                 pass
                         self._dropped_rows[dataset] = self._dropped_rows.get(dataset, 0) + 1
                         return False
+                    # CRITICAL fix (audit 2026-09-21): the spilled row must ALSO
+                    # sit in _buffer. flush() only persists _buffer and then
+                    # truncates the WAL — a WAL-only row was erased by the next
+                    # successful flush without ever reaching Parquet (silent
+                    # loss, 7/12 rows in repro). Over-cap buffering is bounded
+                    # in practice (backpressure event fires per append, operator
+                    # paged) and never silently drops per §10A.
+                    try:
+                        self._buffer.append(BufferedRow(
+                            dataset=dataset,
+                            asset=asset or row.get("asset"),
+                            date_str=date_str,
+                            row=row,
+                        ))
+                    except Exception:
+                        # buffer append must not fail; WAL still holds the row
+                        # and _wal_replay recovers it on restart (no silent loss)
+                        pass
                     return True
                 # Flush made room — fall through to WAL+buffer path (dedup already reserved, don't re-add)
             else:
@@ -368,7 +416,7 @@ class ParquetWriter:
                     except Exception:
                         pass
                 if self.on_event:
-                    self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": f"WAL append failed: {e}"})
+                    self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "error": f"WAL append failed: {e}"})
                 return False
 
         br = BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row)
@@ -376,7 +424,23 @@ class ParquetWriter:
 
         # maybe flush
         if len(self._buffer) >= self.flush_threshold or (time.monotonic() - self._last_flush_ts) >= self.flush_interval:
-            self.flush()
+            try:
+                self.flush()
+            except Exception as e:
+                # HIGH fix (audit 2026-09-21): a failing threshold flush must
+                # never escape append() — it aborted the whole snapshot tick
+                # (outer catch skips every remaining market/bucket) and dropped
+                # the RTDS socket (chainlink append unguarded). The row is
+                # already WAL-durable + buffered, so returning True is honest.
+                # Event throttled to one per 60s (a sustained fault must not
+                # flood collector_events at 28 rows/s).
+                try:
+                    _now_m = time.monotonic()
+                    if _now_m - self._flush_fail_event_ts > 60.0:
+                        self._flush_fail_event_ts = _now_m
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "threshold_flush_failed", "error": str(e)[:200]})
+                except Exception:
+                    pass
         return True
 
     def flush(self) -> int:
@@ -419,7 +483,7 @@ class ParquetWriter:
             except Exception as e:
                 if self.on_event:
                     try:
-                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
                     except Exception:
                         pass
                 # N2: dead-letter only after a SUSTAINED fault (min failures AND
@@ -470,13 +534,13 @@ class ParquetWriter:
                         _dl_ok = False
                         try:
                             if self.on_event:
-                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_letter_failed", "rows": len(rows), "error": str(_dle)[:200]})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_letter_failed", "rows": len(rows), "error": str(_dle)[:200]})
                         except Exception:
                             pass
                     if _dl_ok:
                         try:
                             if self.on_event:
-                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails, "age_s": round(_age_s, 1)})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails, "age_s": round(_age_s, 1)})
                         except Exception:
                             pass
                         try:
@@ -555,8 +619,8 @@ class ParquetWriter:
                     with open(self._wal_path, "a") as f:
                         f.flush()
                         os.fsync(f.fileno())
-                    # fsync wal dir
-                    dir_fd = os.open(str(self.wal_dir), os.O_DIRECTORY)
+                    # fsync wal dir (O_DIRECTORY missing on Windows — skip there)
+                    dir_fd = os.open(str(self.wal_dir), getattr(os, "O_DIRECTORY", 0))
                     try:
                         os.fsync(dir_fd)
                     finally:
@@ -644,7 +708,7 @@ class ParquetWriter:
             if free < min_bytes:
                 details = {"free_bytes": free, "min_bytes": min_bytes, "data_dir": str(self.data_dir)}
                 if self.on_event:
-                    self.on_event(CollectorEventType.write_failed, details)
+                    self._emit_event(CollectorEventType.write_failed, details)
                 return details
         except Exception:
             pass
@@ -662,7 +726,7 @@ class ParquetWriter:
                 pass
             try:
                 if self.on_event:
-                    self.on_event(CollectorEventType.write_failed, {"reason": "close_flush_failed", "buffered": len(self._buffer), "error": str(e)[:300]})
+                    self._emit_event(CollectorEventType.write_failed, {"reason": "close_flush_failed", "buffered": len(self._buffer), "error": str(e)[:300]})
             except Exception:
                 pass
         try:
@@ -887,7 +951,7 @@ class ParquetWriter:
                             # backpressure check before replay
                             if len(self._buffer) >= self.buffer_max:
                                 if self.on_event:
-                                    self.on_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "replay": True})
+                                    self._emit_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "replay": True})
                                 try:
                                     self.flush()
                                 except Exception:
@@ -970,7 +1034,7 @@ class ParquetWriter:
         # M11: surface malformed-line drops (never silent)
         try:
             if self._wal_malformed_total and self.on_event:
-                self.on_event(CollectorEventType.write_failed, {"reason": "wal_malformed_dropped", "rows": self._wal_malformed_total})
+                self._emit_event(CollectorEventType.write_failed, {"reason": "wal_malformed_dropped", "rows": self._wal_malformed_total})
         except Exception:
             pass
         return replayed
@@ -1124,7 +1188,7 @@ class ParquetWriter:
                         _r["asset"] = "UNKNOWN"
                 try:
                     if self.on_event:
-                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "asset_unknown_partition", "rows": len(rows)})
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "asset_unknown_partition", "rows": len(rows)})
                     else:
                         print(f"[parquet_writer] WARN {dataset}: {len(rows)} rows with missing asset → asset=UNKNOWN (honest gap, unjoinable)")
                 except Exception:
@@ -1212,7 +1276,7 @@ class ParquetWriter:
                             self._ts_fill_count[dataset] = self._ts_fill_count.get(dataset, 0) + 1
                             _n = self._ts_fill_count[dataset]
                             if self.on_event and (_n == 1 or _n % 1000 == 0):
-                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "ts_received_ns_estimated", "count": _n})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "ts_received_ns_estimated", "count": _n})
                         except Exception:
                             pass
                     elif "ts_received_ns_estimated" in _schema_names and nr.get("ts_received_ns_estimated") is None:
@@ -1257,7 +1321,7 @@ class ParquetWriter:
                         nr[fld] = None
                         try:
                             if self.on_event:
-                                self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "test_sentinel_scrubbed", "field": fld})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "test_sentinel_scrubbed", "field": fld})
                         except Exception:
                             pass
         # Honest-gap drop: snapshot rows with no bucket time are unjoinable —
@@ -1269,7 +1333,7 @@ class ParquetWriter:
         if _dropped_ts:
             try:
                 if self.on_event:
-                    self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "missing_snapshot_ts_dropped", "rows": len(_dropped_ts)})
+                    self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "missing_snapshot_ts_dropped", "rows": len(_dropped_ts)})
                 else:
                     print(f"[parquet_writer] WARN dropped {len(_dropped_ts)} {dataset} rows with missing snapshot ts (honest gap)")
             except Exception:
@@ -1386,7 +1450,7 @@ class ParquetWriter:
             if "non-nullable but contains nulls" in str(e) or "ArrowInvalid" in str(type(e).__name__):
                 try:
                     if self.on_event:
-                        self.on_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "nullable_schema_fallback", "error": str(e)[:300], "rows": len(norm_rows)})
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "nullable_schema_fallback", "error": str(e)[:300], "rows": len(norm_rows)})
                     else:
                         print(f"[parquet_writer] WARN {dataset}: strict schema rejected NULLs ({str(e)[:200]}); writing inferred schema so rows are preserved")
                 except Exception:
@@ -1414,7 +1478,7 @@ class ParquetWriter:
                 except Exception:
                     pass
             try:
-                _dfd = os.open(str(out_dir), os.O_DIRECTORY)
+                _dfd = os.open(str(out_dir), getattr(os, "O_DIRECTORY", 0))
                 try:
                     os.fsync(_dfd)
                 finally:
@@ -1444,7 +1508,7 @@ class ParquetWriter:
             pass
         _os_replace_safe(tmp_path, final_path)
         try:
-            _dfd2 = os.open(str(out_dir), os.O_DIRECTORY)
+            _dfd2 = os.open(str(out_dir), getattr(os, "O_DIRECTORY", 0))
             try:
                 os.fsync(_dfd2)
             finally:

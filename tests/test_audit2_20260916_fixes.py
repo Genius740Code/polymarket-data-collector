@@ -72,7 +72,9 @@ def test_buffer_live_retires_after_deadline():
     assert mgr.buffer_live(rid) is False
     mgr.buffer_message(rid, {"seq": 1})
     mgr.buffer_message(rid, {"seq": 2})
-    assert len(mgr._buffers[rid]) == 0  # refused, not appended
+    # refused, not appended; retired buffer is popped (audit 2026-09-21), so
+    # .get() — nothing accumulates on the zombie either way
+    assert len(mgr._buffers.get(rid, [])) == 0  # refused, not appended
     retired = [d for t, d in events if isinstance(d, dict)
                and d.get("reason") == "resync_buffer_retired"]
     assert len(retired) == 1  # exactly one honest event, then silence

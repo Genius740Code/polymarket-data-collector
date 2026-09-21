@@ -48,7 +48,11 @@ kaggle:
   # (5 x 3600s = 5h cadence vs 6h retention, needs 2x headroom). 2-lane
   # cadence = 2h, needs >=4h headroom; 6h leaves margin. Dropped 15m/4h/1d
   # until a bigger box; re-add only after retention_cadence_check() is silent.
-  local_retention_hours: 6
+  # 2026-09-21 5-lane restore: interval 3600->1200 (cadence 5x20min=100min=
+  # 1.67h, needs >=3.3h headroom) + retention 6->4h (2.4x headroom, ~2GB at
+  # ~500MB/h worst case). Fits 4.9G free: 2G hive + 0.6G staging + 0.2G
+  # quarantine + 1G guard ~= 3.8G. Tradeoff: ~14 versions/day/lane on Kaggle.
+  local_retention_hours: 4
   # 2026-09-20 disk-full fix: the prune MOVES files to data/_quarantine/
   # (same filesystem) instead of unlinking — without a bound every "prune"
   # frees 0 bytes. reap_quarantine() deletes quarantined files past the
@@ -56,12 +60,20 @@ kaggle:
   # or unreadable data is ever removed, never the live hive.
   # 2026-09-21: 72h -> 24h, 1GiB -> ~300MB — 19GB box cannot afford 72h of
   # quarantine buffer; 24h is enough review grace on a tight disk.
-  quarantine_retention_hours: 24
-  quarantine_max_bytes: 314572800
+  # 2026-09-21 5-lane restore: 24h -> 6h, 300MB -> 200MB — quarantine lives
+  # on the same filesystem so every un-reaped byte cancels the prune. 6h is
+  # enough review grace; reap runs every upload tick + every 30s disk-guard.
+  quarantine_retention_hours: 6
+  quarantine_max_bytes: 209715200
   test_upload_interval_seconds: 600
   # 2026-09-10: restored 3600 — streaming export bounds staging peak to
   # ~one source file, verified 186k rows at 392MB peak (was 2.2GB+ death).
-  upload_interval_seconds: 3600
+  # 2026-09-21 5-lane restore: 3600 -> 1200 — round-robin cadence is
+  # interval x lanes; 5 x 3600s = 5h cadence stalled the slowest-lane prune
+  # checkpoint (needs 2x headroom vs retention). 5 x 1200s = 100min cadence
+  # vs 4h retention = 2.4x headroom, guard silent. Reap/prune also run 3x
+  # more often. Cost: more Kaggle versions + more export CPU.
+  upload_interval_seconds: 1200
 l2_levels: 10
 liquidity_filter:
   enabled: false
@@ -96,7 +108,10 @@ storage:
   disk_space_check_interval_seconds: 30
   # 2026-09-21: 1GiB -> ~500MB floor — 1GiB is a third of a 3-5GB budget
   # without buying safety (the guard reaps+prunes on breach either way).
-  disk_space_min_bytes: 524288000
+  # 2026-09-21 5-lane restore: 500MB -> 1GiB — earlier tripwire is cheaper
+  # than ENOSPC death; reap is cheap (walks only _quarantine/) and the
+  # zero-leeway emergency prune only deletes already-uploaded rows.
+  disk_space_min_bytes: 1073741824
   flush_interval_seconds: 30
   flush_row_count_threshold: 1500
   wal_dir: ./data/_wal
@@ -136,8 +151,14 @@ timeframes:
   # unix-ts scheme); 1d under the ET end-date slug family
   # ({bitcoin,...}-up-or-down-on-{month}-{day}-{year}, noon-ET windows);
   # unix-ts 1d slugs are empty on Gamma.
+  # 2026-09-21 5-lane restore (interval 1200s + retention 4h, guard silent):
+  # cadence 100min vs 4h = 2.4x headroom. Needs the 4.9G-free box; watch
+  # `df -h` + `[retention-guard]` + `[disk-guard]` for a day before trusting.
   - 5m
+  - 15m
   - 1h
+  - 4h
+  - 1d
 
 ws:
   full_book_diff_interval_seconds: 300

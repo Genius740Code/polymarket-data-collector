@@ -162,7 +162,9 @@ class Collector:
             l2_levels=config.l2_levels,
             schema_version=config.schema_version,
             on_event=self._writer_event,
-            synthetic_mode=getattr(config, "synthetic_mode", False),
+            # AGENT.md §0 (audit 2026-09-21): new code must not read
+            # synthetic_mode (deprecated, always False) — the writer defaults
+            # to False; the pass-through is removed.
         )
         self.markets_log = MarketsLog(config.storage.data_dir, writer=self.writer)
         self.raw_archive = RawArchive(
@@ -307,6 +309,15 @@ class Collector:
                                 book.mark_stale(resync_id=str(uuid.uuid4()))
                                 self.books[state.current_condition_id] = book
                                 self._index_book(book)
+                                # CRITICAL (audit 2026-09-21): a cursor-recovered
+                                # stale book with a minted rid and no episode is
+                                # a guaranteed orphan — link a real episode now
+                                # (find-or-create: reuses an open one if the
+                                # disconnect path already made one).
+                                try:
+                                    self._ensure_episode_for_stale_book(book, asset, "cursor_recovery")
+                                except Exception:
+                                    pass
                                 self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "age_ms": age_ms, "recovered": True})
                                 print(f"[startup] recreated stale book for {asset} [{tf}] {state.current_condition_id}")
                             except Exception as e:
@@ -737,8 +748,10 @@ class Collector:
         fallback deques were never replayed (P0 2026-09-08, ~110MB/min); an
         escalated episode's buffer is popped + dead and must not re-arm
         (P0 leak hunt session 2).
-        PERF: same scan without list() copy (no await inside → no mutation
-        during iteration) + hoisted upper(). Same first-match result.
+        HIGH fix (audit 2026-09-21): route to the NEWEST live buffer via
+        ResyncManager.newest_open_buffer_id — the old first-match scan fed
+        every live message into the oldest (zombie/retired) episode, so
+        buffer-and-replay never worked after the first recycle.
         """
         if msg_resync_id:
             return msg_resync_id
@@ -747,25 +760,146 @@ class Collector:
         except Exception:
             au = asset
         try:
-            _episodes = self.resync._episodes
-            if not _episodes:
-                return ""
-            _buffers = self.resync._buffers
-            if not _buffers:
-                return ""
+            return self.resync.newest_open_buffer_id(au)
         except Exception:
             return ""
-        for rid, ep in _episodes.items():
-            try:
-                if (
-                    ep.asset == au
-                    and ep.resync_completed_ts_utc is None
-                    and rid in _buffers
-                ):
+
+    def _disconnect_asset_books(self, asset: str, reason: str) -> list:
+        """Open disconnect episode(s) covering EVERY book of an asset.
+
+        HIGH fix (audit 2026-09-21): the old call sites passed
+        active_markets()[0].condition_id only, so with 5m+1h lanes the 1h
+        book (and any "next" book) was never marked stale and got no episode
+        — while the snapshot loop still downgraded its rows to stale with a
+        random uuid resync_id that joins to nothing ("high stale%, no
+        episodes"). One episode per live book (per the manager's
+        per-(asset, condition_id) model); a single asset-wide episode when no
+        book is known.
+        """
+        rids: list = []
+        try:
+            au = asset.upper()
+        except Exception:
+            au = asset
+        cids: list = []
+        try:
+            for m in self.rollover.active_markets(asset):
+                try:
+                    if m.condition_id and m.condition_id not in cids:
+                        cids.append(m.condition_id)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            for b in self.books.values():
+                try:
+                    if getattr(b, "asset", "").upper() == au and b.condition_id not in cids:
+                        cids.append(b.condition_id)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            if not cids:
+                rids.append(self.resync.handle_disconnect(asset, None, reason=reason, books=self.books))
+            else:
+                for _cid in cids:
+                    try:
+                        rids.append(self.resync.handle_disconnect(asset, _cid, reason=reason, books=self.books))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return rids
+
+    def _episode_for_snapshot(self, asset: str, condition_id: Optional[str] = None) -> Optional[str]:
+        """Newest open episode id covering (asset, condition_id), or None.
+
+        HIGH fix (audit 2026-09-21): the snapshot T1/catch-up downgrades
+        minted str(uuid4()) resync_ids that exist in no resync_episodes row.
+        Prefer the real episode so every non-live row joins honestly; None
+        when no episode is open (caller keeps existing book rid behaviour).
+        """
+        try:
+            au = asset.upper()
+        except Exception:
+            au = asset
+        try:
+            for rid in reversed(list(self.resync._episodes.keys())):
+                try:
+                    ep = self.resync._episodes.get(rid)
+                    if ep is None or ep.asset != au:
+                        continue
+                    if ep.resync_completed_ts_utc is not None:
+                        continue
+                    if rid in getattr(self.resync, "_escalated", set()):
+                        continue
+                    if condition_id is not None and ep.condition_id not in (None, condition_id):
+                        continue
                     return rid
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _ensure_episode_for_stale_book(self, book, asset: str, reason: str):
+        """Find-or-create the resync episode for a stale book (audit 2026-09-21 CRITICAL).
+
+        Minters like book._enforce_bbo H2 and cursor recovery mark books stale
+        with a minted uuid that joins to no resync_episodes row — and H2
+        returns (True, None), so the reason-gated M10 backfill never sees it.
+        Returns the episode id (book's own rid when it already joins, else the
+        newest open episode for the book, else a newly created one); never
+        raises. Idempotent: at most one episode per stale transition, so the
+        per-message call below costs one dict lookup and creates nothing new.
+        """
+        try:
+            try:
+                au = book.asset.upper()
             except Exception:
-                continue
-        return ""
+                au = asset
+            _brid = getattr(book, "resync_id", None)
+            try:
+                _eps = getattr(self.resync, "_episodes", {})
+                if _brid in _eps:
+                    return _brid
+                for _rid in reversed(list(_eps.keys())):
+                    try:
+                        _ep = _eps.get(_rid)
+                        if _ep is None or _ep.asset != au:
+                            continue
+                        if _ep.resync_completed_ts_utc is not None:
+                            continue
+                        if _rid in getattr(self.resync, "_escalated", set()):
+                            continue
+                        if _ep.condition_id not in (None, book.condition_id):
+                            continue
+                        try:
+                            book.resync_id = _rid
+                        except Exception:
+                            pass
+                        return _rid
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            try:
+                _new = self.resync.handle_disconnect(
+                    asset, book.condition_id, reason=reason, books={book.condition_id: book})
+            except Exception:
+                return _brid
+            try:
+                book.resync_id = _new
+            except Exception:
+                pass
+            return _new
+        except Exception:
+            try:
+                return getattr(book, "resync_id", None)
+            except Exception:
+                return None
 
     async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
         """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
@@ -854,8 +988,21 @@ class Collector:
                     except Exception:
                         pass
         if merged:
-            return merged
-        # Fallback legacy params (endpoint contract verified via §18 gate)
+            # MEDIUM fix (audit 2026-09-21): require BOTH outcomes — a 429 on
+            # one token used to return only up_* keys, replace_from_rest_snapshot
+            # updated just the sides present, and resync() then marked the book
+            # live on half a market (stale DOWN bid shipped as live). The M8
+            # "require both outcomes" discipline existed only on the heal path.
+            _both = all(f"{_o}_{_s}" in merged for _o in ("up", "down") for _s in ("bids", "asks"))
+            if _both:
+                return merged
+            # One-sided fetch is unusable for promotion — fall through to the
+            # legacy probe (also gated below), else None so resync() retries
+            # instead of promoting a half book.
+            merged = {}
+        # Fallback legacy params (endpoint contract verified via §18 gate).
+        # Same both-outcomes gate: a bare single-sided payload must never
+        # promote a half book to live.
         try:
             _c2, _own2 = _client()
             try:
@@ -867,7 +1014,9 @@ class Collector:
                         )
                         if resp.status_code == 200:
                             j = resp.json()
-                            if isinstance(j, dict) and ("bids" in j or "asks" in j):
+                            if isinstance(j, dict) and all(
+                                f"{_o}_{_s}" in j for _o in ("up", "down") for _s in ("bids", "asks")
+                            ):
                                 return j
                 else:
                     resp = await _c2.get(
@@ -876,7 +1025,9 @@ class Collector:
                     )
                     if resp.status_code == 200:
                         j = resp.json()
-                        if isinstance(j, dict) and ("bids" in j or "asks" in j):
+                        if isinstance(j, dict) and all(
+                            f"{_o}_{_s}" in j for _o in ("up", "down") for _s in ("bids", "asks")
+                        ):
                             return j
             finally:
                 if _own2:
@@ -1201,6 +1352,110 @@ class Collector:
         self._mem_task = asyncio.create_task(self._mem_report_loop(), name="mem_report")
         if not enable_kaggle_loop:
             self._kaggle_task = None  # type: ignore
+
+        # MEDIUM (audit 2026-09-21): task supervision — the long-lived loops
+        # historically died silently (the shard NameError incident: no
+        # reconnect ever, books stale forever). Every loop gets a
+        # done-callback that emits a task_died event and restarts it
+        # (bounded: 5 restarts per task, then loud + left dead).
+        try:
+            self._supervised: Dict[str, tuple] = {}
+            self._task_restarts: Dict[str, int] = defaultdict(int)
+
+            def _watch(_name: str, _task: asyncio.Task, _factory) -> None:
+                try:
+                    self._supervised[_name] = (_task, _factory)
+                    _task.add_done_callback(lambda _t, _n=_name: self._task_died(_n))
+                except Exception:
+                    pass
+
+            for _si2, _shard2 in enumerate(_shards):
+                _nm = f"shard-{'+'.join(_shard2)}"
+                try:
+                    _t = self._tasks[_si2]
+                    _watch(_nm, _t,
+                           (lambda _s=list(_shard2), _i=_si2:
+                            self._run_shard_loop(_s, shard_idx=_i)))
+                except Exception:
+                    pass
+            _watch("snapshots", self._snapshot_task, self._snapshot_loop)
+            _watch("clock", self._clock_task, self._clock_loop)
+            _watch("flush", self._flush_loop, self._flush_loop)
+            _watch("resolution_stuck", self._resolution_task, self._resolution_stuck_loop)
+            _watch("chainlink", self._chainlink_task, self._chainlink_loop)
+            _watch("mem_report", self._mem_task, self._mem_report_loop)
+            if getattr(self, "_kaggle_task", None) is not None:
+                _watch("kaggle_upload", self._kaggle_task, self._kaggle_upload_loop)
+        except Exception:
+            pass
+
+    def _task_died(self, name: str) -> None:
+        """Supervisor callback: log loudly, emit task_died, restart bounded."""
+        if not self._running:
+            return
+        try:
+            _task, _factory = self._supervised.get(name, (None, None))
+        except Exception:
+            return
+        if _task is None or _factory is None:
+            return
+        try:
+            if _task.cancelled():
+                return
+        except Exception:
+            pass
+        try:
+            _exc = _task.exception()
+        except Exception:
+            _exc = None
+        _n = 0
+        try:
+            _n = int(self._task_restarts.get(name, 0))
+        except Exception:
+            _n = 0
+        try:
+            print(f"[supervisor] task {name} died ({type(_exc).__name__}: {_exc}); restart {_n + 1}/5")
+        except Exception:
+            pass
+        try:
+            self._collector_event(CollectorEventType.book_anomaly, {
+                "reason": "task_died", "task": name,
+                "error": f"{type(_exc).__name__}: {_exc}"[:200], "restart": _n + 1,
+            })
+        except Exception:
+            pass
+        if _n >= 5:
+            try:
+                print(f"[supervisor] task {name} exceeded restart budget — left dead (loud, honest gap)")
+            except Exception:
+                pass
+            return
+        try:
+            self._task_restarts[name] = _n + 1
+        except Exception:
+            pass
+        try:
+            _nt = asyncio.create_task(_factory(), name=name)
+            self._supervised[name] = (_nt, _factory)
+            _nt.add_done_callback(lambda _t, _nn=name: self._task_died(_nn))
+            _ref = {"snapshots": "_snapshot_task", "clock": "_clock_task", "flush": "_flush_task",
+                    "chainlink": "_chainlink_task", "resolution_stuck": "_resolution_task",
+                    "mem_report": "_mem_task", "kaggle_upload": "_kaggle_task"}.get(name)
+            if _ref:
+                try:
+                    setattr(self, _ref, _nt)
+                except Exception:
+                    pass
+            elif name.startswith("shard-"):
+                try:
+                    for _i, _t in enumerate(list(self._tasks)):
+                        if _t is _task:
+                            self._tasks[_i] = _nt
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # -- missing stubs for lifecycle — filled below (keep compat with start/stop) ----
     async def _run_asset_loop(self, asset: str) -> None:
@@ -1606,10 +1861,24 @@ class Collector:
 
         # Connect with automatic reconnect on disconnect via resync
         # Track tokens already subscribed on this connection to avoid resending duplicates
+        # HIGH fix (audit 2026-09-21): attempt lives OUTSIDE the loop so the
+        # backoff actually grows across consecutive failures (was reset to 0
+        # every iteration → 1.2-2s forever). It resets only after a connection
+        # proves healthy (first data frame). Bounds come from config
+        # (ws.reconnect_backoff_initial_ms/max_ms), not hardcoded 1s/60s.
+        attempt = 0
+        try:
+            initial_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_initial_ms", 500) or 500)
+        except Exception:
+            initial_backoff_ms = 500
+        try:
+            max_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_max_ms", 30000) or 30000)
+        except Exception:
+            max_backoff_ms = 30000
         while self._running:
-            attempt = 0
-            initial_backoff_ms = 1_000
-            max_backoff_ms = 60_000
+            # Per-iteration Retry-After honor (HTTP 429 handshake): parsed in
+            # the generic-except path below, applied to this iteration's sleep.
+            _retry_after_s = 0.0
             try:
                 # WS resilience (docs/WS_RESILIENCE_RESEARCH.md §0): the 3-5min
                 # churn was OUR client closing on protocol-level ping timeouts —
@@ -1620,6 +1889,8 @@ class Collector:
                 # subscribe earns close 1008 "invalid subscription payload").
                 async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
                     conn_established_ms = int(time.time() * 1000)
+                    # Per-connection health flag for the backoff reset above.
+                    saw_data = False
                     # planned recycle: close is OURS — no disconnect episode, no
                     # REST resync, no backoff; books relive from the fresh full book
                     planned_recycle = False
@@ -1722,10 +1993,21 @@ class Collector:
                                 except Exception:
                                     pass
                                 try:
-                                    ws.fail_connection(4000)
+                                    _fc = getattr(ws, "fail_connection", None)
+                                    if callable(_fc):
+                                        _fc(4000)
+                                    else:
+                                        # MEDIUM (audit 2026-09-21): websockets>=13
+                                        # removed fail_connection (verified absent
+                                        # on 17.1) — fall through to the bounded
+                                        # close below instead of AttributeError.
+                                        raise AttributeError("no fail_connection")
                                 except Exception:
                                     try:
-                                        await ws.close()
+                                        # Bounded close: close() on a dead peer
+                                        # waits up to close_timeout — never stall
+                                        # the watchdog longer than 2s.
+                                        await asyncio.wait_for(ws.close(), timeout=2)
                                     except Exception:
                                         return
 
@@ -1786,6 +2068,11 @@ class Collector:
                             # and never reaches here (so a pong-alive/data-dead
                             # socket still trips the watchdog)
                             last_data_ns = time.time_ns()
+                            if not saw_data:
+                                # First data frame: this connection is healthy —
+                                # reset the reconnect backoff for the NEXT failure.
+                                saw_data = True
+                                attempt = 0
 
                             # Handle list payloads (some WS frames are arrays of events)
                             msgs = msg if isinstance(msg, list) else [msg]
@@ -1856,22 +2143,38 @@ class Collector:
                                         except Exception:
                                             pass
                                         # Emit sequence_gap event when gap detected §1A
+                                        # LOW fix (audit 2026-09-21): explicit None
+                                        # checks (seq 0 is valid but falsy under
+                                        # `or` chaining) and distinct expected vs
+                                        # received (was expected == received).
                                         if reason and "sequence_gap" in reason:
+                                            _gseq_raw = single_msg.get("sequence_number")
+                                            if _gseq_raw is None:
+                                                _gseq_raw = single_msg.get("seq")
+                                            try:
+                                                _gseq_int = int(_gseq_raw) if _gseq_raw is not None else 0
+                                            except (TypeError, ValueError):
+                                                _gseq_int = 0
+                                            _gtok = single_msg.get("token_id")
+                                            if _gtok is None:
+                                                _gtok = single_msg.get("asset_id")
+                                            try:
+                                                _glast = book.sequence_numbers.get(str(_gtok)) if _gtok is not None else None
+                                            except Exception:
+                                                _glast = None
+                                            _gexp = (_glast + 1) if _glast is not None else _gseq_int
                                             if self.on_event:
                                                 self.on_event(
                                                     CollectorEventType.sequence_gap,
                                                     {"asset": msg_asset, "condition_id": book.condition_id,
-                                                     "expected": book.sequence_numbers.get(str(single_msg.get("token_id") or single_msg.get("asset_id")) or "unknown", 0) + 1,
-                                                     "received": int(seq) if (seq := single_msg.get("sequence_number") or single_msg.get("seq")) else 0,
+                                                     "expected": _gexp,
+                                                     "received": _gseq_int,
                                                      "reason": reason},
                                                 )
                                             # Trigger resync/disconnect lifecycle on gap
-                                            # M12: pass the real wire seq (was hardcoded received=1)
                                             try:
-                                                _seq_raw = single_msg.get("sequence_number") or single_msg.get("seq")
-                                                _seq_int = int(_seq_raw) if _seq_raw is not None else 0
                                                 self.resync.handle_sequence_gap(
-                                                    msg_asset, book.condition_id, self.books, expected=_seq_int, received=_seq_int
+                                                    msg_asset, book.condition_id, self.books, expected=_gexp, received=_gseq_int
                                                 )
                                             except Exception:
                                                 pass
@@ -1911,22 +2214,22 @@ class Collector:
                                                 try:
                                                     _rsn_l = str(reason or "").lower()
                                                     if ("sanity" in _rsn_l or "crossed" in _rsn_l or "sequence_gap" in _rsn_l):
-                                                        _brid = getattr(book, "resync_id", None)
-                                                        try:
-                                                            _has_ep = _brid in getattr(self.resync, "_episodes", {})
-                                                        except Exception:
-                                                            _has_ep = False
-                                                        if not _has_ep:
-                                                            try:
-                                                                _new_rid = self.resync.handle_disconnect(msg_asset, book.condition_id, f"book_{reason}", {book.condition_id: book})
-                                                                try:
-                                                                    book.resync_id = _new_rid
-                                                                except Exception:
-                                                                    pass
-                                                            except Exception:
-                                                                pass
+                                                        self._ensure_episode_for_stale_book(book, msg_asset, f"book_{reason}")
                                                 except Exception:
                                                     pass
+                                        # CRITICAL backfill (audit 2026-09-21): the
+                                        # M10 path above only runs when `applied`
+                                        # is False with a matching reason — but
+                                        # _enforce_bbo H2 marks stale with an
+                                        # orphan rid while returning (True, None).
+                                        # Unconditional find-or-create closes that
+                                        # hole (idempotent: one dict lookup per
+                                        # message, one episode per transition).
+                                        try:
+                                            if getattr(book.book_state, "value", "") == "stale":
+                                                self._ensure_episode_for_stale_book(book, msg_asset, "stale_no_episode")
+                                        except Exception:
+                                            pass
                                     except Exception as e:
                                         if self.on_event:
                                             self.on_event(
@@ -1995,17 +2298,12 @@ class Collector:
                     # Emit a planned_recycle episode per asset (honest gap) — the
                     # fresh connection's full book relives the books. ws_connected
                     # =False already downgrades snapshots to stale for the window.
+                    # HIGH (audit 2026-09-21): cover ALL lanes via helper (was
+                    # act[0] only — the 1h lane got stale rows with no episode).
                     try:
                         for _ca in shard:
-                            _cid0 = None
                             try:
-                                _act0 = self.rollover.active_markets(_ca)
-                                if _act0:
-                                    _cid0 = _act0[0].condition_id
-                            except Exception:
-                                pass
-                            try:
-                                self.resync.handle_disconnect(_ca, _cid0, reason="planned_recycle", books=self.books)
+                                self._disconnect_asset_books(_ca, reason="planned_recycle")
                             except Exception:
                                 pass
                     except Exception:
@@ -2015,19 +2313,11 @@ class Collector:
                 resync_ids: dict = {}
                 if self._running:
                     for _ca in shard:
-                        _cid = None
                         try:
-                            act = self.rollover.active_markets(_ca)
-                            if act:
-                                _cid = act[0].condition_id
-                            else:
-                                for b in self.books.values():
-                                    if b.asset.upper() == _ca.upper():
-                                        _cid = b.condition_id
-                                        break
+                            _rids = self._disconnect_asset_books(_ca, reason="ws_connection_close")
+                            resync_ids[_ca] = _rids[0] if _rids else None
                         except Exception:
                             pass
-                        resync_ids[_ca] = self.resync.handle_disconnect(_ca, _cid, reason="ws_connection_close", books=self.books)
                 for _ca in shard:
                     self._ws_connected[_ca.upper()] = False
                 # Do NOT auto-reconnect here — wait for real WS reconnect; gap will be closed on next connect `handle_reconnect` or on stop `ensure_all_reconnected`
@@ -2048,18 +2338,12 @@ class Collector:
                     if self._running:
                         for _ca in shard:
                             self._ws_connected[_ca.upper()] = False
-                    # H3: record the recycle as an episode (trade-gap honest)
+                    # H3: record the recycle as an episode (trade-gap honest).
+                    # HIGH (audit 2026-09-21): all lanes, not act[0] only.
                     try:
                         for _ca in shard:
                             try:
-                                _cidr = None
-                                try:
-                                    _actr = self.rollover.active_markets(_ca)
-                                    if _actr:
-                                        _cidr = _actr[0].condition_id
-                                except Exception:
-                                    pass
-                                self.resync.handle_disconnect(_ca, _cidr, reason="planned_recycle", books=self.books)
+                                self._disconnect_asset_books(_ca, reason="planned_recycle")
                             except Exception:
                                 pass
                     except Exception:
@@ -2070,18 +2354,6 @@ class Collector:
                 resync_ids = {}
                 if self._running:
                     for _ca in shard:
-                        _cid2 = None
-                        try:
-                            act2 = self.rollover.active_markets(_ca)
-                            if act2:
-                                _cid2 = act2[0].condition_id
-                            else:
-                                for b in self.books.values():
-                                    if b.asset.upper() == _ca.upper():
-                                        _cid2 = b.condition_id
-                                        break
-                        except Exception:
-                            pass
                         # Diagnosability: keep the WS close code/reason so the
                         # next flap names its cause instead of a bare string.
                         _cc_reason = "ws_connection_close"
@@ -2092,10 +2364,15 @@ class Collector:
                                 _cc_reason = f"ws_connection_close:{_cc_code}:{_cc_msg}"
                         except Exception:
                             pass
-                        _rid = self.resync.handle_disconnect(_ca, _cid2, reason=_cc_reason, books=self.books)
+                        try:
+                            _rids2 = self._disconnect_asset_books(_ca, reason=_cc_reason)
+                        except Exception:
+                            _rids2 = []
+                        _rid = _rids2[0] if _rids2 else None
                         resync_ids[_ca] = _rid
                         self._ws_connected[_ca.upper()] = False
-                        self.resync.buffer_message(_rid, None)  # marker for replay on reconnect
+                        if _rid:
+                            self.resync.buffer_message(_rid, None)  # marker for replay on reconnect
             except Exception as e:
                 if self.on_event:
                     for _ca in shard:
@@ -2103,13 +2380,38 @@ class Collector:
                             self.on_event(CollectorEventType.book_anomaly, {"asset": _ca, "ws_error": str(e)})
                         except Exception:
                             pass
+                # HIGH (audit 2026-09-21): handshake failures (HTTP 429) were
+                # only logged — honor Retry-After so an IP-ban/DNS outage does
+                # not become a tight reconnect storm. Capped at 60s like the
+                # backoff itself.
+                try:
+                    _hdrs = None
+                    for _attr in ("headers", "response"):
+                        try:
+                            _cand = getattr(e, _attr, None)
+                            if _cand is not None and hasattr(_cand, "get"):
+                                if _attr == "response" and hasattr(_cand, "headers"):
+                                    _cand = _cand.headers
+                                _hdrs = _cand
+                                break
+                        except Exception:
+                            continue
+                    if _hdrs is not None:
+                        _ra = _hdrs.get("retry-after") or _hdrs.get("Retry-After")
+                        if _ra is not None:
+                            _retry_after_s = max(0.0, min(60.0, float(str(_ra).strip().split(",")[0])))
+                except Exception:
+                    pass
 
             # Exponential backoff reconnect while running
             if not self._running:
                 return
             attempt += 1
             backoff_s = min(
-                exponential_backoff(attempt, initial_backoff_ms, max_backoff_ms, jitter=True),
+                max(
+                    exponential_backoff(attempt, initial_backoff_ms, max_backoff_ms, jitter=True),
+                    _retry_after_s,
+                ),
                 60,
             )
             # SHARD FIX (2026-09-17): this loop is per-SHARD — the bare `asset`
@@ -2141,20 +2443,13 @@ class Collector:
                 stale_books = [b for b in self.books.values() if b.asset.upper() in shard_set and b.book_state.value == "stale"]
                 for book in stale_books:
                     try:
-                        # Find the episode for this stale book (created by handle_disconnect)
-                        ep_id = None
-                        for rid, ep in list(self.resync._episodes.items()):
-                            if ep.asset == book.asset.upper() and ep.condition_id == book.condition_id and ep.resync_completed_ts_utc is None:
-                                ep_id = rid
-                                break
-                        # Fallback: any pending episode for asset
-                        if ep_id is None:
-                            for rid, ep in list(self.resync._episodes.items()):
-                                if ep.asset == book.asset.upper() and ep.resync_completed_ts_utc is None:
-                                    ep_id = rid
-                                    break
-                        if ep_id is None:
-                            ep_id = resync_id
+                        # Find-or-create (audit 2026-09-21 CRITICAL): the old
+                        # `ep_id = resync_id` fallback reused an unrelated (or
+                        # unbound → NameError, swallowed below) replay-buffer
+                        # id, so the resync never ran and the book stayed stale
+                        # indefinitely. The helper prefers the open episode and
+                        # honestly creates one when none exists.
+                        ep_id = self._ensure_episode_for_stale_book(book, book.asset, "reconnect_resync")
                         # Ensure reconnect timestamp is set before resync
                         try:
                             if ep_id in self.resync._episodes and self.resync._episodes[ep_id].reconnect_ts_utc is None:
@@ -2412,8 +2707,12 @@ class Collector:
                                         one_sided_promotion=self._one_sided_promotion(),
                                     )
                                 # New books start stale until first real data (fixes 5b live-with-nulls)
+                                # HIGH (audit 2026-09-21): reuse the open episode
+                                # for this book when one exists so the stale rows
+                                # join to resync_episodes (was: orphan uuid4).
                                 try:
-                                    book.mark_stale(resync_id=str(uuid.uuid4()))
+                                    _ep0 = self._episode_for_snapshot(m.asset, m.condition_id)
+                                    book.mark_stale(resync_id=_ep0 or str(uuid.uuid4()))
                                 except Exception:
                                     pass
                                 self.books[m.condition_id] = book
@@ -2499,7 +2798,8 @@ class Collector:
                                     # keep book_state stale for this snapshot (will be reflected via snapshot)
                                     if getattr(book.book_state, "value", "") != "stale":
                                         try:
-                                            book.mark_stale(resync_id=str(uuid.uuid4()))
+                                            _epc = self._episode_for_snapshot(m.asset, m.condition_id)
+                                            book.mark_stale(resync_id=_epc or str(uuid.uuid4()))
                                         except Exception:
                                             pass
                             except Exception:
@@ -2559,7 +2859,7 @@ class Collector:
                                     "market_time_remaining_ms": _remain,
                                     "is_rollover_window": _rollover_flag.get(m.condition_id, False),
                                     "book_state": _bs_val,
-                                    "resync_id": getattr(book, "resync_id", None) or str(uuid.uuid4()),
+                                    "resync_id": getattr(book, "resync_id", None) or self._episode_for_snapshot(m.asset, m.condition_id) or str(uuid.uuid4()),
                                     # M8: unknown stays NULL (never fabricate False).
                                     "book_crossed": None,
                                     "up_book_age_ms": None,
@@ -2585,8 +2885,17 @@ class Collector:
                                 if not _ws_conn.get(_m_au, False) and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
-                                        rid = getattr(book, "resync_id", None) or str(uuid.uuid4())
-                                        row["resync_id"] = rid
+                                        # HIGH (audit 2026-09-21): reuse the real
+                                        # episode id when the book's rid is an
+                                        # orphan (never mint blind uuid4 first).
+                                        _brid = getattr(book, "resync_id", None)
+                                        try:
+                                            _joins = _brid in getattr(self.resync, "_episodes", {})
+                                        except Exception:
+                                            _joins = False
+                                        if not _joins:
+                                            _brid = self._episode_for_snapshot(m.asset, m.condition_id) or _brid
+                                        row["resync_id"] = _brid or str(uuid.uuid4())
                                 # Enforce live=>NULL (defensive: if book carried a stale
                                 # rid into a live snapshot, drop it — spec §8).
                                 if row.get("book_state") == "live" and row.get("resync_id") is not None:
@@ -2605,7 +2914,14 @@ class Collector:
                                 if bucket < cur_bucket and row.get("book_state") == "live":
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
-                                        row["resync_id"] = getattr(book, "resync_id", None) or str(uuid.uuid4())
+                                        _brid2 = getattr(book, "resync_id", None)
+                                        try:
+                                            _joins2 = _brid2 in getattr(self.resync, "_episodes", {})
+                                        except Exception:
+                                            _joins2 = False
+                                        if not _joins2:
+                                            _brid2 = self._episode_for_snapshot(m.asset, m.condition_id) or _brid2
+                                        row["resync_id"] = _brid2 or str(uuid.uuid4())
                             except Exception:
                                 pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
@@ -2649,7 +2965,10 @@ class Collector:
     async def _clock_loop(self) -> None:
         while self._running:
             try:
-                drift = check_clock_drift()
+                # MEDIUM (audit 2026-09-21): check_clock_drift() blocks up to
+                # 5s (synchronous NTP request) — run it off the event loop so
+                # the 500ms scheduler never stalls behind it.
+                drift = await asyncio.to_thread(check_clock_drift)
                 if is_clock_issue(drift, threshold_ms=self.config.clock.clock_issue_threshold_ms):
                     self._collector_event(CollectorEventType.clock_issue, {"drift_ms": drift, "threshold_ms": self.config.clock.clock_issue_threshold_ms})
             except Exception:
@@ -2699,6 +3018,45 @@ class Collector:
                 print(f"[mem] rss={_rss}MB objs={sum(_cnt.values())} ntasks={len(self._tasks)} growth={_grow}", flush=True)
             except Exception as _e:
                 print(f"[mem] report err {_e}", flush=True)
+
+    async def _periodic_drift_tick(self) -> None:
+        """Scheduled full-book drift detection (audit 2026-09-21 LOW).
+
+        periodic_drift_check existed but was never called and
+        full_book_diff_interval_seconds was unused — with no wire sequence
+        numbers, drift was healed only by the 150s recycle and never flagged.
+        Throttled to the configured interval; REST 429s fail open (None).
+        """
+        try:
+            import time as _t_dt
+            try:
+                _interval = float(getattr(self.config.ws, "full_book_diff_interval_seconds", 45) or 45)
+            except Exception:
+                _interval = 45.0
+            _now_m = _t_dt.monotonic()
+            if (_now_m - getattr(self, "_last_drift_tick_monotonic", 0.0)) < _interval:
+                return
+            self._last_drift_tick_monotonic = _now_m
+        except Exception:
+            return
+        try:
+            _assets = list(self.config.assets)
+        except Exception:
+            return
+        for _a in _assets:
+            if not self._running:
+                return
+            try:
+                _mlist = self.rollover.active_markets(_a)
+            except Exception:
+                continue
+            for _m in _mlist or []:
+                if not self._running:
+                    return
+                try:
+                    await self.resync.periodic_drift_check(_a, _m.condition_id, self.books)
+                except Exception:
+                    continue
 
     def _drop_totals_note(self) -> str:
         """L4: one-line honest loss accounting for the flush log."""
@@ -2857,6 +3215,22 @@ class Collector:
                 self._disk_guard_tick()
                 if getattr(self, "_emergency_prune_requested", False):
                     await self._run_emergency_prune()
+            except Exception:
+                pass
+            # HIGH (audit 2026-09-21): episode-lifecycle sweep — close open
+            # episodes whose books already healed via background REST heals or
+            # WS full-book promotion (those paths never reach resync(), so
+            # resync_completed_ts_utc stayed NULL and buffers leaked forever).
+            try:
+                _closed = self.resync.close_healed_episodes(self.books)
+                if _closed:
+                    print(f"[resync] sweep closed {_closed} healed episode(s)")
+            except Exception:
+                pass
+            # LOW (audit 2026-09-21): schedule the drift check that was never
+            # wired (throttled internally to full_book_diff_interval_seconds).
+            try:
+                await self._periodic_drift_tick()
             except Exception:
                 pass
 
@@ -3038,9 +3412,18 @@ class Collector:
                                 continue
                             symbol = str(body.get("symbol") or body.get("asset") or "")
                             sym_norm = symbol.lower().replace("-", "").replace("/", "").replace("_", "")
+                            # LOW-MEDIUM fix (audit 2026-09-21): the old prefix
+                            # match (a == sym_norm[:len(a)]) mapped ethfi/usd
+                            # ticks onto ETH. Strip the quote currency, then
+                            # require an EXACT match.
+                            sym_base = sym_norm
+                            for _q in ("usdt", "usd", "usdc"):
+                                if sym_base.endswith(_q) and len(sym_base) > len(_q):
+                                    sym_base = sym_base[: -len(_q)]
+                                    break
                             asset = None
                             for a in self.config.assets:
-                                if a.lower() == sym_norm[:len(a)]:
+                                if a.lower() == sym_base:
                                     asset = a.upper()
                                     break
                             if asset is None:
@@ -3079,18 +3462,21 @@ class Collector:
                             # (to_dict() omits it; without it no market could ever resolve)
                             self._note_chainlink_event(row, asset, ts_ms or int(time.time() * 1000))
                             self._rtds_counts[asset]["parsed"] += 1
-                    attempt = 0
-                    # B-4: periodic received-vs-parsed report per asset — answers
-                    # whether a thin feed (e.g. HYPE ~0.84s ticks) is upstream
-                    # cadence or our parser dropping frames.
-                    if self._running and time.time() - _last_count_log > 120:
-                        _last_count_log = time.time()
-                        counts = {a: dict(v) for a, v in sorted(self._rtds_counts.items())}
-                        print(f"[chainlink] rtds rx/parsed per asset: {counts}")
-                        try:
-                            self._collector_event(CollectorEventType.snapshot_heartbeat, {"rtds_counts": counts})
-                        except Exception:
-                            pass
+                        # LOW-MEDIUM fix (audit 2026-09-21): the rx/parsed report
+                        # was dedented past the `async for`, so it only ran AFTER
+                        # a disconnect — never while connected. Report inline on
+                        # the 120s cadence from inside the message loop.
+                        if time.time() - _last_count_log > 120:
+                            _last_count_log = time.time()
+                            counts = {a: dict(v) for a, v in sorted(self._rtds_counts.items())}
+                            print(f"[chainlink] rtds rx/parsed per asset: {counts}")
+                            try:
+                                self._collector_event(CollectorEventType.snapshot_heartbeat, {"rtds_counts": counts})
+                            except Exception:
+                                pass
+                    # NOTE (audit 2026-09-21): no `attempt = 0` reset here — the
+                    # reset after subscribe covers healthy connections; resetting
+                    # on every loop exit flattened the backoff to a constant 2s.
                     if self._running and not parsed_any and rx_count > 0:
                         # connected but nothing parsed — surface the real payload shape once
                         try:

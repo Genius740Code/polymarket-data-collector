@@ -44,6 +44,8 @@ def main() -> None:
     # without it every test run touched prod ./data).
     ap.add_argument("--data-dir", type=str, default=None,
                     help="override storage data dir (isolated test runs use ./data-test)")
+    ap.add_argument("--skip-gate", action="store_true",
+                    help="bypass the §18 verification gate (not recommended for live runs)")
     args = ap.parse_args()
 
     cfg = CollectorConfig.load(args.config)
@@ -86,6 +88,34 @@ def main() -> None:
             await collector.run_test_mode(num_markets=cfg.test_mode.num_markets, accelerate=cfg.test_mode.accelerate)
             print("test mode completed — data in", cfg.storage.data_dir)
             return
+        # HIGH (audit 2026-09-21): enforce the §18 verification gate before a
+        # live run. Fail closed when REST cannot serve a full L2 book (resync
+        # would be impossible — running anyway guarantees silent staleness).
+        # Other hard fails (e.g. no wire sequence numbers, a known CLOB
+        # property per DATA_CARD) warn loudly but do not block: the collector
+        # already runs the full-book-diff fallback. --skip-gate bypasses all.
+        if not args.skip_gate:
+            try:
+                from .verify_gate import run_gate as _run_verify_gate
+                _gate = await _run_verify_gate()
+                _hard = [c for c in _gate.checks if c.passed is False]
+                _rest_dead = [c for c in _hard if c.name == "rest_full_l2"]
+                for c in _hard:
+                    print(f"[verify-gate] HARD FAIL {c.name}: {c.details}")
+                for c in _gate.checks:
+                    if c.passed is None:
+                        print(f"[verify-gate] UNKNOWN {c.name}: {c.details}")
+                if _rest_dead:
+                    print("[verify-gate] REFUSING TO START: REST cannot serve a full L2 "
+                          "book (§1A resync impossible). Use --skip-gate to override.")
+                    await collector.stop()
+                    return
+                if _hard:
+                    print("[verify-gate] continuing with fallback paths for failed checks "
+                          "(see DATA_CARD); use --skip-gate to silence this gate.")
+            except Exception as _ge:
+                print(f"[verify-gate] gate probe errored ({_ge}) — continuing; "
+                      f"use --skip-gate to silence.")
         await collector.start()
         # run until stopped
         try:

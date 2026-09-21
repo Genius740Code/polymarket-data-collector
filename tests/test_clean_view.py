@@ -118,3 +118,40 @@ def test_clean_view_incremental_appends_without_dupes():
         # (condition_id, ts) via DedupState (see test_streaming_export).
         assert got.num_rows == 5
         assert sorted(r["snapshot_id"] for r in got.to_pylist()).count("1") == 2
+
+
+def test_clean_view_full_rebuild_drops_sidecars_no_dupes():
+    """Forced full rebuild (mtime-gated) must not duplicate sidecar rows."""
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        src_dir = base / "book_snapshots_500ms" / "date=2025-01-01" / "asset=BTC"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        def _row(sid, ts):
+            return {"snapshot_id": sid, "schema_version": "3.0.0", "series_id": "BTC-5MIN",
+                    "window_index": 1, "condition_id": "cid-live", "market_id": "m1",
+                    "asset": "BTC", "up_token_id": "up", "down_token_id": "down",
+                    "ts_snapshot_utc": "2025-01-01T00:00:00Z", "ts_snapshot_ns": ts,
+                    "up_bid": 0.5, "up_ask": 0.6, "up_bid_size": 10, "up_ask_size": 10,
+                    "down_bid": 0.4, "down_ask": 0.5, "down_bid_size": 10, "down_ask_size": 10,
+                    "market_time_remaining_ms": 1000, "up_book_age_ms": 0, "down_book_age_ms": 0,
+                    "is_rollover_window": False, "book_state": "live", "resync_id": None,
+                    "book_crossed": False}
+
+        pq.write_table(pa.Table.from_pylist([_row("1", 0), _row("2", 1)]), str(src_dir / "p1.parquet"))
+        assert build_clean_view(tmp) == 2
+        # incremental -> sidecar file appears alongside part-*
+        import time as _t
+        _t.sleep(0.05)
+        pq.write_table(pa.Table.from_pylist([_row("3", 2)]), str(src_dir / "p2.parquet"))
+        build_clean_view(tmp)
+        out_dir = base / "book_snapshots_clean" / "date=2025-01-01" / "asset=BTC"
+        assert any(p.name.startswith("inc-") for p in out_dir.glob("*.parquet"))
+        # force a full rebuild via the disputed-flag toggle
+        build_clean_view(tmp, opt_in_disputed=True)
+        assert not any(p.name.startswith("inc-") for p in out_dir.glob("*.parquet"))
+        got = load_clean(tmp)
+        ids = [r["snapshot_id"] for r in got.to_pylist()]
+        assert got.num_rows == len(set(ids)) == 3

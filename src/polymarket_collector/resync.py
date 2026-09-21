@@ -172,6 +172,96 @@ class ResyncManager:
         except Exception:
             return False
 
+    def newest_open_buffer_id(self, asset_upper: str) -> str:
+        """Newest live buffer id for an asset (audit 2026-09-21 HIGH).
+
+        The old first-match scan routed live messages to the OLDEST open
+        episode — a zombie from the first recycle whose buffer was retired —
+        so buffer-and-replay never worked after the first recycle. Newest
+        first; never a retired/escalated/completed buffer.
+        """
+        try:
+            if not self._episodes or not self._buffers:
+                return ""
+            for rid in reversed(list(self._episodes.keys())):
+                try:
+                    ep = self._episodes.get(rid)
+                    if ep is None or ep.asset != asset_upper:
+                        continue
+                    if ep.resync_completed_ts_utc is not None:
+                        continue
+                    if rid not in self._buffers:
+                        continue
+                    if not self.buffer_live(rid):
+                        continue
+                    return rid
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return ""
+
+    def close_healed_episodes(self, books: Dict[str, OrderBookState]) -> int:
+        """Close open episodes whose books are live again (audit 2026-09-21 HIGH).
+
+        book_stalled/crossed/sanity episodes are healed by background REST
+        (_heal_book_bg) and planned_recycle episodes by the fresh connection's
+        full-book promotion — neither path touched the episode, so
+        resync_completed_ts_utc stayed NULL forever, _episodes/_buffers grew
+        without bound, and gap metrics were backdated to the next connect.
+        The sweep closes an open episode once every book it covers reads live:
+        reconnect stamped (if missing), completed stamped now, gap measured to
+        the real heal time, buffer popped. Returns episodes closed.
+        """
+        closed = 0
+        try:
+            live_by_asset: Dict[str, list] = {}
+            for b in books.values():
+                try:
+                    if getattr(getattr(b, "book_state", None), "value", "") == "live":
+                        live_by_asset.setdefault(str(getattr(b, "asset", "")).upper(), []).append(
+                            getattr(b, "condition_id", None))
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        for rid, ep in list(self._episodes.items()):
+            try:
+                if self.is_finished(rid):
+                    continue
+                try:
+                    au = str(ep.asset or "").upper()
+                except Exception:
+                    continue
+                live_cids = live_by_asset.get(au, [])
+                if not live_cids:
+                    continue
+                # Episode covers one book (condition_id set) or the whole asset
+                # (condition_id None, e.g. asset-wide disconnect): close when
+                # the covered book(s) are all live.
+                if ep.condition_id is not None and ep.condition_id not in live_cids:
+                    continue
+                if ep.reconnect_ts_utc is None:
+                    try:
+                        self.handle_reconnect(rid)
+                        ep = self._episodes.get(rid) or ep
+                    except Exception:
+                        pass
+                ep.resync_completed_ts_utc = _now_iso()
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.resync_completed, ep.to_dict())
+                    except Exception:
+                        pass
+                self._safe_persist(ep.to_dict(), "close_healed_episodes")
+                self._buffers.pop(rid, None)
+                self._buffer_deadline.pop(rid, None)
+                self._buffer_retired.discard(rid)
+                closed += 1
+            except Exception:
+                continue
+        return closed
+
     def is_finished(self, resync_id: str) -> bool:
         ep = self._episodes.get(resync_id)
         if ep is None:
@@ -283,6 +373,14 @@ class ResyncManager:
                             })
                         except Exception:
                             pass
+                    # HIGH fix (audit 2026-09-21): a retired buffer is never
+                    # replayed — pop it so RAM is freed and no router can feed
+                    # the zombie (routing now requires buffer_live anyway).
+                    try:
+                        self._buffers.pop(resync_id, None)
+                        self._buffer_deadline.pop(resync_id, None)
+                    except Exception:
+                        pass
                 return
             q = self._buffers[resync_id]
             if len(q) >= self.MAX_BUFFERED_MSGS_PER_EPISODE:
@@ -382,6 +480,19 @@ class ResyncManager:
 
                 buffered = list(self._buffers.get(resync_id, []))
                 phase = "replay"
+                # MEDIUM fix (audit 2026-09-21): when the wire carries no
+                # sequence numbers (the normal case per DATA_CARD), a stale
+                # buffered frame used to overwrite the fresher REST snapshot.
+                # Drop frames provably older than the REST fetch (frame clock
+                # vs resync_rest_fetch_ts_utc, 1s skew); frames with no clock
+                # fail open (applied) — reach is limited since the WS is
+                # usually down during resync().
+                try:
+                    import datetime as _dtf
+                    _fetch_ms = int(_dtf.datetime.fromisoformat(
+                        (ep.resync_rest_fetch_ts_utc or "").replace("Z", "+00:00")).timestamp() * 1000)
+                except Exception:
+                    _fetch_ms = None
                 for msg in buffered:
                     if not isinstance(msg, dict):
                         continue  # connection markers (None) — nothing to replay
@@ -395,10 +506,25 @@ class ResyncManager:
                     # discard if provably older/equal to snapshot cursor
                     if snapshot_seq_int is not None and msg_seq_int is not None and msg_seq_int <= snapshot_seq_int:
                         continue
+                    if msg_seq_int is None and snapshot_seq_int is None and _fetch_ms is not None:
+                        try:
+                            from .book import OrderBookState as _OBS
+                            _fts = _OBS._parse_frame_ts_ms(msg)
+                        except Exception:
+                            _fts = None
+                        if _fts is not None and _fts < _fetch_ms - 1000:
+                            continue  # stale pre-fetch frame — REST snapshot is newer
                     for book in targets:
                         book.apply_ws_message(msg)
 
                 # clear stale flag
+                # NOTE (audit 2026-09-21): promotion is NOT gated on both
+                # outcomes here by design — partial-REST success is the pinned
+                # contract (test_resync/chaos: up-only snapshots heal to live;
+                # missing sides ship as honest NULLs). The one-sided-REST hazard
+                # (429 on one token) is fixed at the source: _fetch_rest_book
+                # refuses to return a partial merge (returns None → retry)
+                # instead of letting resync() promote a half book.
                 for book in targets:
                     book.mark_live()
                     if self.on_book_state_change:

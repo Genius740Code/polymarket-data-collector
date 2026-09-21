@@ -1,0 +1,90 @@
+AI FULL-REPO AUDIT PROMPT — REAL DATA ONLY (COPY-PASTE TO ANY AI)
+
+GitHub repo: https://github.com/Genius740Code/polymarket-data-collector
+Clone / audit target: git clone https://github.com/Genius740Code/polymarket-data-collector.git
+CI workflow to include: https://github.com/Genius740Code/polymarket-data-collector/blob/master/.github/workflows/ci.yml
+
+You are a senior Polymarket data engineer + security auditor. Fully audit this repo: polymarket-data-collector.
+Scope MUST include: src/, tests/, config/, services/, apps/, packages/, .github/, docs/, *.py at root, pyproject.toml.
+Read AGENT.md + AGENTS.md first — they override everything. Violating them is worse than any bug.
+
+GOLDEN RULES (fail audit if violated):
+- NEVER delete honest rows. book_state='stale'/'resyncing' rows are truth, NOT bad data. Deleting them fabricates completeness.
+- NEVER synthesize: no synthetic/mock/fake/simulated/seeded/interpolated rows, no price==up_bid chainlink fallback, no old_best==new_best fake book_events, no invented wallets/hashes/fees.
+- ONLY allowed deletions: 1) corrupt/unreadable parquet -> move to quarantine/ + log + emit collector_events coverage_gap, 2) files CONSUMED by compaction (merged + verified, then atomic delete), 3) explicit user rm -rf or export.py:cleanup_local_data AFTER dataset_status==ready. NEVER age-based delete.
+- Gaps must stay gaps: every gap needs book_state='stale'/'resyncing' + resync_episodes with gap_duration_ms + collector_events (ws_disconnected/sequence_gap/coverage_gap).
+
+AUDIT CHECKLIST — check ALL, report file:line + evidence:
+
+1. DATA DELETION (critical)
+   - grep for: os.remove, os.unlink, shutil.rmtree, pathlib.*unlink, rm -rf, .unlink(, cleanup_local_data, age.*delete, expire, prune, retention.*delete
+   - For each hit: is it quarantine-only? compaction-consumed-only? guarded by dataset_status==ready + non-empty check? If unguarded delete of data/book_snapshots_500ms, data/trades, data/markets_log, data/_wal, data/kaggle_staging -> CRITICAL.
+   - Verify storage/compaction.py uses tmp+atomic rename, verifies row counts before delete. Verify storage/quarantine.py moves first, never deletes outright.
+   - Verify storage/export.py:352 monotonic guard: never overwrite non-empty staging with empty. Flag any overwrite without row-count check.
+   - Old watchdog bug: ai_watchdog_prompt.txt told AI to "Delete those parquet files immediately" — flag ANY code/prompt/docs that still instructs bulk deletion. Must be REMOVED.
+
+2. KAGGLE + LOCAL HANDLING
+   - dataset gghgg1/polymarket-5m-crypto is cumulative mirror. Local data/ is source of truth.
+   - Check: export.py, dataset-metadata.json, kaggle.json handling, staging dir logic. Flag: overwrite, non-monotonic upload, age-delete, deleting _wal before flush, missing `fee_is_estimated` on estimated fees.
+   - Verify all writes go via ParquetWriter with atomic tmp+rename, WAL-before-buffer (parquet_writer.py:199), dedup (asset,condition_id,bucket) at :428,:449.
+
+3. STALE / LIVE / BOOK_STATE + RESYNC
+   - Snapshots on 500ms UTC grid floor(unix_ms/500)*500 (book.py:23). Flag drift, non-aligned schedulers.
+   - book_state must be live only when WS up, else stale/resyncing. Flag: live-labeled rows during disconnect (watchdog never fired — check subscribed_once NameError, last_data_ns UnboundLocalError patterns).
+   - Every high-stale day (>30%) MUST have matching resync_episodes with gap_duration_ms populated. High-stale with NO episodes = silent failure -> CRITICAL.
+   - Check resync.py:87, collector.py WS loops, heartbeat <15s (data/heartbeat.json), staleness watchdog, reconnect/backoff, buffer-and-replay, sequence_gap detection.
+   - clean-view parity: every (date,asset) in book_snapshots_500ms must have partition in book_snapshots_clean (built via clean_view.build_clean_view, live-only). Missing = rebuild, never delete source.
+
+4. BOOK CORRECTNESS
+   - Prices 0<=p<=1 (validation.py:33), sizes >=0. Flag out-of-range.
+   - Null-vs-zero (book.py:481): empty side = null, never 0. Flag price null but size not-null, or 0-price with size.
+   - book_crossed==false (<1% true). Flag >1% crossed.
+   - Depth aggregates depth_1c/5c/10c = cumulative size within N¢ of OWN side best (not mid/opposite) (book.py:28). Flag wrong reference.
+   - L2 levels sorted best-first, tail null not 0. Flag unsorted / zero-padded tails.
+   - book_events: price_change rows with old==new on BOTH bid+ask at >5% = fake-event generator -> CRITICAL.
+   - Synthetic markers: source='synthetic' or report_id startswith 'synth-' anywhere in src/ prod paths -> CRITICAL. synthetic_mode (config.py:159) must be False/deprecated, never read in new code.
+   - Traceability: every row ts_source + ts_received_ns, condition_id -> markets_latest (markets_log.py:206), token maps to up/down_token_id (book.py:332). Duplicates deduped.
+   - book_hash recorded AND verified on write (old bug: stored never checked).
+
+5. MARKETS / ROLLOVER (Gamma)
+   - Markets via Gamma slug deterministic (rollover.py:164), dual-tracking RolloverManager overlap. Flag hardcoded condition_ids, missing dual-track, dropped secondary condition_ids (old price_change `break` bug dropping ~56k msgs/run).
+   - markets_log event-sourced (markets_log.py:21) + markets_latest compaction. Flag direct overwrite of markets_latest without log.
+
+6. CHAINLINK / SETTLEMENT
+   - Chainlink events real WS wss://ws-live-data.polymarket.com or empty with schema, never derived price==up_bid (old collector.py:1177 bug).
+   - Settlement settlement_report_id/price/tx_hash (schemas.py:46) only when fetch_settlement (chainlink.py:104) finds on-chain or inferred_nearest flagged. `unknown` is correct until resolver wired — do NOT invent.
+
+7. ERROR SWALLOWING + LOGGING
+   - grep for: `except:`, `except Exception:.*pass`, `except.*: *pass` (was 323 sites). Each must log + emit collector_events, never silent pass in WS/collect/write paths.
+   - Verify NameError/UnboundLocalError patterns fixed: bare subscribed_once vs ws_holder["subscribed_once"], nonlocal last_data_ns.
+   - Verify NTP clock.py 50ms threshold + clock_issue event, ts_source vs ts_received_ns preserved distinctly.
+
+8. GITHUB (.github/workflows/ci.yml) + CI POLICY GATE
+   - Include .github/ in audit. Verify CI: 1) checkout+setup-python+pip install, 2) real-data-only gate fails on source='synthetic', report_id synth-, synth- in src/ (excluding tests/audit comments), + pytest tests/test_policy_no_synthetic.py, 3) full pytest tests/ -q.
+   - Flag: missing policy gate, weak grep allowing bypass, no chaos tests in CI, auto-commit/push without human approval, changed git config in prompts/scripts.
+
+9. TESTS + CHAOS
+   - Must have tests/test_chaos.py disconnect/sequence-gap/malformed injections (PLAN.md:19), tests/test_policy_no_synthetic.py, momentum decision tests. Full suite ~243 passed expected.
+   - Flag: skipped chaos, tests that enable synthetic_mode in prod path, tests that delete data/ without quarantine, missing resync_episodes/collector_events assertions.
+
+10. PERF / OPS / FRAGMENTATION
+    - Fragmentation >100 files per (date,asset) leaf = uncompacted -> compact via storage.compaction.compact_dataset (20k-row chunks, safe on 3GB boxes). No manual deletes.
+    - RSS <2.5GB, heartbeat fresh, per-asset flow newest file <300s, sampled stale% <30%, zero bad prices.
+    - Check ecosystem.*.config.cjs, services/, infra/, paper bots: must be real-data-only (live CLOB book-walk fills, Chainlink strikes/settlement, late-joined windows skipped never estimated).
+
+HOW TO RUN (do this):
+1. `ls` repo root, read AGENT.md, .github/workflows/ci.yml, config/collector.yaml, pyproject.toml
+2. `grep -rn "synthetic\|synth-\|synthetic_mode" src/ --include='*.py'`
+3. `grep -rn "os.remove\|os.unlink\|shutil.rmtree\|unlink()\|rm -rf\|cleanup_local_data\|except.*pass" src/ --include='*.py'`
+4. `grep -rn "price.*==.*up_bid\|old.*==.*new\|interpolat" src/ --include='*.py'`
+5. `pytest tests/ -q` + `pytest tests/test_policy_no_synthetic.py -q`
+6. Sample data/: pq.read_metadata footer counts per (date,asset), stale%, crossed%, null-vs-zero, old==new rate, resync gap_duration_ms populated, clean parity.
+
+OUTPUT FORMAT (strict):
+- Table: | Severity CRITICAL/HIGH/MEDIUM/LOW | File:Line | Category [deletion/kaggle/stale/book/chainlink/error-swallowing/github/tests/perf] | Evidence (quote) | Why it violates AGENT.md §X | Fix (concrete patch) |
+- End with: PASS/FAIL vs Real-Data-Only policy + top 5 fixes in order + exact re-run commands.
+- Fail-closed: any CRITICAL (synthetic producer, unguarded delete, stale-with-no-episodes, fake book_events, Kaggle overwrite) = overall FAIL. Never auto-delete, auto-commit, or auto-push. Propose diffs only.
+
+CONSTRAINTS:
+- Read-only audit unless user explicitly says FIX. Do not delete data/, do not git add/commit/push, do not change git config.
+- If asked to fix: quarantine-only deletes, compaction for fragmentation, rebuild for missing clean partitions, add regression test per fix, re-run full tests green before done.

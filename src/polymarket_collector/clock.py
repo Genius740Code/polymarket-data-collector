@@ -32,7 +32,13 @@ def ts_bucket_ms(unix_ms: int, interval_ms: int = 500) -> int:
 
 
 def check_clock_drift(ntp_server: str = "pool.ntp.org", timeout: int = 5) -> Optional[float]:
-    """Return drift in milliseconds (positive = local ahead) or None if unavailable."""
+    """Return drift in milliseconds (positive = local clock is BEHIND ntp) or None if unavailable.
+
+    offset is defined as ntp_time - local_time, so a positive value means the
+    local clock lags the server (was documented with the wrong sign). Callers
+    must run this off the event loop (asyncio.to_thread) — the NTP request
+    blocks synchronously up to `timeout` seconds.
+    """
     if not _HAS_NTPLIB:
         return None
     try:

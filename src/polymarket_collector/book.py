@@ -145,6 +145,32 @@ def _nz(v: Optional[float]) -> Optional[float]:
     return None if v is None or v == 0 else v
 
 
+def sanitize_level(price, size) -> Optional[Tuple[float, float]]:
+    """Shared §3A bounds sanitizer (audit 2026-09-21 MEDIUM).
+
+    Returns (price, size) floats when the level is a real resting quote:
+    price in [0,1], size >= 0, price != 0 (E4 empty-side sentinel). Returns
+    None for removals (size 0 — handled by callers), sentinels, unparsable
+    or out-of-range levels. Used by BOTH _apply_levels (WS book frames,
+    which previously bypassed the M7 bounds check) and
+    replace_from_rest_snapshot so the two paths cannot disagree.
+    """
+    try:
+        p = float(price)
+        s = float(size)
+    except (TypeError, ValueError):
+        return None
+    if p == 0:
+        return None  # E4: 0-price is an empty-side sentinel, not a quote
+    if s == 0:
+        return None  # removal — caller tracks it separately
+    if not (0.0 <= p <= 1.0):
+        return None  # §3A bounds
+    if not (s >= 0):
+        return None  # §3A bounds
+    return (p, s)
+
+
 @dataclass(slots=True)
 class Level:
     price: Optional[float]  # None → null (absent level)
@@ -680,6 +706,14 @@ class OrderBookState:
             # F10: with one_sided_promotion (weather thin buckets), a hashed
             # frame with ANY side present promotes — asks-only books are the
             # norm far-future, not broken. Without it, both sides required.
+            # NOTE (audit 2026-09-21): promotion stays per touched outcome by
+            # design — the CLOB wire sends full `book` frames per TOKEN, so a
+            # single UP frame promoting is the cold-start/post-resync path the
+            # A4 tests pin (the alternate outcome's frame arrives in the same
+            # subscribe burst; a genuinely missing side ships as honest NULLs
+            # per §3 null-vs-zero, never fabricated). Requiring both outcomes
+            # in one frame was tried and reverted: it broke per-token promotion
+            # and held books stale whenever frames arrive separately.
             if self.book_state != BookState.live:
                 has_bid = book.bids.best_top()[0] is not None
                 has_ask = book.asks.best_top()[0] is not None
@@ -704,12 +738,14 @@ class OrderBookState:
             "ask": ask, "ask_size": ask_size,
         }
 
-    def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 0.0101) -> None:
+    def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 1e-9) -> None:
         """Compare the book's top-of-book to the exchange-reported best_bid/best_ask.
 
         Every CLOB price_change carries the authoritative post-change BBO for its
-        token. If our book's best disagrees by more than a tick (dropped deltas,
-        taker-side artifacts), emit a `bbo_snapped` event and REMOVE the stale
+        token. If our book's best disagrees by more than float epsilon — i.e. any
+        real disagreement, not just a >1-tick one (audit 2026-09-21 MEDIUM: a
+        1-tick disagreement used to ship as live forever) — emit a `bbo_snapped`
+        event and REMOVE the stale
         best level (size 0 = remove) — never rewrite a resting level's price in
         place. Rewriting kept the old size under a price that never rested on
         the wire (fabricated quote); snapshots then shipped it as truth.
@@ -887,33 +923,39 @@ class OrderBookState:
                 price, size = lvl[0], lvl[1]
                 if price is None or size is None:
                     continue
+                # removal vs shared bounds gate (E4/M7 via sanitize_level)
                 try:
-                    p = float(price); s = float(size)
+                    _s0 = float(size)
                 except (TypeError, ValueError):
                     continue
-                if p == 0:
-                    continue  # E4: 0-price is an empty-side sentinel, not a quote
-                if s == 0:
-                    removals.add(float(p))
+                if _s0 == 0:
+                    try:
+                        removals.add(float(price))
+                    except (TypeError, ValueError):
+                        pass
                     continue  # removal — tracked below
-                new_levels.append(Level(price=p, size=s))
+                _ok = sanitize_level(price, size)
+                if _ok is None:
+                    continue
+                new_levels.append(Level(price=_ok[0], size=_ok[1]))
             elif isinstance(lvl, dict):
                 p = lvl.get("price"); s = lvl.get("size")
                 if p is None or s is None:
                     continue
                 try:
-                    pf = float(p); sf = float(s)
+                    _s0 = float(s)
                 except (TypeError, ValueError):
                     continue
-                if pf == 0:
-                    continue  # E4: 0-price is an empty-side sentinel, not a quote
-                if sf == 0:
+                if _s0 == 0:
                     try:
-                        removals.add(float(pf))
-                    except Exception:
+                        removals.add(float(p))
+                    except (TypeError, ValueError):
                         pass
                     continue
-                new_levels.append(Level(price=pf, size=sf))
+                _ok = sanitize_level(p, s)
+                if _ok is None:
+                    continue
+                new_levels.append(Level(price=_ok[0], size=_ok[1]))
         # sort best-first
         new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
         # FULL REPLACE (book events are complete side snapshots from the exchange)
@@ -941,25 +983,15 @@ class OrderBookState:
                 new_levels: List[Level] = []
                 for lvl in levels:
                     if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
-                        try:
-                            p = float(lvl[0]); s = float(lvl[1])
-                        except (TypeError, ValueError):
+                        _ok = sanitize_level(lvl[0], lvl[1])
+                        if _ok is None:
                             continue
-                        if p == 0:
-                            continue  # E4: 0-price sentinel, not a quote
-                        if not (0.0 <= p <= 1.0) or not (s >= 0):
-                            continue  # M7: §3A bounds, same as WS path
-                        new_levels.append(Level(price=p, size=s))
+                        new_levels.append(Level(price=_ok[0], size=_ok[1]))
                     elif isinstance(lvl, dict):
-                        try:
-                            p = float(lvl["price"]); s = float(lvl["size"])
-                        except (TypeError, ValueError, KeyError):
+                        _ok = sanitize_level(lvl.get("price"), lvl.get("size"))
+                        if _ok is None:
                             continue
-                        if p == 0:
-                            continue  # E4: 0-price sentinel, not a quote
-                        if not (0.0 <= p <= 1.0) or not (s >= 0):
-                            continue  # M7: §3A bounds, same as WS path
-                        new_levels.append(Level(price=p, size=s))
+                        new_levels.append(Level(price=_ok[0], size=_ok[1]))
                 new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
                 side.levels = new_levels[: self._ram_levels]
                 while len(side.levels) < self._ram_levels:

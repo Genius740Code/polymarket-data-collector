@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  policy-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Real-data-only policy gate (AGENT.md §4)
+        run: |
+          # Fail closed on synthetic producers in live writer paths.
+          ! grep -rn --include='*.py' -E "source\s*=\s*['\"]synthetic['\"]" src/ | grep -v "remov\|never\|forbid" || exit 1
+          ! grep -rn --include='*.py' -E "report_id\s*=\s*f?['\"]synth-" src/ || exit 1
+          ! grep -rn --include='*.py' "synth-" src/ | grep -v test | grep -v "audit\|remov\|never\|forbid\|backward compat" || exit 1
+          pytest tests/test_policy_no_synthetic.py -q
+      - name: Test suite
+        run: pytest tests/ -q
