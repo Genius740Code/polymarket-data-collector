@@ -4380,6 +4380,35 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
         if _rows(fpath) is None:
             return False
     # Monotonic check vs prior staging (download-merge fallback when no local hive yet)
+    # Gap-evidence guard: collector_events / resync_episodes must NEVER shrink,
+    # even in rolling_window mode (retention prune never touches them locally,
+    # so any shrink is an overwrite bug, not retention). Enforced regardless
+    # of check_monotonic.
+    try:
+        state_path_gap = staging.parent.parent / "_kaggle_state.json"
+        if not state_path_gap.exists():
+            state_path_gap = staging.parent / "_kaggle_state.json"
+        if state_path_gap.exists():
+            import json as _js_gap
+            _state_gap = _js_gap.loads(state_path_gap.read_text())
+            for _k_gap, _v_gap in _state_gap.items():
+                if isinstance(_v_gap, dict) and "_last_staging_counts" in _v_gap:
+                    _prior_gap = _v_gap["_last_staging_counts"]
+                    for _gap_key in ("collector_events.parquet", "resync_episodes.parquet"):
+                        _prior_n = _prior_gap.get(_gap_key)
+                        if _prior_n is not None and _prior_n > 0:
+                            _cur_gap_p = staging / _gap_key
+                            try:
+                                import pyarrow.parquet as _pq_gap
+                                _cur_n = _pq_gap.read_metadata(str(_cur_gap_p)).num_rows
+                                if _cur_n < _prior_n:
+                                    print(f"[staging-verify] FAIL gap evidence shrank: {_gap_key} { _cur_n} < {_prior_n}")
+                                    return False
+                            except Exception:
+                                return False
+                    break
+    except Exception:
+        pass
     if not check_monotonic:
         return True
     try:
@@ -4483,9 +4512,10 @@ def cleanup_local_data(
     - condition-bearing datasets (snapshots, clean view, book_events, trades):
       delete only if EVERY condition_id in the file maps to a market that ended
       before the cutoff; any unknown condition → keep (conservative).
-    - timestamp-only datasets (chainlink_events, collector_events): delete only if
+    - timestamp-only datasets (chainlink_events ONLY): delete only if
       the max timestamp is before the cutoff.
-    - markets_log / markets_latest: never deleted (the resolution map depends on them).
+    - markets_log / markets_latest / collector_events / resync_episodes:
+      never deleted (resolution map + gap evidence stay local forever).
 
     In cumulative mode (rolling_window=False, the legacy default) NOTHING is
     deleted — the staging is cumulative and rebuilt from the full local hive, so
@@ -4500,11 +4530,12 @@ def cleanup_local_data(
 
     Quarantine bound (2026-09-20 disk-full fix): the prune MOVES files to
     <data_dir>/_quarantine/ (same filesystem) instead of unlinking, so without
-    a bound every "prune" frees 0 bytes. This function therefore reaps the
-    quarantine FIRST (aged past quarantine_retention_hours, then oldest-first
-    over quarantine_max_bytes) — even when the prune below early-returns
-    (no verified upload yet, cumulative mode), because the reaper only ever
-    removes already-uploaded or unreadable data, never the live hive.
+    a bound every "prune" frees 0 bytes. The quarantine reap runs ONLY after
+    a verified upload checkpoint is established (fail closed — no checkpoint,
+    no reap, no prune), bounded by quarantine_retention_hours /
+    quarantine_max_bytes, and each expiry batch emits a coverage_gap
+    collector_events row. The reaper only ever removes already-uploaded or
+    unreadable review-buffer data, never the live hive.
     Pass reap_quarantine=False to skip (tests); dry_run reports without
     deleting anything.
     """
@@ -4516,32 +4547,12 @@ def cleanup_local_data(
     base = Path(data_dir)
     tf_label = str(timeframe_labels[0]).lower()
 
-    # Bound the quarantine first (see docstring): the _quarantine/ dir lives
-    # on the same filesystem, so un-reaped it cancels every byte the prune
-    # "deletes". Runs even on early-return paths below — the reaper's own
-    # age/cap policy is the only gate, independent of upload checkpoints.
+    # Quarantine reap is GATED on verified upload (see below, after the
+    # checkpoint is resolved): the _quarantine/ dir lives on the same
+    # filesystem, but reaping before any upload would delete review-buffer
+    # contents with no remote copy. Fail closed — no checkpoint, no reap.
     if reap_quarantine is None:
         reap_quarantine = True
-    if reap_quarantine:
-        if quarantine_retention_hours is None or quarantine_max_bytes is None:
-            try:
-                from ..config import CollectorConfig as _CCq
-                _kq = _CCq.load().kaggle
-                if quarantine_retention_hours is None:
-                    quarantine_retention_hours = float(getattr(_kq, "quarantine_retention_hours", 72))
-                if quarantine_max_bytes is None:
-                    quarantine_max_bytes = int(getattr(_kq, "quarantine_max_bytes", 1_073_741_824))
-            except Exception:
-                if quarantine_retention_hours is None:
-                    quarantine_retention_hours = 72
-                if quarantine_max_bytes is None:
-                    quarantine_max_bytes = 1_073_741_824
-        try:
-            from .quarantine import reap_quarantine as _reap
-            _reap(base, max_age_hours=quarantine_retention_hours,
-                  max_total_bytes=quarantine_max_bytes, dry_run=dry_run)
-        except Exception as _reap_e:
-            print(f"[prune] WARN quarantine reap failed (prune continues): {_reap_e}")
 
     # Resolve rolling-window policy: explicit arg > config > legacy no-op
     if rolling_window is None:
@@ -4697,6 +4708,34 @@ def cleanup_local_data(
     now_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000)
     cutoff_ms = min(now_ms, checkpoint_ms) - int(retention_hours) * 3600 * 1000
 
+    # Gated quarantine reap: runs ONLY after a verified upload checkpoint
+    # exists (we are past every fail-closed return above). Deletions are
+    # already-uploaded or unreadable rows only, and each deletion batch
+    # emits a coverage_gap collector_events row so the gap trail stays
+    # honest even as the review buffer expires.
+    if reap_quarantine:
+        if quarantine_retention_hours is None or quarantine_max_bytes is None:
+            try:
+                from ..config import CollectorConfig as _CCq
+                _kq = _CCq.load().kaggle
+                if quarantine_retention_hours is None:
+                    quarantine_retention_hours = float(getattr(_kq, "quarantine_retention_hours", 72))
+                if quarantine_max_bytes is None:
+                    quarantine_max_bytes = int(getattr(_kq, "quarantine_max_bytes", 1_073_741_824))
+            except Exception:
+                if quarantine_retention_hours is None:
+                    quarantine_retention_hours = 72
+                if quarantine_max_bytes is None:
+                    quarantine_max_bytes = 1_073_741_824
+        try:
+            from .quarantine import reap_quarantine as _reap
+            _reap_stats = _reap(base, max_age_hours=quarantine_retention_hours,
+                                max_total_bytes=quarantine_max_bytes, dry_run=dry_run)
+            if isinstance(_reap_stats, dict) and (_reap_stats.get("files_deleted") or 0) > 0 and not dry_run:
+                _log_quarantine_gap(base, _reap_stats, "quarantine-reap")
+        except Exception as _reap_e:
+            print(f"[prune] WARN quarantine reap failed (prune continues): {_reap_e}")
+
     # condition_id -> market_end map (never pruned source of truth)
     end_by_cid: dict = {}
     latest = base / "markets_latest" / "markets_latest.parquet"
@@ -4716,7 +4755,11 @@ def cleanup_local_data(
         return {}
 
     CID_DATASETS = ["book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades"]
-    TS_DATASETS = ["chainlink_events", "collector_events"]
+    # Gap evidence is never pruned: collector_events + resync_episodes stay
+    # local forever (only chainlink_events, a timestamp-only market-data
+    # feed, is age-eligible). The Kaggle staging rebuild would otherwise
+    # publish a truncated gap trail after each retention prune.
+    TS_DATASETS = ["chainlink_events"]
     skipped = set(skip_datasets or [])
     stats: dict = {}
     pruned_rows = 0
@@ -4730,14 +4773,17 @@ def cleanup_local_data(
         # C3: quarantine before delete (was direct unlink — a bad pass was
         # unrecoverable with raw_archive disabled). Moves preserve the relpath
         # under _quarantine/ for manual review/recovery.
+        # Fail-closed fallback: if the quarantine move fails, KEEP the file
+        # and log — never unlink live hive data on a failed move.
         try:
             _q = base / "_quarantine" / rel
             _q.parent.mkdir(parents=True, exist_ok=True)
             try:
                 import shutil as _sh_q
                 _sh_q.move(str(p), str(_q))
-            except Exception:
-                p.unlink()
+            except Exception as _mv:
+                print(f"[prune] KEEP {rel}: quarantine move failed ({_mv}); file left in place")
+                return
             stats[rel] = rows
             pruned_rows += rows
             print(f"[prune] quarantined {rel} ({rows} rows, {reason})")
@@ -4851,81 +4897,113 @@ def cleanup_local_data(
                 except Exception:
                     pass
         # N6: quarantine lives on the same filesystem so nothing is reclaimed
-        # until it expires. Bound it by age + total bytes (defaults 72h / 5GB).
-        try:
-            _expire_quarantine(base)
-        except Exception as _qe:
-            print(f"[prune] WARN quarantine expiry failed: {_qe}")
+        # until it expires. Single reaper (config quarantine_retention_hours /
+        # quarantine_max_bytes), already gated on verified upload above.
+        # Honors reap_quarantine=False (tests) — the gated reap above does too.
+        if reap_quarantine:
+            try:
+                _expire_quarantine(base, ttl_hours=quarantine_retention_hours,
+                                   max_bytes=quarantine_max_bytes)
+            except Exception as _qe:
+                print(f"[prune] WARN quarantine expiry failed: {_qe}")
 
     if stats or pruned_rows:
         print(f"[prune:{tf_label}] deleted {len(stats)} files / {pruned_rows} rows older than {retention_hours}h leeway (cutoff {cutoff_ms})")
     return stats
 
 
-def _expire_quarantine(base: Path, ttl_hours: float = 72.0, max_bytes: int = 5_000_000_000) -> dict:
+def _log_quarantine_gap(base: Path, reap_stats: dict, source: str) -> None:
+    """Emit a coverage_gap collector_events row for quarantine expiry.
+
+    Quarantine holds already-uploaded or unreadable rows, so expiry is not
+    hive data loss — but the review buffer disappearing must stay visible
+    in the gap trail. Best-effort: never raises, never blocks the prune.
+    """
+    try:
+        files_deleted = int((reap_stats or {}).get("files_deleted", 0) or 0)
+        bytes_deleted = int((reap_stats or {}).get("bytes_deleted", 0) or 0)
+        if files_deleted <= 0 and bytes_deleted <= 0:
+            return
+        import datetime as _dt_gap
+        import time as _t_gap
+        import uuid as _uuid_gap
+        now_utc = _dt_gap.datetime.now(tz=_dt_gap.timezone.utc)
+        row = {
+            "ts_utc": now_utc.isoformat(),
+            "ts_received_ns": _t_gap.time_ns(),
+            "ts_received_ns_estimated": False,
+            "condition_id": None,
+            "asset": None,
+            "event_id": f"quarantine-expire-{_uuid_gap.uuid4().hex[:8]}",
+            "event_type": "coverage_gap",
+            "connection_id": None,
+            "market_id": None,
+            "details": (
+                f"{source} expired {files_deleted} files / {bytes_deleted}B "
+                f"(already-uploaded or unreadable review buffer; hive gap "
+                f"trail in collector_events/resync_episodes untouched)"
+            )[:1000],
+        }
+        from .parquet_writer import ParquetWriter as _PW
+        try:
+            _w = _PW(str(base))
+            try:
+                _w.append("collector_events", row)
+            finally:
+                try:
+                    _w.flush()
+                except Exception:
+                    pass
+                try:
+                    _w.close()
+                except Exception:
+                    pass
+        except Exception as _we:
+            print(f"[quarantine-gap] WARN could not log gap row: {_we}")
+    except Exception as _e:
+        print(f"[quarantine-gap] WARN gap logging skipped: {_e}")
+
+
+def _expire_quarantine(base: Path, ttl_hours: float | None = None, max_bytes: int | None = None) -> dict:
     """N6: expire data/_quarantine/ by age then by size (oldest first).
 
-    Quarantine is a safety buffer, not an archive — without expiry the box
-    drifts back to the ENOSPC that triggers dead-letter/loss (N2). Returns
-    {"expired_files": n, "expired_bytes": b, "remaining_bytes": r}.
+    Single-reaper policy: delegates to quarantine.reap_quarantine so there
+    is exactly one expiry implementation. Resolves defaults from config
+    (quarantine_retention_hours / quarantine_max_bytes) when not given.
+    Callers must gate on verified upload (see cleanup_local_data) — this
+    helper itself never scans the live hive. Expiry batches emit a
+    coverage_gap collector_events row via _log_quarantine_gap.
+    Returns {"expired_files": n, "expired_bytes": b, "remaining_bytes": r}.
     """
-    import time as _t_q
-    stats = {"expired_files": 0, "expired_bytes": 0, "remaining_bytes": 0}
+    if ttl_hours is None or max_bytes is None:
+        try:
+            from ..config import CollectorConfig as _CCe
+            _ke = _CCe.load().kaggle
+            if ttl_hours is None:
+                ttl_hours = float(getattr(_ke, "quarantine_retention_hours", 72))
+            if max_bytes is None:
+                max_bytes = int(getattr(_ke, "quarantine_max_bytes", 1_073_741_824))
+        except Exception:
+            if ttl_hours is None:
+                ttl_hours = 72.0
+            if max_bytes is None:
+                max_bytes = 1_073_741_824
     try:
-        _qroot = base / "_quarantine"
-        if not _qroot.exists():
-            return stats
-        try:
-            _now = _t_q.time()
-        except Exception:
-            _now = 0.0
-        _files: list = []
-        for _p in _qroot.rglob("*.parquet"):
-            try:
-                _st = _p.stat()
-                _files.append((_st.st_mtime, _st.st_size, _p))
-            except OSError:
-                continue
-        _ttl_s = float(ttl_hours) * 3600.0
-        for _mt, _sz, _p in sorted(_files):
-            try:
-                if _now - float(_mt) > _ttl_s:
-                    _p.unlink()
-                    stats["expired_files"] += 1
-                    stats["expired_bytes"] += int(_sz)
-            except OSError:
-                continue
-        _remaining = []
-        for _mt, _sz, _p in sorted(_files):
-            try:
-                if _p.exists():
-                    _remaining.append((_mt, _sz, _p))
-            except OSError:
-                continue
-        try:
-            _total = sum(int(_s) for _, _s, _ in _remaining)
-        except Exception:
-            _total = 0
-        if _total > int(max_bytes):
-            for _mt, _sz, _p in sorted(_remaining):
-                try:
-                    _p.unlink()
-                    stats["expired_files"] += 1
-                    stats["expired_bytes"] += int(_sz)
-                    _total -= int(_sz)
-                except OSError:
-                    continue
-                if _total <= int(max_bytes):
-                    break
-        try:
-            stats["remaining_bytes"] = max(0, _total - stats["expired_bytes"] if stats["expired_files"] else _total)
-        except Exception:
-            pass
-        if stats["expired_files"]:
-            print(f"[quarantine] expired {stats['expired_files']} files / {stats['expired_bytes']}B (TTL {ttl_hours}h, cap {max_bytes}B)")
+        from .quarantine import reap_quarantine as _reap2
+        _rs = _reap2(base, max_age_hours=float(ttl_hours),
+                     max_total_bytes=int(max_bytes), dry_run=False)
+        stats = {
+            "expired_files": int(_rs.get("files_deleted", 0)),
+            "expired_bytes": int(_rs.get("bytes_deleted", 0)),
+            "remaining_bytes": int(_rs.get("bytes_kept", 0)),
+        }
+        if stats["expired_files"] > 0:
+            _log_quarantine_gap(base, {"files_deleted": stats["expired_files"],
+                                       "bytes_deleted": stats["expired_bytes"]},
+                                "quarantine-expire")
+        return stats
     except Exception:
-        pass
-    return stats
+        return {"expired_files": 0, "expired_bytes": 0, "remaining_bytes": 0}
 
 
 # =============================================================================

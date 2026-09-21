@@ -170,6 +170,12 @@ class RawArchive:
                     d.rmdir()
             except Exception:
                 continue
+        if deleted:
+            # Real-Data-Only: age-prune of the diagnostic archive must always
+            # be visible (no silent deletes). Dormant in prod (enabled: false
+            # in config/collector.yaml, no callers) — diagnostic use only.
+            print(f"[raw_archive] pruned {deleted} raw-*.jsonl files older than "
+                  f"{self.retention_hours}h (diagnostic archive only; hive untouched)")
         return deleted
 
     def replay(self, asset: str, date_str: str | None = None):

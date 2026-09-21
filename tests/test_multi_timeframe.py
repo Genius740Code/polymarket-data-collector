@@ -254,10 +254,14 @@ def test_prune_skip_datasets_keeps_event_history(tmp_path):
     for _f in (f_cid, f_events, f_chain):
         _os2.utime(_f, _old2 * 2)
 
-    # without skip: the ~0h cutoff deletes everything old (the 2026-09-07 bug)
+    # without skip: the ~0h cutoff deletes eligible market data (chainlink).
+    # collector_events is gap evidence and is NEVER pruned (2026-09-21 fix:
+    # TS_DATASETS == ["chainlink_events"] only) — the 2026-09-07 bug that
+    # wiped it (229->2 rows) must not regress.
     stats = cleanup_local_data(str(base), rolling_window=True, retention_hours=0,
                                checkpoint_ms=now_ms)
-    assert not f_events.exists() and not f_chain.exists()
+    assert not f_chain.exists(), "chainlink prune should still work without skip"
+    assert f_events.exists(), "collector_events gap evidence must NEVER prune (even without skip)"
     # restore event files, keep CID file deleted state out of the equation
     _write_parquet(f_events, [{"event_type": "market_added", "ts_utc": old_ns}], ["event_type", "ts_utc"])
     _write_parquet(f_chain, [{"asset": "BTC", "ts_utc": old_ns}], ["asset", "ts_utc"])

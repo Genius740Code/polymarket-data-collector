@@ -8,29 +8,28 @@ STEP 1 — RUN TEST SUITE
   Execute: python -m pytest tests/ -q
   IF any test fails:
     - Log the failure details
-    - Delete problematic data (see STEP 3)
-    - Re-run the pipeline from the failure point
+    - REPORT ONLY. Never delete hive data (see STEP 3 quarantine rule).
     - GOTO LOOP START (restart 3h timer)
     - DO NOT continue to STEP 2
 
 STEP 2 — CHECK FOR STALE/LIVE MISMATCH IN BOOK SNAPSHOTS
   Read every partition in data/book_snapshots_500ms/:
     - For each parquet file, count rows where book_state='live'
-    - IF there are rows labeled 'live' that should be 'stale':
-      * This means the watchdog never fired (original bugs: subscribed_once bare name → NameError at t+10s, last_data_ns no nonlocal → UnboundLocalError at t+5s)
-      * Delete those parquet files immediately
-      * Re-run collector to repopulate with correct data
-      * GOTO LOOP START (restart 3h timer)
+    - NOTE: live >95% is the HEALTHY steady state (the clean view itself is
+      live-only). Live-labeled rows are NOT a data-quality issue.
+    - REPORT ONLY. Never delete, move, or quarantine hive parquet files.
+      Check heartbeat freshness (STEP 3) and resync_episodes / coverage_gap
+      accounting instead.
     - IF all books properly labeled stale when WS down, live when WS up:
       * Continue to STEP 3
 
 STEP 3 — CHECK HEARTBEAT FRESHNESS
   Read data/heartbeat.json:
     - IF heartbeat ts_ns is older than 15 seconds:
-      * The _heartbeat closure had bare `subscribed_once` NameError
-      * Fix: change to ws_holder["subscribed_once"] (already fixed in code)
-      * Delete heartbeat, delete stale data
-      * Re-run collector startup
+      * REPORT ONLY (stale heartbeat = WS/resync issue, not a data-deletion trigger).
+      * Never delete heartbeat, hive rows, or quarantine contents.
+      * Check resync_episodes / collector_events for the gap, then restart
+        the collector via the supervisor (pm2) — do not rm data files.
       * GOTO LOOP START (restart 3h timer)
     - IF heartbeat within 15s:
       * Continue to STEP 4
@@ -42,9 +41,8 @@ STEP 4 — 3-HOUR CLEAN TIMER
     - Reset timer: start time = NOW
     - GOTO LOOP START
   ELSE IF 3 hours (10800 seconds) have elapsed with NO issues:
-    - Run: git add .
-    - Run: git commit -m "watchdog: automated fixes after 3h clean run"
-    - Run: git push
+    - Print `git status` for a HUMAN to review; never commit or push.
+      Automation must never run git add / git commit / git push.
     - EXIT — TASK COMPLETE ✓
   ELSE:
     - Calculate remaining time: 3h - (now - start time)
@@ -52,12 +50,15 @@ STEP 4 — 3-HOUR CLEAN TIMER
     - Sleep 30 seconds
     - GOTO STEP 1 (re-run tests and checks)
 
-WHEN DELETING PROBLEMATIC DATA:
-  - Remove data/book_snapshots_clean/ entirely (rebuild fresh on next run)
-  - Remove data/heartbeat.json (force fresh beat on restart)
-  - Remove data/book_snapshots_500ms partitions where >95% of rows are 'live'
-    (these indicate watchdog never forced reconnects due to original bugs)
-  - Re-run the collector pipeline start() function
+WHEN SUSPECT DATA IS FOUND (QUARANTINE-ONLY, NEVER DELETE):
+  - REPORT ONLY by default. Live-labeled rows are the healthy state; never delete.
+  - The derived clean view (data/book_snapshots_clean/) may be MOVED to
+    data/_quarantine/<timestamp>/ for human review ONLY when
+    WATCHDOG_ALLOW_QUARANTINE=1 is set — otherwise dry-run print only.
+  - NEVER unlink/rmtree primary hive rows (data/book_snapshots_500ms/,
+    trades, markets_log, _wal, kaggle_staging). Gaps stay honest via
+    book_state='stale' + resync_episodes + collector_events.
+  - NEVER run git add / git commit / git push. Print `git status` for a human.
 
 ORIGINAL BUGS THIS WATCHDOG WILL DETECT AND CIRCUMVENT:
   1. _heartbeat: bare name `subscribed_once` only exists as ws_holder["subscribed_once"]
@@ -72,26 +73,25 @@ ORIGINAL BUGS THIS WATCHDOG WILL DETECT AND CIRCUMVENT:
   5. book_hash recorded but never verified on write
      → Exchange integrity hashes stored but never checked at commit time
 
-FAIL-FAST PATTERN:
+FAIL-FAST PATTERN (REPORT-ONLY, NEVER DELETE):
   while True:
-    if tests_fail OR stale_live_rows OR heartbeat_stale:
-        delete_bad_data()
-        re_run_pipeline()
+    if tests_fail OR heartbeat_stale:
+        report_issue()  # log + collector_events; NEVER delete_bad_data()
         continue  # restart loop immediately — NO sleep before re-run
     else:
         if timer_not_started:
             start_3h_timer()
         elif timer_running_and_3_hours_elapsed:
-            git_commit_all()
+            print_git_status_for_human()
             exit()  # ONLY STOP POINT
         else:
             continue_checks()
     sleep(30s)  # ONLY SLEEP COMMAND — 30 second intervals
 
-COMMIT PROCEDURE (ONLY after 3h clean):
-  git add .
-  git commit -m "watchdog: automated fixes after 3h clean run"
-  git push
+COMMIT PROCEDURE (DISABLED — HUMAN ONLY):
+  Automation must NEVER run git add / git commit / git push (it once
+  committed a deleted-data state with a 'clean' message, destroying
+  provenance). After 3h clean, print `git status` for a human to review.
   ✓ TASK COMPLETE — you may now stop looping
 
 TIMER RULE: 

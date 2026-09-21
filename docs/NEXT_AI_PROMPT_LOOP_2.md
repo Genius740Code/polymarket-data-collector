@@ -28,7 +28,8 @@ CONTEXT FROM SESSION 1 (already fixed — verify, don't redo):
 THE LOOP (repeat; one iteration ≈ 25–40 min):
   STEP 1 — RUN THE TEST CYCLE
   `python run_2x5min_test.py 2>&1 | tee test_run_<UTC timestamp>.log`
-  The tool wipes local data/ and DELETES + recreates the Kaggle dataset (gghgg1/polymarket-5m-crypto),
+  The tool is gated (no wipe without explicit `--wipe --yes`; refuses prod
+  ./data and the prod Kaggle slug without explicit --data-dir/--dataset),
   collects 2×5min live, uploads (verified), backfills resolutions, uploads the final version.
   ~25–40 min. Let it run to completion; never interrupt it.
   STEP 2 — ANALYZE (in this order; every hit is a bug to fix or an upstream fact to document):
@@ -63,8 +64,8 @@ THE LOOP (repeat; one iteration ≈ 25–40 min):
   are repo law). Keep pytest green before and after every fix. If an issue is upstream
   (Polymarket-side) and unfixable in code, document it in DATA_CARD.md + handoff.md as ACCEPTED with
   evidence, and continue.
-  STEP 4 — COMMIT (every iteration, clean or not)
-  `git add -A && git commit -m "loop2 iter<N>: <fixes>; evidence: pytest <n>/<n>, staging <n>/39, completeness <x>%, kaggle <status>"`.
+  STEP 4 — COMMIT (every iteration, clean or not; explicit paths ONLY — NEVER `git add -A`)
+  `git add src/ tests/ <explicit paths> && git commit -m "loop2 iter<N>: <fixes>; evidence: pytest <n>/<n>, staging <n>/39, completeness <x>%, kaggle <status>"`.
   Do NOT push unless the operator asks.
 
 KNOWN OPEN ITEMS (highest value first):

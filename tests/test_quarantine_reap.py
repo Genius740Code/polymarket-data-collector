@@ -10,7 +10,9 @@ Covers:
 - reap deletes aged files, keeps young ones, never touches the live hive
 - size cap deletes oldest-first until under budget (even within grace)
 - dry_run reports without deleting
-- cleanup_local_data reaps even when the prune early-returns (no upload yet)
+- cleanup_local_data reaps ONLY after a verified upload checkpoint exists
+  (fail closed: no checkpoint → no reap, no prune); with an explicit
+  checkpoint the gated reap runs
 - retention_cadence_check flags lane-cadence > retention (the incident math)
 """
 import os
@@ -71,15 +73,23 @@ def test_reap_missing_quarantine_is_noop(tmp_path):
     assert stats == {"files_deleted": 0, "bytes_deleted": 0, "files_kept": 0, "bytes_kept": 0}
 
 
-def test_cleanup_reaps_even_when_prune_early_returns(tmp_path):
-    # No verified upload anywhere -> prune returns {} early, but the reaper
-    # must still run (its age/cap policy is independent of checkpoints).
+def test_cleanup_reap_gated_on_verified_upload(tmp_path):
+    # No verified upload anywhere -> fail closed: prune returns {} early and
+    # the gated reaper must NOT run (2026-09-21 fix: reaping before any
+    # upload would delete the review buffer with no remote copy).
     old = _mk(tmp_path / "_quarantine" / "book_events" / "stale.parquet", age_hours=100)
     out = cleanup_local_data(tmp_path, rolling_window=True, retention_hours=6,
                              quarantine_retention_hours=72,
                              quarantine_max_bytes=10**9)
     assert out == {}
-    assert not old.exists(), "reap must run even when prune early-returns"
+    assert old.exists(), "gated reap must NOT run without a verified upload checkpoint"
+    # With an explicit verified checkpoint the gated reap runs.
+    import time as _t
+    out = cleanup_local_data(tmp_path, rolling_window=True, retention_hours=6,
+                             checkpoint_ms=int(_t.time() * 1000),
+                             quarantine_retention_hours=72,
+                             quarantine_max_bytes=10**9)
+    assert not old.exists(), "gated reap must run once a verified checkpoint exists"
 
 
 def test_cleanup_reap_disabled_when_asked(tmp_path):

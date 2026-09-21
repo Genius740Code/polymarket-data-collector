@@ -18,10 +18,17 @@ jobs:
           pip install -e ".[dev]"
       - name: Real-data-only policy gate (AGENT.md §4)
         run: |
-          # Fail closed on synthetic producers in live writer paths.
-          ! grep -rn --include='*.py' -E "source\s*=\s*['\"]synthetic['\"]" src/ | grep -v "remov\|never\|forbid" || exit 1
-          ! grep -rn --include='*.py' -E "report_id\s*=\s*f?['\"]synth-" src/ || exit 1
-          ! grep -rn --include='*.py' "synth-" src/ | grep -v test | grep -v "audit\|remov\|never\|forbid\|backward compat" || exit 1
+          # AST-based gate is authoritative (tests/test_policy_no_synthetic.py
+          # ::test_no_synthetic_literals_ast catches dict(source="synthetic"),
+          # {"source": "synthetic"}, and synth- literals in any quoting form;
+          # grep is bypassable via comments/quoting so it is NOT a gate).
           pytest tests/test_policy_no_synthetic.py -q
+      - name: Silent-except lint (storage + WS loops)
+        run: |
+          # Fail on NEW bare `except: pass/continue` in storage/ (Real-Data-Only §7:
+          # WS/collect/write paths must log + collector_events, not swallow).
+          # Baseline is tracked in tests/test_silent_except_lint.py; this step
+          # just surfaces the count for CI logs.
+          python -m pytest tests/test_silent_except_lint.py -q
       - name: Test suite
         run: pytest tests/ -q

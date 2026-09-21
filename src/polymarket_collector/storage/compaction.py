@@ -71,6 +71,7 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
     # (PyArrow reads row-group-at-a-time; iter_batches slices do not release
     # the parent), tripping the worker RSS cap and killing uploads.
     total_rows = 0
+    expected_rows = 0  # sum of rows actually READ from consumed inputs
     consumed: list = []  # only files actually read — unreadable stubs are
     # never deleted here (they go to quarantine, not oblivion, per
     # Real-Data-Only: gaps stay honest instead of vanishing in compaction).
@@ -100,10 +101,14 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
         if not _pending:
             return
         _t = _pending[0] if len(_pending) == 1 else pa.concat_tables(_pending, promote_options="default")
-        _pending = []
-        _pending_rows = 0
+        # Write FIRST, clear only on success — a failed write_table must not
+        # drop the buffered chunk (Real-Data-Only: fail closed, retry later).
+        # Let exceptions propagate so the whole compaction aborts (outer
+        # handler unlinks tmp, inputs untouched).
         _writer.write_table(_t, row_group_size=CHUNK_ROWS)
         total_rows += _t.num_rows
+        _pending = []
+        _pending_rows = 0
         del _t
 
     try:
@@ -175,37 +180,44 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
                     _trim()
                 except Exception:
                     pass
-            try:
-                _got_rows = False
-                for t in _file_batches(p):
+            # NOTE: no per-file try/except-continue here by design. Unreadable
+            # files yield zero batches (handled inside _file_batches) and are
+            # simply never marked consumed. Any REAL exception (flush/write
+            # failure, concat error) must abort the WHOLE compaction via the
+            # outer handler (tmp unlinked, inputs untouched) — silently
+            # skipping the file would publish a partial output and then
+            # delete previously-consumed inputs (data loss).
+            _got_rows = False
+            _file_rows = 0
+            for t in _file_batches(p):
+                try:
+                    if _writer is None:
+                        _wschema = t.schema
+                        _writer = pq.ParquetWriter(str(tmp_path), _wschema, compression="zstd")
+                    if not t.schema.equals(_wschema):
+                        t = _norm(t)
+                        if t is None or t.num_rows == 0:
+                            continue
+                    _got_rows = True
+                    _file_rows += t.num_rows
+                    _pending.append(t)
+                    _pending_rows += t.num_rows
+                    if _pending_rows >= CHUNK_ROWS:
+                        _flush_pending()
+                finally:
                     try:
-                        if _writer is None:
-                            _wschema = t.schema
-                            _writer = pq.ParquetWriter(str(tmp_path), _wschema, compression="zstd")
-                        if not t.schema.equals(_wschema):
-                            t = _norm(t)
-                            if t is None or t.num_rows == 0:
-                                continue
-                        _got_rows = True
-                        _pending.append(t)
-                        _pending_rows += t.num_rows
-                        if _pending_rows >= CHUNK_ROWS:
-                            _flush_pending()
-                    finally:
-                        try:
-                            del t
-                        except Exception:
-                            pass
-                if _got_rows:
-                    consumed.append(p)
-            except Exception:
-                continue
+                        del t
+                    except Exception:
+                        pass
+            if _got_rows:
+                consumed.append(p)
+                expected_rows += _file_rows
         _flush_pending()
         if _writer is not None:
-            try:
-                _writer.close()
-            except Exception:
-                pass
+            # Let close() raise on footer-write failure → outer handler
+            # unlinks tmp and returns 0 with inputs untouched. Swallowing it
+            # here would publish a corrupt file and delete the inputs.
+            _writer.close()
             _writer = None
         else:
             return 0
@@ -220,6 +232,26 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
                 tmp_path.unlink()
         except Exception:
             pass
+        return 0
+    # Row-count verification BEFORE publish (Real-Data-Only §2 "merged +
+    # verified, then delete"): output footer must equal rows written and rows
+    # read. Any mismatch → unlink tmp, return 0, inputs untouched.
+    try:
+        _out_n = pq.read_metadata(str(tmp_path)).num_rows
+    except Exception as _ve:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        print(f"[compaction] VERIFY FAIL {dataset_path}: cannot read tmp footer ({_ve}) — inputs kept")
+        return 0
+    if _out_n != total_rows or total_rows != expected_rows:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+        print(f"[compaction] VERIFY FAIL {dataset_path}: out={_out_n} written={total_rows} read={expected_rows} — inputs kept")
         return 0
     # fsync tmp before publish (same crash window as the writer flush path).
     try:

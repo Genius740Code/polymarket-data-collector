@@ -20,9 +20,10 @@ THE LOOP (repeat; one iteration ≈ 20–25 min):
 
   STEP 1 — RUN THE TEST CYCLE
   `python run_2x5min_test.py 2>&1 | tee test_run_<UTC timestamp>.log`
-  The tool intentionally wipes local data/ and DELETES + recreates the Kaggle dataset
-  (gghgg1/polymarket-5m-crypto), collects 2×5min live, uploads, backfills resolutions, uploads the
-  final version. ~15–20 min. Let it run to completion; never interrupt it.
+  The tool is gated and safe by default (no wipe without explicit `--wipe --yes`;
+  refuses prod ./data and the prod Kaggle slug without explicit --data-dir/--dataset).
+  It collects 2×5min live, uploads, backfills resolutions, uploads the
+  final version. ~15–20 min. Let it run to completion; never interrupt it. Never wipe by hand.
 
   STEP 2 — ANALYZE (in this order; every hit is a bug to fix or an upstream fact to document):
   a) pytest still green? If not, fix and restart the iteration.
@@ -52,8 +53,8 @@ THE LOOP (repeat; one iteration ≈ 20–25 min):
   (Polymarket-side) and unfixable in code, document it in DATA_CARD.md + handoff.md as ACCEPTED with
   evidence, and continue.
 
-  STEP 4 — COMMIT (every iteration, clean or not)
-  `git add -A && git commit -m "loop iter<N>: <fixes>; evidence: pytest <n>/<n>, staging <n>/39, completeness <x>%, kaggle <status>"`.
+  STEP 4 — COMMIT (every iteration, clean or not; explicit paths ONLY — NEVER `git add -A`)
+  `git add src/ tests/ <explicit paths from git status> && git commit -m "loop iter<N>: <fixes>; evidence: pytest <n>/<n>, staging <n>/39, completeness <x>%, kaggle <status>"`.
   Do NOT push unless the operator asks.
 
 KNOWN OPEN ITEMS (work these into the loop when nothing newer is broken — highest value first):

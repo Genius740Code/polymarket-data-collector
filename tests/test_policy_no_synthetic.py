@@ -84,3 +84,48 @@ def test_synthetic_mode_never_enabled():
                         f"AGENT.md §0: new code must not read synthetic_mode — "
                         f"{path.relative_to(REPO)}:{i}: {line.strip()[:160]}"
                     )
+
+
+def test_no_synthetic_literals_ast():
+    """AST-based gate (replaces grep): catches dict(source="synthetic"),
+    {"source": "synthetic"}, source='synthetic', and synth- report_id
+    literals in ANY quoting/spacing/comment form. Grep misses
+    dict(source="synthetic") and is bypassed by a trailing "# never" comment;
+    the AST sees string values, not text.
+    """
+    import ast
+
+    hits: list[str] = []
+    for path in SRC.rglob("*.py"):
+        if path.name in ALLOWLIST:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"),
+                             filename=str(path))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            # Keyword: source="synthetic" (any quote style)
+            if isinstance(node, ast.keyword) and node.arg == "source":
+                v = node.value
+                if isinstance(v, ast.Constant) and v.value == "synthetic":
+                    hits.append(f"{path.relative_to(REPO)}:{v.lineno}: kw source='synthetic'")
+            # Dict literal: {"source": "synthetic"} / {'source': 'synthetic'}
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (isinstance(k, ast.Constant) and k.value == "source"
+                            and isinstance(v, ast.Constant) and v.value == "synthetic"):
+                        hits.append(f"{path.relative_to(REPO)}:{v.lineno}: dict source='synthetic'")
+            # String literal starting with synth- (report_id fabrication)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value.startswith("synth-") or node.value == "synthetic":
+                    # Allow the isolation-guard validator message itself
+                    # (config.py raises on synthetic_mode=true) and audit
+                    # comments are not AST strings, so no comment bypass here.
+                    if path.name == "config.py":
+                        continue
+                    # Bare "synthetic" elsewhere is suspicious; report with context
+                    hits.append(f"{path.relative_to(REPO)}:{node.lineno}: literal {node.value[:40]!r}")
+    # Filter: the only legitimate "synthetic" string outside config.py is in
+    # verify_gate.py (allowlisted above) and test isolation asserts (not in SRC).
+    assert not hits, "AGENT.md §4 AST violation — synthetic literals in live code:\n" + "\n".join(hits)

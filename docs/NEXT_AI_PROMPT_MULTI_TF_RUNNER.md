@@ -29,7 +29,7 @@ Start by syncing the repo and reading context:
 - `python -m polymarket_collector.cli --config config/collector.yaml` is NOT run yet — first check `Collector(cfg)` constructs and `cfg.timeframe_window_sizes()` matches the yaml.
 
 ### 3. Live validation — 5m regression (gate: exit 0, completeness ≥99%, coverage_gaps 0)
-- `python run_2x5min_test.py` (2×5min, wipes local data + deletes/recreates the 5m Kaggle dataset). This proves the multi-lane refactor did not regress the proven 5m path. Watch the log for `[test-mode:real] lane restricted to 5m`.
+- `python run_2x5min_test.py` (2×5min, gated: no wipe without `--wipe --yes`; refuses prod ./data / prod slug without explicit flags). This proves the multi-lane refactor did not regress the proven 5m path. Watch the log for `[test-mode:real] lane restricted to 5m`.
 - Check `data/test_analysis.json`: `snapshot_completeness_pct >= 99`, `clean >= 99`, `collector_events_by_type` has no `coverage_gap`/`subscription_failed` rise.
 
 ### 4. Live validation — 15m lane (gate: same, 2×15min ≈ 40 min)
@@ -43,7 +43,7 @@ Start by syncing the repo and reading context:
 ### 6. Production run + commit
 - `pm2 start ecosystem.config.js && pm2 save` on the Linux VPS (or a background run on Windows for the overnight soak).
 - After ≥1h: confirm all three lane datasets uploaded (`[kaggle:5m]`, `[kaggle:15m]`, `[kaggle:4h]` success lines) and no `[prune] WARN`.
-- Write `TEST_RUN_REPORT_<UTC date>_MULTI_TF.md` with: per-lane completeness, probe output, prune dry-run output, any issues. `git add -A && git commit` with the verdict in the message. Do not push unless the operator asks.
+- Write `TEST_RUN_REPORT_<UTC date>_MULTI_TF.md` with: per-lane completeness, probe output, prune dry-run output, any issues. Commit ONLY explicit paths (`git add src/ tests/ <report>`, NEVER `git add -A`) with the verdict in the message. Do not push unless the operator asks.
 
 ## Hard rules (carry over from AGENT.md/handoff.md)
 - Never fabricate or impute market data; a missing lane stays off.

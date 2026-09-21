@@ -3,10 +3,14 @@
 Loops until 3 hours of no issues are detected in the collector data.
 On each iteration:
   1. Run the test suite
-  2. Check book_snapshots_500ms for books labeled 'live' that should be 'stale'
+  2. Report book_snapshots_500ms live/stale counts (report-only; high live
+     share is the healthy steady state, never a deletion trigger)
   3. Check heartbeat/watchdog state
-  4. If issues found: delete stale/problematic data, re-run the pipeline
-  5. If 3 hours pass with zero issues: git commit and exit
+  4. If issues found: REPORT ONLY (quarantine of the derived clean view
+     only when WATCHDOG_ALLOW_QUARANTINE=1, else dry-run). Primary hive
+     rows are never unlinked by automation.
+  5. If 3 hours pass with zero issues: print `git status` for a human;
+     automation never commits or pushes.
 """
 
 import asyncio

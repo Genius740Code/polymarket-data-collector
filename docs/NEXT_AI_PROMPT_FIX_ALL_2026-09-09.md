@@ -28,14 +28,14 @@ P2 — low severity:
 - E4 zero sentinel `0.04%` (27/60,257 `down_bid` + 3 `up_bid_level_1_price`): empty side `0.0` not `NULL` (`book.py:693` `if up_bid is None: up_bid_size=None` misses `0`). Fix: `if not price` → `None` before `to_flat_dict` (`book.py:149`).
 - Thesis completeness gaps: `5m` 63/721=8.7% low `<570/600` (worst 177), `15m` 14.3%, `1h` 33% (worst 15), `4h` 100% (span 17.5h <28,800). Not code bug — collection span 2026-09-08T21:18-14:55Z < one `4h` window. Fix: scope thesis to `5m/15m` until ≥7d span; doc `coverage_gap` 8h `2026-09-08T22:29→06:38Z` YAML indent bug `plan.md:320` as honest gap.
 
-After each group: `pytest`, then `git add -A && git commit -m "fix(<scope>): <E# list> ..."` (do not push).
+After each group: `pytest`, then commit ONLY explicit paths (`git add src/ tests/`, NEVER `git add -A`) with `git commit -m "fix(<scope>): <E# list> ..."` (do not push).
 
 ===============================================================================
 PHASE 2 — 5m 2×5min KAGGLE TEST LOOP (destructive, operator-approved)
 ===============================================================================
 This is the 5m-only pilot that must pass before any multi-TF.
 - Verify Kaggle creds: `~/.kaggle/kaggle.json` or `KAGGLE_USERNAME/KAGGLE_KEY` env (`.venv/bin/python -c "from src.polymarket_collector.storage.export import _validate_kaggle_config; print(_validate_kaggle_config())"`).
-- Run: `python run_2x5min_test.py 2>&1 | tee test_run_5m_<timestamp>.log`  (wipes local `data/` + deletes `gghgg1/polymarket-5m-crypto` as first step — approved, ~15-20 min, 2 windows ×7 assets).
+- Run: `python run_2x5min_test.py 2>&1 | tee test_run_5m_<timestamp>.log`  (gated: wipe ONLY with explicit `--wipe --yes`, refuses prod ./data / prod slug without --data-dir/--dataset — approved, ~15-20 min, 2 windows ×7 assets).
 - Analyze in order, fix and re-run until clean (bound 4-5 iterations):
   1. `pytest tests/ --ignore=tests/test_verify_gate.py` → green.
   2. `grep -i "ERROR\|WARN\|backpressure\|sequence_gap\|book_anomaly\|ws_error\|resync\|staging pre-validation failed\|✗" test_run_5m_*.log` → each hit is bug or upstream ACCEPTED (doc in `DATA_CARD.md`).
@@ -48,7 +48,7 @@ This is the 5m-only pilot that must pass before any multi-TF.
 ===============================================================================
 PHASE 3 — SEQUENTIAL TF ROLLOUT (only if Phase 2 passed)
 ===============================================================================
-Do not run all TFs at once. Do in order, each needs its own 2× window test + audit. Each test wipes `data/` — this is expected; staging per TF is `kaggle_staging/{tf}/`.
+Do not run all TFs at once. Do in order, each needs its own 2× window test + audit. Tests use isolated dirs by default (prod `data/` untouched unless explicit `--wipe --yes --data-dir`); staging per TF is `kaggle_staging/{tf}/`.
 
 1. **15m** (30 min wall): `python run_2x5min_test.py --timeframe 15m 2>&1 | tee test_run_15m_<ts>.log` (~40 min, 2×15m). Gate: exit 0, `kaggle_staging/15m/.../BTC_book_snapshots_500ms.parquet` `series_id=="BTC-15m"` purity 100% (3614 rows each, zero cross-TF), `collector_events` full history (not 2-row truncation via `skip_datasets` fix), `completeness 100%` on 2 windows, `chainlink dup 0` after E9 fix.
 2. **1h + 1h audit** (2h wall): `python run_2x5min_test.py --timeframe 1h 2>&1 | tee test_run_1h_<ts>.log` (≈2.5h, 2×1h). Gate: as above + run ` .venv/bin/python -c "import pyarrow.parquet as pq; t=pq.read_table('data/kaggle_staging/1h/gghgg1/polymarket-1h-crypto/markets_summary.parquet'); print(t.num_rows, [c.null_count for c in [t.column(c) for c in ['underlying_open','settlement_price']]])"` → `underlying_open` null ≤33% (expected 10s tolerance), `settlement_price` null ≤62% (short span, backfill heals via `resolution_backfill --reupload --all-lanes`). Also run the 1h per-column audit from `kaggle_null_audit_2026-09-09.md:114` (BBO 1.4% etc.) and compare to `5m` thresholds (expect lower BBO null on `1h`).
@@ -59,9 +59,10 @@ Between TFs: keep collector `pm2` on `5m` prod (`pm2 start ecosystem.config.js -
 ===============================================================================
 PHASE 4 — COMMIT
 ===============================================================================
-When 5m passes cleanly (or 5m+15m+1h if you did rollout):
+When 5m passes cleanly (or 5m+15m+1h if you did rollout; explicit paths ONLY — NEVER `git add -A`):
 ```
-git add -A
+git status  # review; stage only intended src/tests/docs paths
+git add src/ tests/
 git commit -m "fix(data): E1 market_id hex, E2 window_index null, E5 side lower, E6/E7 fee/age, E9 chainlink dedup; verified via 2×5m (5m 100%/39 files) + 15m (100%/39) + 1h (audit BBO 1.4% underling 33%) — pytest <N>/131, staging 39/TF, kaggle ready"
 ```
 Include `test_run_5m_*` tail `data/test_analysis_final.json` numbers and `kaggle datasets list` timestamp in commit body. Do not push unless operator asks.

@@ -513,12 +513,20 @@ class OrderBookState:
     # -- A4 book-hash integrity primitive ----------------------------------
     @staticmethod
     def _well_formed_hash(h) -> bool:
-        """A usable exchange integrity attestation: non-empty string, hash-like."""
+        """Exchange hash attestation (format-only, NOT content verification).
+
+        The CLOB publishes a per-frame hash whose algorithm is not documented,
+        so content verification is out of scope. This gate only ensures the
+        attestation is a plausible non-empty hash-like string before storing
+        it alongside the book; it is never used to overwrite, interpolate, or
+        "correct" book contents. A missing/malformed hash stays NULL (honest
+        gap), never fabricated.
+        """
         return isinstance(h, str) and len(h.strip()) >= 8
 
     def _note_frame_hash(self, msg: dict, outcome: Optional[str],
                          entry_hash: object = None) -> None:
-        """Capture the exchange hash for an outcome (top-level or per-entry)."""
+        """Capture the exchange hash attestation for an outcome (top-level or per-entry)."""
         if outcome not in ("up", "down"):
             return
         h = msg.get("hash") if isinstance(msg, dict) else None

@@ -94,11 +94,11 @@
 
 1. **FIX** — work through the ISSUE CHECKLIST below. Keep `pytest tests/ --ignore=tests/test_verify_gate.py` green before and after every fix (94 tests as of this writing).
 2. **TEST-LOOP** — run the destructive full test (protocol below), analyze the run for errors and bad practices, fix what you find, and repeat until a complete clean pass.
-3. **COMMIT** — when the loop passes cleanly, `git add -A && git commit` with a message that lists the fixes and the evidence from the final passing run. Do NOT push unless the operator asks.
+3. **COMMIT** — when the loop passes cleanly, commit ONLY explicit paths from `git status` (e.g. `git add src/ tests/ run_2x5min_test.py` — NEVER `git add -A`; the foreign TS scaffold must never be staged) with a message that lists the fixes and the evidence from the final passing run. Do NOT push unless the operator asks.
 
 **Standing rules:**
 - NEVER fabricate data. A missing value stays NULL (null-vs-zero, honest gaps — repo law).
-- Deleting local `data/` and the Kaggle dataset is EXPECTED and OPERATOR-APPROVED: `run_2x5min_test.py` does exactly that as its first step. Do not do destructive deletes by hand beyond what the tool does.
+- `run_2x5min_test.py` is gated and safe by default: without `--wipe --yes` it touches neither local `data/` nor Kaggle; even with `--wipe --yes` it refuses prod `./data` and the prod Kaggle slug unless `--data-dir` / `--dataset` are passed explicitly. Destructive wipes happen ONLY through that tool with explicit flags — never by hand.
 - The "Verified live facts" below were measured against the production endpoints. Do not re-derive them; build on them. If you contradict one with a fresh probe, update this file.
 - Context docs: `docs/WS_RESILIENCE_RESEARCH.md` (WS findings + live probe transcripts), `DATA_CARD.md` (dataset caveats — the issues below exist to shrink this list).
 
@@ -155,9 +155,10 @@ wipe local `data/` → delete the Kaggle dataset (gghgg1/polymarket-5m-crypto) �
 
 ## COMMIT (phase 3)
 
-When the loop passes cleanly:
+When the loop passes cleanly (commit ONLY explicit paths — NEVER `git add -A`):
 ```
-git add -A
+git status  # review; stage only src/ tests/ + named docs
+git add src/ tests/ run_2x5min_test.py
 git commit -m "<summary>: <fix list>; verified via N clean 2x5min test runs (pytest 94/94, staging 39 files, kaggle ready, completeness <X>%)"
 ```
 Include the final `test_analysis_final.json` numbers in the message body. Do not push unless the operator asks.

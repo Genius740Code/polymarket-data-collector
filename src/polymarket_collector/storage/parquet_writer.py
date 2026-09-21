@@ -651,9 +651,11 @@ class ParquetWriter:
 
         Nothing in the repo read _dead_letter/ so good dead-letters never
         returned. Returns {"requeued": n, "files": m, "errors": [...]}.
-        Callers delete a .jsonl file only when every row in it requeues
-        (append True); partial files stay for the next pass. No hive writes
-        happen here — rows flow through the normal WAL-before-buffer path.
+        A .jsonl file is deleted ONLY when every non-blank row in it was
+        requeued (append True). Partial files stay for the next pass —
+        including the limit-hit case (hitting `limit` mid-file must NOT
+        delete the remainder). No hive writes happen here — rows flow
+        through the normal WAL-before-buffer path.
         """
         import json as _js_dl
         stats: dict = {"requeued": 0, "files": 0, "errors": []}
@@ -668,9 +670,19 @@ class ParquetWriter:
                     stats["errors"].append(f"{_fp}: { _e}")
                     continue
                 _ok_all = True
+                _nonblank_total = sum(1 for _ln in _lines if _ln.strip())
+                _processed = 0
+                _limit_hit = False
                 for _ln in _lines:
                     if not _ln.strip():
                         continue
+                    if stats["requeued"] >= limit:
+                        # Limit reached BEFORE this row was processed — the
+                        # file is only partially requeued. Keep it for the
+                        # next pass; never delete a partially-processed file.
+                        _ok_all = False
+                        _limit_hit = True
+                        break
                     try:
                         _obj = _js_dl.loads(_ln)
                         _ok = bool(self.append(
@@ -683,12 +695,15 @@ class ParquetWriter:
                         stats["errors"].append(f"{_fp}: {str(_e2)[:120]}")
                     if _ok:
                         stats["requeued"] += 1
+                        _processed += 1
                     else:
                         _ok_all = False
                         break  # backpressure — retry file next pass
-                    if stats["requeued"] >= limit:
-                        break
-                if _ok_all:
+                # Only delete when every non-blank line was requeued in THIS
+                # and prior passes resolve to full coverage: _processed must
+                # equal the file's non-blank count AND no backpressure/limit
+                # break occurred.
+                if _ok_all and not _limit_hit and _processed >= _nonblank_total:
                     try:
                         _fp.unlink()
                     except Exception:

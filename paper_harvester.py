@@ -90,11 +90,16 @@ def load_chainlink_ticks(asset="BTC"):
 
 
 def load_book_snapshots(asset="BTC", series_id="BTC-5m"):
-    """Load live book snapshots from parquet."""
+    """Load live book snapshots from parquet (real data only).
+
+    Includes best-ask SIZE columns so the simulator can depth-check fills
+    instead of assuming infinite liquidity at the touch.
+    """
     d = ds.dataset('data/book_snapshots_500ms/', format='parquet', partitioning='hive')
     t = d.to_table(
         columns=['ts_snapshot_ns', 'condition_id', 'series_id', 'window_index', 'asset',
                  'up_bid', 'up_ask', 'down_bid', 'down_ask',
+                 'up_ask_size', 'down_ask_size',
                  'market_time_remaining_ms', 'book_state'],
         filter=(ds.field('asset') == asset)
         & (ds.field('series_id') == series_id)
@@ -409,55 +414,71 @@ def run_simulation(minutes=120, variant="twap"):
             print("  SKIP: spread %.3f > SPREAD_MAX %.2f" % (spread, SPREAD_MAX))
             continue
 
-            # --- determine shares size ---
-            fee_pts_share = FEE_RATE * ask_px * (1.0 - ask_px)
-            cost_per_share = ask_px + fee_pts_share
+        # --- determine shares size ---
+        fee_pts_share = FEE_RATE * ask_px * (1.0 - ask_px)
+        cost_per_share = ask_px + fee_pts_share
 
-            # Risk 2% of bankroll per window (KELLY_FRAC / 2 approximation)
-            max_stake = BANKROLL0 * WINDOW_RISK_CAP
-            shares = max_stake / cost_per_share
-            shares = min(shares, 50.0)   # cap per trade
-            shares = max(shares, 1.0)    # at least 1 share
+        # Risk 2% of bankroll per window (KELLY_FRAC / 2 approximation)
+        max_stake = BANKROLL0 * WINDOW_RISK_CAP
+        shares = max_stake / cost_per_share
+        shares = min(shares, 50.0)   # cap per trade
+        shares = max(shares, 1.0)    # at least 1 share
 
-            # --- execute BUY (simulation: assume full fill at ask) ---
-            cost_total = shares * cost_per_share
-            fee = shares * fee_pts_share
-            total_cost = cost_total + fee
-            broker.cash -= total_cost
+        # --- depth-checked BUY (no infinite-liquidity assumption) ---
+        # Walk the recorded best-ask size: fill at most what the snapshot
+        # shows. Skip when depth is missing or insufficient (honest sim —
+        # never assume a full fill at the touch).
+        side_ask_size_key = "up_ask_size" if side == "Up" else "down_ask_size"
+        try:
+            avail_size = row.get(side_ask_size_key)
+        except Exception:
+            avail_size = None
+        if avail_size is None or (isinstance(avail_size, float) and math.isnan(avail_size)):
+            broker.skip_window(win_start_s, strat.strike, ask_px)
+            print("  SKIP: no %s ask size in snapshot (depth unknown)" % side)
+            continue
+        if float(avail_size) < shares:
+            broker.skip_window(win_start_s, strat.strike, ask_px)
+            print("  SKIP: insufficient depth %.1f < %.1f shares at ask %.3f" % (float(avail_size), shares, ask_px))
+            continue
+        cost_total = shares * cost_per_share
+        fee = shares * fee_pts_share
+        total_cost = cost_total + fee
+        broker.cash -= total_cost
 
-            pos = {
-                "side": side,
-                "shares": shares,
-                "vwap": ask_px,
-                "cost_total": total_cost,
-                "entry_edge_cents": edge_cents,
-                "variant": variant_tag,
-                "p_fav_at_entry": p_fav,
-                "tau_at_entry": tau,
-            }
+        pos = {
+            "side": side,
+            "shares": shares,
+            "vwap": ask_px,
+            "cost_total": total_cost,
+            "entry_edge_cents": edge_cents,
+            "variant": variant_tag,
+            "p_fav_at_entry": p_fav,
+            "tau_at_entry": tau,
+        }
 
-            # Log the trade
-            ts_now = int(time.time())
-            broker.log_trade(
-                ts_now, win_start_s, "BUY", side, shares, ask_px, fee, broker.cash,
-                "harvester %s edge %.1f c p_fav %.3f τ %.0f s" % (variant_tag, edge_cents, p_fav, tau))
+        # Log the trade
+        ts_now = int(time.time())
+        broker.log_trade(
+            ts_now, win_start_s, "BUY", side, shares, ask_px, fee, broker.cash,
+            "harvester %s edge %.1f c p_fav %.3f τ %.0f s" % (variant_tag, edge_cents, p_fav, tau))
 
-            # --- hold to settlement using true outcome from markets_log ---
-            won = (side == "Up" and up_won == 1) or (side == "Down" and up_won == 0)
-            pnl = broker.settle(pos, win_start_s, strat.strike, float(up_won), won)
+        # --- hold to settlement using true outcome from markets_log ---
+        won = (side == "Up" and up_won == 1) or (side == "Down" and up_won == 0)
+        pnl = broker.settle(pos, win_start_s, strat.strike, float(up_won), won)
 
-            if won:
-                print("  FILL %s: %.1f @ %.3f fee $%.2f PNL %+.2f CASH %d WON" %
-                      (side, shares, ask_px, fee, pnl, broker.cash))
-            else:
-                print("  FILL %s: %.1f @ %.3f fee $%.2f PNL %+.2f CASH %d LOST" %
-                      (side, shares, ask_px, fee, pnl, broker.cash))
+        if won:
+            print("  FILL %s: %.1f @ %.3f fee $%.2f PNL %+.2f CASH %d WON" %
+                  (side, shares, ask_px, fee, pnl, broker.cash))
+        else:
+            print("  FILL %s: %.1f @ %.3f fee $%.2f PNL %+.2f CASH %d LOST" %
+                  (side, shares, ask_px, fee, pnl, broker.cash))
 
-            # Circuit breaker
-            strat.consec_losses += 0 if won else 1
-            if strat.consec_losses >= CONSEC_FAIL_KILL:
-                print("  CIRCUIT BREAKER: %d losses — standing down 12 windows" % CONSEC_FAIL_KILL)
-                # In a full impl, skip next 12 windows; here we just note it
+        # Circuit breaker
+        strat.consec_losses += 0 if won else 1
+        if strat.consec_losses >= CONSEC_FAIL_KILL:
+            print("  CIRCUIT BREAKER: %d losses — standing down 12 windows" % CONSEC_FAIL_KILL)
+            # In a full impl, skip next 12 windows; here we just note it
 
         completed_windows += 1
 

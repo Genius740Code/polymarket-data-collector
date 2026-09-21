@@ -3130,8 +3130,17 @@ class Collector:
             except Exception:
                 _ret, _cap = 72, 1_073_741_824
             try:
-                reap_quarantine(self.config.storage.data_dir, max_age_hours=_ret,
-                                max_total_bytes=_cap, dry_run=False)
+                _rs = reap_quarantine(self.config.storage.data_dir, max_age_hours=_ret,
+                                      max_total_bytes=_cap, dry_run=False)
+                # Gap trail: expiry of the review buffer must stay visible even
+                # on the emergency path (2026-09-21 audit fix).
+                try:
+                    if isinstance(_rs, dict) and (int(_rs.get("files_deleted", 0) or 0) > 0):
+                        from .storage.export import _log_quarantine_gap as _log_qgap
+                        from pathlib import Path as _P
+                        _log_qgap(_P(str(self.config.storage.data_dir)), _rs, "disk-guard-reap")
+                except Exception as _gq_e:
+                    print(f"[disk-guard] gap-log err {_gq_e}")
             except Exception as _re:
                 print(f"[disk-guard] reap err {_re}")
             # (2) full verified prune is a slow hive scan — flag it for the
