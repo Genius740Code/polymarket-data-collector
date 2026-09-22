@@ -31,6 +31,7 @@ from .config import CollectorConfig
 from .enums import BookState, CollectorEventType, MarketStatus, ResolutionOutcome
 from .storage.export import (
     cleanup_local_data,
+    emergency_reclaim_staging,
     export_and_upload_all_kaggle,
     prepare_kaggle_staging_5m,
     _validate_kaggle_config,
@@ -273,6 +274,39 @@ class Collector:
         import datetime
         lanes = self.rollover.enabled_lane_labels()
         print(f"[startup] recovering cursor state for assets: {self.config.assets} lanes: {lanes}")
+        # P0 tmpfs-amnesia restore: if cursor dir is empty (reboot wiped
+        # /dev/shm) but hdd-staging/cursor-backup has mirrors, restore them
+        # before loading so 51× "no cursor" does not repeat.
+        try:
+            import shutil as _sh2
+            from pathlib import Path as _P2
+            _backup = _P2.cwd() / "hdd-staging" / "cursor-backup"
+            if _backup.exists():
+                try:
+                    _base = _P2(self.config.cursor_store.path)
+                except Exception:
+                    _base = None
+                if _base is not None:
+                    try:
+                        _existing = list(_base.glob("*.db")) if _base.exists() else []
+                    except Exception:
+                        _existing = []
+                    if not _existing:
+                        try:
+                            _base.mkdir(parents=True, exist_ok=True)
+                            _n = 0
+                            for _b in _backup.glob("*.db"):
+                                try:
+                                    _sh2.copyfile(_b, _base / _b.name)
+                                    _n += 1
+                                except Exception:
+                                    continue
+                            if _n:
+                                print(f"[startup] restored {_n} cursor DBs from hdd-staging/cursor-backup (tmpfs was wiped)")
+                        except Exception as _e_r:
+                            print(f"[startup] cursor restore err {_e_r}")
+        except Exception:
+            pass
         now_ms = int(time.time() * 1000)
         for asset in self.config.assets:
             for tf in lanes:
@@ -904,7 +938,19 @@ class Collector:
     async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
         """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
         try:
-            await self._fetch_and_apply_rest_book(book, market)
+            try:
+                if self.resync.fetch_none_quiet(book.condition_id):
+                    return
+            except Exception:
+                pass
+            ok = await self._fetch_and_apply_rest_book(book, market)
+            try:
+                if ok:
+                    self.resync.note_fetch_ok(book.condition_id)
+                elif not ok:
+                    self.resync.note_fetch_none(book.condition_id)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1131,6 +1177,18 @@ class Collector:
             path.write_text(json.dumps({"ts_ns": ts_ns, "ts_utc": ts_utc, "assets": self.config.assets}))
         except Exception:
             pass
+        # P0 tmpfs-amnesia mitigation: mirror heartbeat to durable HDD log dir
+        # (survives /dev/shm wipe; watchdog forensics + 19.5h-stall post-mortem).
+        try:
+            _mirror = Path.cwd() / "logs" / "heartbeat-mirror.jsonl"
+            try:
+                _mirror.parent.mkdir(parents=True, exist_ok=True)
+                with open(_mirror, "a", encoding="utf-8") as _fh:
+                    _fh.write(json.dumps({"ts_ns": ts_ns, "ts_utc": ts_utc, "data_dir": str(self.config.storage.data_dir)}) + "\n")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _persist_cursor_sync(self) -> None:
         """Persist cursor state to durable storage (§1B) — one row per (asset, tf) lane.
@@ -1236,6 +1294,19 @@ class Collector:
                     store.sync()
                 except Exception:
                     pass
+                # P0 tmpfs-amnesia mitigation: mirror cursor sqlite to durable
+                # HDD (hdd-staging/cursor-backup/<asset>.db) so a reboot that
+                # wipes /dev/shm does not lose all 51 cursors. Restore is
+                # manual-or-auto on next start (see _recover_from_cursor).
+                try:
+                    import shutil as _sh
+                    _bb = Path.cwd() / "hdd-staging" / "cursor-backup"
+                    _bb.mkdir(parents=True, exist_ok=True)
+                    _src = Path(getattr(store, "db_path", ""))
+                    if _src.exists():
+                        _sh.copyfile(_src, _bb / _src.name)
+                except Exception:
+                    pass
             except Exception:
                 continue
 
@@ -1246,6 +1317,8 @@ class Collector:
         await self._recover_from_cursor()
 
         # §10A WAL replay: recover any rows written before crash
+        # P2: verify by count — replay returns count, flush, then compare
+        # buffered totals so a silent short-replay is loud, not assumed.
         try:
             n = self.writer._wal_replay()
             if n:
@@ -1254,9 +1327,32 @@ class Collector:
                 # WAL files are retained until this flush succeeds, but an
                 # immediate flush shrinks the re-replay window to ~zero.
                 try:
-                    self.writer.flush()
+                    flushed = self.writer.flush()
+                    print(f"[startup] post-replay flush persisted {flushed} rows (replayed={n})")
+                    if flushed < n:
+                        print(f"[startup] WARN replay/flush mismatch replayed={n} flushed={flushed} — WAL retained for retry")
+                        try:
+                            self._collector_event(CollectorEventType.write_failed, {"reason": "wal_replay_flush_short", "replayed": n, "flushed": flushed})
+                        except Exception:
+                            pass
                 except Exception as e:
                     print(f"[startup] post-replay flush err {e}")
+            # Crash forensics on durable disk (survives /dev/shm wipe): append
+            # a startup line to <cwd>/logs/crash-forensics.log so a 19.5h stall
+            # + reboot leaves an off-hive liveness record even when the hive,
+            # cursor, WAL and pm2 state die with tmpfs.
+            try:
+                import datetime as _dt_crash
+                from pathlib import Path as _P_crash
+                _cf = _P_crash.cwd() / "logs" / "crash-forensics.log"
+                try:
+                    _cf.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_cf, "a", encoding="utf-8") as _fh:
+                        _fh.write(f"{_dt_crash.datetime.now(tz=_dt_crash.timezone.utc).isoformat()} startup data_dir={self.config.storage.data_dir} replayed={n}\n")
+                except Exception as _e_crash:
+                    print(f"[startup] crash-forensics log err {_e_crash}")
+            except Exception:
+                pass
         except Exception as e:
             print(f"[startup] WAL replay err {e}")
 
@@ -2251,8 +2347,15 @@ class Collector:
                                 # Trade handling — persist with wallet (no RPC) §5
                                 try:
                                     self._handle_trade_message(single_msg, _msg_asset_all, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    try:
+                                        print(f"[ws] trade handle failed asset={_msg_asset_all}: {str(e)[:160]}")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": _msg_asset_all, "reason": "trade_handle_failed", "error": str(e)[:200]})
+                                    except Exception:
+                                        pass
 
                                 # Buffer message for resync/replay on disconnect
                                 # (only under a genuinely OPEN episode: buffering live
@@ -2489,13 +2592,25 @@ class Collector:
                     break
                 try:
                     msg = json.loads(message) if isinstance(message, str) else message
-                except Exception:
+                except Exception as e:
+                    try:
+                        print(f"[ws] bad JSON dropped asset={asset}: {str(e)[:160]}")
+                    except Exception:
+                        pass
+                    try:
+                        self._collector_event(CollectorEventType.book_anomaly, {"asset": asset, "reason": "invalid_ws_json", "error": str(e)[:200]})
+                    except Exception:
+                        pass
                     continue
 
                 # Validate WS message via shared validator
                 try:
                     validate_ws_message(msg)
-                except Exception:
+                except Exception as e:
+                    try:
+                        self._collector_event(CollectorEventType.book_anomaly, {"asset": asset, "reason": "ws_validation_failed", "error": str(e)[:200]})
+                    except Exception:
+                        pass
                     # invalid messages are dropped; book will be marked stale
                     pass
 
@@ -2924,8 +3039,60 @@ class Collector:
                                         row["resync_id"] = _brid2 or str(uuid.uuid4())
                             except Exception:
                                 pass
+                            # P0 write-amp fix (weather audit 2026-09-21): skip
+                            # dataless-book ticks. 95.9% of weather rows had no
+                            # side at all (no up/down bid/ask) — unconditional
+                            # 500ms appends drove buf to 99.5% cap + rss 800MB.
+                            # Skip when all 4 BBOs are None AND book_state is not
+                            # live, except a 1/min keep-alive per market so the
+                            # gap trail stays honest (stale rows prove liveness,
+                            # absence would look like a missing market).
+                            try:
+                                _bbo_empty = (row.get("up_bid") is None and row.get("up_ask") is None
+                                              and row.get("down_bid") is None and row.get("down_ask") is None)
+                            except Exception:
+                                _bbo_empty = False
+                            if _bbo_empty and row.get("book_state") != "live":
+                                try:
+                                    _ek = f"empty_skip:{m.condition_id}"
+                                    _last = self._ws_noise_throttle.get(_ek, 0)
+                                except Exception:
+                                    _last = 0
+                                    _ek = f"empty_skip:{m.condition_id}"
+                                # keep-alive: 1 per ~60 ticks (≈60s at 1s weather cadence, ≈30s at 500ms)
+                                if _tick % 60 != 0 and _last:
+                                    try:
+                                        self._ws_noise_throttle[_ek] = 1
+                                    except Exception:
+                                        pass
+                                    continue
+                                try:
+                                    self._ws_noise_throttle[_ek] = 1
+                                except Exception:
+                                    pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
                             if not result:
+                                # P0 tick-drop fix: append False means WAL failed
+                                # (writer already flush+WAL-spills on cap). Retry
+                                # once after a flush; if still False emit
+                                # write_failed (honest, countable) — never silent.
+                                try:
+                                    self.writer.flush()
+                                except Exception:
+                                    pass
+                                try:
+                                    result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
+                                except Exception:
+                                    result = False
+                                if not result:
+                                    try:
+                                        print(f"[snapshot] DROP bucket={bucket} asset={m.asset} WAL-failed")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        self._collector_event(CollectorEventType.write_failed, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket, "reason": "wal_failed_after_retry"})
+                                    except Exception:
+                                        pass
                                 try:
                                     self._collector_event(CollectorEventType.backpressure, {"dataset": "book_snapshots_500ms", "asset": m.asset, "bucket": bucket})
                                 except Exception:
@@ -2963,12 +3130,29 @@ class Collector:
                 break
 
     async def _clock_loop(self) -> None:
+        # P1 clock-blind fix: ntplib is a hard dep (pyproject) but may be
+        # missing in the venv — fail LOUD once, not silent-None forever.
+        try:
+            from . import clock as _clk
+            if not getattr(_clk, "_HAS_NTPLIB", False):
+                print("[clock] WARN ntplib missing — drift checks return None (blind). pip install ntplib")
+                try:
+                    self._collector_event(CollectorEventType.clock_issue, {"reason": "ntplib_missing", "blind": True})
+                except Exception:
+                    pass
+        except Exception:
+            pass
         while self._running:
             try:
                 # MEDIUM (audit 2026-09-21): check_clock_drift() blocks up to
                 # 5s (synchronous NTP request) — run it off the event loop so
                 # the 500ms scheduler never stalls behind it.
                 drift = await asyncio.to_thread(check_clock_drift)
+                if drift is None:
+                    try:
+                        self._collector_event(CollectorEventType.clock_issue, {"reason": "ntp_unavailable", "drift_ms": None})
+                    except Exception:
+                        pass
                 if is_clock_issue(drift, threshold_ms=self.config.clock.clock_issue_threshold_ms):
                     self._collector_event(CollectorEventType.clock_issue, {"drift_ms": drift, "threshold_ms": self.config.clock.clock_issue_threshold_ms})
             except Exception:
@@ -3145,9 +3329,24 @@ class Collector:
                 print(f"[disk-guard] reap err {_re}")
             # (2) full verified prune is a slow hive scan — flag it for the
             # async loop, which runs it in a thread (overlap + hourly throttle).
+            # 2026-09-22 ENOSPC fix: hive prune fail-closes (0 files) while a
+            # lane never uploads, and staging (rebuildable per-lane cache)
+            # kept growing. Reclaim stalled-lane staging INLINE here — cheap
+            # stat walk of kaggle_staging/ only, never the hive — so the
+            # guard frees real bytes even when the hive prune is gated.
             try:
+                _srec = emergency_reclaim_staging(self.config.storage.data_dir)
+                if isinstance(_srec, dict) and int(_srec.get("files_deleted", 0) or 0) > 0:
+                    print(f"[disk-guard] staging reclaim freed "
+                          f"{int(_srec.get('bytes_deleted', 0) or 0)}B "
+                          f"({int(_srec.get('files_deleted', 0) or 0)} files)")
+            except Exception as _se:
+                print(f"[disk-guard] staging reclaim err {_se}")
+            try:
+                _critical = free < 256 * 1024 * 1024
+                _throttle_s = 600.0 if _critical else 1800.0
                 if (not getattr(self, "_emergency_prune_running", False)
-                        and (now_m - getattr(self, "_last_emergency_prune_monotonic", 0.0)) > 1800):
+                        and (now_m - getattr(self, "_last_emergency_prune_monotonic", 0.0)) > _throttle_s):
                     self._last_emergency_prune_monotonic = now_m
                     self._emergency_prune_running = True
                 else:
@@ -3180,6 +3379,21 @@ class Collector:
             )
             print(f"[disk-guard] emergency prune done: {len(res)} files "
                   f"({sum(res.values()) if res else 0} rows)")
+            if not res:
+                # Hive fail-closed (stalled lane) — staging reclaim already ran
+                # inline in _disk_guard_tick, but retry here post-scan: a lane
+                # may have finished uploading since the tick, changing which
+                # staging is reclaimable. Hive itself is never forced.
+                try:
+                    _srec2 = await asyncio.to_thread(
+                        emergency_reclaim_staging,
+                        self.config.storage.data_dir,
+                    )
+                    if isinstance(_srec2, dict) and int(_srec2.get("files_deleted", 0) or 0) > 0:
+                        print(f"[disk-guard] post-prune staging reclaim freed "
+                              f"{int(_srec2.get('bytes_deleted', 0) or 0)}B")
+                except Exception as _se2:
+                    print(f"[disk-guard] post-prune staging reclaim err {_se2}")
         except Exception as e:
             print(f"[disk-guard] emergency prune err {e}")
         finally:

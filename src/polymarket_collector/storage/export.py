@@ -4259,7 +4259,29 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                     _remote_ok = False
                                     print(f"[kaggle] WARN remote zero-byte files: {_zero[:4]}")
                                 if remote_sizes:
-                                    print(f"[kaggle] note: remote content verified by name+nonzero-size only ({len(remote_sizes)} sizes); row-count parity is local staging (_verify_staging_row_counts)")
+                                    # Size-parity gate (audit 2026-09-22): Kaggle
+                                    # exposes no hashes, but sizes must match
+                                    # local staging exactly (same bytes uploaded).
+                                    # Mismatch = truncated/partial remote → fail closed.
+                                    _mismatch = []
+                                    for _nm in expected_names:
+                                        try:
+                                            _rs = remote_sizes.get(_nm)
+                                            if _rs is None:
+                                                continue  # already failed subset check above
+                                            _lp = staging / _nm
+                                            if not _lp.exists():
+                                                continue
+                                            _ls = int(_lp.stat().st_size)
+                                            if int(_rs) != _ls:
+                                                _mismatch.append(f"{_nm} remote={_rs} local={_ls}")
+                                        except Exception:
+                                            continue
+                                    if _mismatch:
+                                        _remote_ok = False
+                                        print(f"[kaggle] WARN remote/local size mismatch (truncated upload?): {_mismatch[:4]}")
+                                    else:
+                                        print(f"[kaggle] remote content verified by name+nonzero-size+size-parity ({len(remote_sizes)} sizes); row-count parity is local staging (_verify_staging_row_counts)")
                                 else:
                                     print("[kaggle] note: remote API exposed no sizes — content verification is filename-only; prune still requires local row-count monotonicity + market-end cutoff")
                             except Exception:
@@ -4612,7 +4634,16 @@ def cleanup_local_data(
                 _per_lane[_lane] = _best
             else:
                 print(f"[prune] WARN lane {_lane} has no verified upload yet — "
-                      f"not gating prune (its history is at risk until it uploads)")
+                      f"pruning skipped (fail closed; its history is at risk until it uploads)")
+        _missing_lanes = [l for l in _lanes if l not in _per_lane]
+        if _missing_lanes:
+            # Fail closed: a lane with no verified upload must gate the prune.
+            # The old code excluded such lanes so other lanes authorized
+            # deleting rows the stalled lane never shipped (2026-09-11 class).
+            # Tradeoff: a newly added lane blocks pruning until its first
+            # upload — budget disk for that.
+            print(f"[prune] lanes {_missing_lanes} have no verified upload — pruning skipped (fail closed)")
+            return {}
         if _per_lane:
             _slow = min(_per_lane, key=lambda k: _per_lane[k])
             checkpoint_ms = min(_per_lane.values())
@@ -4922,7 +4953,15 @@ def _log_quarantine_gap(base: Path, reap_stats: dict, source: str) -> None:
     try:
         files_deleted = int((reap_stats or {}).get("files_deleted", 0) or 0)
         bytes_deleted = int((reap_stats or {}).get("bytes_deleted", 0) or 0)
-        if files_deleted <= 0 and bytes_deleted <= 0:
+        try:
+            files_quarantined = int((reap_stats or {}).get("files_quarantined", 0) or 0)
+        except Exception:
+            files_quarantined = 0
+        try:
+            bytes_quarantined = int((reap_stats or {}).get("bytes_quarantined", 0) or 0)
+        except Exception:
+            bytes_quarantined = 0
+        if files_deleted <= 0 and bytes_deleted <= 0 and files_quarantined <= 0:
             return
         import datetime as _dt_gap
         import time as _t_gap
@@ -4940,6 +4979,7 @@ def _log_quarantine_gap(base: Path, reap_stats: dict, source: str) -> None:
             "market_id": None,
             "details": (
                 f"{source} expired {files_deleted} files / {bytes_deleted}B "
+                f"quarantined {files_quarantined} files / {bytes_quarantined}B "
                 f"(already-uploaded or unreadable review buffer; hive gap "
                 f"trail in collector_events/resync_episodes untouched)"
             )[:1000],
@@ -5004,6 +5044,121 @@ def _expire_quarantine(base: Path, ttl_hours: float | None = None, max_bytes: in
         return stats
     except Exception:
         return {"expired_files": 0, "expired_bytes": 0, "remaining_bytes": 0}
+
+
+def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> dict:
+    """Free disk by deleting REBUILDABLE Kaggle staging for stalled lanes.
+
+    2026-09-22 ENOSPC fix: ``cleanup_local_data`` fail-closes the HIVE when
+    any lane has no verified upload (2026-09-11 data-loss guard) — correct
+    for safety, but it means the disk-guard emergency path freed 0 bytes
+    while ``kaggle_staging/{lane}/`` kept 5 lanes of derived copies.
+    Staging is a pure build cache: every lane's staging is rebuilt from the
+    live hive on each upload tick, so deleting it loses nothing (next
+    successful export regenerates it; coverage proof simply treats the
+    missing lane as not-gating, i.e. keeps *more* hive, never less).
+
+    Only touches ``<data_dir>/kaggle_staging/`` parquet files belonging to
+    lanes WITHOUT a verified ``_kaggle_state.json`` checkpoint. Lanes with
+    a checkpoint keep their staging (it is their coverage proof). Never
+    touches the live hive, ``_quarantine/``, state JSON, or gap evidence
+    (``collector_events``/``resync_episodes``/``markets_log``).
+    ``dry_run`` reports without deleting. Never raises.
+    Returns {"files_deleted", "bytes_deleted", "lanes_reclaimed"}.
+    """
+    stats: dict = {"files_deleted": 0, "bytes_deleted": 0, "lanes_reclaimed": []}
+    try:
+        base = Path(data_dir)
+        staging_root = base / "kaggle_staging"
+        if not staging_root.exists():
+            return stats
+        try:
+            from ..config import CollectorConfig as _CCs
+            _lanes = [str(t).lower() for t in (_CCs.load().timeframes or [])]
+        except Exception:
+            _lanes = []
+        if not _lanes:
+            try:
+                _lanes = [p.name.lower() for p in staging_root.iterdir() if p.is_dir()]
+            except Exception:
+                return stats
+        import json as _js
+
+        def _lane_verified(lane: str) -> bool:
+            for cand in (staging_root / lane / "_kaggle_state.json",
+                         staging_root / "_kaggle_state.json"):
+                try:
+                    if not cand.exists():
+                        continue
+                    j = _js.loads(cand.read_text())
+                    vals = [v.get("last_upload_unix_ms") for v in j.values()
+                            if isinstance(v, dict) and v.get("last_upload_unix_ms")]
+                    if vals:
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        for lane in _lanes:
+            try:
+                if _lane_verified(lane):
+                    continue
+            except Exception:
+                continue
+            lane_dir = staging_root / lane
+            if not lane_dir.exists():
+                continue
+            reclaimed_here = False
+            try:
+                targets = sorted(lane_dir.rglob("*.parquet"))
+            except Exception:
+                continue
+            for p in targets:
+                try:
+                    if p.name.endswith(".tmp") or not p.is_file() or p.is_symlink():
+                        continue
+                    if "_kaggle_state.json" in p.parts:
+                        continue
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                if dry_run:
+                    stats["files_deleted"] += 1
+                    stats["bytes_deleted"] += size
+                    reclaimed_here = True
+                    continue
+                try:
+                    p.unlink()
+                    stats["files_deleted"] += 1
+                    stats["bytes_deleted"] += size
+                    reclaimed_here = True
+                except OSError as e:
+                    print(f"[staging-reclaim] WARN could not delete {p}: {e}")
+            if reclaimed_here:
+                try:
+                    stats["lanes_reclaimed"].append(lane)
+                except Exception:
+                    pass
+            # remove newly-empty leaf dirs (hygiene only; staging rebuilds them)
+            if not dry_run:
+                try:
+                    for d in sorted((q for q in lane_dir.rglob("*") if q.is_dir()),
+                                    reverse=True):
+                        try:
+                            if next(d.iterdir(), None) is None:
+                                d.rmdir()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        if stats["files_deleted"]:
+            print(f"[staging-reclaim] deleted {stats['files_deleted']} files / "
+                  f"{stats['bytes_deleted']}B staging for stalled lanes "
+                  f"{stats['lanes_reclaimed']} (rebuildable cache; hive untouched)")
+        return stats
+    except Exception as e:
+        print(f"[staging-reclaim] WARN {e}")
+        return stats
 
 
 # =============================================================================
@@ -5081,6 +5236,22 @@ def _export_and_upload_all_kaggle_impl(
     # clean HIVE is maintained out-of-band (build_clean_view stays for manual
     # use + test mode, which calls it explicitly). Rebuilding 2.85M rows here
     # SIGKilled the box on every lane export.
+
+    # Step 0c: auto-quarantine unreadable stubs (audit 2026-09-22). A SIGKILL
+    # mid-flush leaves footer-less parquets that fail-closed the export
+    # forever. quarantine_unreadable() MOVES (never deletes) them aside.
+    try:
+        from .quarantine import quarantine_unreadable as _quar
+        _moved = _quar(base, dry_run=bool(dry_run))
+        if _moved and not dry_run:
+            try:
+                _log_quarantine_gap(base, {"files_deleted": 0, "bytes_deleted": 0,
+                                           "files_quarantined": len(_moved),
+                                           "bytes_quarantined": sum(int(m.get("size", 0) or 0) for m in _moved if isinstance(m, dict))}, "export-precheck-quarantine")
+            except Exception:
+                pass
+    except Exception as _qe:
+        print(f"[export] quarantine pre-check warn: {_qe}")
 
     # Gate: only upload full closed markets
     try:
