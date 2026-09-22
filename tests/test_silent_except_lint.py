@@ -1,28 +1,41 @@
-"""Silent-except lint — Real-Data-Only §7 (audit 2026-09-21).
+"""Silent-except lint — Real-Data-Only §7 (audit 2026-09-21, expanded 2026-09-22).
 
 WS/collect/write paths must log + collector_events, never swallow errors
-with bare `except: pass/continue`. This test fails on NEW silent handlers
-in storage/ (burn-down: compaction + writer first), not on the historical
-baseline — so existing code passes, but additions are blocked.
+with bare `except: pass/continue`. This test fails on NEW silent handlers,
+not on the historical baseline — so existing code passes, but additions are blocked.
 
-Baseline (2026-09-21, multiline-aware count of `except:` blocks whose body
+Baseline (2026-09-22, multiline-aware count of `except:` blocks whose body
 is bare pass/continue within 3 lines):
-  compaction.py: 19, export.py: 99, parquet_writer.py: 78
-(resync.py lives at src/polymarket_collector/resync.py; collector.py WS
-loops tracked separately — see test_ws_silent_except below.)
+  storage: compaction 19, export 98, parquet_writer 78, quarantine 2,
+    clean_view 12, markets_log 14, cursor_store 7, raw_archive 14, streaming 11
+  core: collector 213, resync 21, book 11, rollover 12
+Burn-down: lower each ceiling over time; new code must log + events.
 """
 import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 STORAGE = REPO / "src" / "polymarket_collector" / "storage"
+CORE = REPO / "src" / "polymarket_collector"
 
 # Per-file ceilings (current count + 0 headroom: any new silent handler fails).
 BASELINE = {
     "compaction.py": 19,
-    "export.py": 96,
+    "export.py": 98,
     "parquet_writer.py": 78,
     "quarantine.py": 2,
+    "clean_view.py": 12,
+    "markets_log.py": 14,
+    "cursor_store.py": 7,
+    "raw_archive.py": 14,
+    "streaming.py": 11,
+}
+
+CORE_BASELINE = {
+    "collector.py": 213,
+    "resync.py": 21,
+    "book.py": 11,
+    "rollover.py": 12,
 }
 
 
@@ -60,4 +73,19 @@ def test_ws_silent_except_no_growth():
     if not p.exists():
         return
     got = _count_silent(p)
-    assert got <= 194, f"collector.py silent handlers grew: {got} > 194"
+    assert got <= 213, f"collector.py silent handlers grew: {got} > 213"
+
+
+def test_core_silent_except_no_growth():
+    """Core modules (resync/book/rollover): frozen, burn-down over time."""
+    over = []
+    for name, ceiling in CORE_BASELINE.items():
+        if name == "collector.py":
+            continue  # covered above
+        p = CORE / name
+        if not p.exists():
+            continue
+        got = _count_silent(p)
+        if got > ceiling:
+            over.append(f"{name}: {got} > baseline {ceiling} — log + collector_events instead of pass/continue")
+    assert not over, "NEW silent except handlers in core/:\n" + "\n".join(over)

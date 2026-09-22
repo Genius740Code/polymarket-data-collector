@@ -4275,7 +4275,8 @@ def _upload_kaggle_folder(staging: Path, dataset: str, max_retries: int = 5, exp
                                             _ls = int(_lp.stat().st_size)
                                             if int(_rs) != _ls:
                                                 _mismatch.append(f"{_nm} remote={_rs} local={_ls}")
-                                        except Exception:
+                                        except Exception as _sp_e:
+                                            print(f"[kaggle] WARN size-parity stat failed for {_nm}: {_sp_e}")
                                             continue
                                     if _mismatch:
                                         _remote_ok = False
@@ -4955,11 +4956,13 @@ def _log_quarantine_gap(base: Path, reap_stats: dict, source: str) -> None:
         bytes_deleted = int((reap_stats or {}).get("bytes_deleted", 0) or 0)
         try:
             files_quarantined = int((reap_stats or {}).get("files_quarantined", 0) or 0)
-        except Exception:
+        except Exception as _fq_e:
+            print(f"[prune] WARN quarantine gap stat files_quarantined unparsable: {_fq_e}")
             files_quarantined = 0
         try:
             bytes_quarantined = int((reap_stats or {}).get("bytes_quarantined", 0) or 0)
-        except Exception:
+        except Exception as _bq_e:
+            print(f"[prune] WARN quarantine gap stat bytes_quarantined unparsable: {_bq_e}")
             bytes_quarantined = 0
         if files_deleted <= 0 and bytes_deleted <= 0 and files_quarantined <= 0:
             return
@@ -5095,7 +5098,8 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
                             if isinstance(v, dict) and v.get("last_upload_unix_ms")]
                     if vals:
                         return True
-                except Exception:
+                except Exception as _lv_e:
+                    print(f"[staging-reclaim] WARN lane state parse failed for {cand}: {_lv_e}")
                     continue
             return False
 
@@ -5103,7 +5107,8 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
             try:
                 if _lane_verified(lane):
                     continue
-            except Exception:
+            except Exception as _lvc_e:
+                print(f"[staging-reclaim] WARN lane verify failed for {lane}: {_lvc_e}")
                 continue
             lane_dir = staging_root / lane
             if not lane_dir.exists():
@@ -5111,7 +5116,8 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
             reclaimed_here = False
             try:
                 targets = sorted(lane_dir.rglob("*.parquet"))
-            except Exception:
+            except Exception as _rg_e:
+                print(f"[staging-reclaim] WARN rglob failed for {lane_dir}: {_rg_e}")
                 continue
             for p in targets:
                 try:
@@ -5120,7 +5126,8 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
                     if "_kaggle_state.json" in p.parts:
                         continue
                     size = p.stat().st_size
-                except OSError:
+                except OSError as _st_e:
+                    print(f"[staging-reclaim] WARN stat failed for {p}: {_st_e}")
                     continue
                 if dry_run:
                     stats["files_deleted"] += 1
@@ -5137,7 +5144,8 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
             if reclaimed_here:
                 try:
                     stats["lanes_reclaimed"].append(lane)
-                except Exception:
+                except Exception as _lr_e:
+                    print(f"[staging-reclaim] WARN lanes_reclaimed append failed: {_lr_e}")
                     pass
             # remove newly-empty leaf dirs (hygiene only; staging rebuilds them)
             if not dry_run:
@@ -5147,9 +5155,11 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
                         try:
                             if next(d.iterdir(), None) is None:
                                 d.rmdir()
-                        except Exception:
+                        except Exception as _rd_e:
+                            print(f"[staging-reclaim] WARN rmdir failed for {d}: {_rd_e}")
                             pass
-                except Exception:
+                except Exception as _rl_e:
+                    print(f"[staging-reclaim] WARN leaf cleanup failed for {lane_dir}: {_rl_e}")
                     pass
         if stats["files_deleted"]:
             print(f"[staging-reclaim] deleted {stats['files_deleted']} files / "

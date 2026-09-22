@@ -246,8 +246,31 @@ def test_prune_gated_by_slowest_lane(tmp_path, monkeypatch):
     _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms})
     _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms})
     _write_lane_state(base, "5m", now_ms)
+    _write_lane_state(base, "15m", now_ms)
     stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
     assert not f_old.exists() and not f_mid.exists(), stats
+
+    # ...and with 15m NEVER uploaded (no state), NOTHING prunes (fail closed,
+    # 2026-09-22: excluding the missing lane let others delete rows it never
+    # shipped — same class as the 2026-09-11 loss).
+    base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
+    _os.utime(f_old, (now_ms / 1000 - 13 * 86400,) * 2)
+    _os.utime(f_mid, (now_ms / 1000 - 13 * 86400,) * 2)
+    # _prune_hive reuses tmp_path/"data": drop the 15m state left by the
+    # block above so this block truly has "15m NEVER uploaded".
+    import pathlib as _pl
+    for _stale in [base / "kaggle_staging" / "15m" / "_kaggle_state.json",
+                   base / "kaggle_staging" / "_kaggle_state.json"]:
+        try:
+            if _stale.exists():
+                _stale.unlink()
+        except Exception:
+            pass
+    _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    _write_lane_state(base, "5m", now_ms)
+    stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
+    assert f_old.exists() and f_mid.exists(), f"missing-lane must fail closed: {stats}"
 
     # ...but with 15m lagging 10d, the mid file (11d old > 12d cutoff) survives
     base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
