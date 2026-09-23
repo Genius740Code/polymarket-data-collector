@@ -25,7 +25,7 @@ packages/*/dist/
 .DS_Store
 .mypy_cache/
 .ruff_cache/
-# Kaggle credentials — never commit (audit 2026-09-21: KGAT_ token was pasted in docs/plan.md)
+# Kaggle credentials — never commit (audit 2026-09-21: API key was pasted in docs/plan.md)
 kaggle.json
 **/kaggle.json
 .kaggle/

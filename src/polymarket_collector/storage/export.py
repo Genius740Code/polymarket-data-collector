@@ -5423,6 +5423,6 @@ def _validate_kaggle_config() -> bool:
             print(f"✓ Kaggle API credentials found in {p}")
             return True
     print("⚠ No Kaggle API credentials configured.")
-    print("  Setup: 1) ~/.kaggle/kaggle.json {\"username\":\"gghgg1\",\"key\":\"KGAT_...\"} chmod 600")
-    print("        2) env KAGGLE_API_TOKEN=KGAT_... (new) or KAGGLE_USERNAME/KEY")
+    print("  Setup: env KAGGLE_USERNAME/KAGGLE_KEY (or KAGGLE_API_TOKEN),")
+    print("         or ~/.kaggle/kaggle.json chmod 600 (provision out-of-band; never paste values)")
     return False

@@ -162,7 +162,7 @@ cron 0 * * * *  polymarket-kaggle-uploader (PM2, ecosystem.config.js:30 cron_res
   3. For window in [5m,15m,1h,4h,1d]:
      export_per_asset_single_file:206 time-first sorted (TS_SORT_CANDIDATES:38), zstd, atomic tmp → data/kaggle_staging/{window}/{slug}/ 15 files; chainlink files COPIED across windows (not re-exported, single feed per §2.1)
      write dataset-metadata.json {"title":"Polymarket {window} Crypto — BTC/ETH/SOL", "id":slug, "licenses":[{"name":"CC BY-NC-SA 4.0"}], "resources":[{"path":...}]}
-  4. Auth: KAGGLE_API_TOKEN env else ~/.kaggle/kaggle.json chmod600 (kagglesdk/kaggle_http_client.py:34); gghgg1 credentials via env only — rotate after paste, never commit. Use `kaggle.json` `{"username":"gghgg1","key":"KGAT_..."}` or `KAGGLE_USERNAME`/`KAGGLE_KEY` env.
+  4. Auth: env only — `KAGGLE_USERNAME`/`KAGGLE_KEY` (or `KAGGLE_API_TOKEN`) else `~/.kaggle/kaggle.json` chmod 600 (kagglesdk/kaggle_http_client.py:34). Never paste key values into docs, chat, or git — server-side only.
   5. For each slug: dataset_status(slug) ? dataset_create_version(folder, version_notes="hourly UTC {now} +{rows}", convert_to_csv=False, delete_old_versions=False) : dataset_create_new(folder, public=True) with retry 5 (2s×2 jitter→60s) on 429/500, emit collector_events:kaggle_upload_* (enums.py: add kaggle_upload_started/success/failed)
   6. Poll dataset_status until ready (timeout 10m); on success update data/kaggle_staging/_kaggle_state.json {slug:{last_version, last_upload_utc, row_counts, md5}} + kaggle_upload_success; on failure after 5 → kaggle_upload_failed + watchdog alert watchdog.py:83 (add kaggle_upload_failed to alert_on config.py:83 watchdog.alert_on)
   7. After ready: prune hive only `date < checkpoint_ts-2h` and `max(market_end) < checkpoint_ts`, keep 2h buffer for re-export; never delete current open window; data/kaggle_staging kept (source for next concat if needed); NEVER blind age delete (fix storage/export.py:640 pc.datetime bug → datetime, cleanup_local_data:644 must check market_end not mtime)
@@ -224,7 +224,7 @@ Measured after P1 pilot (update with live numbers; below is analytic estimate fo
 
 1. **P1 verify:** `pytest -q` `77 passed`, `polymarket-verify-gate --config config/collector.yaml` (WS seq, REST L2, settlement, rate-limit).
 2. **P2 deploy:** update `config/collector.yaml` `window_sizes_seconds: [300,900,3600,14400,86400]`, `pm2 restart polymarket-collector --update-env`, tail `pm2 logs` for `market_added` per `asset×window`.
-3. **Kaggle auth:** `mkdir -p ~/.kaggle && chmod 700 ~/.kaggle && printf '{"username":"gghgg1","key":"KGAT_..."}' > ~/.kaggle/kaggle.json && chmod 600 ~/.kaggle/kaggle.json` or env `KAGGLE_USERNAME`/`KAGGLE_KEY` via `ecosystem.config.js:54` `env:` — **REVOKED `KGAT_[REDACTED-ROTATE-NOW]` (was exposed in prior draft, revoke in Kaggle settings)**.
+3. **Kaggle auth (env only, never paste values):** export `KAGGLE_USERNAME`/`KAGGLE_KEY` in server env (or pm2 `ecosystem.config.js:54` `env:`), or provision `~/.kaggle/kaggle.json` out-of-band with `chmod 600`. A prior draft exposed a live key in docs — keep that key revoked in Kaggle settings; do not re-add key material here.
 4. **First upload (P6):** `polymarket-kaggle-upload --dry-run` → verify `data/kaggle_staging/5m/gghgg1/polymarket-5m-crypto/dataset-metadata.json` + 15 parquets, then `polymarket-kaggle-upload --window 5m` (single window smoke, creates `dataset_create_new` public). Confirm Kaggle UI shows public dataset with 15 files, `CC BY-NC-SA 4.0`.
 5. **Hourly:** `pm2 start ecosystem.config.js` enables `polymarket-kaggle-uploader` `cron_restart "0 * * * *"`; monitor `data/kaggle_staging/_kaggle_state.json` checkpoint and `watchdog` `kaggle_upload_failed` alerts. First week run with `--window 5m` only; promote to 5 windows after §18 gate confirms `1h/4h/1d` Gamma liquidity.
 6. **Prune:** only via `prune_hive_after_verified` after `dataset_status==ready` (see §5.7); never `cron rm` on age. Keep `data/kaggle_staging` as source for next concat.
@@ -238,7 +238,7 @@ Measured after P1 pilot (update with live numbers; below is analytic estimate fo
 * **WS drift / sequence gap:** `resync.py:58` backoff + `book.py:84` `book_state` tagging + `clean_view.py:69` filter; redundant collector future option (§1A) without schema change (idempotent key `parquet_writer.py:193` `(asset,condition_id,bucket)`).
 * **Synthetic resample leak:** `export.py:362` `aggregate_5min_to_timeframe` violates Non-goals — delete in P2; native `window=` hive is only path.
 * **Blind delete:** `export.py:644` `cleanup_local_data` uses `mtime` not `market_end` and has `pc.datetime` bug — replace with checkpointed prune `market_end < checkpoint_ts-2h` in `kaggle_upload.py`.
-* **Kaggle secret leak:** previous draft pasted `KGAT_...` — rotate key, use env/`~/.kaggle/kaggle.json` only, `.gitignore` already excludes `*.json`? Add `kaggle.json` to `.gitignore:19`.
+* **Kaggle secret leak:** a prior draft pasted a live key into docs — key revoked; policy is env/`~/.kaggle/kaggle.json` only, never in docs/chat/git. `.gitignore` now excludes `kaggle.json`/`.kaggle/`.
 
 ---
 
