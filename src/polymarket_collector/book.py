@@ -627,9 +627,28 @@ class OrderBookState:
                 try:
                     p = float(price) if price is not None else None
                     s = float(size) if size is not None else None
-                except Exception:
+                except Exception as e:
+                    try:
+                        self.pending_events.append({
+                            "event_type": "level_parse_failed",
+                            "token_id": pc_token, "outcome": pc_outcome,
+                            "price": str(price)[:32], "size": str(size)[:32],
+                            "error": str(e)[:120],
+                            "ts_source": self._resolve_ts_source(msg),
+                        })
+                    except Exception:
+                        pass
                     continue
                 if p is None or s is None:
+                    try:
+                        self.pending_events.append({
+                            "event_type": "level_parse_failed",
+                            "token_id": pc_token, "outcome": pc_outcome,
+                            "reason": "null_price_or_size",
+                            "ts_source": self._resolve_ts_source(msg),
+                        })
+                    except Exception:
+                        pass
                     continue
                 # price_change with size 0 means remove level
                 book = self.up if pc_outcome == "up" else self.down
@@ -729,6 +748,18 @@ class OrderBookState:
                 if promotable:
                     if self._well_formed_hash(msg.get("hash")):
                         self.mark_live()
+                    elif self.one_sided_promotion:
+                        # Weather decision (audit 2026-09-22): CLOB sends no
+                        # hash on ~96% of weather `book` frames, so the strict
+                        # gate held every book stale forever (0.0 live). With
+                        # one_sided_promotion (weather thin buckets only) a
+                        # full-book frame with real levels promotes WITHOUT
+                        # hash — honest via book_anomaly, levels are real
+                        # exchange data, never fabricated. Crypto
+                        # (one_sided_promotion=False) stays hash-gated.
+                        self.mark_live()
+                        promo_note = (f"book_hash_missing_promoted_anyway outcome={outcome} "
+                                      f"hash={msg.get('hash')!r} — one-sided weather promotion, levels real")
                     else:
                         promo_note = (f"book_hash_missing_on_promotion outcome={outcome} "
                                       f"hash={msg.get('hash')!r} — levels applied, promotion refused; REST heal covers")
@@ -926,15 +957,18 @@ class OrderBookState:
         # mirrored crossed books seen on 2026-09-05. Empty list = side is empty.)
         new_levels: List[Level] = []
         removals: set[float] = set()
+        _dropped_levels = 0
         for lvl in levels:
             if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 price, size = lvl[0], lvl[1]
                 if price is None or size is None:
+                    _dropped_levels += 1
                     continue
                 # removal vs shared bounds gate (E4/M7 via sanitize_level)
                 try:
                     _s0 = float(size)
                 except (TypeError, ValueError):
+                    _dropped_levels += 1
                     continue
                 if _s0 == 0:
                     try:
@@ -944,15 +978,18 @@ class OrderBookState:
                     continue  # removal — tracked below
                 _ok = sanitize_level(price, size)
                 if _ok is None:
+                    _dropped_levels += 1
                     continue
                 new_levels.append(Level(price=_ok[0], size=_ok[1]))
             elif isinstance(lvl, dict):
                 p = lvl.get("price"); s = lvl.get("size")
                 if p is None or s is None:
+                    _dropped_levels += 1
                     continue
                 try:
                     _s0 = float(s)
                 except (TypeError, ValueError):
+                    _dropped_levels += 1
                     continue
                 if _s0 == 0:
                     try:
@@ -962,8 +999,20 @@ class OrderBookState:
                     continue
                 _ok = sanitize_level(p, s)
                 if _ok is None:
+                    _dropped_levels += 1
                     continue
                 new_levels.append(Level(price=_ok[0], size=_ok[1]))
+            else:
+                _dropped_levels += 1
+        if _dropped_levels:
+            try:
+                self.pending_events.append({
+                    "event_type": "level_parse_failed",
+                    "reason": f"dropped {_dropped_levels} invalid levels in full-book frame",
+                    "count": _dropped_levels,
+                })
+            except Exception:
+                pass
         # sort best-first
         new_levels.sort(key=lambda x: x.price if x.price is not None else 0, reverse=is_bid)
         # FULL REPLACE (book events are complete side snapshots from the exchange)

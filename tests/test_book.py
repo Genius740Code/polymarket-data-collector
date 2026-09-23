@@ -340,9 +340,25 @@ def test_f10_one_sided_stays_stale_without_flag():
 
 
 def test_f10_hash_gate_survives_flag():
+    # Weather decision 2026-09-22: CLOB sends no hash on ~96% of weather
+    # `book` frames → strict gate held everything stale (0.0 live). With
+    # one_sided_promotion (weather only) a hashed-or-not full-book frame
+    # with real levels promotes honestly (reason logged); crypto
+    # (one_sided=False) stays hash-gated. See test below.
     book = _make_f10_book(True)
     book.mark_stale("r1")
     f = _one_sided_book_frame(ts="1788649334527")
+    del f["hash"]
+    applied, reason = book.apply_ws_message(f)
+    assert applied is True
+    assert book.book_state == BookState.live
+    assert reason is not None and "book_hash_missing_promoted_anyway" in reason
+
+
+def test_f10_hash_gate_strict_without_flag():
+    book = _make_f10_book(False)
+    book.mark_stale("r1")
+    f = _live_book_frame(ts="1788649334527")
     del f["hash"]
     applied, reason = book.apply_ws_message(f)
     assert applied is True

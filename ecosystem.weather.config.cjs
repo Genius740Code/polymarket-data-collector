@@ -28,6 +28,14 @@ const python = path.join(cwd, '.venv', 'bin', 'python');
 // Kaggle is the durable archive (rolling_window); local is a 12h staging
 // window, so tmpfs volatility (reboot wipes) is by design. Recreated here
 // so `pm2 start`/`pm2 resurrect` self-heals after a reboot wiped /dev/shm.
+// DURABILITY (audit 2026-09-22): hot path stays tmpfs for perf, but
+// - cursor sqlite mirrored to hdd-staging/cursor-backup on every persist
+//   and auto-restored on startup when tmpfs is empty;
+// - heartbeat mirrored to logs/heartbeat-mirror.jsonl;
+// - startup/clean-stop markers in logs/crash-forensics.log (off-hive
+//   liveness: a missing STOPPED line + next STARTUP = unclean reboot,
+//   with ≥8k buffered rows + ≤10min page-cache WAL honestly lost).
+// WAL fsync is per-flush (flush_interval 600s), not per-row — documented loss window.
 for (const [link, target] of [
   ['data-weather-high', '/dev/shm/pw-weather-high'],
   ['data-weather-low', '/dev/shm/pw-weather-low'],

@@ -115,6 +115,12 @@ class ResyncManager:
         # Counts every on_episode_persist exception; each also fires a
         # write_failed event so the blind spot is operationally visible.
         self._persist_fail_total: int = 0
+        # P1 fetch_none quiet (weather audit 2026-09-22): some tokens expose
+        # no full L2 (AMSTERDAM/ANKARA/ATLANTA) — REST returns None forever.
+        # Track consecutive fetch_none per condition_id; after threshold the
+        # book stays honestly stale with terminal backoff instead of hot churn.
+        self._fetch_none_streak: Dict[str, int] = {}
+        self._fetch_none_quiet_until: Dict[str, float] = {}
 
     def _safe_persist(self, payload: dict, where: str) -> None:
         """Persist an episode via on_episode_persist with loud failure accounting.
@@ -147,6 +153,37 @@ class ResyncManager:
                     })
                 except Exception:
                     pass
+
+    def fetch_none_quiet(self, condition_id: str) -> bool:
+        """True if this condition is in terminal fetch_none backoff (honest stale, no churn)."""
+        try:
+            return time.monotonic() < float(self._fetch_none_quiet_until.get(str(condition_id), 0))
+        except Exception:
+            return False
+
+    def note_fetch_none(self, condition_id: str) -> int:
+        """Record a fetch_none; returns streak. >=5 enters 1h terminal quiet."""
+        try:
+            k = str(condition_id)
+            n = int(self._fetch_none_streak.get(k, 0) or 0) + 1
+            self._fetch_none_streak[k] = n
+            if n >= 5:
+                self._fetch_none_quiet_until[k] = time.monotonic() + 3600.0
+                if self.on_event:
+                    try:
+                        self.on_event(CollectorEventType.resync_failed, {"condition_id": k, "fail_branch": "fetch_none_terminal", "attempts": n, "quiet_s": 3600, "reason": "REST exposes no full L2 for this token — honest stale, backing off"})
+                    except Exception:
+                        pass
+            return n
+        except Exception:
+            return 0
+
+    def note_fetch_ok(self, condition_id: str) -> None:
+        try:
+            self._fetch_none_streak.pop(str(condition_id), None)
+            self._fetch_none_quiet_until.pop(str(condition_id), None)
+        except Exception:
+            pass
 
     def _buffer_age_limit_s(self) -> float:
         try:
@@ -439,6 +476,9 @@ class ResyncManager:
         last_fail_branch: Optional[str] = None
         last_fail_error: Optional[str] = None
 
+        if self.fetch_none_quiet(condition_id):
+            return False
+
         # mark resyncing
         # PERF: single targets list (was 4 full books.values() scans + BxM nest).
         # Same set/order (dict order), same mark_live/on_book_state_change sequence.
@@ -462,7 +502,15 @@ class ResyncManager:
                 if snapshot is None:
                     attempt_branch = "fetch_none"
                     attempt_error = "REST fetch returned None (endpoint may not expose full L2 — §18 gate)"
+                    try:
+                        self.note_fetch_none(condition_id)
+                    except Exception:
+                        pass
                     raise RuntimeError(attempt_error)
+                try:
+                    self.note_fetch_ok(condition_id)
+                except Exception:
+                    pass
 
                 # wholesale replace
                 phase = "replace"

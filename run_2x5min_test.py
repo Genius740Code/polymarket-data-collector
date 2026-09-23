@@ -261,6 +261,8 @@ def main() -> int:
                     help="C4: test Kaggle slug (default gghgg1/polymarket-5m-crypto-test; never prod without --yes)")
     ap.add_argument("--timeframe", type=str, default=None, choices=["5m", "15m", "1h", "4h", "1d"],
                     help="validate a specific timeframe lane (2 windows of that size; note 1h/1d must be probe-OK)")
+    ap.add_argument("--allow-prod-delete", action="store_true",
+                    help="explicit opt-in to delete a prod TF_DATASETS slug (never by accident)")
     args = ap.parse_args()
     # N10: default to an ISOLATED dir so a bare `--wipe --yes` never nukes prod
     # ./data (the old code ignored --data-dir entirely and always wiped ./data).
@@ -295,15 +297,15 @@ def main() -> int:
         print("[1/3] wiping local collected data...")
         wipe_local_data(_data_dir)
         print("[2/3] deleting Kaggle dataset (fresh start)...")
-        _slug = args.dataset or (kaggle_dataset_for(args.timeframe) if args.dataset else _slug_default)
-        if "polymarket-5m-crypto" == _slug.split("/")[-1] and not args.dataset:
-            # prod slug requires explicit --dataset override (never by accident)
-            print(f"[refuse] prod slug {_slug} requires explicit --dataset; using {_slug_default}")
+        _slug = args.dataset or _slug_default
+        # Fail closed: never delete a prod TF_DATASETS slug by accident.
+        # --timeframe only selects the test lane; the delete target is always
+        # _slug (explicit --dataset or isolated -test default). Prod slugs
+        # require BOTH --dataset <prod-slug> AND --allow-prod-delete.
+        if _slug in TF_DATASETS.values() and not args.allow_prod_delete:
+            print(f"[refuse] prod slug {_slug} requires --dataset <slug> + --allow-prod-delete; using {_slug_default}")
             _slug = _slug_default
-        if args.timeframe and args.dataset:
-            delete_kaggle_dataset(kaggle_dataset_for(args.timeframe))
-        else:
-            delete_kaggle_dataset(_slug)
+        delete_kaggle_dataset(_slug)
     else:
         print("[skip] no --wipe given: local data and Kaggle dataset left untouched (C4 safe default)")
     print("[3/3] running 2x5min live test with Kaggle upload...")

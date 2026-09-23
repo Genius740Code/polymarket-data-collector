@@ -1,0 +1,113 @@
+AI DATA-SAFETY AUDIT PROMPT — DELETION / SAVING / STALE / MISSING / DISK (COPY-PASTE TO ANY AI)
+
+GitHub repo: https://github.com/Genius740Code/polymarket-data-collector
+Clone / audit target: git clone https://github.com/Genius740Code/polymarket-data-collector.git
+
+You are a senior Polymarket data engineer + auditor. Audit this repo for DATA-SAFETY bugs only:
+data wrongly deleted, data never saved, stale book data mislabeled, data missing with no gap record,
+and disk-full death spirals (the 2026-09-22 ENOSPC class).
+Read AGENT.md + AGENTS.md first — they override everything. Violating them is worse than any bug.
+
+GOLDEN RULES (fail audit if violated):
+- NEVER delete honest rows. book_state='stale'/'resyncing' rows are truth, NOT bad data.
+- NEVER synthesize: no mock/fake/seeded/interpolated rows, no price==up_bid fallback,
+  no old_best==new_best fake book_events, no invented wallets/hashes/fees.
+- ONLY allowed deletions: 1) corrupt/unreadable parquet -> MOVE to _quarantine/ + log +
+  collector_events coverage_gap row, 2) compaction-consumed files (merged + row-count
+  verified, then delete), 3) export.py:cleanup_local_data AFTER verified Kaggle upload
+  (market-end aware, slowest-lane + per-dataset coverage gates). NEVER age-based delete.
+  Staging (kaggle_staging/) is rebuildable cache — the ONLY thing an emergency path may delete.
+- Gaps must stay gaps: every gap needs book_state='stale'/'resyncing' + resync_episodes
+  with gap_duration_ms + collector_events (ws_disconnected/sequence_gap/coverage_gap/write_failed).
+
+AUDIT CHECKLIST — check ALL, report file:line + quoted evidence:
+
+1. DELETION SAFETY (critical)
+   - grep: os.remove, os.unlink, shutil.rmtree, .unlink(, rm -rf, cleanup_local_data,
+     expire, prune, retention, reap_quarantine, emergency_reclaim
+   - For each hit: hive or derived-cache? Hive deletes must be post-verified-upload,
+     market-end aware, slowest-lane gated, coverage-proofed. Any direct unlink of
+     data/book_snapshots_500ms, data/trades, data/markets_log, data/_wal,
+     data/collector_events, data/resync_episodes -> CRITICAL.
+   - Verify: compaction.py tmp+atomic rename + row-count verify before delete;
+     quarantine.py moves first, never deletes outright; _delete_file in export.py
+     moves to _quarantine/ with fail-closed fallback (keep on failed move).
+   - Verify emergency_reclaim_staging touches ONLY kaggle_staging/ parquets of lanes
+     WITHOUT verified _kaggle_state.json; never hive/_quarantine/state JSON/gap evidence.
+   - Flag any prompt/docs/code still instructing bulk parquet deletion.
+
+2. SAVE PATH — is collected data actually persisted? (critical)
+   - Trace: WS frame -> writer.append -> WAL-before-buffer (parquet_writer.py) ->
+     flush (interval/row-count) -> atomic tmp+rename. Flag any append path that skips WAL.
+   - grep: WAL-failed, DROP bucket, write_failed, close_flush_failed, flush_short,
+     wal_replay_flush_short. Each DROP must be counted + emit collector_events.
+     Silent drops, drops without counters, WAL truncated before flush success -> CRITICAL.
+   - Verify startup WAL replay replays AND flushes AND warns on replay/flush mismatch.
+   - Verify ParquetWriter.close() never reports clean shutdown with rows unflushed.
+
+3. STALE / LIVE LABELING (critical)
+   - Snapshots on 500ms UTC grid floor(unix_ms/500)*500 (book.py). Flag drift/un aligned schedulers.
+   - book_state=='live' ONLY when WS connected for that asset; else 'stale'/'resyncing'.
+     Flag: live-labeled rows during disconnect (check subscribed_once/connection-state bugs).
+   - Null-vs-zero (book.py): empty side = null price AND null size, never 0. Flag violations.
+   - book_crossed rate, L2 sort order, depth aggregates vs own-side best — flag anomalies,
+     but NEVER "fix" by deleting stale rows.
+
+4. MISSING DATA / GAP HONESTY (critical)
+   - High-stale day (>30%) with NO resync_episodes = silent failure -> CRITICAL.
+   - Every resync_episodes row must have gap_duration_ms populated.
+   - Clean-view parity: every (date,asset) in book_snapshots_500ms needs a partition in
+     book_snapshots_clean (rebuild, never delete source).
+   - Chainlink/settlement: unknown is honest; inferred must be flagged fee_is_estimated/
+     inferred_nearest — never invented on-chain tx/price.
+   - book_events: price_change rows with old==new on BOTH bid+ask at >5% = fake generator -> CRITICAL.
+
+5. DISK-FULL RESILIENCE (the 2026-09-22 class — critical)
+   - Slowest-lane deadlock: does ANY emergency path free bytes when a lane never uploads?
+     cleanup_local_data fail-closed on missing lane is CORRECT for hive; verify the
+     emergency path still reclaims staging (rebuildable) so 0-file prunes don't = death.
+   - 0-byte moves: any "prune" that MOVEs within the same filesystem without a bounded
+     reap frees 0B — verify reap is called on the emergency path and capped
+     (quarantine_retention_hours / quarantine_max_bytes).
+   - Throttle vs fill rate: emergency throttle interval vs observed flush growth/30s.
+     A 30-min throttle against MBs/minute fill = deferred death. Verify critical-tier
+     bypass (e.g. free <256MB runs unthrottled).
+   - Growth accounting: lanes × assets × 500ms + clean-view duplicate + per-lane staging
+     copies + quarantine + WAL + logs vs box size. Verify retention_cadence_check math
+     (lanes × upload_interval vs local_retention_hours, 2x headroom) AND that it accounts
+     for build overruns/failures, not just the happy path.
+   - Scope mismatch: free-space check watches the whole filesystem but reclaim only
+     touches data_dir — flag unmonitored external hogs (opencode.db, .venv, /tmp, logs/)
+     with no startup warning or log rotation.
+   - Config vs reality: timeframes list vs comments (5-lane list with 2-lane comment =
+     incident). Retention shorter than a lane's market lifetime (e.g. 4h retention with
+     1d lane) means that lane's files are NEVER prunable — flag.
+   - Restart storms: repeated restarts replaying WAL + rebuilding all lane staging
+     simultaneously while disk is low. Verify backoff / single-lane-at-a-time behavior.
+
+6. ERROR SWALLOWING
+   - grep: `except:` , `except Exception:` + `pass` with no log/event. Each must log +
+     emit collector_events in WS/collect/write paths. Flag silent pass (was 323 sites).
+
+HOW TO RUN (do this):
+1. `ls` root; read AGENT.md, config/collector.yaml (timeframes vs retention comments), pyproject.toml
+2. `grep -rn "os.remove\|os.unlink\|shutil.rmtree\|\.unlink(\|cleanup_local_data\|reap_quarantine\|emergency_reclaim" src/ --include='*.py'`
+3. `grep -rn "DROP bucket\|WAL-failed\|write_failed\|except.*pass" src/ --include='*.py' | head -50`
+4. `grep -rn "synthetic\|synth-\|synthetic_mode\|old.*==.*new\|interpolat" src/ --include='*.py'`
+5. `pytest tests/test_quarantine_reap.py tests/test_kaggle_upload_recovery.py tests/test_multi_timeframe.py tests/test_kaggle_data_loss.py -q`
+6. Check logs/: last LOW DISK free-byte trend, `emergency prune done: 0 files` streaks,
+   `has no verified upload` lanes, `worker failed — keeping prior staging` streaks.
+
+OUTPUT FORMAT (strict):
+- Table: | Severity CRITICAL/HIGH/MEDIUM/LOW | File:Line | Category [deletion/save/stale/missing/disk/error] | Evidence (quote) | Why it violates AGENT.md §X | Fix (concrete patch) |
+- End with: PASS/FAIL vs Real-Data-Only policy + top 5 fixes in order + exact re-run commands.
+- Fail-closed: any CRITICAL (unguarded hive delete, silent drop, live-during-disconnect,
+  stale-with-no-episodes, fake book_events, 0-byte emergency reclaim, throttle-deferred
+  death) = overall FAIL. Never auto-delete, auto-commit, or auto-push. Propose diffs only.
+
+CONSTRAINTS:
+- Read-only audit unless user explicitly says FIX. Do not delete data/, do not git
+  add/commit/push, do not change git config.
+- If asked to fix: quarantine-only deletes, staging-only emergency reclaim, compaction for
+  fragmentation, rebuild for missing clean partitions, one regression test per fix,
+  full suite green before done.

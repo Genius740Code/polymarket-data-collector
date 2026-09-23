@@ -116,6 +116,18 @@ def main() -> None:
         finally:
             await collector.stop()
             print("[weather] stopped — buffers flushed, cursor persisted")
+            try:
+                import datetime as _dt_s
+                from pathlib import Path as _P_s
+                _cf = _P_s.cwd() / "logs" / "crash-forensics.log"
+                try:
+                    _cf.parent.mkdir(parents=True, exist_ok=True)
+                    with open(_cf, "a", encoding="utf-8") as _fh:
+                        _fh.write(f"{_dt_s.datetime.now(tz=_dt_s.timezone.utc).isoformat()} stopped-clean mode={mode}\n")
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     try:
         asyncio.run(run())
