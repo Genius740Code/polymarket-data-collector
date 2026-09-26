@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -198,6 +199,18 @@ class ParquetWriter:
         # a loss window (crash between replay-truncate and flush lost the rows
         # the WAL existed to protect).
         self._replay_dirty: list = []
+        # 2026-09-25 data-safety audit (CRITICAL fix): WAL files that were
+        # PARTIALLY replayed (backpressure leftover lines). The old code
+        # rewrote them to pending-only lines IMMEDIATELY at replay time —
+        # dropping every already-replayed-but-unflushed row from the WAL, so
+        # a crash/restart between replay and the first successful flush lost
+        # those rows forever (PM2 restart storms under ENOSPC make that
+        # window probable; observed 2026-09-24 11:26 WAL-failed DROP streak).
+        # Now the full file is kept until the first successful flush persists
+        # the replayed rows; only then is it atomically rewritten to the
+        # pending-only remainder (see flush()). pending rows were never
+        # buffered, so they always survive in the WAL.
+        self._replay_pending: Dict[str, list] = {}
         # Re-entrancy guard (audit 2026-09-21 HIGH): on_event routes
         # writer -> markets_log.append_event -> writer.append. Emitting a
         # backpressure/write_failed event while already inside an emission
@@ -207,6 +220,9 @@ class ParquetWriter:
         self._nested_event_dropped = 0
         # Throttle for threshold-flush failure events (one per 60s max).
         self._flush_fail_event_ts = 0.0
+        # Throttle for WAL-spill failure events in the backpressure path
+        # (2026-09-25 audit: the drop was counted but never evented).
+        self._spill_fail_event_ts = 0.0
 
     def _emit_event(self, event_type, details: dict) -> None:
         """on_event choke point: re-entrancy safe, never raises."""
@@ -366,7 +382,7 @@ class ParquetWriter:
                     # Dedup key already reserved, so WAL contains exactly one copy
                     try:
                         self._wal_append(dataset, row, asset, date_str)
-                    except Exception:
+                    except Exception as _spill_e:
                         # WAL failed: remove reserved dedup key so retry can succeed after WAL recovers
                         if dedup_key is not None:
                             try:
@@ -374,6 +390,24 @@ class ParquetWriter:
                             except Exception:
                                 pass
                         self._dropped_rows[dataset] = self._dropped_rows.get(dataset, 0) + 1
+                        # 2026-09-25 audit fix: a WAL-spill failure is a
+                        # blocked/possibly-dropped row — the counter alone was
+                        # invisible to the gap trail. Emit a throttled
+                        # write_failed (one per 60s, like threshold-flush
+                        # failures) carrying the running dropped total.
+                        # No try/except here: _emit_event is re-entrancy safe
+                        # and never raises (docstring contract), and the
+                        # throttle clock is infallible — a silent guard would
+                        # add a new bare except (silent-except lint).
+                        _now_sp = time.monotonic()
+                        if _now_sp - self._spill_fail_event_ts > 60.0:
+                            self._spill_fail_event_ts = _now_sp
+                            self._emit_event(CollectorEventType.write_failed, {
+                                "dataset": dataset,
+                                "reason": "wal_spill_failed_append_returned_false",
+                                "error": str(_spill_e)[:200],
+                                "dropped_total": self._dropped_rows.get(dataset, 0),
+                            })
                         return False
                     # CRITICAL fix (audit 2026-09-21): the spilled row must ALSO
                     # sit in _buffer. flush() only persists _buffer and then
@@ -639,11 +673,51 @@ class ParquetWriter:
                 for _p in list(_dirty):
                     try:
                         open(_p, "w").close()
-                    except Exception:
+                    except Exception as _dt_e:
+                        # MEDIUM fix (2026-09-25 audit): keep failed files in
+                        # _replay_dirty (the old blanket .clear() dropped
+                        # them, leaving never-shrinking WAL husks) + log.
+                        print(f"[flush] WARN replay-wal truncate failed {_p}: {_dt_e}")
                         continue
-                _dirty.clear()
-            except Exception:
-                pass
+                    try:
+                        _dirty.remove(_p)
+                    except ValueError as _vr:
+                        # Only reachable if _p was already removed in this
+                        # sweep (unique paths) — the outer handler below logs
+                        # any real failure; log here too so nothing is silent.
+                        print(f"[flush] WARN replay-wal {_p} already removed: {_vr}")
+                        continue
+            except Exception as _dirty_e:
+                print(f"[flush] WARN replay-wal truncate sweep failed: {_dirty_e}")
+        # 2026-09-25 CRITICAL fix companion: the replayed rows are durable in
+        # parquet now — shrink partially-replayed WAL files to their pending
+        # (never-buffered) remainder. Atomic tmp+replace so a crash mid-write
+        # leaves either the full original (rows re-replayed + deduped by the
+        # on-disk scan) or the pending remainder — never a truncated loss.
+        _pend = getattr(self, "_replay_pending", None)
+        if _pend and flushed and not _batch_incomplete:
+            for _pp in list(_pend.keys()):
+                _lines = _pend[_pp]
+                try:
+                    _tmp_pp = _pp + ".pendingtmp"
+                    with open(_tmp_pp, "w", encoding="utf-8") as _pf:
+                        for _pl in _lines:
+                            _pf.write(_pl + "\n")
+                        # No silent guard: an fsync failure must fail the
+                        # whole rewrite — the outer handler keeps the FULL
+                        # original file (replayed rows re-replay + dedupe on
+                        # restart; never a truncated loss) and retries on the
+                        # next successful flush.
+                        _pf.flush()
+                        os.fsync(_pf.fileno())
+                    os.replace(_tmp_pp, _pp)
+                    _pend.pop(_pp, None)
+                except Exception as _pp_e:
+                    # Fail safe: keep the entry AND the full file; retried on
+                    # the next successful flush. Replayed rows are already on
+                    # disk, so a re-replay of the full file only risks
+                    # deduped (tolerated) duplicates, never loss.
+                    print(f"[flush] WARN pending-wal rewrite failed {_pp}: {_pp_e}")
         return flushed
 
     def replay_dead_letters(self, limit: int = 100_000) -> dict:
@@ -685,6 +759,16 @@ class ParquetWriter:
                         break
                     try:
                         _obj = _js_dl.loads(_ln)
+                        if not _obj.get("dataset"):
+                            # 2026-09-25 audit fix: a dead-letter line without
+                            # its dataset would append(dataset=None) and
+                            # materialize a data/None/date=* partition in the
+                            # hive. Skip + count (never silent); the line
+                            # stays in the file for manual review.
+                            _ok = False
+                            _ok_all = False
+                            stats["errors"].append(f"{_fp}: dead-letter line missing dataset — skipped: {str(_ln)[:120]}")
+                            continue
                         _ok = bool(self.append(
                             _obj.get("dataset"),
                             _obj.get("row") or {},
@@ -762,6 +846,24 @@ class ParquetWriter:
                 self._wal_f = None
             except Exception:
                 pass
+        # 2026-09-25 audit fix (husk accumulation): every ParquetWriter
+        # instance leaves an empty wal-<uuid>.jsonl husk behind — throwaway
+        # writers (e.g. export._log_quarantine_gap creates one per reap
+        # batch) grow data/_wal forever. Remove OWN husk when it is provably
+        # empty: WAL-before-buffer means a 0-byte WAL implies every WAL entry
+        # was truncated after a successful flush, i.e. nothing is pending and
+        # no row can be lost. A non-empty WAL (close-flush failed) is kept.
+        # Other processes' files are never touched here.
+        if self.wal_enabled:
+            try:
+                if self._wal_path.exists() and self._wal_path.stat().st_size == 0:
+                    self._wal_path.unlink()
+            except Exception as _husk_e:
+                # contextlib.suppress (not a bare except) guards only the
+                # print call itself — a closed-stdout during shutdown must
+                # not turn husk cleanup into a close() failure.
+                with contextlib.suppress(Exception):
+                    print(f"[parquet_writer] WARN wal husk cleanup failed for {self._wal_path}: {_husk_e}")
 
     # Bound for the on-disk dedup scan below: WAL content always postdates the
     # last successful flush (flush truncates the WAL after every write), so a
@@ -777,6 +879,10 @@ class ParquetWriter:
     # file-open overhead on hives with thousands of uncompacted flush files
     # (seen 2026-09-08: 1354 files / 1.5M rows in 2.5h).
     _REPLAY_SCAN_MAX_FILES_PER_DATASET = 50
+    # 2026-09-25 audit: empty WAL husks older than this are janitored at
+    # replay time (see _wal_replay). 7 days makes an "active" husk
+    # impossible — live writers touch their WAL every flush interval.
+    _WAL_HUSK_MAX_AGE_S = 7 * 86400
 
     # PERF 2026-09-12 (#10): dedup-key columns only for the replay scan.
     # The old path did read_table().to_pylist() on full 120-col snapshot rows
@@ -810,6 +916,30 @@ class ParquetWriter:
         import time as _time
         replayed = 0
         seen_replay_keys: Set[Tuple] = set()  # track keys replayed in this pass
+        # 2026-09-25 audit fix (husk janitor): 0-byte wal-*.jsonl husks are
+        # never removed by anyone — crashed instances leave one per restart
+        # and throwaway writers one per call, so data/_wal grows forever
+        # (85 files on a 2-day-old prod hive). An empty file can hold no
+        # rows, so deleting it cannot lose data. Only files idle for >7 days
+        # are removed: a live writer's active WAL is appended to at ≥2Hz and
+        # truncated at least every flush interval, so its mtime is always
+        # fresh. Nothing but wal-*.jsonl files with st_size==0 is touched.
+        try:
+            _husk_cutoff = _time.time() - self._WAL_HUSK_MAX_AGE_S
+            for _husk in self.wal_dir.glob("wal-*.jsonl"):
+                try:
+                    if _husk.stat().st_size == 0 and _husk.stat().st_mtime < _husk_cutoff:
+                        _husk.unlink()
+                        print(f"[wal-replay] removed 7d+ empty WAL husk {_husk.name}")
+                except FileNotFoundError as _hv:
+                    # File vanished between glob and stat (concurrent janitor)
+                    # — nothing to clean; log so the scan is never silent.
+                    print(f"[wal-replay] husk vanished mid-scan: {_hv.filename}")
+                    continue
+                except Exception as _husk_e:
+                    print(f"[wal-replay] WARN husk cleanup failed for {_husk}: {_husk_e}")
+        except Exception as _husk_sweep_e:
+            print(f"[wal-replay] WARN husk sweep failed: {_husk_sweep_e}")
         # Build set of on-disk dedup keys to avoid re-adding rows already in parquet
         on_disk_keys: Dict[str, Set[Tuple]] = {}
         try:
@@ -1031,12 +1161,20 @@ class ParquetWriter:
                 # C2: retain fully-replayed files until the first successful
                 # post-replay flush() truncates them (see flush()). Truncating
                 # here lost replayed-but-unflushed rows on a second crash.
-                # Only backpressured (unreplayed) lines are rewritten back.
+                # 2026-09-25 CRITICAL fix: the same loss window applied to
+                # PARTIALLY-replayed files — rewriting them to pending-only
+                # here dropped the replayed lines from the WAL while they were
+                # still only in _buffer (memory). A crash before the first
+                # successful flush lost them forever (probable under the
+                # ENOSPC + PM2 restart-storm conditions of 2026-09-24). Keep
+                # the FULL file now; the first successful flush() shrinks it
+                # to the pending remainder once the replayed rows are durable.
                 try:
                     if pending_lines:
-                        with open(wal_path, "w") as out:
-                            for pl in pending_lines:
-                                out.write(pl + "\n")
+                        try:
+                            self._replay_pending[str(wal_path)] = list(pending_lines)
+                        except Exception as _pend_e:
+                            print(f"[wal-replay] WARN could not retain pending lines for {wal_path}: {_pend_e}")
                     elif raw_lines:
                         try:
                             self._replay_dirty.append(str(wal_path))
@@ -1166,6 +1304,32 @@ class ParquetWriter:
                 fh.flush()
             except Exception:
                 pass
+            # 2026-09-25 audit fix (fd↔path rebind): write_text() truncates
+            # via the PATH, not our handle. If another process (or a husk
+            # janitor) replaced/unlinked the file between our appends, the
+            # old fd points at a dead/orphaned inode and every later append
+            # would be invisible — silently breaking crash recovery forever.
+            # Compare inodes; reopen when they diverge so the handle is
+            # always bound to the file the path names.
+            try:
+                _fd_ino = os.fstat(fh.fileno()).st_ino
+                _path_ino = os.stat(str(self._wal_path)).st_ino
+                if _fd_ino != _path_ino:
+                    fh.close()
+                    raise OSError("wal handle rebound to path")
+            except OSError:
+                try:
+                    self._wal_f = open(self._wal_path, "a", encoding="utf-8", buffering=8192)
+                    return
+                except Exception:
+                    self._wal_f = None
+                    return
+            except Exception as _ino_e:
+                # Non-OSError from the inode check (unrealistic — fstat/stat
+                # raise OSError subclasses): log and continue to the seek;
+                # a dead handle is recovered by _wal_append's per-append
+                # fallback, never silently.
+                print(f"[wal-truncate] WARN wal inode check failed: {_ino_e}")
             try:
                 fh.seek(0)
             except Exception:

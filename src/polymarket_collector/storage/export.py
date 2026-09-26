@@ -4615,17 +4615,38 @@ def cleanup_local_data(
             _lanes = []
         if not _lanes:
             _lanes = [tf_label]
+        # Lane -> dataset slug (the key _write_kaggle_state writes). With a
+        # slash-less dataset_prefix the state file lands at the SHARED staging
+        # root and accumulates every lane's entry — taking max() over ALL of
+        # them would let one lane's fresh upload mark every lane verified, so
+        # a lane that never shipped would stop gating the prune (2026-09-11
+        # data-loss class). The shared-root candidate is restricted to THIS
+        # lane's own dataset entry; the per-lane candidate file belongs to
+        # this lane by construction and keeps its max() over all entries.
+        # datasets absent from config => all lanes share dataset_prefix =>
+        # the shared entry IS this lane's upload (filter off, same max()).
+        _lane_ds: dict = {}
+        try:
+            from ..config import CollectorConfig as _CCk
+            _kcfg = _CCk.load().kaggle
+            for _ln in _lanes:
+                _lane_ds[_ln] = (getattr(_kcfg, "datasets", {}) or {}).get(_ln) \
+                    or getattr(_kcfg, "dataset_prefix", None)
+        except Exception:
+            _lane_ds = {}
         _per_lane: dict = {}
         for _lane in _lanes:
             _best = None
-            for cand in (base / "kaggle_staging" / _lane / "_kaggle_state.json",
-                         base / "kaggle_staging" / "_kaggle_state.json"):
+            for _ci, cand in enumerate((base / "kaggle_staging" / _lane / "_kaggle_state.json",
+                         base / "kaggle_staging" / "_kaggle_state.json")):
                 try:
                     if not cand.exists():
                         continue
                     j = _json.loads(cand.read_text())
-                    vals = [v.get("last_upload_unix_ms") for v in j.values()
-                            if isinstance(v, dict) and v.get("last_upload_unix_ms")]
+                    _only_key = _lane_ds.get(_lane) if (_ci == 1 and _lane_ds) else None
+                    vals = [v.get("last_upload_unix_ms") for k, v in j.items()
+                            if isinstance(v, dict) and v.get("last_upload_unix_ms")
+                            and (_only_key is None or k == _only_key)]
                     if vals:
                         _v = max(vals)
                         _best = _v if _best is None else max(_best, _v)
@@ -5087,15 +5108,34 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
                 return stats
         import json as _js
 
+        # Lane -> dataset slug (see cleanup_local_data): the SHARED-root
+        # _kaggle_state.json accumulates every lane's entry when the dataset
+        # slug has no slash — checking ANY entry would mark every lane
+        # verified, so stalled-lane staging was never reclaimed (0-byte
+        # emergency reclaim = deferred death, the 2026-09-22 class). Only
+        # this lane's own dataset entry (or its per-lane state file) proves
+        # the lane verified.
+        _lane_ds: dict = {}
+        try:
+            from ..config import CollectorConfig as _CCv
+            _kcfg = _CCv.load().kaggle
+            for _ln in _lanes:
+                _lane_ds[_ln] = (getattr(_kcfg, "datasets", {}) or {}).get(_ln) \
+                    or getattr(_kcfg, "dataset_prefix", None)
+        except Exception:
+            _lane_ds = {}
+
         def _lane_verified(lane: str) -> bool:
-            for cand in (staging_root / lane / "_kaggle_state.json",
-                         staging_root / "_kaggle_state.json"):
+            for _ci, cand in enumerate((staging_root / lane / "_kaggle_state.json",
+                         staging_root / "_kaggle_state.json")):
                 try:
                     if not cand.exists():
                         continue
                     j = _js.loads(cand.read_text())
-                    vals = [v.get("last_upload_unix_ms") for v in j.values()
-                            if isinstance(v, dict) and v.get("last_upload_unix_ms")]
+                    _only_key = _lane_ds.get(lane) if (_ci == 1 and _lane_ds) else None
+                    vals = [v.get("last_upload_unix_ms") for k, v in j.items()
+                            if isinstance(v, dict) and v.get("last_upload_unix_ms")
+                            and (_only_key is None or k == _only_key)]
                     if vals:
                         return True
                 except Exception as _lv_e:

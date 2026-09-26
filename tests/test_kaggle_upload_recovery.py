@@ -376,3 +376,92 @@ def test_write_kaggle_state_records_build_start(tmp_path):
     st = _js.loads((tmp_path / "kaggle_staging" / "5m" / "_kaggle_state.json").read_text())
     assert st["gghgg1/ds"]["build_start_unix_ms"] == 123456789
     assert st["gghgg1/ds"]["last_upload_unix_ms"] is not None
+
+
+def _fake_cfg(monkeypatch, datasets):
+    """Hermetic config: lanes 5m+15m with an explicit lane->dataset map."""
+    import polymarket_collector.config as _CFG
+
+    _fake = type("C", (), {
+        "kaggle": type("K", (), {
+            "rolling_window": True, "local_retention_hours": 48,
+            "datasets": datasets,
+        })(),
+        "timeframes": ["5m", "15m"],
+    })()
+    monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))
+
+
+def test_shared_root_state_does_not_gate_other_lanes(tmp_path, monkeypatch):
+    """2026-09-25 audit (latent): with a slash-less dataset_prefix the upload
+    state file lands at the SHARED staging root and accumulates every lane's
+    entry. cleanup_local_data took max() over ALL entries for EVERY lane, so
+    one lane's fresh upload marked every lane verified and a lane that never
+    shipped stopped gating the prune (2026-09-11 data-loss class). The
+    shared-root candidate must count only this lane's own dataset entry."""
+    import os as _os
+    import json as _js
+    import time as _t
+
+    import polymarket_collector.storage.export as _E
+
+    _fake_cfg(monkeypatch, {"5m": "gghgg1/polymarket-5m-crypto",
+                            "15m": "gghgg1/polymarket-15m-crypto"})
+    now_ms = int(_t.time() * 1000)
+    base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
+    _os.utime(f_old, (now_ms / 1000 - 13 * 86400,) * 2)
+    _os.utime(f_mid, (now_ms / 1000 - 13 * 86400,) * 2)
+    _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    # SHARED-root state (slash-less-slug layout): ONLY the 5m dataset uploaded.
+    sp = base / "kaggle_staging" / "_kaggle_state.json"
+    sp.write_text(_js.dumps(
+        {"gghgg1/polymarket-5m-crypto": {"last_upload_unix_ms": now_ms}}))
+    stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
+    # 15m has no verified upload of its OWN dataset -> fail closed, nothing prunes.
+    assert f_old.exists() and f_mid.exists(), \
+        f"shared-root entry for 5m must not verify 15m: {stats}"
+
+    # 15m's own dataset uploaded -> its entry gates normally and the prune bites.
+    sp.write_text(_js.dumps({
+        "gghgg1/polymarket-5m-crypto": {"last_upload_unix_ms": now_ms},
+        "gghgg1/polymarket-15m-crypto": {"last_upload_unix_ms": now_ms},
+    }))
+    stats2 = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
+    assert not f_old.exists() and not f_mid.exists(), \
+        f"both lanes verified their own dataset -> prune proceeds: {stats2}"
+
+
+def test_emergency_reclaim_reclaims_only_unverified_lanes(tmp_path, monkeypatch):
+    """2026-09-25 audit: _lane_verified() checked the SHARED _kaggle_state.json
+    for ANY lane's entry — one lane's verified upload marked every lane
+    verified, so stalled-lane staging was never reclaimed (0-byte emergency
+    reclaim = deferred death, the 2026-09-22 class). The shared-root candidate
+    must count only this lane's own dataset entry; state JSON and verified
+    lanes' staging are never touched."""
+    import json as _js
+    import time as _t
+
+    from polymarket_collector.storage.export import emergency_reclaim_staging
+
+    _fake_cfg(monkeypatch, {"5m": "gghgg1/polymarket-5m-crypto",
+                            "15m": "gghgg1/polymarket-15m-crypto"})
+    now_ms = int(_t.time() * 1000)
+    base = tmp_path / "data"
+    staging_root = base / "kaggle_staging"
+    staging_root.mkdir(parents=True)
+    # 5m verified via the shared root (own dataset entry); 15m stalled (no state).
+    (staging_root / "_kaggle_state.json").write_text(_js.dumps(
+        {"gghgg1/polymarket-5m-crypto": {"last_upload_unix_ms": now_ms}}))
+    for lane in ("5m", "15m"):
+        p = staging_root / lane / "gghgg1" / "BTC_book_snapshots_500ms.parquet"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+    stats = emergency_reclaim_staging(str(base))
+    assert stats["files_deleted"] == 1, stats
+    assert stats["lanes_reclaimed"] == ["15m"], stats
+    assert (staging_root / "5m" / "gghgg1" / "BTC_book_snapshots_500ms.parquet").exists(), \
+        "verified lane's staging (its coverage proof) must be kept"
+    assert not (staging_root / "15m" / "gghgg1" / "BTC_book_snapshots_500ms.parquet").exists(), \
+        "stalled lane's rebuildable staging must be reclaimed"
+    assert (staging_root / "_kaggle_state.json").exists(), "state JSON never touched"
