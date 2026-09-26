@@ -376,3 +376,36 @@ def test_write_kaggle_state_records_build_start(tmp_path):
     st = _js.loads((tmp_path / "kaggle_staging" / "5m" / "_kaggle_state.json").read_text())
     assert st["gghgg1/ds"]["build_start_unix_ms"] == 123456789
     assert st["gghgg1/ds"]["last_upload_unix_ms"] is not None
+
+
+def test_emergency_reclaim_sweeps_orphan_lanes(tmp_path):
+    """2026-09-24 crash fix: emergency_reclaim_staging only visited configured
+    lanes, so 15m/4h staging orphaned by the 4->2 lane cut was never reclaimed
+    while ENOSPC approached. Orphan lane dirs (no checkpoint) must be swept;
+    lanes WITH a verified checkpoint must be kept; the hive must be untouched."""
+    from polymarket_collector.storage.export import emergency_reclaim_staging
+
+    base = tmp_path / "data"
+    # verified lane: staging + checkpoint -> kept
+    keep_dir = base / "kaggle_staging" / "5m"
+    keep_dir.mkdir(parents=True)
+    keep_f = keep_dir / "x.parquet"
+    pq.write_table(pa.table({"a": [1]}), str(keep_f))
+    _write_lane_state(base, "5m", 1_700_000_000_000)
+    # orphan lane (decommissioned, no checkpoint) -> reclaimed
+    orph_dir = base / "kaggle_staging" / "15m"
+    orph_dir.mkdir(parents=True)
+    orph_f = orph_dir / "y.parquet"
+    pq.write_table(pa.table({"a": [1]}), str(orph_f))
+    # live hive file -> never touched
+    hive_dir = base / "book_snapshots_500ms" / "date=x" / "asset=BTC"
+    hive_dir.mkdir(parents=True)
+    hive_f = hive_dir / "h.parquet"
+    pq.write_table(pa.table({"a": [1]}), str(hive_f))
+
+    stats = emergency_reclaim_staging(base)
+    assert not orph_f.exists(), "orphan staging must be reclaimed"
+    assert keep_f.exists(), "verified-lane staging must be kept"
+    assert hive_f.exists(), "hive must never be touched"
+    assert stats["files_deleted"] >= 1
+    assert "15m" in stats.get("lanes_reclaimed", [])

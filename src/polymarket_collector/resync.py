@@ -77,7 +77,13 @@ class ResyncManager:
     # Hard cap per replay buffer. Overflow drops the OLDEST buffered deltas and
     # counts them (honest accounting) — the REST snapshot supplies the base book,
     # so replay correctness is preserved for the retained tail.
-    MAX_BUFFERED_MSGS_PER_EPISODE = 50_000
+    # 2026-09-24 11:20 triage: 50k->5k. Under WS churn (150s recycles x7 assets
+    # + thrashed-box slow heals), concurrent episodes buffered the full firehose
+    # for minutes each; ~100MB/min RSS growth with bounded writer buf/ntasks
+    # points here (500 eps x 50k multi-KB msgs = GBs worst case). Overflow path
+    # already counts + emits book_anomaly, so the tighter bound only converts
+    # would-be-OOM into honest, counted drops. Revisit after RSS is flat.
+    MAX_BUFFERED_MSGS_PER_EPISODE = 5_000
     # C4 (audit 2026-09-16): max age of an episode's replay buffer. A resync
     # that never completes (expired-window 404 loop) kept every live WS
     # message feeding a dead deque for hours — 1.36M drops in one XRP
@@ -121,6 +127,30 @@ class ResyncManager:
         # book stays honestly stale with terminal backoff instead of hot churn.
         self._fetch_none_streak: Dict[str, int] = {}
         self._fetch_none_quiet_until: Dict[str, float] = {}
+        # 2026-09-25 stale-epidemic fix: per-asset newest LIVE buffer id.
+        # newest_open_buffer_id() runs on EVERY WS message; the old
+        # reversed(list(_episodes.keys())) scan allocated an O(N) list per
+        # message and, once the asset's buffers were all retired (books stale
+        # past the 300s buffer deadline), walked ALL of _episodes (~2.3k open
+        # in prod, 22.7k minted in 3.1h) per message — the event loop
+        # starved, the 500ms scheduler fell 30-90s behind, and every live
+        # snapshot row was honestly-but-misleadingly downgraded to stale by
+        # the catch-up rule while the CLOB killed sockets with 1013 "slow
+        # consumer". The cache is set at mint (the only episode-creation
+        # point) and revalidated by buffer_live() per message; any
+        # retirement/reap/completion/supersede/escalation flips buffer_live()
+        # and the scan fallback refreshes it, so the returned id is always
+        # identical to the scan's.
+        self._newest_buf_by_asset: Dict[str, str] = {}
+        # Stale-healing fix (2026-09-26): optional market-status resolver,
+        # wired by the collector to its live markets registry:
+        #   resolver(condition_id) -> (market_end_ts_ms|None, status|None)
+        #   or None when the condition is unknown to discovery.
+        # Lets resync() refuse dead markets up front (their REST 404s
+        # forever — prod 2026-09-26: 77% of attempted conditions ended, 648
+        # unknown) instead of burning a full escalation per ghost per walk.
+        # None = standalone/test use: every market is treated as open.
+        self.market_status_resolver = None
 
     def _safe_persist(self, payload: dict, where: str) -> None:
         """Persist an episode via on_episode_persist with loud failure accounting.
@@ -185,6 +215,34 @@ class ResyncManager:
         except Exception:
             pass
 
+    def market_ended(self, condition_id: str):
+        """True if the condition's window ended, False if open, None if unknown.
+
+        Stale-healing fix (2026-09-26): consults market_status_resolver when
+        wired (collector's live registry). None resolver or unknown condition
+        returns None — discovery may lag, so unknown markets always proceed.
+        """
+        try:
+            _resolver = getattr(self, "market_status_resolver", None)
+            if not callable(_resolver):
+                return None
+            _mstat = _resolver(condition_id)
+            if _mstat is None:
+                return None
+            try:
+                _end_ms, _status = _mstat
+            except Exception:
+                return None
+            if _end_ms is None:
+                return None
+            try:
+                import time as _t_mod
+                return int(_end_ms) < int(_t_mod.time() * 1000)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def _buffer_age_limit_s(self) -> float:
         try:
             base = float(getattr(getattr(self.config, "ws", self.config), "max_resync_duration_seconds", 60))
@@ -216,14 +274,37 @@ class ResyncManager:
         episode — a zombie from the first recycle whose buffer was retired —
         so buffer-and-replay never worked after the first recycle. Newest
         first; never a retired/escalated/completed buffer.
+
+        2026-09-25 fix: this runs per WS MESSAGE, and the O(N) list alloc +
+        scan (N = all open episodes, thousands under episode churn) starved
+        the event loop (see _newest_buf_by_asset). Fast path: the cached id
+        for the asset, revalidated with the exact same gates as the scan.
+        The cache is refreshed at mint (handle_disconnect) and by the scan
+        fallback, so it can never return anything the scan would not.
         """
         try:
+            au = str(asset_upper).upper()
+        except Exception:
+            return ""
+        try:
             if not self._episodes or not self._buffers:
+                self._newest_buf_by_asset.pop(au, None)
                 return ""
+            cached = self._newest_buf_by_asset.get(au, "")
+            if cached:
+                try:
+                    ep = self._episodes.get(cached)
+                    if (ep is not None and ep.asset == au
+                            and ep.resync_completed_ts_utc is None
+                            and cached in self._buffers
+                            and self.buffer_live(cached)):
+                        return cached
+                except Exception:
+                    _cache_validate_note = "cache entry failed revalidation; falling through to scan"
             for rid in reversed(list(self._episodes.keys())):
                 try:
                     ep = self._episodes.get(rid)
-                    if ep is None or ep.asset != asset_upper:
+                    if ep is None or ep.asset != au:
                         continue
                     if ep.resync_completed_ts_utc is not None:
                         continue
@@ -231,12 +312,86 @@ class ResyncManager:
                         continue
                     if not self.buffer_live(rid):
                         continue
+                    try:
+                        self._newest_buf_by_asset[au] = rid
+                    except Exception:
+                        _cache_store_note = "cache store failed; scan remains source of truth"
                     return rid
                 except Exception:
                     continue
+            self._newest_buf_by_asset.pop(au, None)
+            return ""
         except Exception:
-            pass
-        return ""
+            return ""
+
+    def reap_expired_buffers(self) -> int:
+        """Actively retire replay buffers past their age deadline (leak hunt 2026-09-25).
+
+        The lazy retirement in buffer_message() only fires when ANOTHER message
+        arrives for the same episode — but the dominant leak shape is a feed
+        that went quiet (window rolled while the book was stale): no further
+        buffer_message() call ever comes, the deadline passes unobserved, and
+        the deque (up to MAX_BUFFERED_MSGS_PER_EPISODE parsed WS frames; a
+        full-ladder `book` frame is multi-KB) stays pinned in RAM forever.
+        The episode can never reach a final state in that shape — resync() is
+        only driven from the reconnect path, and close_healed_episodes only
+        closes episodes whose book went live — so neither the escalation pop
+        nor the finished-episode FIFO eviction applies. Measured prod
+        2026-09-25 (fresh reseed, 2.9h): 1494/2538 episodes never-final with
+        ZERO resync attempts, each pinning its buffer (20-min 7-asset repro:
+        tracemalloc 36.9MB / 518k retained orjson dicts at the loads() site,
+        RSS ~22MB/min). Same contract as the lazy path: retired once, one
+        honest resync_buffer_retired event, buffer + deadline popped, never
+        replayed (buffer_live() gates on _buffer_retired).
+        """
+        now = time.monotonic()
+        reaped = 0
+        errs: list = []
+        retired_events: list = []
+        for rid in list(self._buffers.keys()):
+            try:
+                ep = self._episodes.get(rid)
+                if rid in self._escalated or (ep is not None and ep.resync_completed_ts_utc is not None):
+                    # Dead episode: drop any leftover buffer the state
+                    # transitions missed (same pops the escalation/completion
+                    # paths already do).
+                    self._buffers.pop(rid, None)
+                    self._buffer_deadline.pop(rid, None)
+                    reaped += 1
+                    continue
+                dl = self._buffer_deadline.get(rid)
+                if dl is None or now <= dl:
+                    continue  # still live — nothing to do
+                if rid not in self._buffer_retired and rid in self._episodes:
+                    self._buffer_retired.add(rid)
+                    retired_events.append((rid, ep))
+                # RAM cleanup happens BEFORE the event so an on_event failure
+                # can never skip freeing the buffer.
+                self._buffers.pop(rid, None)
+                self._buffer_deadline.pop(rid, None)
+                reaped += 1
+            except Exception as e:
+                errs.append((rid, e))
+                continue
+        for rid, ep in retired_events:
+            # One honest book_anomaly per retired buffer — the same event the
+            # lazy path emits (buffer_message). A failure here is counted
+            # loudly, never silent, and never fails the whole sweep.
+            try:
+                if self.on_event:
+                    self.on_event(CollectorEventType.book_anomaly, {
+                        "resync_id": rid,
+                        "asset": ep.asset if ep is not None else None,
+                        "reason": "resync_buffer_retired",
+                        "dropped_total": self._buffer_dropped_total.get(rid, 0),
+                        "cap": self.MAX_BUFFERED_MSGS_PER_EPISODE,
+                    })
+            except Exception as e:
+                errs.append((rid, e))
+        if errs:
+            print(f"[resync] reap_expired_buffers: {len(errs)} error(s), "
+                  f"buffers left in place (last: {errs[-1][1]!r})")
+        return reaped
 
     def close_healed_episodes(self, books: Dict[str, OrderBookState]) -> int:
         """Close open episodes whose books are live again (audit 2026-09-21 HIGH).
@@ -299,6 +454,47 @@ class ResyncManager:
                 continue
         return closed
 
+    def supersede_ended_market_episodes(self, books: Dict[str, OrderBookState]) -> int:
+        """Supersede open episodes whose book's market window has ended (2026-09-25).
+
+        The stale-epidemic tail: books of markets that ended <6h ago stay in
+        RAM (books=777 measured in prod), their episodes mint per recycle /
+        book_stalled and can never reach a final state — REST resync of an
+        ended condition 404s forever, close_healed_episodes only closes
+        books-live episodes, and the 6h memory eviction is the only exit
+        (prod 2026-09-25: 29,678 never-final episodes in one day, 29,678 with
+        ZERO resync attempts; supersede_episode had no callers at all).
+        Each open episode also pins its replay buffer and keeps
+        newest_open_buffer_id routing live WS messages into a dead deque.
+
+        The sweep closes such an episode once via supersede_episode (honest
+        resync_failed with superseded=True + persisted, buffer freed). Books
+        whose window is still open or unknown are left to the normal paths.
+        Returns episodes superseded.
+        """
+        superseded = 0
+        try:
+            now_ms = int(time.time() * 1000)
+        except Exception:
+            return 0
+        for rid, ep in list(self._episodes.items()):
+            try:
+                if self.is_finished(rid):
+                    continue
+                if ep.condition_id is None:
+                    continue  # asset-wide episode: closed by close_healed_episodes
+                book = books.get(ep.condition_id)
+                if book is None:
+                    continue  # book evicted: the 6h memory tick owns it
+                end_ms = getattr(book, "market_end_ts_ms", None)
+                if end_ms is None or end_ms >= now_ms:
+                    continue  # window open or unknown — normal healing applies
+                if self.supersede_episode(rid, "market_window_ended_sweep"):
+                    superseded += 1
+            except Exception:
+                continue
+        return superseded
+
     def is_finished(self, resync_id: str) -> bool:
         ep = self._episodes.get(resync_id)
         if ep is None:
@@ -356,6 +552,14 @@ class ResyncManager:
         self._episodes[resync_id] = ep
         self._buffers[resync_id] = deque()
         self._buffer_deadline[resync_id] = time.monotonic() + self._buffer_age_limit_s()
+        # 2026-09-25: mint is the only episode-creation point — a fresh
+        # buffer is by definition the newest live one for the asset, so the
+        # per-message routing cache (newest_open_buffer_id) can serve O(1)
+        # until this buffer retires/reaps/completes and the scan refreshes.
+        try:
+            self._newest_buf_by_asset[ep.asset] = resync_id
+        except Exception:
+            _mint_cache_note = "cache store failed at mint; scan covers"
         self._evict_finished_episodes()  # after insert: guarantees len(_episodes) <= cap
         # mark each affected book
         for key, book in books.items():
@@ -479,6 +683,17 @@ class ResyncManager:
         if self.fetch_none_quiet(condition_id):
             return False
 
+        # Stale-healing fix (2026-09-26): a market whose window already ended
+        # never reaches the retry loop — its REST 404s forever and each drive
+        # burns up to max_duration. Supersede immediately (honest final
+        # state, zero attempts) so live books behind it still get driven.
+        try:
+            if self.market_ended(condition_id) is True:
+                self.supersede_episode(resync_id, "market_window_ended_resync_precheck")
+                return False
+        except Exception:
+            _precheck_note = "resolver failed; proceeding with normal resync"
+
         # mark resyncing
         # PERF: single targets list (was 4 full books.values() scans + BxM nest).
         # Same set/order (dict order), same mark_live/on_book_state_change sequence.
@@ -600,6 +815,17 @@ class ResyncManager:
                                       "replay": "replay_err"}.get(phase, "unknown")
                     attempt_error = f"{type(e).__name__}: {e}"[:200]
                 last_fail_branch, last_fail_error = attempt_branch, attempt_error
+                # Stale-healing fix (2026-09-26): an ended market must not ride
+                # out the backoff/escalation burn after a fetch_none — abandon
+                # immediately (honest final state). Unknown markets keep the
+                # normal retry path (discovery may lag).
+                if attempt_branch == "fetch_none":
+                    try:
+                        if self.market_ended(condition_id) is True:
+                            self.supersede_episode(resync_id, "market_window_ended_fetch_none")
+                            return False
+                    except Exception:
+                        _abandon_note = "resolver failed; continuing normal retry"
                 print(f"[resync] attempt {ep.resync_attempt_count} {asset} {condition_id} "
                       f"failed at {attempt_branch}: {attempt_error}")
                 # persist attempt state for honest episode bookkeeping

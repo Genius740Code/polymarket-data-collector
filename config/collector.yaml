@@ -161,10 +161,20 @@ timeframes:
   # retention headroom to match (guard must print nothing) AND after each
   # lane verifies its first upload (prune stays fail-closed otherwise).
   # 2026-09-23: user-ordered fresh reseed (data/ deleted), all 4 lanes enabled (28 lanes).
+  # 2026-09-24 crash fix: back to the proven 5m+1h pair (14 lanes). The 4-lane
+  # round-robin never completed an upload for 15m/1h/4h (every tick cancelled
+  # by the next restart), so no verified checkpoint existed, the slowest-lane
+  # gate fail-closed every prune to 0 files, disk filled to ENOSPC, and RSS
+  # hit 1.9GB -> PM2 max-memory-restart kill + stale heartbeat. Re-add lanes
+  # only after each lane verifies its first upload AND retention-guard is silent.
+  # 2026-09-25: user-ordered fresh reseed on 100G data disk — all 5 lanes
+  # (5m+15m+1h+4h+1d, 35 lanes). Disk headroom no longer the constraint;
+  # watch RSS/leak + per-lane first verified upload instead.
   - 5m
   - 15m
   - 1h
   - 4h
+  - 1d
 
 ws:
   full_book_diff_interval_seconds: 300

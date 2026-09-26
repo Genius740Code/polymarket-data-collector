@@ -177,16 +177,21 @@ def test_ended_market_episode_eviction_prunes_ram(tmp_path):
 
 def test_ended_market_episode_NOT_evicted_when_unpersisted(tmp_path):
     """An episode not yet persisted to parquet must survive eviction — never
-    drop data (AGENT.md)."""
+    drop data (AGENT.md). Since the 2026-09-25 leak fix, 'persisted' means
+    '>=1 transition row landed in parquet' (marked on the FIRST successful
+    append), so the honest way to simulate an unwritten episode is a writer
+    that refuses every append."""
     cfg = CollectorConfig(assets=["BTC"],
                           storage={"data_dir": str(tmp_path)},
                           cursor_store={"path": str(tmp_path / "cursor_state")},
                           timeframes=["5m"])
     c = Collector(cfg)
+    c.writer.append = lambda *a, **k: False  # every transition append fails
     rid = c.resync.handle_disconnect("BTC", "cid-old2", "test", {})
     c.resync.buffer_message(rid, {"m": 1})
     c._episode_latest[rid] = {"resync_id": rid, "condition_id": "cid-old2"}
-    # NOT added to _episode_persisted
+    # NOT in _episode_persisted — no append ever succeeded
+    assert rid not in c._episode_persisted
 
     class FakeMarket:
         asset = "BTC"
@@ -199,7 +204,7 @@ def test_ended_market_episode_NOT_evicted_when_unpersisted(tmp_path):
     c.markets["cid-old2"] = FakeMarket()
 
     c._memory_eviction_tick(int(time.time() * 1000))
-    # market RAM evicted, but the unpersisted episode survives for stop() to write
+    # market RAM evicted, but the unwritten episode survives for stop() to write
     assert "cid-old2" not in c.markets
     assert rid in c.resync._episodes
     assert rid in c._episode_latest

@@ -78,7 +78,14 @@ module.exports = {
       // must intervene; ticks are fail-closed and resume next cycle.
       // TODO: memory leak — collector RSS grows ~200-400MB per snapshot tick;
       // raised cap to 1800M to postpone OOM while leak is investigated.
-      max_memory_restart: '1800M',
+      // 2026-09-24 11:10 triage: 1800M->2100M TEMPORARY. PM2 SIGINT-cycles at
+      // ~18min age, cancelling every 5m export (needs ~12min from tick) so no
+      // upload ever verifies and prune stays fail-closed -> certain ENOSPC
+      // death. +300M buys the export time to land ONE checkpoint; then prune
+      // frees GBs and the cap goes back. Total pressure ~3.5GB vs 3.8GB RAM +
+      // 3GB free swap; kernel OOM'd at higher pressure on 09-11. If the kernel
+      // kills instead, WAL replay recovers (proven). REVERT after leak fix.
+      max_memory_restart: '2100M',
       restart_delay: 1000,
       exp_backoff_restart_delay: 100,
       kill_timeout: 120000,          // SIGINT → give collector time to flush + persist cursor (§1B)

@@ -350,6 +350,13 @@ class OrderBookState:
         self.down = OutcomeBook()
         self.book_state: BookState = BookState.live
         self.resync_id: Optional[str] = None
+        # Stale-healing fix (2026-09-26): RAM-only birth clock so orphan
+        # sweeps can tell a fresh book (discovery may lag minutes) from a
+        # dead one (no market record for hours). Never written to parquet.
+        try:
+            self.created_ms: int = int(time.time() * 1000)
+        except Exception:
+            self.created_ms: int = 0
         self._last_update_ns: Optional[int] = None
         self._up_book_age_ms: Optional[int] = None
         self._down_book_age_ms: Optional[int] = None

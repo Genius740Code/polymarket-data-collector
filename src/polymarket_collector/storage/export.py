@@ -5080,11 +5080,22 @@ def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> di
             _lanes = [str(t).lower() for t in (_CCs.load().timeframes or [])]
         except Exception:
             _lanes = []
+        # 2026-09-24 crash fix: also sweep lane dirs present on disk but no
+        # longer configured (e.g. 15m/4h staging orphaned by the 4->2 lane
+        # cut). Previously only configured lanes were visited, so orphaned
+        # staging was never reclaimed while ENOSPC approached. Orphan lanes
+        # have no _kaggle_state.json checkpoint, so _lane_verified() is False
+        # and their rebuildable staging is reclaimed below. Never touches the
+        # hive, quarantine, state JSON, or gap evidence. Logs (never silent —
+        # silent-except lint, audit §7) when the sweep itself fails.
+        try:
+            for _od in staging_root.iterdir():
+                if _od.is_dir() and _od.name.lower() not in _lanes:
+                    _lanes.append(_od.name.lower())
+        except Exception as _od_e:
+            print(f"[staging-reclaim] WARN orphan-lane sweep failed: {_od_e}")
         if not _lanes:
-            try:
-                _lanes = [p.name.lower() for p in staging_root.iterdir() if p.is_dir()]
-            except Exception:
-                return stats
+            return stats
         import json as _js
 
         def _lane_verified(lane: str) -> bool:

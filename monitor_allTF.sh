@@ -5,13 +5,24 @@
 cd /home/fese/polymarket-data-collector || exit 1
 LOG=logs/monitor-allTF.log
 CFG=config/collector.fast.yaml
-PATTERN="polymarket_collector.cli --config $CFG"
+# 2026-09-24 crash fix: match ANY collector invocation, not just $CFG.
+# pm2 runs config/collector.yaml while this script starts $CFG — the old
+# config-specific pattern missed the pm2 instance and launched a SECOND
+# concurrent writer on the same ./data (double RSS -> OOM-kill 06:46,
+# raced _kaggle_state.json -> 1h never verified -> prune fail-closed).
+# Single-supervisor rule: exactly one collector process per data dir.
+# NOTE: the trailing "--config" excludes polymarket_collector.watchdog.cli
+# (separate watchdog process by design) — otherwise a live watchdog would
+# mask a dead collector and no restart would fire (2026-09-24 fix).
+PATTERN="polymarket_collector.cli --config"
 
 check_once() {
   echo "=== $(date -u +%FT%TZ) ===" >> "$LOG"
-  # 1. process alive? restart if dead (append logs, never overwrite)
+  # 1. process alive? restart if dead (append logs, never overwrite).
+  # 2026-09-24: ONLY restart when NO collector with ANY config is alive
+  # (single-supervisor rule — see PATTERN). Never kill/restart a live one.
   if pgrep -f "$PATTERN" > /dev/null; then
-    echo "collector: ALIVE pid=$(pgrep -f "$PATTERN" | head -n1)" >> "$LOG"
+    echo "collector: ALIVE pid=$(pgrep -f "$PATTERN" | head -n1) cmd=$(pgrep -af "$PATTERN" | head -n1)" >> "$LOG"
   else
     echo "collector: DEAD -> restarting" >> "$LOG"
     setsid nohup .venv/bin/python -m polymarket_collector.cli --config "$CFG" \
@@ -68,7 +79,28 @@ for tbl in ['trades','chainlink_events','book_events','resync_episodes']:
 }
 
 check_once
+# 2026-09-24 crash fix: split liveness (cheap, every 60s) from the heavy
+# full-scan audit (hourly). The old single hourly cadence left the 07:00
+# death undetected for up to an hour (MTTR ~1h). The light check only runs
+# pgrep - no parquet scans, no heartbeat reads.
+light_check() {
+  if pgrep -f "$PATTERN" > /dev/null; then
+    return 0
+  fi
+  echo "=== $(date -u +%FT%TZ) light ===" >> "$LOG"
+  echo "collector: DEAD -> restarting" >> "$LOG"
+  setsid nohup .venv/bin/python -m polymarket_collector.cli --config "$CFG" \
+    >> logs/collector-allTF-out.log 2>> logs/collector-allTF-error.log < /dev/null &
+  echo "collector: restarted pid=$!" >> "$LOG"
+}
+n=0
 while true; do
-  sleep 3600
-  check_once
+  sleep 60
+  n=$((n+1))
+  if [ "$n" -ge 60 ]; then
+    n=0
+    check_once
+  else
+    light_check
+  fi
 done

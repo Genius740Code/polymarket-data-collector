@@ -180,6 +180,10 @@ class Collector:
             on_event=self._collector_event,
             on_episode_persist=self._persist_resync_episode,
         )
+        # Stale-healing fix (2026-09-26): let resync() refuse dead markets up
+        # front via the live markets registry (their REST 404s forever).
+        # Plain attribute set (cannot raise on a live instance).
+        self.resync.market_status_resolver = self._market_status_for_resync
 
         self._running = False
         self._tasks: List[asyncio.Task] = []
@@ -412,13 +416,18 @@ class Collector:
                 episode_dict = dict(episode_dict)
                 episode_dict["condition_id"] = None
             self._episode_latest[rid] = dict(episode_dict)
-            is_final = bool(
-                episode_dict.get("resync_completed_ts_utc") or episode_dict.get("escalated")
-            )
             ok = self.writer.append("resync_episodes", episode_dict, asset=episode_dict.get("asset"))
-            if is_final and ok:
+            if ok:
+                # Leak 2026-09-25: the row IS in parquet from the first
+                # transition on, so mark it persisted NOW — not only when a
+                # final state lands. Never-final episodes (window rolled
+                # while stale; resync() never driven) otherwise evade every
+                # eviction path (the 6h ended-market tick guards on this set)
+                # and _episodes/_episode_latest grow ~500 entries/h forever.
+                # A failed append still discards below, so the "never drop
+                # an unwritten episode" contract is unchanged.
                 self._episode_persisted.add(rid)
-            elif not ok:
+            else:
                 self._episode_persisted.discard(rid)
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
         except Exception:
@@ -878,6 +887,131 @@ class Collector:
             pass
         return None
 
+    def _market_status_for_resync(self, condition_id):
+        """(market_end_ts_ms|None, status|None) for resync dead-market checks.
+
+        Stale-healing fix (2026-09-26): reads the live markets registry.
+        None when the condition is unknown (discovery may lag — callers must
+        treat unknown as open, never as dead).
+        """
+        try:
+            m = self.markets.get(condition_id)
+            if m is None:
+                return None
+            return (getattr(m, "market_end_ts_ms", None), getattr(m, "status", None))
+        except Exception:
+            return None
+
+    async def _reconnect_resync_walk(self, shard_set: set, now_ms: int) -> None:
+        """Attempt REST resync for all stale books of a shard before reconnecting WS.
+
+        Extracted from the shard loop (was inline) so the dead-market skip is
+        testable; same walk order (books dict order) and same break-on-first-
+        success semantics (a resync that heals ends the walk early).
+
+        Stale-epidemic fix (2026-09-25): a book whose market window has
+        ALREADY ended must not be driven through resync() — its REST target
+        404s forever, so every drive burns the full 60-284s escalation (prod
+        2026-09-25: 1,679 escalations, ALL on ended markets, mean 82s each)
+        and the walk never reaches the live-market books behind it — the
+        shard task then spends ~100% of its time in dead-market churn and the
+        WS never reconnects (ETH: zero `connected` events 20:00-23:00 UTC).
+        Supersede the open episode (honest final state, persisted) and move
+        on; the book's rows are time-gated so it ships no snapshots.
+        """
+        stale_books = [b for b in self.books.values() if b.asset.upper() in shard_set and b.book_state.value == "stale"]
+        # Stale-healing fix (2026-09-26): drive current windows FIRST so a
+        # wall of dead books cannot starve live markets (prod: shard spent
+        # ~100% of reconnects in dead-market churn). Orphan books — condition
+        # in no market record (cursor recovery for windows discovery never
+        # returns, ended long ago) — are superseded past a grace window
+        # instead of burning resync escalations forever. Grace protects
+        # fresh books at startup (discovery fills the registry in seconds,
+        # never 30 minutes).
+        _ORPHAN_GRACE_MS = 30 * 60 * 1000
+        _known_cids = set(getattr(self, "markets", None) or {})
+        _rollover = getattr(self, "rollover", None)
+        _am_fn = getattr(_rollover, "active_markets", None) if _rollover is not None else None
+        if callable(_am_fn):
+            for _sa in shard_set:
+                try:
+                    _ml = _am_fn(_sa) or []
+                except Exception:
+                    _ml = []
+                for _am in _ml:
+                    _ac = getattr(_am, "condition_id", None)
+                    if _ac:
+                        _known_cids.add(_ac)
+        def _walk_key(b):
+            try:
+                _e = getattr(b, "market_end_ts_ms", None)
+                if _e is not None:
+                    return (0, -int(_e))
+                return (1, 0)
+            except Exception:
+                _key_fallback = (1, 0)
+                return _key_fallback
+        try:
+            stale_books = sorted(stale_books, key=_walk_key)
+        except Exception:
+            _sort_note = "walk order unchanged (sort failed)"
+        # Pass 1: supersede dead/orphan episodes FIRST so a success-return in
+        # pass 2 can never strand them behind a healed book (their cleanup
+        # must not depend on walk order).
+        for book in stale_books:
+            _dead_rid = None
+            try:
+                _b_end = getattr(book, "market_end_ts_ms", None)
+                if _b_end is not None and _b_end < now_ms:
+                    _dead_rid = self._episode_for_snapshot(book.asset, book.condition_id)
+                elif _b_end is None and book.condition_id not in _known_cids:
+                    try:
+                        _age_ms = now_ms - int(getattr(book, "created_ms", now_ms) or now_ms)
+                    except Exception:
+                        _age_ms = 0
+                    if _age_ms > _ORPHAN_GRACE_MS:
+                        _dead_rid = self._episode_for_snapshot(book.asset, book.condition_id)
+            except Exception:
+                _dead_rid = None
+            if _dead_rid is not None:
+                try:
+                    self.resync.supersede_episode(
+                        _dead_rid, "market_window_ended_reconnect"
+                        if getattr(book, "market_end_ts_ms", None) is not None
+                        else "orphan_book_no_market_record")
+                except Exception:
+                    _supersede_note = "supersede failed loudly upstream"
+        for book in stale_books:
+            try:
+                _b_end = getattr(book, "market_end_ts_ms", None)
+                if _b_end is not None and _b_end < now_ms:
+                    continue  # superseded in pass 1
+                if _b_end is None and book.condition_id not in _known_cids:
+                    try:
+                        _age_ms = now_ms - int(getattr(book, "created_ms", now_ms) or now_ms)
+                    except Exception:
+                        _age_ms = 0
+                    if _age_ms > _ORPHAN_GRACE_MS:
+                        continue  # superseded in pass 1
+                # Find-or-create (audit 2026-09-21 CRITICAL): the old
+                # `ep_id = resync_id` fallback reused an unrelated (or
+                # unbound → NameError, swallowed below) replay-buffer
+                # id, so the resync never ran and the book stayed stale
+                # indefinitely. The helper prefers the open episode and
+                # honestly creates one when none exists.
+                ep_id = self._ensure_episode_for_stale_book(book, book.asset, "reconnect_resync")
+                # Ensure reconnect timestamp is set before resync
+                try:
+                    if ep_id in self.resync._episodes and self.resync._episodes[ep_id].reconnect_ts_utc is None:
+                        self.resync.handle_reconnect(ep_id)
+                except Exception:
+                    pass
+                res = await self.resync.resync(book.asset, book.condition_id, self.books, ep_id)
+                if res:
+                    return  # resync succeeded for this book
+            except Exception:
+                continue
+
     def _ensure_episode_for_stale_book(self, book, asset: str, reason: str):
         """Find-or-create the resync episode for a stale book (audit 2026-09-21 CRITICAL).
 
@@ -938,6 +1072,15 @@ class Collector:
     async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
         """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
         try:
+            # Stale-healing fix (2026-09-26): never hammer REST for a market
+            # whose window already ended (404s forever, feeds fetch_none
+            # streaks). The walk/supersede paths own ended markets.
+            try:
+                _h_end = getattr(market, "market_end_ts_ms", None)
+                if _h_end is not None and int(_h_end) < int(time.time() * 1000):
+                    return
+            except Exception:
+                _heal_end_note = "uncomparable end ts; proceeding with heal"
             try:
                 if self.resync.fetch_none_quiet(book.condition_id):
                     return
@@ -1185,8 +1328,22 @@ class Collector:
                 _mirror.parent.mkdir(parents=True, exist_ok=True)
                 with open(_mirror, "a", encoding="utf-8") as _fh:
                     _fh.write(json.dumps({"ts_ns": ts_ns, "ts_utc": ts_utc, "data_dir": str(self.config.storage.data_dir)}) + "\n")
-            except Exception:
-                pass
+                self._hb_mirror_failures = 0
+            except Exception as _hm_e:
+                # 2026-09-24 crash fix: never silent. The 07:00 death was
+                # invisible for 6 minutes because mirror appends failed
+                # (ENOSPC) while the heartbeat.json overwrite above kept
+                # succeeding — except:pass hid the divergence. Throttled
+                # warning (heartbeat ticks every ~5s; warn 1st + every 60s).
+                try:
+                    _hm_n = int(getattr(self, "_hb_mirror_failures", 0) or 0) + 1
+                    self._hb_mirror_failures = _hm_n
+                except Exception:
+                    _hm_n = 1
+                if _hm_n == 1 or _hm_n % 12 == 0:
+                    # NOTE: deliberately unguarded print — a stdout failure
+                    # propagates to the outer handler (no NEW silent pass).
+                    print(f"[heartbeat] mirror FAILED x{_hm_n} ({_hm_e}) — disk full?")
         except Exception:
             pass
 
@@ -2543,27 +2700,7 @@ class Collector:
                 await asyncio.sleep(_random.uniform(0.0, 2.0))
             # Attempt REST resync for all stale books before reconnecting WS
             try:
-                stale_books = [b for b in self.books.values() if b.asset.upper() in shard_set and b.book_state.value == "stale"]
-                for book in stale_books:
-                    try:
-                        # Find-or-create (audit 2026-09-21 CRITICAL): the old
-                        # `ep_id = resync_id` fallback reused an unrelated (or
-                        # unbound → NameError, swallowed below) replay-buffer
-                        # id, so the resync never ran and the book stayed stale
-                        # indefinitely. The helper prefers the open episode and
-                        # honestly creates one when none exists.
-                        ep_id = self._ensure_episode_for_stale_book(book, book.asset, "reconnect_resync")
-                        # Ensure reconnect timestamp is set before resync
-                        try:
-                            if ep_id in self.resync._episodes and self.resync._episodes[ep_id].reconnect_ts_utc is None:
-                                self.resync.handle_reconnect(ep_id)
-                        except Exception:
-                            pass
-                        res = await self.resync.resync(book.asset, book.condition_id, self.books, ep_id)
-                        if res:
-                            break  # resync succeeded for this book
-                    except Exception:
-                        pass
+                await self._reconnect_resync_walk(shard_set, int(time.time() * 1000))
             except Exception:
                 pass
             # Drain any buffered messages before reconnect
@@ -3188,7 +3325,16 @@ class Collector:
                     _gc_counts = _gc.get_count()
                 except Exception:
                     _gc_counts = ()
-                print(f"[mem] rss={_rss}MB buf={_buf} ntasks={len(self._tasks)} gc={_gc_counts}", flush=True)
+                # Leak verification (2026-09-25): eps = RAM episodes,
+                # ebuf = parsed WS messages pinned in replay buffers. Before
+                # the expired-buffer reaper, never-final episodes accumulated
+                # ~500/h and ebuf climbed monotonically to the 5k/episode cap.
+                try:
+                    _eps = len(getattr(self, "resync", None)._episodes or {})
+                    _ebuf = sum(len(q) for q in (getattr(self, "resync", None)._buffers or {}).values())
+                except Exception:
+                    _eps = _ebuf = -1
+                print(f"[mem] rss={_rss}MB buf={_buf} ntasks={len(self._tasks)} eps={_eps} ebuf={_ebuf} gc={_gc_counts}", flush=True)
                 continue
             try:
                 import collections as _collections
@@ -3380,6 +3526,13 @@ class Collector:
             print(f"[disk-guard] emergency prune done: {len(res)} files "
                   f"({sum(res.values()) if res else 0} rows)")
             if not res:
+                # 2026-09-24 crash fix: make the stall COUNTABLE. The Sep-24
+                # death printed "prune done: 0 files" for hours in stdout
+                # only — audits scanning collector_events saw nothing until
+                # WAL-failed drops began. Throttled upstream (600s/1800s),
+                # so at most a few rows/hour. _writer_event swallows
+                # internally (pre-existing handler) — no new silent pass here.
+                self._writer_event(CollectorEventType.write_failed, {"dataset": "book_snapshots_500ms", "reason": "emergency_prune_zero_files", "note": "slowest-lane checkpoint stalled; hive prune fail-closed"})
                 # Hive fail-closed (stalled lane) — staging reclaim already ran
                 # inline in _disk_guard_tick, but retry here post-scan: a lane
                 # may have finished uploading since the tick, changing which
@@ -3406,10 +3559,68 @@ class Collector:
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.config.storage.flush_interval_seconds)
+            # HIGH (audit 2026-09-21): episode-lifecycle sweep — close open
+            # episodes whose books already healed via background REST heals or
+            # WS full-book promotion (those paths never reach resync(), so
+            # resync_completed_ts_utc stayed NULL and buffers leaked forever).
+            # Leak 2026-09-25: run BEFORE the kaggle-lock section. An export
+            # tick holds the lock for many minutes (measured 27min on the 1d
+            # lane — trades workers get a 420s Data-API budget each), and the
+            # loop parks at `async with` while it waits: with the sweep/reap
+            # below the lock, prod buffered 25k->332k msgs (+600MB RSS) during
+            # one export and the PM2 memory cap fired mid-export — cancelling
+            # the tick so slow lanes never verify. Episode RAM hygiene must not
+            # wait on the export lock (it never touches the flush/parquet path
+            # guarded by §10A; its _safe_persist appends are as safe as the
+            # WS-path appends that run during exports anyway).
+            try:
+                _closed = self.resync.close_healed_episodes(self.books)
+                if _closed:
+                    print(f"[resync] sweep closed {_closed} healed episode(s)")
+                # Leak 2026-09-25 (steady-state RSS growth): the buffer age
+                # deadline was only enforced lazily — on the NEXT message for the
+                # same episode. Quiet feeds (window rolled while stale) never send
+                # that message, so expired deques pinned up to 5k parsed WS
+                # frames each forever (prod: 1494 never-final episodes in 2.9h).
+                # Actively reap expired buffers here; the retired episode's rows
+                # are already in parquet and its book stays honestly stale.
+                _reaped = self.resync.reap_expired_buffers()
+                if _reaped:
+                    print(f"[resync] reaped {_reaped} expired replay buffer(s)")
+                # Stale-epidemic fix (2026-09-25): books of markets ended <6h
+                # ago mint episodes per recycle/book_stalled that can never
+                # reach a final state (REST 404s forever; close_healed only
+                # closes books-live; the 6h eviction is the only exit) —
+                # 29,678 never-final episodes in one prod day. Supersede them
+                # here (honest final state, buffer freed) instead of leaving
+                # the flood open until the RAM tick.
+                _superseded = self.resync.supersede_ended_market_episodes(self.books)
+                if _superseded:
+                    print(f"[resync] sweep superseded {_superseded} ended-market episode(s)")
+            except Exception:
+                pass
             # Use kaggle lock so flush never races with chunk upload's flush/export (§10A lossless)
             if hasattr(self, "_kaggle_lock"):
+                # 2026-09-25 leak fix: wait at most a few seconds for the lock.
+                # An export tick holds it for many minutes (27min measured on
+                # the 1d lane — each trades worker gets a 420s Data-API
+                # budget); the old unconditional `async with` parked the WHOLE
+                # loop, so the episode sweep/reaper above stopped for the
+                # entire export and replay buffers pinned +600MB mid-tick (the
+                # PM2 memory kill that cancels slow-lane uploads). Skipping
+                # the parquet flush while the export runs is the pre-existing
+                # §10A behavior (rows stay WAL'd on append); the loop now
+                # retries next tick instead of parking.
                 try:
-                    async with self._kaggle_lock:
+                    _lock_wait_s = min(5.0, float(self.config.storage.flush_interval_seconds or 30))
+                except Exception:
+                    _lock_wait_s = 5.0
+                try:
+                    _locked = await asyncio.wait_for(self._kaggle_lock.acquire(), timeout=_lock_wait_s)
+                except Exception:
+                    _locked = False
+                if _locked:
+                    try:
                         n = self.writer.flush()
                         if n:
                             print(f"[flush] {n} rows{self._drop_totals_note()}")
@@ -3418,8 +3629,14 @@ class Collector:
                         except Exception:
                             pass
                         self._persist_cursor_sync()
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            self._kaggle_lock.release()
+                        except Exception as _rel_e:
+                            print(f"[flush] kaggle lock release failed: {_rel_e}")
+                # else: export holds the lock — flush retried next tick
             else:
                 try:
                     n = self.writer.flush()
@@ -3438,16 +3655,6 @@ class Collector:
                 self._disk_guard_tick()
                 if getattr(self, "_emergency_prune_requested", False):
                     await self._run_emergency_prune()
-            except Exception:
-                pass
-            # HIGH (audit 2026-09-21): episode-lifecycle sweep — close open
-            # episodes whose books already healed via background REST heals or
-            # WS full-book promotion (those paths never reach resync(), so
-            # resync_completed_ts_utc stayed NULL and buffers leaked forever).
-            try:
-                _closed = self.resync.close_healed_episodes(self.books)
-                if _closed:
-                    print(f"[resync] sweep closed {_closed} healed episode(s)")
             except Exception:
                 pass
             # LOW (audit 2026-09-21): schedule the drift check that was never
@@ -3814,6 +4021,24 @@ class Collector:
         """
         evict_cutoff = now_ms - 6 * 3600 * 1000
         evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
+        # Stale-healing fix (2026-09-26): orphan books (condition in NO market
+        # record — cursor recovery for windows discovery never returns) are
+        # invisible to the cutoff above and churn resync forever. Evict past
+        # the same 6h grace by birth clock (fresh orphans may still be
+        # discovered; their episodes stay persisted either way).
+        try:
+            _books_view = list(getattr(self, "books", {}).items())
+        except Exception:
+            _books_view = []
+        for _ocid, _ob in _books_view:
+            if _ocid in self.markets:
+                continue
+            try:
+                _oage = now_ms - int(getattr(_ob, "created_ms", now_ms) or now_ms)
+            except Exception:
+                _oage = -1
+            if _oage > 6 * 3600 * 1000 and _ocid not in evict_cids:
+                evict_cids.append(_ocid)
         for cid in evict_cids:
             self.books.pop(cid, None)
             self._unindex_book(cid)
@@ -4602,9 +4827,14 @@ class Collector:
         # Only stagger the steady hourly cadence, not the 5-min fast path or
         # a paused (huge-interval) truce: cap the shift so the first upload
         # still fires while RSS is low.
+        # 2026-09-24: cap 600->300. With the ~95MB/min leak, PM2 SIGINT-cycles
+        # the process at ~18min age; a 535s stagger put the first tick at
+        # ~13min age, leaving <5min for an export that needs 6+min — every
+        # upload cancelled, 1h never verified, prune fail-closed, ENOSPC.
+        # First tick at ~5min age wins the race against the memory cap.
         if interval <= 3600:
             try:
-                initial_delay = min(initial_delay + _stagger, 600)
+                initial_delay = min(initial_delay + _stagger, 300)
             except Exception:
                 pass
         if _stagger:
