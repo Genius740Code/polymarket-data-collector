@@ -99,6 +99,10 @@ class CollectorEventType(StrEnum):
     discovery_poll = "discovery_poll"
     discovery_jump = "discovery_jump"
     discovery_recovery = "discovery_recovery"
+    # PERF (2026-09-27): hourly memory telemetry for the leak hunt —
+    # diagnostic only (RSS + registry sizes), never market data. Throttled
+    # to 1/hour so it cannot spam collector_events.
+    mem_report = "mem_report"
 
 
 class DisconnectReason(StrEnum):

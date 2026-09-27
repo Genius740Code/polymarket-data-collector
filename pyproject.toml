@@ -28,6 +28,7 @@ dependencies = [
   "structlog>=24.1",
   "pyyaml>=6.0",
   "ntplib>=0.4",
+  "uvloop>=0.21; sys_platform!='win32'",
 ]
 
 [project.optional-dependencies]

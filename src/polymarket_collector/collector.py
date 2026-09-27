@@ -1555,6 +1555,89 @@ class Collector:
                     print(f"[heartbeat] mirror FAILED x{_hm_n} ({_hm_e}) — disk full?")
         except Exception:
             pass
+        try:
+            self._maybe_mem_report(now)
+        except Exception as _mm_e:
+            print(f"[heartbeat] mem_report hook failed: {_mm_e}", flush=True)
+
+    @staticmethod
+    def _mem_report_snapshot(src: object) -> dict:
+        """PERF (2026-09-27): leak-hunt telemetry (diagnostic only — RSS plus
+        registry sizes, never market data). Duck-typed via getattr so tests
+        can pass a stub; every lookup has a -1 fallback, never raises."""
+        def _count(obj: object, attr: str, sub: str | None = None) -> int:
+            try:
+                v = getattr(obj, attr, None)
+                if v is None:
+                    return -1
+                if sub is not None:
+                    v = getattr(v, sub, None)
+                    if v is None:
+                        return -1
+                return int(len(v))  # type: ignore[arg-type]
+            except (TypeError, ValueError, AttributeError):
+                return -1
+
+        try:
+            import resource as _res
+
+            rss_mb = int(_res.getrusage(_res.RUSAGE_SELF).ru_maxrss) // 1024
+        except (ImportError, AttributeError, ValueError, OSError):
+            rss_mb = -1
+        try:
+            import gc as _gc
+
+            gc_counts = [int(c) for c in _gc.get_count()]
+        except (ImportError, AttributeError, ValueError):
+            gc_counts = [-1]
+        snap: dict = {
+            "rss_mb": rss_mb,
+            "gc_counts": gc_counts,
+            "books": _count(src, "books"),
+            "books_by_token": _count(src, "_books_by_token"),
+            "episode_latest": _count(src, "_episode_latest"),
+            "last_frame_ns": _count(src, "_last_frame_ns_per_book"),
+            "underlying_cache": _count(src, "_underlying_cache"),
+            "heal_inflight": _count(src, "_heal_inflight"),
+            "chainlink_events": _count(src, "_chainlink_events"),
+            "writer_buffered": _count(src, "writer", "_buffer"),
+        }
+        try:
+            rs = getattr(src, "resync", None)
+            snap["resync_episodes"] = _count(rs, "_episodes") if rs is not None else -1
+            snap["resync_buffers"] = _count(rs, "_buffers") if rs is not None else -1
+            try:
+                bufs = getattr(rs, "_buffers", None) if rs is not None else None
+                snap["resync_buffered_msgs"] = int(sum(len(b) for b in bufs.values())) if bufs else 0
+            except (TypeError, ValueError, AttributeError):
+                snap["resync_buffered_msgs"] = -1
+        except (TypeError, ValueError, AttributeError):
+            snap["resync_episodes"] = -1
+            snap["resync_buffers"] = -1
+            snap["resync_buffered_msgs"] = -1
+        return snap
+
+    def _maybe_mem_report(self, now_monotonic: float) -> None:
+        """Emit one mem_report/hour (throttled) — leak-hunt evidence."""
+        try:
+            last = float(getattr(self, "_last_mem_report_monotonic", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        try:
+            now_f = float(now_monotonic)
+        except (TypeError, ValueError):
+            return
+        if now_f - last < 3600.0:
+            return
+        self._last_mem_report_monotonic = now_f
+        try:
+            snap = Collector._mem_report_snapshot(self)
+        except Exception as e:
+            snap = {"error": repr(e)[:120]}
+        try:
+            self._collector_event(CollectorEventType.mem_report, snap)
+        except Exception as e:
+            print(f"[mem_report] event failed: {e}", flush=True)
 
     def _persist_cursor_sync(self) -> None:
         """Persist cursor state to durable storage (§1B) — one row per (asset, tf) lane.

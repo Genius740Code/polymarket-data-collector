@@ -133,7 +133,20 @@ def main() -> None:
             print("collector stopped")
 
     _install_windows_loop_policy()
+    # PERF (2026-09-27): uvloop fast event loop on non-Windows — same
+    # callbacks, same order, same rows; only the loop spins faster
+    # (2-4x on message-heavy workloads). Falls back to asyncio default
+    # when uvloop is unavailable (Windows, minimal installs).
     try:
+        import uvloop as _uvloop
+
+        def _loop_factory() -> asyncio.AbstractEventLoop:
+            return _uvloop.new_event_loop()
+
+        asyncio.run(run(), loop_factory=_loop_factory)
+    except (ImportError, AttributeError, TypeError):
+        # TypeError: loop_factory kwarg needs Python 3.12+ (requires-python
+        # is >=3.10) — old interpreters take the default loop instead.
         asyncio.run(run())
     except ConnectionResetError:
         # R-4 belt-and-braces: any reset that still slips through loop teardown
