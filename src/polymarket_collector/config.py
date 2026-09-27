@@ -50,6 +50,15 @@ class WsConfig(BaseModel):
     # ANY side present promotes. Default False (crypto books are two-sided;
     # unknown-unknown there). Enabled in the weather yaml only.
     promotion_one_sided: bool = False
+    # WS/stale fix (2026-09-26): proactive connection-recycle interval. The
+    # CLOB kills long-lived connections server-side (~5min observed deaths);
+    # the recycle preempts that on OUR schedule — lightly, no REST resync.
+    # 150s fired 25,694 ws_disconnected events/day (74% of the 2026-09-25
+    # flood — one episode per book per recycle via _disconnect_asset_books)
+    # plus a ~1s trade gap per swap; 240s still preempts the ~5min server
+    # kill while cutting the churn ~1.6x. Swaps stay honest: the episode row
+    # (planned_recycle) is the gap evidence.
+    recycle_interval_seconds: int = 240
 
     @field_validator("cities_per_connection")
     @classmethod
@@ -70,6 +79,9 @@ class ChainlinkConfig(BaseModel):
     max_resolution_wait_seconds: int = 120
     settlement_source_preference: Literal["on_chain_confirmed", "inferred_nearest"] = "on_chain_confirmed"
     enable_binance_fallback: bool = False
+    # Per-tick underlying alignment (3.4.0): max age of the chainlink tick
+    # stamped onto a snapshot (previous-only lookup). Older → NULLs.
+    underlying_align_tolerance_ms: int = 2000
 
 
 class StorageConfig(BaseModel):
@@ -201,7 +213,9 @@ class CollectorConfig(BaseSettings):
     # window, not just the published 10 L2 levels; book_events token_id/outcome
     # are honest NULLs (were ""/"unknown"); trades reconciled series_id honest
     # NULL (was "{ASSET}-5m"). Compare depth across versions with care.
-    schema_version: str = "3.3.0"
+    # 3.4.0 — snapshots carry per-tick underlying alignment
+    # (underlying_price/underlying_ts_ns/underlying_age_ms, nullable).
+    schema_version: str = "3.4.0"
 
     rollover_lead_seconds: int = 30
     max_coverage_gap_seconds: int = 5

@@ -136,6 +136,31 @@ def retention_cadence_check(config: CollectorConfig) -> str | None:
     return None
 
 
+# Quote-context keys stamped onto live trade rows (3.4.0) — same names as
+# the snapshot BBO columns so trade-time quotes compare directly to snapshots.
+_TRADE_QUOTE_KEYS = ("up_bid", "up_ask", "up_bid_size", "up_ask_size",
+                     "down_bid", "down_ask", "down_bid_size", "down_ask_size")
+
+
+def _retry_after_s_of(resp: Any, default_s: float) -> float:
+    """Parse an HTTP Retry-After header into seconds, bounded to [0, 60].
+
+    WS/stale fix (2026-09-26): REST /book 429s under 35-lane load were either
+    skipped (resync path) or ignored entirely (heal path), so the response's
+    own backoff hint was discarded. Bounded like the reconnect backoff so a
+    huge Retry-After cannot park a fetch forever. Falls back to default_s.
+    """
+    try:
+        _h = getattr(resp, "headers", None)
+        if _h is not None:
+            _v = _h.get("retry-after") or _h.get("Retry-After")
+            if _v is not None:
+                return max(0.0, min(60.0, float(str(_v).strip().split(",")[0])))
+    except Exception:
+        pass
+    return default_s
+
+
 class Collector:
     """BTC/ETH/SOL/HYPE/BNB/XRP/DOGE 5-min market collector (§1-§19) — 5m-only, 4 markets test, 10-min Kaggle."""
 
@@ -233,6 +258,14 @@ class Collector:
         self._coverage_gapped: set = set()
         # books with a background REST heal in flight (prevents snapshot-loop stalls)
         self._heal_inflight: set = set()
+        # WS/stale fix (2026-09-26): pending shard reconnect requests minted by
+        # repeated heal failures (asset uppercase -> pending flag) plus the
+        # last-request monotonic clock per asset (cooldown). Honored by each
+        # shard's staleness watchdog within its 5s tick; the cooldown bounds
+        # the storm (the 2026-09-25 stall window saw zero reconnects for
+        # 30.6 min — the opposite failure is 34,695 ws_disconnected/day).
+        self._shard_reconnect_requests: Dict[str, bool] = {}
+        self._shard_reconnect_last: Dict[str, float] = {}
         # R-1 pre-warm gate: when set, the collector tasks run (WS connect,
         # discovery, subscriptions) but snapshots are only WRITTEN from this
         # epoch-ms onward — used by test mode to warm up before the window
@@ -552,6 +585,47 @@ class Collector:
             except Exception:
                 pass
 
+    def _stamp_trade_quote(self, row: dict, condition_id) -> None:
+        """Contemporaneous quote context on a live trade row (3.4.0).
+
+        Stamps the RAM book's current BBO for both outcomes (+ sizes) and the
+        book_state onto the row, so backtests read exact slippage without a
+        ±500ms snapshot join. Null-vs-zero applies per side (empty side →
+        None price AND None size). No book / unresolvable market → NULLs
+        (honest gap; reconciled api- rows keep NULLs — the RAM book is long
+        gone by export time). Total function by construction: pure reads over
+        the in-RAM levels, no I/O, no raises — worst case is NULLs.
+        """
+        for _k in _TRADE_QUOTE_KEYS:
+            row[_k] = None
+        row["quote_book_state"] = None
+        if not condition_id:
+            return
+        _books = getattr(self, "books", None)
+        if not isinstance(_books, dict):
+            return
+        _book = _books.get(condition_id)
+        if _book is None:
+            return
+        _tops_fn = getattr(_book, "tops", None)
+        if not callable(_tops_fn):
+            return
+        _tops = _tops_fn()
+        if not isinstance(_tops, tuple) or len(_tops) != 5:
+            return
+        (_up_b, _up_b_sz), (_up_a, _up_a_sz), (_dn_b, _dn_b_sz), (_dn_a, _dn_a_sz), _crossed = _tops
+        for (_p, _s), (_pk, _sk) in zip(
+            ((_up_b, _up_b_sz), (_up_a, _up_a_sz), (_dn_b, _dn_b_sz), (_dn_a, _dn_a_sz)),
+            (("up_bid", "up_bid_size"), ("up_ask", "up_ask_size"),
+             ("down_bid", "down_bid_size"), ("down_ask", "down_ask_size")),
+        ):
+            _p = None if _p is None or _p == 0 else _p
+            row[_pk] = _p
+            row[_sk] = _s if _p is not None else None
+        _bs = getattr(_book, "book_state", None)
+        _bsv = _bs if isinstance(_bs, str) else getattr(_bs, "value", None)
+        row["quote_book_state"] = _bsv if isinstance(_bsv, str) else None
+
     def _handle_trade_message(self, msg: dict, asset: str, now_ns: int, now_bucket_ms: int | None = None) -> bool:
         """Parse a CLOB trade WS message and persist to trades with wallet — no RPC.
         Returns True if a trade row was written.
@@ -723,6 +797,9 @@ class Collector:
                 "taker_wallet": taker_wallet,
                 "wallet": wallet,
             }
+            # Quote context for backtests (3.4.0): contemporaneous RAM-book
+            # BBO + book_state stamped live; NULLs when the book is missing.
+            self._stamp_trade_quote(row, condition_id)
             ok = self.writer.append("trades", row, asset=asset.upper())
             if not ok:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "trades", "asset": asset})
@@ -1069,9 +1146,79 @@ class Collector:
             except Exception:
                 return None
 
-    async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo") -> None:
-        """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler."""
+    def _heal_phase(self, condition_id: str) -> int:
+        """Deterministic per-book phase in the 60-tick (~30s) heal window.
+
+        WS/stale fix (2026-09-26): the old global `_tick % 60 == 0` gate fired
+        EVERY stale book of EVERY lane on the SAME tick — N books × 2 GETs in
+        <1s, which 429s the shared IP under 35-lane load and feeds the
+        fetch_none streaks (6,443 resync_failed/day). A per-book phase spreads
+        the herd across the window. hash() is process-randomized, which is
+        fine: the phase only needs to differ BETWEEN books, and stays stable
+        for one book within the process.
+        """
         try:
+            return int(hash(str(condition_id))) % 60
+        except Exception:
+            return 0
+
+    def request_shard_reconnect(self, asset: str, reason: str) -> None:
+        """WS/stale fix (2026-09-26): request a bounded WS reconnect for the
+        shard carrying this asset.
+
+        A stale book for a CURRENT market whose REST heal keeps failing waits
+        forever otherwise (prod 2026-09-25: drift_detected 19:28:59, zero
+        reconnect until 19:59:35 — 30.6 min stale, all 387 snapshots stale
+        while the vendor streamed 161k L2 ticks). The fresh connection
+        re-subscribes with full books, which relives the book without REST.
+
+        Bounded by a per-asset cooldown so repeated heal failures cannot
+        become a reconnect storm (the 2026-09-25 flood was 34,695
+        ws_disconnected/day). The staleness watchdog honors the request
+        within its 5s tick and consumes it. Never raises.
+        """
+        try:
+            au = str(asset).upper()
+        except Exception:
+            au = asset
+        _COOLDOWN_S = 60.0
+        now_m = time.monotonic()
+        try:
+            _last = float(self._shard_reconnect_last.get(au, 0.0) or 0.0)
+        except Exception:
+            _last = 0.0
+        if _last > 0.0 and (now_m - _last) < _COOLDOWN_S:
+            return  # cooldown: one reconnect request per asset per minute
+        try:
+            self._shard_reconnect_last[au] = time.monotonic()
+            self._shard_reconnect_requests[au] = True
+        except Exception:
+            return
+        try:
+            self._collector_event(CollectorEventType.book_anomaly, {
+                "asset": au, "reason": "shard_reconnect_requested", "why": reason,
+            })
+        except Exception as _e_ev:
+            # Loud fallback (real-data-only §7): the event path failed — never silent.
+            print(f"[ws] shard_reconnect_requested event failed asset={au}: {_e_ev}", flush=True)
+
+    async def _heal_book_bg(self, book: "OrderBookState", market: "MarketInfo", delay_s: float = 0.0) -> None:
+        """Background REST heal for stale/resyncing books — never blocks the 500ms scheduler.
+
+        WS/stale fix (2026-09-26): optional jitter delay spreads the GETs of
+        simultaneous heals (the phase-staggered gate spreads the starts across
+        ticks; the delay spreads them within a second). The book is re-checked
+        after the delay — a book that healed/superseded during it is never
+        healed. Rate-limited (429) fetches are NOT fetch_none: only a genuine
+        200-empty/404 response grows the no-L2 streak (a 429 is transient).
+        """
+        try:
+            if delay_s and delay_s > 0:
+                await asyncio.sleep(delay_s)
+                # Re-check after the jitter delay: getattr-with-default is total.
+                _bs_after = getattr(getattr(book, "book_state", None), "value", "")
+                if _bs_after not in ("stale", "resyncing"):
+                    return
             # Stale-healing fix (2026-09-26): never hammer REST for a market
             # whose window already ended (404s forever, feeds fetch_none
             # streaks). The walk/supersede paths own ended markets.
@@ -1081,19 +1228,33 @@ class Collector:
                     return
             except Exception:
                 _heal_end_note = "uncomparable end ts; proceeding with heal"
-            try:
-                if self.resync.fetch_none_quiet(book.condition_id):
-                    return
-            except Exception:
-                pass
+            # 429 backoff (2026-09-26): a token in rate-limit backoff gets
+            # NO heal GET either — the backoff is the medicine. Both callees
+            # are total (internal try/except, safe defaults) — no guard needed.
+            _rl_fn = getattr(self.resync, "rate_limited", None)
+            if self.resync.fetch_none_quiet(book.condition_id) or (
+                    callable(_rl_fn) and _rl_fn(book.condition_id)):
+                return
             ok = await self._fetch_and_apply_rest_book(book, market)
-            try:
-                if ok:
-                    self.resync.note_fetch_ok(book.condition_id)
-                elif not ok:
-                    self.resync.note_fetch_none(book.condition_id)
-            except Exception:
-                pass
+            # note_fetch_ok/note_fetch_none/rate_limited/request_shard_reconnect
+            # are all total — worst case is a skipped counter.
+            if ok:
+                self.resync.note_fetch_ok(book.condition_id)
+            elif not ok:
+                _rl_fn = getattr(self.resync, "rate_limited", None)
+                _was_rl = bool(_rl_fn(book.condition_id)) if callable(_rl_fn) else False
+                if _was_rl:
+                    # Rate-limited heal — bounded backoff already recorded
+                    # by the fetcher; the no-L2 streak must not grow.
+                    pass
+                else:
+                    _streak = self.resync.note_fetch_none(book.condition_id)
+                    # Reconnect on repeated heal failure (2026-09-26): a
+                    # current-market book whose REST heal keeps failing
+                    # waits forever — request the bounded shard reconnect
+                    # so the fresh full book relives it.
+                    if int(_streak or 0) >= 3:
+                        self.request_shard_reconnect(book.asset, reason="repeated_heal_failure")
         except Exception:
             pass
 
@@ -1133,7 +1294,25 @@ class Collector:
                                     params={"token_id": token_id},
                                 )
                                 if resp.status_code == 429:
-                                    await asyncio.sleep(1.0)
+                                    # 429 backoff (WS/stale fix 2026-09-26): retry the
+                                    # SAME token after the backoff instead of skipping it —
+                                    # a transient 429 used to poison the token's no-L2
+                                    # streak (5 cumulative → 1h terminal quiet, renewed
+                                    # forever → unhealable book).
+                                    _ra = _retry_after_s_of(resp, 1.0)
+                                    await asyncio.sleep(_ra)
+                                    resp = await client.get(
+                                        self.config.ws.rest_book_url,
+                                        params={"token_id": token_id},
+                                    )
+                                if resp.status_code == 429:
+                                    # persistent 429: bounded rate-limit backoff on the
+                                    # manager (NOT fetch_none — a rate limit is
+                                    # transient, unlike a token that exposes no full L2).
+                                    # note_rate_limited is total — no guard needed.
+                                    _rl_note = getattr(self.resync, "note_rate_limited", None)
+                                    if callable(_rl_note):
+                                        _rl_note(condition_id, _retry_after_s_of(resp, 1.0))
                                     continue
                                 if resp.status_code != 200:
                                     continue
@@ -1156,7 +1335,19 @@ class Collector:
                                 params={"token_id": token_id},
                             )
                             if resp.status_code == 429:
-                                await asyncio.sleep(1.0)
+                                # 429 backoff (WS/stale fix 2026-09-26): retry the
+                                # SAME token after the backoff (see owned branch).
+                                _ra = _retry_after_s_of(resp, 1.0)
+                                await asyncio.sleep(_ra)
+                                resp = await client.get(
+                                    self.config.ws.rest_book_url,
+                                    params={"token_id": token_id},
+                                )
+                            if resp.status_code == 429:
+                                # persistent 429: bounded rate-limit backoff (NOT fetch_none).
+                                _rl_note = getattr(self.resync, "note_rate_limited", None)
+                                if callable(_rl_note):
+                                    _rl_note(condition_id, _retry_after_s_of(resp, 1.0))
                                 continue
                             if resp.status_code != 200:
                                 continue
@@ -1243,6 +1434,24 @@ class Collector:
         for outcome, token_id in [("up", market.up_token_id), ("down", market.down_token_id)]:
             try:
                 resp = await _get(token_id)
+                if resp.status_code == 429:
+                    # 429 backoff (WS/stale fix 2026-09-26): the heal path had NO
+                    # 429 handling at all — a 429 fell straight through to
+                    # any_success=False → note_fetch_none, so the token's no-L2
+                    # streak grew on transient 429s (5 → 1h terminal quiet,
+                    # renewed forever → unhealable book). Retry the SAME token
+                    # after the backoff; a persistent 429 records bounded
+                    # rate-limit backoff (NOT fetch_none).
+                    _ra = _retry_after_s_of(resp, 1.0)
+                    await asyncio.sleep(_ra)
+                    resp = await _get(token_id)
+                if resp.status_code == 429:
+                    # persistent 429: bounded rate-limit backoff (NOT fetch_none).
+                    # note_rate_limited is total — no guard needed.
+                    _rl_note = getattr(self.resync, "note_rate_limited", None)
+                    if callable(_rl_note):
+                        _rl_note(book.condition_id, _retry_after_s_of(resp, 1.0))
+                    continue
                 if resp.status_code == 200:
                     j = resp.json()
                     bids = j.get("bids") or j.get("bids") or []
@@ -2128,6 +2337,14 @@ class Collector:
             max_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_max_ms", 30000) or 30000)
         except Exception:
             max_backoff_ms = 30000
+        # WS/stale fix (2026-09-26): recycle interval from config (was hardcoded
+        # 150s — 25,694 ws_disconnected events/day, 74% of the flood, one
+        # episode per book per recycle). 240s still preempts the ~5min
+        # server-side kill while cutting the churn and the per-swap trade gap.
+        try:
+            _recycle_ms = max(1, int(getattr(self.config.ws, "recycle_interval_seconds", 240) or 240)) * 1000
+        except Exception:
+            _recycle_ms = 240_000
         while self._running:
             # Per-iteration Retry-After honor (HTTP 429 handshake): parsed in
             # the generic-except path below, applied to this iteration's sleep.
@@ -2222,6 +2439,47 @@ class Collector:
                         # because it only fires on INCOMING messages.
                         while self._running:
                             await asyncio.sleep(5)
+                            # WS/stale fix (2026-09-26): honor reconnect requests
+                            # minted by repeated heal failures — a stalled book
+                            # whose REST heal keeps 429ing waits forever otherwise
+                            # (prod 2026-09-25: 30.6 min stale). The fresh
+                            # connection re-subscribes with full books and relives
+                            # the book. Consumed once; the cooldown in
+                            # request_shard_reconnect bounds the storm.
+                            # Dict assignment and the flag read are total — no
+                            # outer guard needed; the I/O below is guarded.
+                            _req_pending = False
+                            for _ea in shard:
+                                try:
+                                    _rau = str(_ea).upper()
+                                except Exception:
+                                    _rau = _ea
+                                if self._shard_reconnect_requests.get(_rau):
+                                    self._shard_reconnect_requests[_rau] = False
+                                    _req_pending = True
+                            if _req_pending:
+                                print(f"[ws:{_label}] reconnect requested (repeated heal failure) — resubscribing with full books", flush=True)
+                                try:
+                                    for _ea in shard:
+                                        self.on_event(CollectorEventType.book_anomaly, {"asset": _ea, "ws_error": "reconnect_requested_repeated_heal_failure"})
+                                except Exception as _e_ev:
+                                    # Loud fallback (real-data-only §7): never silent.
+                                    print(f"[ws:{_label}] reconnect-request event failed: {_e_ev}", flush=True)
+                                try:
+                                    _fc = getattr(ws, "fail_connection", None)
+                                    if callable(_fc):
+                                        _fc(4000)
+                                    else:
+                                        # MEDIUM (audit 2026-09-21): websockets>=13
+                                        # removed fail_connection — fall through to
+                                        # the bounded close below.
+                                        raise AttributeError("no fail_connection")
+                                except Exception:
+                                    try:
+                                        await asyncio.wait_for(ws.close(), timeout=2)
+                                    except Exception:
+                                        return
+                                continue
                             if time.time_ns() - last_data_ns > 30_000_000_000:
                                 # Only force a reconnect if the event loop itself is
                                 # alive. During a long synchronous export/compaction
@@ -2277,9 +2535,9 @@ class Collector:
                             # books relive from the fresh connection's full book
                             # and are honestly labeled stale during the ~1s swap
                             # (via the ws_connected downgrade in the snapshot loop).
-                            if int(time.time() * 1000) - conn_established_ms > 150_000:
+                            if int(time.time() * 1000) - conn_established_ms > _recycle_ms:
                                 planned_recycle = True
-                                print(f"[ws:{_label}] planned 150s recycle — reconnecting")
+                                print(f"[ws:{_label}] planned recycle — reconnecting")
                                 break
                             # §13 raw archive + processing share ONE parse (PERF #4):
                             # previously json.loads ran once for archive and again
@@ -3030,12 +3288,22 @@ class Collector:
                                 # await blocked the whole 500ms scheduler for the length
                                 # of slow/rate-limited REST calls (a 15:48 heal blocked
                                 # every asset past the run's end in the 15:40 run)
+                                # WS/stale fix (2026-09-26): per-book phase-staggered
+                                # heal gate — the old global `_tick % 60 == 0` fired
+                                # EVERY stale book of EVERY lane on the SAME tick
+                                # (N books × 2 GETs in <1s → 429s the shared IP →
+                                # fetch_none streaks). A deterministic per-book phase
+                                # spreads the herd; the inflight guard still prevents
+                                # duplicates per book, and the jitter delay spreads
+                                # the GETs within a second.
                                 try:
                                     _bs_val = getattr(getattr(book, "book_state", None), "value", "")
-                                    if _bs_val in ("stale", "resyncing") and _tick % 60 == 0 and book.condition_id not in self._heal_inflight:
-                                        self._heal_inflight.add(book.condition_id)
-                                        _t = asyncio.create_task(self._heal_book_bg(book, m))
-                                        _t.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
+                                    if _bs_val in ("stale", "resyncing") and book.condition_id not in self._heal_inflight:
+                                        if _tick % 60 == self._heal_phase(book.condition_id):
+                                            self._heal_inflight.add(book.condition_id)
+                                            _t = asyncio.create_task(self._heal_book_bg(
+                                                book, m, delay_s=(self._heal_phase(book.condition_id) % 20) / 10.0))
+                                            _t.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
                                 except Exception:
                                     pass
                             # Pre-snapshot crossed check: if book crossed persists, mark stale and trigger REST resync (fixes 15-26% crossed)
@@ -3125,6 +3393,19 @@ class Collector:
                                             row[f"{_oc}_{_sk}_level_{_lvl}_size"] = None
                                         for _thc in (1, 5, 10):
                                             row[f"{_oc}_{_sk}_depth_{_thc}c"] = None
+                            # Per-tick underlying alignment (3.4.0): nearest
+                            # previous chainlink tick for this asset at or
+                            # before the bucket; NULLs when none in tolerance
+                            # (honest gap). Covers both the live and the
+                            # exception-fallback row above.
+                            try:
+                                self._stamp_underlying(row, bucket, m.asset)
+                            except Exception:
+                                # _stamp_underlying is total (no raises in practice);
+                                # this fallback only restores the NULL defaults.
+                                row["underlying_price"] = None
+                                row["underlying_ts_ns"] = None
+                                row["underlying_age_ms"] = None
                             # Honest freshness labeling (I-8): if the asset's WS is
                             # down, a REST-healed book is frozen — label stale, never
                             # live, so the clean view reflects reality.
@@ -3720,6 +4001,71 @@ class Collector:
         if best is not None and best_delta is not None and best_delta <= max_delta_ms:
             return best
         return None
+
+    def _stamp_underlying(self, row: dict, bucket_ms: int, asset: str) -> None:
+        """Per-tick underlying alignment (3.4.0) — previous-only, tolerance-gated.
+
+        Stamps the nearest chainlink tick for this asset at or before the
+        bucket onto the snapshot row (underlying_price/underlying_ts_ns/
+        underlying_age_ms). No tick within tolerance (or no price on the
+        tick) → NULLs (honest gap — never interpolated or carried forward).
+
+        Results are memoized per (asset, bucket) so the N markets of one
+        asset share a single RAM scan per tick.
+        """
+        try:
+            _cache = self._underlying_cache
+        except AttributeError:
+            _cache = self._underlying_cache = {}
+        try:
+            _au = asset.upper() if isinstance(asset, str) else asset
+        except Exception:
+            _au = asset
+        _key = (_au, int(bucket_ms))
+        if _key in _cache:
+            _px, _ts_ns, _age = _cache[_key]
+            row["underlying_price"] = _px
+            row["underlying_ts_ns"] = _ts_ns
+            row["underlying_age_ms"] = _age
+            return
+        try:
+            if len(_cache) > 4096:
+                _cache.clear()
+        except Exception:
+            _cache = self._underlying_cache = {}
+        _px: object = None
+        _ts_ns: object = None
+        _age: object = None
+        try:
+            try:
+                _tol = int(getattr(getattr(self.config, "chainlink", None), "underlying_align_tolerance_ms", 2000) or 2000)
+            except Exception:
+                _tol = 2000
+            _ev = self._nearest_chainlink(int(bucket_ms), asset, max_delta_ms=_tol)
+        except Exception:
+            _ev = None
+        if _ev:
+            try:
+                _raw = _ev.get("price")
+                _p = float(_raw) if _raw is not None else None
+                if _p is not None and (_p != _p or _p in (float("inf"), float("-inf"))):
+                    _p = None
+            except Exception:
+                _p = None
+            if _p is not None:
+                try:
+                    _tick_ms = int(_ev.get("_ts_ms") or 0)
+                except Exception:
+                    _tick_ms = 0
+                if _tick_ms:
+                    _px, _ts_ns, _age = _p, _tick_ms * 1_000_000, int(bucket_ms) - _tick_ms
+        try:
+            _cache[_key] = (_px, _ts_ns, _age)
+        except Exception:
+            self._underlying_cache = {_key: (_px, _ts_ns, _age)}
+        row["underlying_price"] = _px
+        row["underlying_ts_ns"] = _ts_ns
+        row["underlying_age_ms"] = _age
 
     async def _chainlink_loop(self) -> None:
         """§6 Chainlink RTDS consumer — settlement ground truth.

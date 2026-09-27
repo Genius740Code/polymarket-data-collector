@@ -155,3 +155,56 @@ def test_clean_view_full_rebuild_drops_sidecars_no_dupes():
         got = load_clean(tmp)
         ids = [r["snapshot_id"] for r in got.to_pylist()]
         assert got.num_rows == len(set(ids)) == 3
+
+
+def test_clean_view_unreadable_file_never_marked_processed(tmp_path):
+    """Audit 2026-09-26: the sidecar branch marked unreadable files done in
+    _clean_manifest.json, so the incremental filter never re-selected them
+    once readable (their mtime stays old, and they were recorded as done) —
+    their rows never reached the clean view. Only files actually read may be
+    marked processed."""
+    import json
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        src_dir = base / "book_snapshots_500ms" / "date=2025-01-01" / "asset=BTC"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        old_ts = time.time() - 3600
+
+        def _row(sid, ts):
+            return {"snapshot_id": sid, "schema_version": "3.0.0", "series_id": "BTC-5MIN",
+                    "window_index": 1, "condition_id": "cid-live", "market_id": "m1",
+                    "asset": "BTC", "up_token_id": "up", "down_token_id": "down",
+                    "ts_snapshot_utc": "2025-01-01T00:00:00Z", "ts_snapshot_ns": ts,
+                    "up_bid": 0.5, "up_ask": 0.6, "up_bid_size": 10, "up_ask_size": 10,
+                    "down_bid": 0.4, "down_ask": 0.5, "down_bid_size": 10, "down_ask_size": 10,
+                    "market_time_remaining_ms": 1000, "up_book_age_ms": 0, "down_book_age_ms": 0,
+                    "is_rollover_window": False, "book_state": "live", "resync_id": None,
+                    "book_crossed": False}
+
+        pq.write_table(pa.Table.from_pylist([_row("1", 0)]), str(src_dir / "p1.parquet"))
+        assert build_clean_view(tmp) == 1
+        # p2 arrives UNREADABLE with an OLD mtime; p3 arrives readable (new)
+        bad = src_dir / "p2.parquet"
+        bad.write_bytes(b"not a parquet file")
+        os.utime(bad, (old_ts, old_ts))
+        time.sleep(0.05)
+        pq.write_table(pa.Table.from_pylist([_row("3", 2)]), str(src_dir / "p3.parquet"))
+        n2 = build_clean_view(tmp)
+        assert n2 == 1, f"only p3 is readable this call: {n2}"
+        manifest_p = base / "book_snapshots_clean" / "date=2025-01-01" / "asset=BTC" / "_clean_manifest.json"
+        manifest = json.loads(manifest_p.read_text())
+        assert "p2.parquet" not in manifest, \
+            f"unreadable file must NOT be marked processed (permanent orphaning): {manifest}"
+        assert "p3.parquet" in manifest
+        # p2 heals (readable) while keeping its OLD mtime — it must be
+        # re-selected and its rows must reach the clean view
+        pq.write_table(pa.Table.from_pylist([_row("2", 1)]), str(bad))
+        os.utime(bad, (old_ts, old_ts))
+        n3 = build_clean_view(tmp)
+        assert n3 == 1, f"healed p2 must be re-selected despite its old mtime: {n3}"
+        got = load_clean(tmp)
+        assert got is not None and got.num_rows == 3
+        ids = [r["snapshot_id"] for r in got.to_pylist()]
+        assert "2" in ids, f"rows must reach the clean view after healing: {ids}"

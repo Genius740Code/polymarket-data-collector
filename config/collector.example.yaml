@@ -74,6 +74,7 @@ chainlink:
   max_resolution_wait_seconds: 120
   settlement_source_preference: "on_chain_confirmed"  # fallback: inferred_nearest
   enable_binance_fallback: false  # no binance data, RTDS only
+  underlying_align_tolerance_ms: 2000  # per-tick snapshot alignment (3.4.0): max tick age; older → NULLs
 
 # §10A — write batching / backpressure
 storage:

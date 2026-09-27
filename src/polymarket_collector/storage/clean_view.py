@@ -162,10 +162,12 @@ def build_clean_view(
                         _capped.append(_p)
                         _bytes += _sz
                     tables = []
+                    _capped_ok: list = []
                     for part in _capped:
                         try:
                             _t = read_table(part)
                         except Exception:
+                            _unreadable += 1
                             continue
                         # M5 (audit 2026-09-18): read_table returns None (never
                         # raises) — appending None poisoned the concat and aborted
@@ -174,13 +176,19 @@ def build_clean_view(
                             _unreadable += 1
                             continue
                         tables.append(_t)
+                        _capped_ok.append(part)
                     if not tables:
                         continue
                     combined = _concat_tables(tables) if len(tables) > 1 else tables[0]
                     del tables
                     sidecar = True
+                    # M6 (audit 2026-09-26): mark ONLY files actually read —
+                    # the old `_capped` list included unreadable files, so the
+                    # manifest permanently marked them done and the
+                    # incremental filter never re-selected them once readable
+                    # (silent clean-view orphaning).
                     try:
-                        _processed_names = [p.name for p in _capped]
+                        _processed_names = [p.name for p in _capped_ok]
                     except Exception:
                         _processed_names = []
                 except Exception:

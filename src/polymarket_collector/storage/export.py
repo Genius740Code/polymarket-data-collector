@@ -219,6 +219,7 @@ def _backfill_trade_wallets_chunked(
     chunk_rows: int = 8000,
     deadline_s: Optional[float] = None,
     pool_cache: Optional[dict] = None,
+    timeframe_label: Optional[str] = None,
 ) -> pa.Table:
     """Bounded-RAM wrapper around _backfill_trade_wallets (2026-09-10 OOM).
 
@@ -232,10 +233,17 @@ def _backfill_trade_wallets_chunked(
     pool_cache: optional dict shared across calls — per-market leg pools are
     fetched once and reused (the streaming export calls this per file-group;
     without the cache every group would re-fetch the same markets).
+    timeframe_label: lane label for the H5-ZERO 0-trade reconcile — when set,
+    only markets whose series_id matches "{ASSET}-{label}" are reconciled, so
+    a 15m market's fills can never leak into the 5m lane's staging build (the
+    lane filter ran before this call and inserts appended here bypass it).
     """
     if table is None or table.num_rows == 0 or table.num_rows <= chunk_rows:
-        return _backfill_trade_wallets(table, data_dir, asset=asset, reconcile=reconcile,
-                                       deadline_s=deadline_s, pool_cache=pool_cache)
+        out = _backfill_trade_wallets(table, data_dir, asset=asset, reconcile=reconcile,
+                                      deadline_s=deadline_s, pool_cache=pool_cache)
+        return _append_zero_trade_reconciles(out, data_dir, asset=asset, reconcile=reconcile,
+                                             timeframe_label=timeframe_label, deadline_s=deadline_s,
+                                             pool_cache=pool_cache)
     try:
         import gc as _gc_c
         import time as _time_c
@@ -289,10 +297,62 @@ def _backfill_trade_wallets_chunked(
         out = parts[0] if len(parts) == 1 else pa.concat_tables(parts, promote_options="default")
         del parts
         _gc_c.collect()
-        return out
+        return _append_zero_trade_reconciles(out, data_dir, asset=asset, reconcile=reconcile,
+                                             timeframe_label=timeframe_label, deadline_s=deadline_s,
+                                             pool_cache=pool_cache)
     except Exception as e:
         print(f"[export] WARN chunked backfill failed, direct fallback: {e}")
         return _backfill_trade_wallets(table, data_dir, asset=asset, reconcile=reconcile)
+
+
+def _append_zero_trade_reconciles(table: Optional[pa.Table], data_dir: Path,
+                                  asset: Optional[str], reconcile: bool,
+                                  timeframe_label: Optional[str],
+                                  deadline_s: Optional[float],
+                                  pool_cache: Optional[dict]) -> pa.Table:
+    """H5-ZERO: append api- rows for markets with ZERO local trades rows.
+
+    STAGING ONLY, insert-only: the live collector path is untouched and no
+    live row is ever modified. Runs only when reconcile=True (the
+    wallet/outcome-only second pass must never insert) and asset is set (the
+    whole-hive markets_summary fallback read passes asset=None → skip; the
+    per-asset staging builds carry the lane context). The input table supplies
+    the local ts span; candidates come from markets_latest with the lane
+    series match. Failures degrade to the input table unchanged (honest 0
+    rows for unvisited markets, healed next pass)."""
+    if not reconcile or asset is None or table is None:
+        return table
+    try:
+        import pyarrow.compute as _pc_z
+        names = table.schema.names
+        if "ts_source" not in names:
+            return table
+        _ts = table.column("ts_source")
+        _lo = _pc_z.min(_ts).as_py()
+        _hi = _pc_z.max(_ts).as_py()
+        try:
+            _lo = int(_lo) if _lo is not None else None
+            _hi = int(_hi) if _hi is not None else None
+        except Exception:
+            return table
+        if _lo is None or _hi is None:
+            return table
+        _want = (f"{asset.upper()}-{timeframe_label}" if timeframe_label else None)
+        _known = set()
+        if "condition_id" in names:
+            _known.update(v for v in table.column("condition_id").to_pylist() if v)
+        ins = list(_reconcile_zero_trade_markets(Path(data_dir), asset, _known, _lo, _hi,
+                                                 series_want=_want, deadline_s=deadline_s,
+                                                 pool_cache=pool_cache))
+        if not ins:
+            return table
+        return pa.concat_tables(
+            [table] + ins,
+            **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True}),
+        )
+    except Exception as e:
+        print(f"[export] WARN zero-trade reconcile (table append) failed: {e}")
+        return table
 
 
 def _fetch_market_trades(cid: str, taker_only: bool, oldest_needed_ms: Optional[int], max_pages: int = 60) -> list:
@@ -642,11 +702,20 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
                     else:
                         fee_derived += 1
                 # R-2: attribute the maker leg when the earlier both-legs fetch
-                # exposed it unambiguously for this fill key (single distinct wallet)
+                # exposed it unambiguously for this fill key (single distinct wallet).
+                # H5-MAKER (audit 2026-09-26): the maker pool is SIDE-AWARE —
+                # side=BUY → maker on the SELL leg, side=SELL → maker on the
+                # BUY leg (a row's side is the aggressor side). The old code
+                # always used the SELL pool, so every SELL-side reconciled row
+                # self-attributed the TAKER's own wallet as maker_wallet.
+                # Unknown side keeps NULL (never guessed).
                 maker_w = None
                 leg_pools = legs_by_cid.get(cid)
                 if leg_pools:
-                    maker_w = _unambiguous_wallet(leg_pools[1].get(k))
+                    _t_side = str(t.get("side") or "").upper()
+                    if _t_side in ("BUY", "SELL"):
+                        _mk_pool = leg_pools[1] if _t_side == "BUY" else leg_pools[0]
+                        maker_w = _unambiguous_wallet(_mk_pool.get(k))
                 try:
                     _ord = int(_ord_seen.get(k, 0))
                     _ord_seen[k] = _ord + 1
@@ -799,11 +868,16 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                 else:
                     _fee_derived[0] += 1
             # R-2: attribute the maker leg when the cached both-legs fetch
-            # exposed it unambiguously for this fill key (single distinct wallet)
+            # exposed it unambiguously for this fill key (single distinct wallet).
+            # H5-MAKER: side-aware (see the per-table site above) — side=BUY →
+            # SELL pool, side=SELL → BUY pool; unknown side stays NULL.
             maker_w = None
             leg_pools = (pool_cache.get(cid) if pool_cache is not None else None)
             if leg_pools:
-                maker_w = _unambiguous_wallet(leg_pools[1].get(k))
+                _t_side2 = str(t.get("side") or "").upper()
+                if _t_side2 in ("BUY", "SELL"):
+                    _mk_pool2 = leg_pools[1] if _t_side2 == "BUY" else leg_pools[0]
+                    maker_w = _unambiguous_wallet(_mk_pool2.get(k))
             try:
                 _ord2 = int(_ord_seen2.get(k, 0))
                 _ord_seen2[k] = _ord2 + 1
@@ -845,6 +919,180 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
             yield pa.Table.from_pylist(_rows_to_add)
     if _inserted[0] or _fee_derived[0]:
         print(f"[export] trade reconciliation: inserted {_inserted[0]} missing fills from data-api (CLOB stream coalesces liquid fills); fee derived for {_fee_derived[0]} rows from the market's exchange-reported rate")
+
+
+def _reconcile_zero_trade_markets(base: Path, asset: Optional[str], known_cids: set,
+                                  span_lo_ms: Optional[int], span_hi_ms: Optional[int],
+                                  series_want: Optional[str] = None,
+                                  deadline_s: Optional[float] = None,
+                                  pool_cache: Optional[dict] = None,
+                                  taker_cache: Optional[dict] = None,
+                                  max_markets: int = 24):
+    """H5-ZERO (audit 2026-09-26): reconcile fills for markets with ZERO local
+    trades rows.
+
+    Both existing reconcile paths only visit condition_ids that already have
+    local rows (`by_cid` from table rows / `markets_order` from hive rows), so
+    a market the CLOB stream never delivered (churn, missed subscribe —
+    measured: 164/247 BTC-5m windows inside the current local span carry 0
+    rows while the Data-API shows real fills, e.g. 1358 fills for condition
+    0x676aa091… on 2026-09-25 with 0 local rows) is never reconciled and its
+    fills are missing from every Kaggle version.
+
+    This generator yields one insert Table per such market. Candidates come
+    from markets_latest (authoritative series/window context — no sentinels):
+    same asset, same lane series when series_want is set, window overlapping
+    the local data span [span_lo_ms, span_hi_ms] (a window outside the span is
+    not a hole in the shipped data and must not resurrect pruned history),
+    newest first, capped at max_markets. STAGING ONLY — never the live
+    collector path, never overwriting live rows (insert-only; the writer
+    dedups by trade_id). Rows are `source='api_reconciled'` with honest
+    timestamps: ts_received_ns NULL (never wall-clock), ts_backfilled_ns =
+    event time, ts_source = exchange epoch-ms. fee stays NULL with
+    fee_is_estimated NULL (a 0-trade market has no streamed rows, so there is
+    no exchange-reported rate to derive from — never fabricated); maker is
+    attributed side-aware from the both-legs pools (side=BUY → SELL pool,
+    side=SELL → BUY pool), NULL when ambiguous (healed by the on-chain pass).
+    """
+    import time as _time_z
+
+    if span_lo_ms is None or span_hi_ms is None:
+        return
+    _deadline = (_time_z.time() + (deadline_s if deadline_s else 120.0))
+    try:
+        _ml = _load_markets_latest_rows(base)
+    except Exception as e:
+        print(f"[export] WARN zero-trade reconcile skipped (markets_latest unreadable: {e})")
+        return
+    _au = (asset or "").upper()
+    cands = []
+    for r in _ml:
+        cid = r.get("condition_id")
+        if not cid or cid in known_cids:
+            continue
+        if _au and str(r.get("asset") or "").upper() != _au:
+            continue
+        if series_want and r.get("series_id") != series_want:
+            continue
+        try:
+            s_i = int(r.get("market_start_ts_ms"))
+            e_i = int(r.get("market_end_ts_ms"))
+        except Exception:
+            s_i = e_i = None
+        if s_i is None or e_i is None:
+            continue
+        if e_i >= span_lo_ms and s_i <= span_hi_ms:
+            cands.append((s_i, cid, r))
+    if not cands:
+        return
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    if len(cands) > max_markets:
+        cands = cands[:max_markets]
+    print(f"[export] zero-trade reconcile: {len(cands)} markets with 0 local rows "
+          f"but window inside local span — querying data-api")
+    _inserted = [0]
+    for _s, cid, mr in cands:
+        if _time_z.time() > _deadline:
+            print(f"[export] zero-trade reconcile deadline hit at {asset}: "
+                  f"remaining markets keep honest 0 rows (healed next pass)")
+            break
+        _taker = taker_cache.get(cid) if taker_cache is not None else None
+        if _taker is None and taker_cache is not None and cid in taker_cache:
+            continue  # already fetched and empty/deadlined
+        if _taker is None:
+            _taker = _fetch_market_trades(cid, taker_only=True, oldest_needed_ms=_s)
+            if taker_cache is not None:
+                taker_cache[cid] = _taker
+        if not _taker:
+            continue
+        _cached = (pool_cache.get(cid) if pool_cache is not None else None)
+        if _cached is not None:
+            buy_pool, sell_pool, outcome_by_key = _cached
+        else:
+            buy_pool, sell_pool, outcome_by_key = _build_leg_pools(
+                _fetch_market_trades(cid, taker_only=False, oldest_needed_ms=_s))
+            if pool_cache is not None:
+                pool_cache[cid] = (buy_pool, sell_pool, outcome_by_key)
+        _wsec = mr.get("window_size_seconds")
+        try:
+            _wsec = int(_wsec) if _wsec else 300
+        except Exception:
+            _wsec = 300
+        _rows = []
+        _ord_seen: dict = {}
+        for t in _taker:
+            txh = (t.get("transactionHash") or "").lower()
+            try:
+                k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
+            except Exception:
+                k = None
+            if k is None:
+                # malformed API fill (unparseable price/size) — skipped, honest
+                # gap: the fill is not fabricated from a partial key.
+                continue
+            # a 0-trade market has no local rows — nothing to dedup against;
+            # every fill is inserted with a per-key occurrence ordinal.
+            w = t.get("proxyWallet") or t.get("wallet")
+            ts_ms = _api_ts_ms(t)
+            # E2/N10: unknown window stays NULL (never a 0 sentinel).
+            try:
+                widx = int(ts_ms) // 1000 // _wsec if ts_ms else mr.get("window_index")
+            except Exception:
+                widx = mr.get("window_index")
+            price_f = t.get("price")
+            size_f = t.get("size")
+            notional = round(float(price_f) * float(size_f), 6) if price_f is not None and size_f is not None else None
+            # fee: no streamed rows on a 0-trade market → no exchange-reported
+            # rate to derive from → NULL (never fabricated, never cross-market).
+            # H5-MAKER: side-aware maker pool (side=BUY → SELL leg pool,
+            # side=SELL → BUY leg pool); unknown side keeps NULL.
+            maker_w = None
+            _t_side = str(t.get("side") or "").upper()
+            if _t_side in ("BUY", "SELL"):
+                _mk_pool = sell_pool if _t_side == "BUY" else buy_pool
+                maker_w = _unambiguous_wallet(_mk_pool.get(k))
+            try:
+                _ord = int(_ord_seen.get(k, 0))
+                _ord_seen[k] = _ord + 1
+            except Exception:
+                _ord = 0
+            _rows.append({
+                "ts_source": ts_ms or None,
+                # H4: NULL receive clock + source tag (never wall-clock);
+                # sort reconciled rows by ts_backfilled_ns.
+                "ts_received_ns": None,
+                "ts_received_ns_estimated": None,
+                "source": "api_reconciled",
+                "ts_backfilled_ns": int(ts_ms) * 1_000_000 if ts_ms else None,
+                "condition_id": cid,
+                # E1: NULL when the numeric Gamma id is unknown.
+                "market_id": mr.get("market_id") or None,
+                # N7/N10: series from markets_latest (authoritative) or honest NULL.
+                "series_id": mr.get("series_id") or None,
+                # E2: unknown window stays NULL.
+                "window_index": int(widx) if widx is not None else None,
+                "asset": (_au or str(mr.get("asset") or "").upper() or None),
+                "trade_id": _api_trade_id(txh, t.get("price"), t.get("size"), _ord),
+                "transaction_hash": txh or None,
+                "token_id": (str(t.get("asset_id") or t.get("asset")) if (t.get("asset_id") or t.get("asset")) else None),
+                "outcome": _api_outcome_label(t) or None,
+                "price": float(price_f) if price_f is not None else None,
+                "size": float(size_f) if size_f is not None else None,
+                "notional": notional,
+                "fee": None,
+                "fee_is_estimated": None,
+                "side": (t.get("side") or "").lower() or None,
+                "aggressor_side": (t.get("side") or "").lower() or None,
+                "maker_wallet": maker_w,
+                "taker_wallet": w,
+                "wallet": w or maker_w,
+            })
+            _inserted[0] += 1
+        if _rows:
+            yield pa.Table.from_pylist(_rows)
+    if _inserted[0]:
+        print(f"[export] zero-trade reconcile: inserted {_inserted[0]} fills for "
+              f"{len(cands)} 0-row markets from data-api (CLOB stream churn/missed subscribe)")
 
 
 _WEATHER_SERIES_IDS = ("WEATHER-HIGH-1D", "WEATHER-LOW-1D")
@@ -1116,6 +1364,8 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     first_ctx = {}
     oldest_needed = {}
     markets_order = []
+    _span_lo = None
+    _span_hi = None
     _pre_failed = 0
     _pre_failed_bytes = 0
     # union output schema across input vintages (matches the legacy
@@ -1208,6 +1458,15 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                     _prev = oldest_needed.get(cid)
                     if _tsm is not None and (_prev is None or _tsm < _prev):
                         oldest_needed[cid] = _tsm
+                # H5-ZERO: local ts span for the 0-trade reconcile (every row,
+                # not just enrichment-needing ones — the span bounds which
+                # windows are holes in the shipped data).
+                _tsm_any = _ts_ms_of(r.get("ts_source"))
+                if _tsm_any is not None:
+                    if _span_lo is None or _tsm_any < _span_lo:
+                        _span_lo = _tsm_any
+                    if _span_hi is None or _tsm_any > _span_hi:
+                        _span_hi = _tsm_any
             del d
         except Exception:
             _pre_failed += 1
@@ -1331,6 +1590,22 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                 yield _ins
         except Exception as e:
             print(f"[export] WARN trades global reconcile failed: {e}")
+        # phase 2b: H5-ZERO — markets with ZERO local rows but real Data-API
+        # fills (CLOB stream churn / missed subscribe) get their fills
+        # reconciled as api- rows, staging only, honest timestamps. Existing
+        # reconcile paths never visit a cid with no local rows, so these
+        # windows were missing from every Kaggle version.
+        try:
+            for _ins in _reconcile_zero_trade_markets(base, asset_upper,
+                                                      set(markets_order),
+                                                      _span_lo, _span_hi,
+                                                      series_want=want,
+                                                      deadline_s=_left_all(),
+                                                      pool_cache=pool_cache,
+                                                      taker_cache=taker_cache):
+                yield _ins
+        except Exception as e:
+            print(f"[export] WARN zero-trade reconcile failed: {e}")
 
     n = write_batches(_gen(), tmp_path, schema=_union_schema, stats=io_stats)
     del pool_cache, taker_cache, seen_dd, have, ctx_by_cid, markets_order
@@ -1465,19 +1740,39 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
     _newest_ns = 0
-    # One narrow read per asset: footer max ts_received_ns per file
+    # One narrow read per asset: footer max ts_received_ns per file.
+    # H5-NAME (audit 2026-09-26): this loop called `_read_dataset_per_asset_files`,
+    # a function that does not exist anywhere — a second unguarded NameError in
+    # the same pass (the freshness guard died before the enrichment loop did).
+    # The file listing is inlined with the same rglob+asset pattern the plain
+    # reader uses.
     for asset in assets:
         au = asset.upper()
-        parts = _read_dataset_per_asset_files(base, "trades", au)
+        _tdir = base / "trades"
+        parts = []
+        if _tdir.exists():
+            parts = [p for p in _tdir.rglob("*.parquet")
+                     if not p.name.endswith(".tmp")
+                     and (f"asset={au}" in str(p) or f"asset={asset}" in str(p))]
         if parts:
             _mx = 0
             for p in parts:
                 try:
                     pf = pq.ParquetFile(str(p))
-                    rg = pf.metadata.row_group(0)
-                    col = rg.column("ts_received_ns")
-                    if hasattr(col, "statistics") and col.statistics is not None:
-                        _mx = max(_mx, col.statistics.minmax[1] if col.statistics.minmax else 0)
+                    # H5-NAME (audit 2026-09-26): `rg.column("ts_received_ns")`
+                    # raises TypeError on pyarrow >=21 (an integer index is
+                    # required) and `statistics.minmax` no longer exists —
+                    # both were swallowed, so the guard never saw any
+                    # statistics (silent no-op). Resolve the column index by
+                    # name and read .min/.max across ALL row groups (statistics
+                    # only, no data-page decode) for the true file max.
+                    _cidx = pf.schema_arrow.get_field_index("ts_received_ns")
+                    if _cidx < 0:
+                        continue
+                    for _rgi in range(pf.metadata.num_row_groups):
+                        st = pf.metadata.row_group(_rgi).column(_cidx).statistics
+                        if st is not None and getattr(st, "has_min_max", False) and st.max is not None:
+                            _mx = max(_mx, int(st.max))
                 except Exception:
                     pass
             _newest_ns = max(_newest_ns, int(_mx) if _mx else 0)
@@ -1487,14 +1782,15 @@ def second_pass_enrich_trades(data_dir: str | Path, assets: Optional[List[str]] 
             print(f"[export] second-pass enrichment deferred: newest trade is {int(_age_s)}s old (<900s) — data-api coverage not healed yet, 15-min cron will pick it up")
             stats["deferred"] = True
             return stats
-    # Enrichment pass: reuse per-asset narrow tables from freshness pass above
-    # (one read per asset instead of two full hive concatenations). If a narrow
-    # table was not available, fall back to the plain read as before.
+    # Enrichment pass: one plain read per asset (no side effects). H5-NAME
+    # (audit 2026-09-26): this loop referenced `_narrow_tbls`, a variable the
+    # freshness guard above never defines — every run died with NameError at
+    # the first asset, so enrichment round 2 NEVER ran and wallet NULLs were
+    # never healed (production symptom: 100% NULL wallets on data/trades/).
+    # The plain read is the fallback that was always intended.
     for asset in assets:
         au = asset.upper()
-        tbl = _narrow_tbls.get(au)
-        if tbl is None:
-            tbl = _read_dataset_per_asset_plain(base, "trades", au)
+        tbl = _read_dataset_per_asset_plain(base, "trades", au)
         if tbl is None or tbl.num_rows == 0 or "wallet" not in tbl.schema.names:
             continue
         stats["assets_scanned"] += 1
@@ -2382,7 +2678,8 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     if dataset == "trades" and combined.num_rows > 0:
         try:
             combined = _backfill_trade_wallets_chunked(combined, data_dir, asset=asset, deadline_s=deadline_s,
-                                                       reconcile=reconcile, pool_cache=pool_cache)
+                                                       reconcile=reconcile, pool_cache=pool_cache,
+                                                       timeframe_label=timeframe_label)
             # B-5: persist the enrichment into the hive so data/trades/ matches
             # what ships to Kaggle (NULLs filled only, atomic per file).
             # The streaming export (per-file-group calls) defers this to one
@@ -4414,22 +4711,29 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
         if state_path_gap.exists():
             import json as _js_gap
             _state_gap = _js_gap.loads(state_path_gap.read_text())
-            for _k_gap, _v_gap in _state_gap.items():
-                if isinstance(_v_gap, dict) and "_last_staging_counts" in _v_gap:
-                    _prior_gap = _v_gap["_last_staging_counts"]
-                    for _gap_key in ("collector_events.parquet", "resync_episodes.parquet"):
-                        _prior_n = _prior_gap.get(_gap_key)
-                        if _prior_n is not None and _prior_n > 0:
-                            _cur_gap_p = staging / _gap_key
-                            try:
-                                import pyarrow.parquet as _pq_gap
-                                _cur_n = _pq_gap.read_metadata(str(_cur_gap_p)).num_rows
-                                if _cur_n < _prior_n:
-                                    print(f"[staging-verify] FAIL gap evidence shrank: {_gap_key} { _cur_n} < {_prior_n}")
-                                    return False
-                            except Exception:
+            # Audit 2026-09-26: prefer THIS staging's own dataset entry —
+            # with a state file that mixes lanes (shared fallback layout)
+            # the first entry can be another lane's prior, so the gap check
+            # compared unrelated counts (a false pass could hide a shrink).
+            _v_gap = _state_gap.get(Path(staging).name)
+            if not (isinstance(_v_gap, dict) and "_last_staging_counts" in _v_gap):
+                _v_gap = next((_v for _v in _state_gap.values()
+                               if isinstance(_v, dict) and "_last_staging_counts" in _v),
+                              None)
+            if isinstance(_v_gap, dict) and "_last_staging_counts" in _v_gap:
+                _prior_gap = _v_gap["_last_staging_counts"]
+                for _gap_key in ("collector_events.parquet", "resync_episodes.parquet"):
+                    _prior_n = _prior_gap.get(_gap_key)
+                    if _prior_n is not None and _prior_n > 0:
+                        _cur_gap_p = staging / _gap_key
+                        try:
+                            import pyarrow.parquet as _pq_gap
+                            _cur_n = _pq_gap.read_metadata(str(_cur_gap_p)).num_rows
+                            if _cur_n < _prior_n:
+                                print(f"[staging-verify] FAIL gap evidence shrank: {_gap_key} { _cur_n} < {_prior_n}")
                                 return False
-                    break
+                        except Exception:
+                            return False
     except Exception:
         pass
     if not check_monotonic:
@@ -4441,24 +4745,28 @@ def _verify_staging_row_counts(staging: Path, expected_assets: List[str], check_
         if state_path.exists():
             import json as _js
             state = _js.loads(state_path.read_text())
-            # find last export row counts if stored under _last_staging_counts
-            for _k, _v in state.items():
-                if isinstance(_v, dict) and "_last_staging_counts" in _v:
-                    prior_counts = _v["_last_staging_counts"]
-                    for au in expected_assets:
-                        for ds in required_gt_zero | optional_per_asset:
-                            key = f"{au}_{ds}.parquet"
-                            prior = prior_counts.get(key)
-                            if prior is not None and prior > 0:
-                                cur_path = staging / key
-                                try:
-                                    import pyarrow.parquet as _pq_mono
-                                    cur_rows = _pq_mono.read_metadata(str(cur_path)).num_rows
-                                    if cur_rows < prior:
-                                        return False
-                                except Exception:
+            # Audit 2026-09-26: prefer THIS staging's own dataset entry (see
+            # gap-guard note) — the first entry of a mixed state file can be
+            # another lane's prior counts.
+            _v = state.get(Path(staging).name)
+            if not (isinstance(_v, dict) and "_last_staging_counts" in _v):
+                _v = next((_v2 for _v2 in state.values()
+                           if isinstance(_v2, dict) and "_last_staging_counts" in _v2), None)
+            if isinstance(_v, dict) and "_last_staging_counts" in _v:
+                prior_counts = _v["_last_staging_counts"]
+                for au in expected_assets:
+                    for ds in required_gt_zero | optional_per_asset:
+                        key = f"{au}_{ds}.parquet"
+                        prior = prior_counts.get(key)
+                        if prior is not None and prior > 0:
+                            cur_path = staging / key
+                            try:
+                                import pyarrow.parquet as _pq_mono
+                                cur_rows = _pq_mono.read_metadata(str(cur_path)).num_rows
+                                if cur_rows < prior:
                                     return False
-                    break
+                            except Exception:
+                                return False
     except Exception:
         pass
     return True
@@ -4503,7 +4811,13 @@ def _write_kaggle_state(staging: Path, dataset: str, notes: str, build_start_ms:
             "build_start_unix_ms": int(build_start_ms) if build_start_ms is not None else None,
             "_last_staging_counts": staging_counts,
         }
-        state_path.write_text(_json.dumps(state, indent=2))
+        # Audit 2026-09-26: atomic tmp+rename — a crash mid-write used to
+        # truncate the JSON, which silently skipped the gap-evidence guard
+        # and left every lane's checkpoint unreadable (fail-closed prune,
+        # but the gap trail lost its guard).
+        _tmp_state = state_path.with_suffix(".json.tmp")
+        _tmp_state.write_text(_json.dumps(state, indent=2))
+        _os_replace_safe(_tmp_state, state_path)
     except Exception:
         pass
 
@@ -4596,6 +4910,41 @@ def cleanup_local_data(
         except Exception:
             retention_hours = 48
 
+    # Resolve lane -> dataset keys ONCE (audit 2026-09-26): both the
+    # slowest-lane checkpoint and the per-dataset coverage proof must read
+    # EACH lane's OWN dataset entry. _write_kaggle_state keys state entries
+    # by dataset prefix; in the shared fallback layout (single-component
+    # dataset_prefix) ALL lanes write the SAME _kaggle_state.json, so an
+    # unfiltered max() over its entries let a fresh 5m upload authorize
+    # deleting 15m/1h/4h rows the slower lanes never shipped (2026-09-11
+    # data-loss class) and defeated the missing-lane fail-closed check.
+    # Resolution mirrors _export_and_upload_all_kaggle_impl.
+    _lane_ds: dict = {}
+    try:
+        from ..config import CollectorConfig as _CCds
+        _cfg_ds = _CCds.load()
+        _lanes_cfg = [str(t).lower() for t in (_cfg_ds.timeframes or [])]
+        for _l in _lanes_cfg:
+            _ds_key = None
+            try:
+                _ds_key = str(_cfg_ds.kaggle.datasets[_l])
+            except Exception:
+                _ds_key = None
+            if not _ds_key:
+                try:
+                    _dp = getattr(_cfg_ds.kaggle, "dataset_prefix", None)
+                    _ds_key = str(_dp) if _dp else None
+                except Exception:
+                    _ds_key = None
+            _lane_ds[_l] = _ds_key or "gghgg1/polymarket-5m-crypto"
+    except Exception:
+        _lane_ds = {}
+        _lanes_cfg = []
+    if not _lanes_cfg:
+        _lanes_cfg = [tf_label]
+        _lane_ds[tf_label] = "gghgg1/polymarket-5m-crypto"
+    _per_lane: dict = {}
+
     # Resolve checkpoint: MINIMUM last-upload across ALL enabled lanes.
     # 2026-09-11 DATA-LOSS FIX: lanes share one hive (rows for every lane
     # interleave in the same flush files), but uploads happen one lane per
@@ -4607,15 +4956,7 @@ def cleanup_local_data(
     # advances and the prune bites on its own. Never-uploaded lanes are
     # excluded (their rows are recent by construction) but WARN loudly.
     if checkpoint_ms is None:
-        _lanes: list = []
-        try:
-            from ..config import CollectorConfig as _CC2
-            _lanes = [str(t).lower() for t in (_CC2.load().timeframes or [])]
-        except Exception:
-            _lanes = []
-        if not _lanes:
-            _lanes = [tf_label]
-        _per_lane: dict = {}
+        _lanes: list = list(_lanes_cfg)
         for _lane in _lanes:
             _best = None
             for cand in (base / "kaggle_staging" / _lane / "_kaggle_state.json",
@@ -4624,8 +4965,16 @@ def cleanup_local_data(
                     if not cand.exists():
                         continue
                     j = _json.loads(cand.read_text())
-                    vals = [v.get("last_upload_unix_ms") for v in j.values()
-                            if isinstance(v, dict) and v.get("last_upload_unix_ms")]
+                    # Audit 2026-09-26: only THIS lane's own dataset entry may
+                    # advance its checkpoint — a state file that mixes lanes
+                    # (shared fallback layout) must never let a fresh 5m
+                    # upload authorize deleting rows the slower lanes never
+                    # shipped (2026-09-11 data-loss class).
+                    _ds_key = _lane_ds.get(_lane)
+                    _ent = j.get(_ds_key) if _ds_key else None
+                    vals = ([_ent.get("last_upload_unix_ms")]
+                            if isinstance(_ent, dict) and _ent.get("last_upload_unix_ms")
+                            else [])
                     if vals:
                         _v = max(vals)
                         _best = _v if _best is None else max(_best, _v)
@@ -4679,12 +5028,17 @@ def cleanup_local_data(
                         "collector_events.parquet": "collector_events",
                         "resync_episodes.parquet": "resync_episodes"}
     _BUILD_SLACK_MS = 3 * 3600 * 1000
+    # Audit 2026-09-26: staging mtimes advance on FAILED uploads (the build
+    # runs before the upload attempt; on failure the staging stays on disk
+    # with a fresh mtime while the lane's verified-upload checkpoint stays
+    # stale). A staging file newer than the lane's last VERIFIED upload is
+    # unverified — no uploaded version could have included it — so it must
+    # NOT gate coverage. 60s absorbs build-vs-checkpoint ordering jitter
+    # (the state timestamp is written after the staging commit in the
+    # verified flow); a real outage (minutes+) still trips the gate below.
+    _STAGING_VERIFIED_SLACK_MS = 60 * 1000
     _fresh_by_ds: dict = {}
-    try:
-        from ..config import CollectorConfig as _CCb
-        _lanes_b = [str(t).lower() for t in (_CCb.load().timeframes or [])] or [tf_label]
-    except Exception:
-        _lanes_b = [tf_label]
+    _lanes_b = list(_lanes_cfg)
     for _lane in _lanes_b:
         _sdir = None
         for _cand in (base / "kaggle_staging" / _lane,):
@@ -4718,6 +5072,16 @@ def cleanup_local_data(
         except Exception:
             continue
         for _ds, _mt in _per_ds_min.items():
+            # Audit 2026-09-26: staging newer than this lane's verified
+            # upload is unverified — fail closed for that (lane, dataset);
+            # its hive files are never pruned until the lane ships it.
+            _lane_ckpt = _per_lane.get(_lane)
+            if _lane_ckpt is None:
+                _lane_ckpt = checkpoint_ms  # explicit-checkpoint callers
+            if _lane_ckpt is not None and _mt > _lane_ckpt + _STAGING_VERIFIED_SLACK_MS:
+                print(f"[prune] WARN lane {_lane} staging for {_ds} is newer than its "
+                      f"verified upload — unverified staging does not gate coverage")
+                continue
             _fresh_by_ds.setdefault(_ds, {})[_lane] = _mt
     _fresh_cutoff_by_ds: dict = {}
     for _ds, _per_lane in _fresh_by_ds.items():

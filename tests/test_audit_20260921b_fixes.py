@@ -83,3 +83,30 @@ def test_compaction_verifies_and_spares_unreadable(tmp_path):
     assert len(finals) == 1
     assert pq.read_metadata(str(finals[0])).num_rows == 9
     assert stub.exists(), "unreadable stubs must survive compaction for quarantine"
+
+
+def test_compaction_norm_drop_fails_closed(tmp_path):
+    """Audit 2026-09-26: a batch whose schema cannot normalize to the output
+    schema used to be dropped silently while the file stayed consumed — the
+    published output was short, the footer==written==read verify passed, and
+    the consumed inputs were deleted (silent loss). A dropped/short
+    normalized batch must abort the whole compaction with inputs untouched."""
+    leaf = tmp_path / "leaf"
+    leaf.mkdir()
+    for i in range(2):
+        pq.write_table(pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]}),
+                       str(leaf / f"book_snapshots_500ms_{1000 + i}.parquet"))
+    # One file, two batches: batch 1 casts to the int schema, batch 2 does
+    # not ("not-an-int"). The old code dropped batch 2, still consumed the
+    # file, passed the verify on a short output, and deleted the inputs.
+    vals = [str(v) for v in range(20)] + ["not-an-int"]
+    pq.write_table(pa.table({"a": vals, "b": ["y"] * len(vals)}),
+                   str(leaf / "book_snapshots_500ms_2000.parquet"))
+    n = compact_dataset(leaf)
+    assert n == 0, f"norm drop must abort the compaction, got {n}"
+    # inputs untouched: every original flush file survives, no partial output
+    parts = [p for p in leaf.iterdir()
+             if p.suffix == ".parquet" and not p.name.startswith("part-compacted-")]
+    assert len(parts) == 3, [p.name for p in parts]
+    assert not any(p.name.startswith("part-compacted-") for p in leaf.iterdir()), \
+        "no partial output may be published"

@@ -166,7 +166,11 @@ def _write_lane_state(base, lane, upload_ms):
 
     sp = base / "kaggle_staging" / lane / "_kaggle_state.json"
     sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(_js.dumps({"gghgg1/polymarket-x": {"last_upload_unix_ms": upload_ms}}))
+    # Keyed by the lane's dataset prefix (audit 2026-09-26: the slowest-lane
+    # gate reads only THIS lane's own dataset entry, never max() over a
+    # state file that mixes lanes).
+    sp.write_text(_js.dumps({f"gghgg1/polymarket-{lane}-crypto":
+                             {"last_upload_unix_ms": upload_ms}}))
 
 
 def test_wal_replay_survives_truncated_line(tmp_path):
@@ -229,7 +233,9 @@ def test_prune_gated_by_slowest_lane(tmp_path, monkeypatch):
     # `from ..config import CollectorConfig` locally per call, so patch the
     # source class.
     _fake = type("C", (), {
-        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48})(),
+        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48,
+                                 "datasets": {"5m": "gghgg1/polymarket-5m-crypto",
+                                              "15m": "gghgg1/polymarket-15m-crypto"}})(),
         "timeframes": ["5m", "15m"],
     })()
     monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))
@@ -276,13 +282,103 @@ def test_prune_gated_by_slowest_lane(tmp_path, monkeypatch):
     base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
     _os.utime(f_old, (now_ms / 1000 - 13 * 86400,) * 2)
     _os.utime(f_mid, (now_ms / 1000 - 13 * 86400,) * 2)
+    # 15m's staging must predate its verified upload (audit 2026-09-26
+    # staging-mtime gate): a fresh staging newer than the lane's checkpoint
+    # is unverified and fail-closes the coverage proof instead.
     _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms})
-    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms - 10 * 24 * 3600 * 1000})
     _write_lane_state(base, "5m", now_ms)
     _write_lane_state(base, "15m", now_ms - 10 * 24 * 3600 * 1000)
     stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
     assert not f_old.exists(), "30d-old file is past every cutoff and must prune"
     assert f_mid.exists(), f"11d-old file must survive while 15m lags: {stats}"
+
+
+def test_prune_shared_state_file_never_gates_lane(tmp_path, monkeypatch):
+    """Audit 2026-09-26: the shared fallback _kaggle_state.json mixes ALL
+    lanes' dataset entries (single-component dataset_prefix layout). An
+    unfiltered max() over its entries let a fresh 5m upload advance EVERY
+    lane's checkpoint (and defeat the missing-lane fail-closed check) — only
+    THIS lane's own dataset entry may gate its checkpoint."""
+    import json as _js
+    import os as _os
+    import time as _t
+
+    import polymarket_collector.config as _CFG
+    import polymarket_collector.storage.export as _E
+
+    now_ms = int(_t.time() * 1000)
+    _fake = type("C", (), {
+        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48,
+                                 "datasets": {"5m": "gghgg1/polymarket-5m-crypto",
+                                              "15m": "gghgg1/polymarket-15m-crypto"}})(),
+        "timeframes": ["5m", "15m"],
+    })()
+    monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))
+
+    base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
+    _os.utime(f_old, (now_ms / 1000 - 13 * 86400,) * 2)
+    _os.utime(f_mid, (now_ms / 1000 - 13 * 86400,) * 2)
+    # Both lanes last VERIFIED-uploaded 13d ago; their staging predates that
+    # (verified per the staging-mtime gate) and covers the 13d-old files.
+    _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms - 2 * 86400 * 1000})
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms - 2 * 86400 * 1000})
+    _write_lane_state(base, "5m", now_ms - 13 * 86400 * 1000)
+    _write_lane_state(base, "15m", now_ms - 13 * 86400 * 1000)
+    # DECOY: a fresh entry in the SHARED fallback file. With the old
+    # unfiltered max() this advanced every lane's checkpoint to `now`,
+    # authorizing deletion of rows the 13d-stale lanes never shipped.
+    (base / "kaggle_staging" / "_kaggle_state.json").write_text(_js.dumps(
+        {"gghgg1/polymarket-5m-crypto": {"last_upload_unix_ms": now_ms}}))
+    stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
+    assert f_old.exists() and f_mid.exists(), \
+        f"shared state file must never gate a lane's checkpoint: {stats}"
+
+
+def test_prune_unverified_staging_fails_closed(tmp_path, monkeypatch):
+    """Audit 2026-09-26: staging mtimes advance on FAILED uploads (the build
+    runs before the upload attempt; on failure the staging stays fresh on
+    disk while the lane's checkpoint stays stale). A staging file newer than
+    the lane's last VERIFIED upload is unverified — no uploaded version could
+    have included it — and must NOT gate coverage (fail closed)."""
+    import os as _os
+    import time as _t
+
+    import polymarket_collector.config as _CFG
+    import polymarket_collector.storage.export as _E
+
+    now_ms = int(_t.time() * 1000)
+    _fake = type("C", (), {
+        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48,
+                                 "datasets": {"5m": "gghgg1/polymarket-5m-crypto",
+                                              "15m": "gghgg1/polymarket-15m-crypto"}})(),
+        "timeframes": ["5m", "15m"],
+    })()
+    monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))
+
+    base, f_old, f_mid = _prune_hive(tmp_path, now_ms)
+    _os.utime(f_old, (now_ms / 1000 - 13 * 86400,) * 2)
+    _os.utime(f_mid, (now_ms / 1000 - 13 * 86400,) * 2)
+    # 5m verified now (staging predates its checkpoint); 15m uploaded 13d ago
+    # but its staging was REBUILT now by a failed-upload tick. With the old
+    # pure-mtime proof the fresh staging gated coverage and the 13d-old hive
+    # files were deleted although no 15m upload ever shipped them.
+    _write_staging(base, "5m", {"BTC_book_snapshots_500ms.parquet": now_ms - 2 * 86400 * 1000})
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms})
+    _write_lane_state(base, "5m", now_ms)
+    _write_lane_state(base, "15m", now_ms - 13 * 86400 * 1000)
+    stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=48)
+    assert f_old.exists() and f_mid.exists(), \
+        f"staging newer than the lane's verified upload must fail closed: {stats}"
+
+    # ...and once the 15m lane's staging predates its verified upload again
+    # (a successful tick rebuilds before uploading), coverage resumes
+    _write_staging(base, "15m", {"BTC_book_snapshots_500ms.parquet": now_ms - 60_000})
+    _write_lane_state(base, "15m", now_ms)
+    stats = _E.cleanup_local_data(str(base), rolling_window=True, retention_hours=288)
+    assert not f_old.exists(), \
+        f"verified coverage must resume once staging predates the checkpoint: {stats}"
+    assert f_mid.exists(), "11d-old file is inside the 288h leeway and must survive"
 
 
 def _write_staging(base, lane, files_mtimes_ms):
@@ -313,7 +409,8 @@ def test_prune_coverage_proof_is_per_dataset(tmp_path, monkeypatch):
 
     now_ms = int(_t.time() * 1000)
     _fake = type("C", (), {
-        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48})(),
+        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48,
+                                 "datasets": {"5m": "gghgg1/polymarket-5m-crypto"}})(),
         "timeframes": ["5m"],
     })()
     monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))
@@ -345,7 +442,9 @@ def test_prune_coverage_needs_every_lane(tmp_path, monkeypatch):
 
     now_ms = int(_t.time() * 1000)
     _fake = type("C", (), {
-        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48})(),
+        "kaggle": type("K", (), {"rolling_window": True, "local_retention_hours": 48,
+                                 "datasets": {"5m": "gghgg1/polymarket-5m-crypto",
+                                              "15m": "gghgg1/polymarket-15m-crypto"}})(),
         "timeframes": ["5m", "15m"],
     })()
     monkeypatch.setattr(_CFG.CollectorConfig, "load", classmethod(lambda cls, *a, **k: _fake))

@@ -127,6 +127,16 @@ class ResyncManager:
         # book stays honestly stale with terminal backoff instead of hot churn.
         self._fetch_none_streak: Dict[str, int] = {}
         self._fetch_none_quiet_until: Dict[str, float] = {}
+        # 429 backoff (WS/stale fix 2026-09-26): REST /book 429s under 35-lane
+        # load were conflated with "token exposes no full L2" — a TRANSIENT 429
+        # poisoned the cumulative fetch_none streak (5 → 1h terminal quiet,
+        # renewed on every further attempt → unhealable book; prod 2026-09-25
+        # BTC window: 30.6 min stale, 6,443 resync_failed/day). Rate-limited
+        # fetches instead ride a BOUNDED backoff (Retry-After or 1s, max 60s):
+        # no fetch_none counting, no escalation burn, and resync() refuses at
+        # entry so the reconnect walk is not starved (each dead drive used to
+        # burn the full max_resync_duration per book before the WS reconnect).
+        self._rate_limited_until: Dict[str, float] = {}
         # 2026-09-25 stale-epidemic fix: per-asset newest LIVE buffer id.
         # newest_open_buffer_id() runs on EVERY WS message; the old
         # reversed(list(_episodes.keys())) scan allocated an O(N) list per
@@ -188,6 +198,36 @@ class ResyncManager:
         """True if this condition is in terminal fetch_none backoff (honest stale, no churn)."""
         try:
             return time.monotonic() < float(self._fetch_none_quiet_until.get(str(condition_id), 0))
+        except Exception:
+            return False
+
+    def note_rate_limited(self, condition_id: str, retry_after_s: float = 1.0) -> None:
+        """Record a rate-limited (HTTP 429) fetch with a BOUNDED backoff.
+
+        WS/stale fix (2026-09-26): a 429 is transient — unlike a token that
+        exposes no full L2 it must NOT grow the cumulative fetch_none streak
+        (5 → 1h terminal quiet, renewed on every further attempt = unhealable
+        book for an hour while the CLOB recovers in minutes). The backoff
+        window is bounded to [0.5, 60]s so a huge Retry-After cannot park the
+        book forever either. Total by construction: str/coerce/dict-store
+        cannot raise; the event emission is guarded with a loud fallback.
+        """
+        k = str(condition_id)
+        try:
+            _s = max(0.5, min(60.0, float(retry_after_s if retry_after_s is not None else 1.0)))
+        except Exception:
+            _s = 1.0
+        self._rate_limited_until[k] = time.monotonic() + _s
+        if self.on_event:
+            try:
+                self.on_event(CollectorEventType.rate_limited, {"condition_id": k, "backoff_s": _s, "reason": "REST /book 429 — bounded rate-limit backoff (not fetch_none)"})
+            except Exception as _e:
+                print(f"[resync] rate_limited event failed: {_e}", flush=True)
+
+    def rate_limited(self, condition_id: str) -> bool:
+        """True if this condition is in bounded rate-limit backoff (429 medicine)."""
+        try:
+            return time.monotonic() < float(self._rate_limited_until.get(str(condition_id), 0))
         except Exception:
             return False
 
@@ -683,6 +723,17 @@ class ResyncManager:
         if self.fetch_none_quiet(condition_id):
             return False
 
+        # 429 backoff (WS/stale fix 2026-09-26): a rate-limited fetch rides out
+        # a BOUNDED backoff (note_rate_limited), not the full max_duration
+        # escalation — prod 2026-09-25: 6,443 resync_failed/day escalated on
+        # fetch_none that were 429s under 35-lane load, and each drive burned
+        # 60s before the WS reconnect (the reconnect walk is starved behind
+        # the wall). Honest stale + bounded backoff: the episode stays open
+        # and the heal/walk retries after the backoff expires.
+        # rate_limited() is total (internal try/except) — no guard needed.
+        if self.rate_limited(condition_id):
+            return False
+
         # Stale-healing fix (2026-09-26): a market whose window already ended
         # never reaches the retry loop — its REST 404s forever and each drive
         # burns up to max_duration. Supersede immediately (honest final
@@ -717,10 +768,13 @@ class ResyncManager:
                 if snapshot is None:
                     attempt_branch = "fetch_none"
                     attempt_error = "REST fetch returned None (endpoint may not expose full L2 — §18 gate)"
-                    try:
+                    # 429 backoff (WS/stale fix 2026-09-26): a rate-limited
+                    # fetch is NOT fetch_none — the token's no-L2 streak must
+                    # not grow on a 429 (only a genuine 200-empty/404 response
+                    # counts). note_rate_limited was already recorded by the
+                    # fetcher before it returned None; rate_limited() is total.
+                    if not self.rate_limited(condition_id):
                         self.note_fetch_none(condition_id)
-                    except Exception:
-                        pass
                     raise RuntimeError(attempt_error)
                 try:
                     self.note_fetch_ok(condition_id)

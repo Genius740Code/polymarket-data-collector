@@ -108,6 +108,13 @@ def snapshot_schema(l2_levels: int = 10) -> pa.Schema:
         # frame per outcome (nullable until first frame; None = not yet attested)
         pa.field("up_book_hash", pa.string(), nullable=True),
         pa.field("down_book_hash", pa.string(), nullable=True),
+        # Per-tick underlying alignment (3.4.0): nearest previous chainlink
+        # tick for this asset at or before the bucket, stamped by the
+        # collector. NULL when no tick within tolerance (honest gap — never
+        # interpolated or carried forward).
+        pa.field("underlying_price", pa.float64(), nullable=True),
+        pa.field("underlying_ts_ns", pa.int64(), nullable=True),
+        pa.field("underlying_age_ms", pa.int64(), nullable=True),
     ])
     return pa.schema(fields)
 
@@ -192,6 +199,21 @@ TRADES_SCHEMA = pa.schema([
     pa.field("maker_wallet", pa.string(), nullable=True),   # maker proxy wallet (0x...)
     pa.field("taker_wallet", pa.string(), nullable=True),   # taker proxy wallet (0x...)
     pa.field("wallet", pa.string(), nullable=True),         # canonical wallet (taker if present else maker) for single-col queries
+    # Quote context at arrival (3.4.0): contemporaneous RAM-book BBO for both
+    # outcomes + sizes, stamped live in _handle_trade_message. NULL when the
+    # book is missing/unresolvable (reconciled api- rows keep NULLs — the RAM
+    # book is long gone by then). Null-vs-zero applies per side.
+    pa.field("up_bid", pa.float64(), nullable=True),
+    pa.field("up_ask", pa.float64(), nullable=True),
+    pa.field("up_bid_size", pa.float64(), nullable=True),
+    pa.field("up_ask_size", pa.float64(), nullable=True),
+    pa.field("down_bid", pa.float64(), nullable=True),
+    pa.field("down_ask", pa.float64(), nullable=True),
+    pa.field("down_bid_size", pa.float64(), nullable=True),
+    pa.field("down_ask_size", pa.float64(), nullable=True),
+    # book_state of the RAM book at arrival (live|stale|resyncing) — filter
+    # slippage math to live-quote fills; NULL when no book.
+    pa.field("quote_book_state", pa.string(), nullable=True),
 ])
 
 # §6 chainlink_events — time first

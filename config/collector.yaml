@@ -183,6 +183,11 @@ ws:
   reconnect_backoff_initial_ms: 500
   reconnect_backoff_max_ms: 30000
   reconnect_jitter: true
+  # WS/stale fix (2026-09-26): proactive recycle interval (was hardcoded 150s —
+  # 25,694 ws_disconnected/day, 74% of the flood, one episode per book per
+  # recycle). 240s still preempts the ~5min server-side kill; swaps stay honest
+  # via the planned_recycle episode rows.
+  recycle_interval_seconds: 240
   rest_book_url: https://clob.polymarket.com/book
   rest_market_url: https://clob.polymarket.com/markets
   resync_rest_backoff_initial_ms: 1000

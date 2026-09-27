@@ -264,6 +264,12 @@ class BookSnapshot:
     # A4 integrity attestation from the last accepted frame per outcome (None = not yet seen)
     up_book_hash: Optional[str] = None
     down_book_hash: Optional[str] = None
+    # Per-tick underlying alignment (3.4.0): nearest previous chainlink tick
+    # for this asset at or before the bucket (None = no tick in tolerance).
+    # Stamped by the collector; snapshot() leaves them None (no chainlink view).
+    underlying_price: Optional[float] = None
+    underlying_ts_ns: Optional[int] = None
+    underlying_age_ms: Optional[int] = None
 
     def to_flat_dict(self) -> Dict[str, object]:
         d: Dict[str, object] = {
@@ -294,6 +300,9 @@ class BookSnapshot:
             "book_crossed": self.book_crossed,
             "up_book_hash": self.up_book_hash,
             "down_book_hash": self.down_book_hash,
+            "underlying_price": self.underlying_price,
+            "underlying_ts_ns": self.underlying_ts_ns,
+            "underlying_age_ms": self.underlying_age_ms,
         }
         d.update(self.l2)
         d.update(self.depths)

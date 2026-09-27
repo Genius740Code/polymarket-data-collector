@@ -195,9 +195,18 @@ def compact_dataset(dataset_path: Path, temp_suffix: str = ".tmp") -> int:
                         _wschema = t.schema
                         _writer = pq.ParquetWriter(str(tmp_path), _wschema, compression="zstd")
                     if not t.schema.equals(_wschema):
+                        _t_in_rows = t.num_rows
                         t = _norm(t)
-                        if t is None or t.num_rows == 0:
-                            continue
+                        if t is None or t.num_rows != _t_in_rows:
+                            # Real-Data-Only: a dropped/short normalized batch
+                            # must abort the WHOLE compaction (outer handler
+                            # unlinks tmp, inputs untouched) — silently
+                            # skipping it would publish a short output, pass
+                            # the footer==written==read verify, and delete
+                            # previously-consumed inputs (silent loss).
+                            raise RuntimeError(
+                                f"normalization dropped batch in {dataset_path}: "
+                                f"in={_t_in_rows} out={0 if t is None else t.num_rows}")
                     _got_rows = True
                     _file_rows += t.num_rows
                     _pending.append(t)

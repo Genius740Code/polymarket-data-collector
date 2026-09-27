@@ -48,6 +48,16 @@ def _trade_row(**over) -> dict:
         "maker_wallet": None,
         "taker_wallet": None,
         "wallet": None,
+        # quote context (3.4.0): hive state at collection time predates it
+        "up_bid": None,
+        "up_ask": None,
+        "up_bid_size": None,
+        "up_ask_size": None,
+        "down_bid": None,
+        "down_ask": None,
+        "down_bid_size": None,
+        "down_ask_size": None,
+        "quote_book_state": None,
     }
     base.update(over)
     return base
