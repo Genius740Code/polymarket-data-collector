@@ -81,6 +81,12 @@ def parse_order_filled_fills(logs: List[dict]) -> List[dict]:
     fee, builder, metadata). V1: (makerAssetId, takerAssetId,
     makerAmountFilled, takerAmountFilled, fee) — a fill matches a row when the
     row's token_id equals the V2 tokenId or either V1 asset id. Pure function.
+
+    Forward-compat keys (checkbox 6 first-class rows): exchange_version
+    ("v1"/"v2"), price/size/fee/builder are None here — the amount-word
+    decode has not landed, and NULL is kept (never 0-guessed). Use
+    onchain_rows_from_fills() to project these records onto
+    ONCHAIN_FILLS_SCHEMA.
     """
     fills: List[dict] = []
     for log in logs or []:
@@ -97,7 +103,9 @@ def parse_order_filled_fills(logs: List[dict]) -> List[dict]:
             data = log.get("data") or ""
             rec = {"tx_hash": txh, "token_id": None, "maker_asset_id": None,
                    "taker_asset_id": None, "maker": _topic_addr(topics[2]),
-                   "taker": _topic_addr(topics[3]), "side": None}
+                   "taker": _topic_addr(topics[3]), "side": None,
+                   "exchange_version": ("v2" if topic0 == ORDERFILLED_V2_TOPIC else "v1"),
+                   "price": None, "size": None, "fee": None, "builder": None}
             if topic0 == ORDERFILLED_V2_TOPIC:
                 token_id = _u256_word(data, 1)
                 if token_id is None:
@@ -113,6 +121,72 @@ def parse_order_filled_fills(logs: List[dict]) -> List[dict]:
         except Exception:
             continue
     return fills
+
+
+def onchain_rows_from_fills(
+    fills: List[dict],
+    token_to_condition: Optional[Dict[str, str]] = None,
+) -> List[dict]:
+    """Project decoded fills onto ONCHAIN_FILLS_SCHEMA rows (pure, no RPC).
+
+    Checkbox 6 writer helper: emits per-fill first-class rows from the
+    existing decode. No new chain reads — price/size/fee/builder stay NULL
+    (absent from the current decode, never 0-guessed). condition_id resolves
+    via token_to_condition (token_id, else either V1 asset id; ambiguous or
+    unresolvable stays NULL). side maps the V2 Side word 0/1 to
+    "buy"/"sell" (CTF Side enum Buy=0 Sell=1); anything else stays NULL.
+    Unanimity is enforced upstream (backfill_wallets_from_fills / tx maps);
+    these rows carry the decoded maker/taker as-is per log.
+    """
+    token_map = token_to_condition or {}
+    rows: List[dict] = []
+    for f in fills or []:
+        try:
+            txh = f.get("tx_hash")
+            if not txh:
+                continue
+            tok = f.get("token_id")
+            tok_s = str(tok) if tok is not None else None
+            cid = None
+            if tok_s is not None:
+                cid = token_map.get(tok_s)
+            if cid is None:
+                # V1 logs carry two asset ids and no single token_id — resolve
+                # only when exactly one side maps (ambiguous stays NULL).
+                cands = set()
+                for aid in (f.get("maker_asset_id"), f.get("taker_asset_id")):
+                    if aid is not None and str(aid) in token_map:
+                        cands.add(token_map[str(aid)])
+                if len(cands) == 1:
+                    cid = next(iter(cands))
+            raw_side = f.get("side")
+            side = None
+            try:
+                if raw_side is not None and int(raw_side) == 0:
+                    side = "buy"
+                elif raw_side is not None and int(raw_side) == 1:
+                    side = "sell"
+            except Exception:
+                side = None
+            if isinstance(raw_side, str) and side is None:
+                _s = raw_side.strip().lower()
+                side = _s if _s in ("buy", "sell") else None
+            rows.append({
+                "tx_hash": str(txh).lower(),
+                "token_id": tok_s,
+                "condition_id": cid,
+                "maker": f.get("maker"),
+                "taker": f.get("taker"),
+                "price": f.get("price"),
+                "size": f.get("size"),
+                "fee": f.get("fee"),
+                "side": side,
+                "exchange_version": f.get("exchange_version"),
+                "builder": f.get("builder"),
+            })
+        except Exception:
+            continue
+    return rows
 
 
 def backfill_wallets_from_fills(rows: List[dict], fills: List[dict]) -> Dict[str, int]:

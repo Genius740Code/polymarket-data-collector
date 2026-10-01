@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from .l2_raw import L2_RAW_SCHEMA
+
 
 # Common
 SCHEMA_VERSION_FIELD = pa.field("schema_version", pa.string(), nullable=False)
@@ -216,6 +218,20 @@ TRADES_SCHEMA = pa.schema([
     pa.field("quote_book_state", pa.string(), nullable=True),
 ])
 
+# §6 chainlink_twap — downstream derived (chainlink_twap.py). Raw RTDS has no
+# TWAP; trailing 30s/60s are computed from stored ticks, NULL on gaps.
+CHAINLINK_TWAP_SCHEMA = pa.schema([
+    pa.field("ts_window_end_ms", pa.int64(), nullable=False),
+    pa.field("ts_window_end_utc", pa.string(), nullable=False),
+    pa.field("ts_window_start_ms_60s", pa.int64(), nullable=False),
+    pa.field("asset", pa.string(), nullable=False),
+    pa.field("twap_30s", pa.float64(), nullable=True),
+    pa.field("twap_60s", pa.float64(), nullable=True),
+    pa.field("n_ticks_30s", pa.int64(), nullable=True),
+    pa.field("n_ticks_60s", pa.int64(), nullable=True),
+    pa.field("gap_max_ms_60s", pa.int64(), nullable=True),
+    pa.field("source", pa.string(), nullable=False),
+])
 # §6 chainlink_events — time first
 # twap/twap_window_seconds/round_id/sequence_number dropped 2026-09-05: the RTDS
 # payload carries none of them (100% null); rolling TWAP is a downstream derived
@@ -277,6 +293,29 @@ THRESHOLDS_SCHEMA = pa.schema([
 ])
 
 
+# §5B onchain_fills — first-class (NEW_COLLECTOR_PERFECT_SPEC checkbox 6).
+# Promoted from the enrich-inside-trades path: one row per OrderFilled log
+# (CTF + NegRisk Exchange v1/v2) on Polygon. Joined to markets via token_id
+# (V2 tokenId / either V1 asset id); unanimity-join at read time —
+# multi-maker same-token fills keep maker NULL (never guessed).
+# price/size/fee stay NULL until the amount-word decode lands (never 0-guess);
+# builder is the V2 builder address word (NULL when absent); side is the
+# taker side, lowercase buy/sell (NULL when unknown).
+ONCHAIN_FILLS_SCHEMA = pa.schema([
+    pa.field("tx_hash", pa.string(), nullable=False),
+    pa.field("token_id", pa.string(), nullable=True),
+    pa.field("condition_id", pa.string(), nullable=True),
+    pa.field("maker", pa.string(), nullable=True),
+    pa.field("taker", pa.string(), nullable=True),
+    pa.field("price", pa.float64(), nullable=True),
+    pa.field("size", pa.float64(), nullable=True),
+    pa.field("fee", pa.float64(), nullable=True),
+    pa.field("side", pa.string(), nullable=True),
+    pa.field("exchange_version", pa.string(), nullable=True),
+    pa.field("builder", pa.string(), nullable=True),
+])
+
+
 # Map dataset name → schema for generic writer
 SCHEMAS = {
     "markets_log": MARKETS_SCHEMA,
@@ -284,6 +323,9 @@ SCHEMAS = {
     "book_events": BOOK_EVENTS_SCHEMA,
     "trades": TRADES_SCHEMA,
     "chainlink_events": CHAINLINK_SCHEMA,
+    "l2_raw": L2_RAW_SCHEMA,
+    "chainlink_twap": CHAINLINK_TWAP_SCHEMA,
+    "onchain_fills": ONCHAIN_FILLS_SCHEMA,
     "collector_events": COLLECTOR_EVENTS_SCHEMA,
     "resync_episodes": RESYNC_EPISODES_SCHEMA,
     "event_thresholds_config": THRESHOLDS_SCHEMA,

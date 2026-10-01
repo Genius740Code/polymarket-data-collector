@@ -44,6 +44,7 @@ from .storage.markets_log import MarketsLog
 from .storage.parquet_io import read_table
 from .storage.parquet_writer import ParquetWriter
 from .storage.raw_archive import RawArchive
+from .storage.l2_raw import append_row as _l2_raw_append_row
 from .validation import coerce_ts_source_ms, validate_ws_message
 
 
@@ -526,6 +527,36 @@ class Collector:
         wallet = taker or maker or generic
         return maker, taker, wallet
 
+    def _append_l2_raw(self, single_msg: dict, shard: List[str]) -> None:
+        """Route one WS frame to l2_raw verbatim (perfect-collector hook).
+
+        Runs BEFORE book/threshold handling so tick_size_change and
+        market_resolved frames (no book handlers) are still captured.
+        Join columns are best-effort; frame_json is always the verbatim
+        frame. Never raises — the WS loop must not die on an audit write.
+        """
+        try:
+            try:
+                asset = self._resolve_msg_asset(single_msg, None, shard)
+            except Exception:
+                asset = "UNKNOWN"
+            cid = single_msg.get("condition_id") or single_msg.get("conditionId")
+            try:
+                _b = self._lookup_book(
+                    cid, single_msg.get("token_id") or single_msg.get("asset_id"))
+                if _b is not None:
+                    cid = _b.condition_id
+            except Exception:
+                pass
+            ok = _l2_raw_append_row(
+                self.writer, single_msg, asset=asset or "UNKNOWN",
+                condition_id=cid if isinstance(cid, str) else None,
+            )
+            if not ok:
+                self._collector_event(CollectorEventType.backpressure, {"dataset": "l2_raw", "asset": asset})
+        except Exception:
+            pass
+
     def _append_book_event(self, ev: dict, book: "OrderBookState", asset: str, msg: dict) -> None:
         """Persist one §4 book_events row captured by OrderBookState.apply_ws_message."""
         try:
@@ -761,6 +792,19 @@ class Collector:
                 except Exception:
                     fee = None
                     fee_is_estimated = None
+            # 4.3 fallback estimate when exchange reports neither fee nor rate:
+            # keep exchange values untouched above; estimate 0.07*size*p*(1-p)
+            # with fee_is_estimated=True so researchers can filter. Never
+            # overwrites a real fee; NULL stays NULL when price/size unknown.
+            if fee is None and price is not None and size is not None:
+                try:
+                    _p = float(price)
+                    _s = float(size)
+                    if 0.0 <= _p <= 1.0 and _s >= 0:
+                        fee = round(0.07 * _s * _p * (1.0 - _p), 6)
+                        fee_is_estimated = True
+                except Exception as _e_fee_est:
+                    self._emit_trade_drop(f"fee_estimate_failed:{_e_fee_est!r}"[:120], asset)
             # E7: Polymarket 5m markets are 0-fee (fee_rate_bps="0") — a 0.0 fee
             # with a True/False flag misleads P&L readers, so the flag is NULL
             # (not applicable) while the real 0.0 value is kept.
@@ -2689,6 +2733,13 @@ class Collector:
                             for single_msg in msgs:
                                 if not isinstance(single_msg, dict):
                                     continue
+                                # l2_raw (perfect §4): verbatim frame log before
+                                # thresholds — every frame incl. tick_size_change /
+                                # market_resolved (no book handlers for those).
+                                try:
+                                    self._append_l2_raw(single_msg, shard)
+                                except Exception:
+                                    pass
                                 # Apply to order book — handles sequence gap detection,
                                 # level updates, and book_state transitions internally
                                 # Try condition_id first, then token_id/asset_id resolution via books scan.
@@ -3465,8 +3516,10 @@ class Collector:
                                     "resync_id": getattr(book, "resync_id", None) or self._episode_for_snapshot(m.asset, m.condition_id) or str(uuid.uuid4()),
                                     # M8: unknown stays NULL (never fabricate False).
                                     "book_crossed": None,
-                                    "up_book_age_ms": None,
-                                    "down_book_age_ms": None,
+                                    # 4.10 carry book age when available; NULL only
+                                    # when truly unanchored (never updated).
+                                    "up_book_age_ms": getattr(book, "_up_book_age_ms", None),
+                                    "down_book_age_ms": getattr(book, "_down_book_age_ms", None),
                                 }
                                 # fill L2 and depths as NULLs to satisfy schema
                                 for _oc in ("up", "down"):

@@ -32,6 +32,7 @@ def _os_replace_safe(src, dst):
 from .parquet_io import read_table
 
 from ..enums import CollectorEventType
+from .l2_raw import dedup_key_for_row as _l2_raw_dedup_key
 from .schemas import SCHEMAS, snapshot_schema
 
 import sys as _sys
@@ -789,6 +790,7 @@ class ParquetWriter:
         "book_snapshots_500ms": ["asset", "condition_id", "ts_snapshot_ns"],
         "book_snapshots_clean": ["asset", "condition_id", "ts_snapshot_ns"],
         "chainlink_events": ["report_id", "asset", "event_id", "ts_source", "ts_received_ns", "price"],
+        "l2_raw": ["token_id", "ts_source", "event_type"],
         "resync_episodes": ["resync_id"],
         "collector_events": ["event_id"],
     }
@@ -1126,6 +1128,10 @@ class ParquetWriter:
             rid = row.get("resync_id")
             if rid:
                 return (_is(rid),)
+        if dataset == "l2_raw":
+            # Verbatim frame log: redelivery across conns A/B shares the frame
+            # but gets a fresh ts_received_ns/source_conn — key excludes both.
+            return _l2_raw_dedup_key(row)
         if dataset == "collector_events":
             eid = row.get("event_id")
             if eid:
@@ -1185,7 +1191,7 @@ class ParquetWriter:
         # for date-only datasets even if caller passed asset=BTC (bug seen in
         # collector_events during rollover spam — 65k files in asset=BTC).
         NON_ASSET_DATASETS = {"markets_log", "resync_episodes", "collector_events"}
-        PER_ASSET_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
+        PER_ASSET_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events", "l2_raw"}
         if dataset in NON_ASSET_DATASETS:
             out_dir = self.data_dir / dataset / f"date={date_str}"
         elif dataset == "markets_latest":
@@ -1339,6 +1345,42 @@ class ParquetWriter:
                                 self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "test_sentinel_scrubbed", "field": fld})
                         except Exception:
                             pass
+                    # 4.7 reject non-hex condition_id at write (test/cid-* etc).
+                    # Real Polymarket condition_id is ^0x[0-9a-f]{64}$; unknown
+                    # stays None (honest gap). Never store token_id or sentinel
+                    # in the condition_id column (poisons the markets join).
+                    if fld == "condition_id" and nr.get("condition_id") is not None:
+                        try:
+                            _cid = str(nr["condition_id"]).strip()
+                            _ok = len(_cid) == 66 and _cid.startswith("0x") and all(
+                                c in "0123456789abcdefABCDEF" for c in _cid[2:]
+                            )
+                            if not _ok:
+                                nr["condition_id"] = None
+                                try:
+                                    if self.on_event:
+                                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "bad_condition_id_scrubbed", "field": fld, "value": _cid[:32]})
+                                except Exception as _e_scrub:
+                                    print(f"[parquet_writer] WARN scrub event failed: {_e_scrub}")
+                        except Exception as _e_cid:
+                            print(f"[parquet_writer] WARN condition_id validate failed: {_e_cid}")
+        # 4.8 int64 recv_ns only, format at read: coerce string ns to int at
+        # write so parquet stays int64; ISO strings remain display-only.
+        # Never fabricate: unparsable stays as-is for schema validation.
+        for nr in norm_rows:
+            try:
+                _v = nr.get("ts_received_ns")
+                if isinstance(_v, str):
+                    _s = _v.strip()
+                    if _s.isdigit():
+                        nr["ts_received_ns"] = int(_s)
+                    else:
+                        try:
+                            nr["ts_received_ns"] = int(float(_s))
+                        except Exception as _e_ns_inner:
+                            print(f"[parquet_writer] WARN ns coerce failed: {_e_ns_inner}")
+            except Exception as _e_ns:
+                print(f"[parquet_writer] WARN ns outer coerce failed: {_e_ns}")
         # Honest-gap drop: snapshot rows with no bucket time are unjoinable —
         # drop with a countable event instead of fabricating a bucket.
         try:
