@@ -138,7 +138,7 @@ module.exports = {
       interpreter: 'none',
       exec_mode: 'fork',
       autorestart: false,
-      cron_restart: '0 3 * * *',   // 03:00 UTC daily
+      cron_restart: '0 */6 * * *',   // every 6h (was daily 03:00 — 35 lanes outrun daily)
       time: true,
       out_file: path.join(cwd, 'logs', 'compact-out.log'),
       error_file: path.join(cwd, 'logs', 'compact-error.log'),

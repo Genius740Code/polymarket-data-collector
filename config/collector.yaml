@@ -118,8 +118,8 @@ storage:
   # than ENOSPC death; reap is cheap (walks only _quarantine/) and the
   # zero-leeway emergency prune only deletes already-uploaded rows.
   disk_space_min_bytes: 1073741824
-  flush_interval_seconds: 30
-  flush_row_count_threshold: 1500
+  flush_interval_seconds: 120
+  flush_row_count_threshold: 5000
   wal_dir: ./data/_wal
   wal_enabled: true
 synthetic_mode: false

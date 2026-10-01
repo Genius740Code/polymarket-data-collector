@@ -1347,6 +1347,53 @@ class Collector:
         import httpx
         m = self.markets.get(condition_id)
         merged: dict = {}
+        # Batched POST /books first (perfect-collector heal): one round-trip
+        # for both tokens instead of 2 GETs — collapses the fetch_none/429
+        # storm under multi-lane load. Any failure falls through to the GET
+        # path below (never raises, never synthesizes).
+        if m:
+            try:
+                from .ingest.heal import heal_books_batched
+                _shared0 = self._get_rest_client()
+
+                async def _post(url: str, payload: list):
+                    if _shared0 is not None:
+                        return await _shared0.post(url, json=payload)
+                    async with httpx.AsyncClient(timeout=6) as _c0:
+                        return await _c0.post(url, json=payload)
+
+                _by_tok = {}
+                try:
+                    _by_tok = {
+                        str(m.up_token_id): condition_id,
+                        str(m.down_token_id): condition_id,
+                    }
+                except Exception:
+                    _by_tok = {}
+                _hr = await heal_books_batched(
+                    [m.up_token_id, m.down_token_id],
+                    _post,
+                    condition_by_token=_by_tok,
+                    resolver=self._market_status_for_resync,
+                )
+                _tok2out = {"up": m.up_token_id, "down": m.down_token_id}
+                _got = True
+                for _o, _tok in _tok2out.items():
+                    try:
+                        _b = (_hr.books or {}).get(str(_tok))
+                    except Exception:
+                        _b = None
+                    if isinstance(_b, dict) and isinstance(_b.get("bids"), list) and isinstance(_b.get("asks"), list):
+                        merged[f"{_o}_bids"] = _b["bids"]
+                        merged[f"{_o}_asks"] = _b["asks"]
+                    else:
+                        _got = False
+                        break
+                if _got and all(f"{_o}_{_s}" in merged for _o in ("up", "down") for _s in ("bids", "asks")):
+                    return merged
+                merged = {}
+            except Exception:
+                merged = {}
         def _client():
             shared = self._get_rest_client()
             if shared is not None:
