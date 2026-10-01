@@ -1076,8 +1076,10 @@ class RolloverManager:
         if state.needs_rollover_lookahead(now_ms, lead_ms):
             # distinguish initial discovery (no current) from true rollover window
             is_initial = state.current is None
-            if not is_initial:
-                state.is_rollover_window = True
+            # 4.1 overlap-only: is_rollover_window=True only when current+next
+            # both present (true overlap). Lookahead-started with no next
+            # stays False so research filters don't include pre-discovery noise.
+            # Flag is set below once state.next is assigned, cleared on promote.
             after = state.current.market_end_ts_ms if state.current else now_ms
             # rate-limited polling — don't tight-loop (§1 #7)
             if state.last_discovery_attempt_ms and (now_ms - state.last_discovery_attempt_ms) < int(discovery._backoff_s * 1000):
@@ -1119,6 +1121,9 @@ class RolloverManager:
                     return "market_added"
                 else:
                     state.next = next_market
+                    # 4.1 overlap-only: current+next both present now.
+                    if state.current is not None:
+                        state.is_rollover_window = True
                     # subscribe immediately (§1 step 2)
                     try:
                         await subscribe_fn(next_market)
