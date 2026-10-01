@@ -32,6 +32,7 @@ def _os_replace_safe(src, dst):
 from .parquet_io import read_table
 
 from ..enums import CollectorEventType
+from ..book import FULL_DEPTH_LEVELS
 from .l2_raw import dedup_key_for_row as _l2_raw_dedup_key
 from .schemas import SCHEMAS, snapshot_schema
 
@@ -131,6 +132,11 @@ class ParquetWriter:
         wal_enabled: bool = True,
         wal_dir: str | Path | None = None,
         l2_levels: int = 10,
+        # Full-depth opt-in (mirrors CollectorConfig.l2_full): when true the
+        # snapshot schema widens dynamically to the deepest level present in
+        # the batch (up to book.FULL_DEPTH_LEVELS) so full-depth rows write
+        # without column loss. Default False = fixed l2_levels schema.
+        l2_full: bool = False,
         schema_version: str = "3.0.0",
         on_event=None,  # callback(event_type, details) for collector_events
         synthetic_mode: bool = False,
@@ -142,6 +148,7 @@ class ParquetWriter:
         self.wal_enabled = wal_enabled
         self.wal_dir = Path(wal_dir) if wal_dir else self.data_dir / "_wal"
         self.l2_levels = l2_levels
+        self.l2_full = bool(l2_full)
         self.schema_version = schema_version
         self.on_event = on_event
         self.synthetic_mode = synthetic_mode
@@ -1185,6 +1192,45 @@ class ParquetWriter:
                 except Exception:
                     self._wal_f = None
 
+    def _snapshot_group_schema(self, rows: List[Dict[str, Any]]):
+        """Arrow schema for a snapshot flush group.
+
+        Default: fixed snapshot_schema(self.l2_levels). With l2_full the
+        schema widens to the deepest `{outcome}_{side}_level_{N}_*` column
+        present in the batch (capped at book.FULL_DEPTH_LEVELS) so full-depth
+        rows write without column loss. Rows narrower than the schema keep
+        NULLs (never fabricated); the _normalize() union already pads them.
+        """
+        if not self.l2_full:
+            return snapshot_schema(self.l2_levels)
+        deepest = self.l2_levels
+        try:
+            # Post-_normalize every row carries the union of keys — the first
+            # row's keys cover the batch.
+            for key in rows[0].keys():
+                if not key.endswith("_price"):
+                    continue
+                head, sep, tail = key.rpartition("_level_")
+                if not sep:
+                    continue
+                try:
+                    n = int(tail.split("_", 1)[0])
+                except Exception:
+                    continue
+                if n > deepest:
+                    deepest = n
+                    if deepest >= FULL_DEPTH_LEVELS:
+                        deepest = FULL_DEPTH_LEVELS
+                        break
+        except Exception:
+            pass
+        try:
+            deepest = int(deepest)
+        except Exception:
+            deepest = self.l2_levels
+        deepest = min(max(deepest, self.l2_levels), FULL_DEPTH_LEVELS)
+        return snapshot_schema(deepest)
+
     def _write_group(self, dataset: str, date_str: str, asset: Optional[str], rows: List[Dict[str, Any]]) -> None:
         # Determine output path §11 partitioning — §11 explicitly lists which
         # datasets are per-asset vs date-only.  Do NOT create asset subdirs
@@ -1439,7 +1485,7 @@ class ParquetWriter:
             has_snapshot_id = any("snapshot_id" in r for r in norm_rows)
             if has_snapshot_id:
                 try:
-                    schema = snapshot_schema(self.l2_levels)
+                    schema = self._snapshot_group_schema(norm_rows)
                     table = pa.Table.from_pylist(norm_rows, schema=schema)
                 except Exception:
                     table = pa.Table.from_pylist(norm_rows)

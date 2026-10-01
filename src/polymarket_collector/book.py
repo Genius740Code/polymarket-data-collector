@@ -145,6 +145,12 @@ def _nz(v: Optional[float]) -> Optional[float]:
     return None if v is None or v == 0 else v
 
 
+# Full-depth opt-in (l2_full): RAM always holds up to this many levels per
+# side (H2); snapshot() emits all of them only when OrderBookState(l2_full=True).
+# Default snapshots stay at l2_levels (10) — no behavior change unless opted in.
+FULL_DEPTH_LEVELS = 100
+
+
 def sanitize_level(price, size) -> Optional[Tuple[float, float]]:
     """Shared §3A bounds sanitizer (audit 2026-09-21 MEDIUM).
 
@@ -327,6 +333,10 @@ class OrderBookState:
         market_end_ts_ms: Optional[int],
         schema_version: str = "3.0.0",
         l2_levels: int = 10,
+        # Full-depth opt-in: when True, snapshot() emits the full RAM depth
+        # (up to FULL_DEPTH_LEVELS) instead of truncating to l2_levels.
+        # Default False — output stays at l2_levels columns (no behavior change).
+        l2_full: bool = False,
         # F10: one-sided promotion for thin books (weather far-future buckets
         # are routinely asks-only). Wired from WsConfig.promotion_one_sided;
         # default False preserves the strict both-sides gate elsewhere.
@@ -349,10 +359,12 @@ class OrderBookState:
         self.market_end_ts_ms = market_end_ts_ms
         self.schema_version = schema_version
         self.l2_levels = l2_levels
+        self.l2_full = bool(l2_full)
         # H2: hold full depth in RAM (truncate only on snapshot write).
-        # L2 output stays at l2_levels columns; RAM keeps up to 100 levels so
+        # L2 output stays at l2_levels columns unless l2_full opts into full
+        # RAM depth; RAM keeps up to FULL_DEPTH_LEVELS levels so
         # level 11+ survives top-of-book removals.
-        self._ram_levels = max(l2_levels, 100)
+        self._ram_levels = max(l2_levels, FULL_DEPTH_LEVELS)
         self.one_sided_promotion = bool(one_sided_promotion)
 
         self.up = OutcomeBook()
@@ -1152,22 +1164,24 @@ class OrderBookState:
         if down_ask is None:
             down_ask_size = None
 
-        # L2 flat columns
+        # L2 flat columns (l2_full=True emits full RAM depth up to
+        # FULL_DEPTH_LEVELS; default truncates to l2_levels).
+        out_levels = self._ram_levels if self.l2_full else self.l2_levels
         l2: Dict[str, Optional[float]] = {}
         for outcome_key, book in (("up", self.up), ("down", self.down)):
             for side_key, side in (("bid", book.bids), ("ask", book.asks)):
                 for i, lvl in enumerate(side.levels, start=1):
-                    # pad already done; but ensure l2_levels pad nulls
-                    if i > self.l2_levels:
+                    # pad already done; but ensure out_levels pad nulls
+                    if i > out_levels:
                         break
                     p_field = f"{outcome_key}_{side_key}_level_{i}_price"
                     s_field = f"{outcome_key}_{side_key}_level_{i}_size"
                     l2[p_field] = lvl.price
                     l2[s_field] = lvl.size
-                # if book had fewer than l2_levels (should be padded) still ensure keys exist
+                # if book had fewer than out_levels (should be padded) still ensure keys exist
                 # PERF: guard avoids range+f-strings on the normal padded path.
-                if len(side.levels) < self.l2_levels:
-                    for i in range(len(side.levels) + 1, self.l2_levels + 1):
+                if len(side.levels) < out_levels:
+                    for i in range(len(side.levels) + 1, out_levels + 1):
                         l2[f"{outcome_key}_{side_key}_level_{i}_price"] = None
                         l2[f"{outcome_key}_{side_key}_level_{i}_size"] = None
 

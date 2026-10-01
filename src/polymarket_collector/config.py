@@ -224,6 +224,12 @@ class CollectorConfig(BaseSettings):
 
     snapshot_interval_ms: int = 500
     l2_levels: int = 10
+    # Full-depth opt-in: when true, OrderBookState.snapshot() emits the full
+    # RAM depth (up to book.FULL_DEPTH_LEVELS=100 per side) instead of
+    # truncating to l2_levels, and ParquetWriter widens the snapshot schema
+    # dynamically so no level columns are lost. Default false = 10-level
+    # behavior unchanged (narrower rows, cheaper staging/uploads).
+    l2_full: bool = False
     depth_thresholds_cents: List[int] = Field(default_factory=lambda: [1, 5, 10])
 
     event_thresholds: EventThresholds = Field(default_factory=EventThresholds)

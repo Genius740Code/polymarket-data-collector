@@ -75,6 +75,12 @@ kaggle:
   # more often. Cost: more Kaggle versions + more export CPU.
   upload_interval_seconds: 1200
 l2_levels: 10
+# Opt-in full-depth L2 snapshots: when true, snapshot() emits the full RAM
+# depth (up to 100 levels per side) instead of truncating to l2_levels, and
+# the writer/export widen the snapshot schema dynamically so no level
+# columns are lost. Default false — 10-level behavior unchanged (narrower
+# rows, cheaper staging/uploads). Opt in only with disk + Kaggle headroom.
+l2_full: false
 liquidity_filter:
   enabled: false
   min_liquidity: 1000
@@ -183,11 +189,15 @@ ws:
   reconnect_backoff_initial_ms: 500
   reconnect_backoff_max_ms: 30000
   reconnect_jitter: true
-  # WS/stale fix (2026-09-26): proactive recycle interval (was hardcoded 150s —
-  # 25,694 ws_disconnected/day, 74% of the flood, one episode per book per
+  # WS/stale fix (2026-09-26): proactive recycle interval (was hardcoded
+  # 150s — 25,694 ws_disconnected/day, 74% of the flood, one episode per book per
   # recycle). 240s still preempts the ~5min server-side kill; swaps stay honest
   # via the planned_recycle episode rows.
-  recycle_interval_seconds: 240
+  # Phase-2 (2026-10-01): 240->270 — stays under the ~300s server kill while
+  # cutting churn ~11%. Do NOT raise past 280 without hot-swap (server kills
+  # first -> unplanned disconnects, worse). Scheduler 6/tick cap kept (1013
+  # protection); catch-up 120-bucket cap kept (p99 tick safety on loaded box).
+  recycle_interval_seconds: 270
   rest_book_url: https://clob.polymarket.com/book
   rest_market_url: https://clob.polymarket.com/markets
   resync_rest_backoff_initial_ms: 1000

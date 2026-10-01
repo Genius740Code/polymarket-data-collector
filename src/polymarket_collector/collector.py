@@ -187,6 +187,7 @@ class Collector:
             wal_enabled=config.storage.wal_enabled,
             wal_dir=config.storage.wal_dir,
             l2_levels=config.l2_levels,
+            l2_full=getattr(config, "l2_full", False),
             schema_version=config.schema_version,
             on_event=self._writer_event,
             # AGENT.md §0 (audit 2026-09-21): new code must not read
@@ -376,6 +377,7 @@ class Collector:
                                     market_end_ts_ms=None,
                                     schema_version=self.config.schema_version,
                                     l2_levels=self.config.l2_levels,
+                                    l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
                                 )
                                 book.mark_stale(resync_id=str(uuid.uuid4()))
@@ -1309,6 +1311,31 @@ class Collector:
         except Exception:
             return False
 
+    def _l2_full(self) -> bool:
+        """Full-depth L2 opt-in flag, exception-safe like _one_sided_promotion."""
+        try:
+            return bool(getattr(self.config, "l2_full", False))
+        except Exception:
+            return False
+
+    def _export_l2_levels(self) -> int:
+        """Snapshot width for staging/export schemas (export drops extras).
+
+        Full-depth hives carry up to book.FULL_DEPTH_LEVELS level columns;
+        staging with l2_levels=10 would silently drop levels 11+. Return the
+        full width when opted in, else the configured narrow width.
+        """
+        try:
+            if bool(getattr(self.config, "l2_full", False)):
+                from .book import FULL_DEPTH_LEVELS
+                return int(FULL_DEPTH_LEVELS)
+        except Exception:
+            pass
+        try:
+            return int(self.config.l2_levels)
+        except Exception:
+            return 10
+
     async def _fetch_rest_book(self, asset: str, condition_id: str) -> Optional[dict]:
         """Fetch a full order-book snapshot via REST for resync — merged both outcomes.
 
@@ -2239,6 +2266,7 @@ class Collector:
                                     market_end_ts_ms=market.market_end_ts_ms,
                                     schema_version=self.config.schema_version,
                                     l2_levels=self.config.l2_levels,
+                                    l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
                                 )
                             except Exception:
@@ -2248,6 +2276,7 @@ class Collector:
                                     window_index=market.window_index,
                                     up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                                     market_end_ts_ms=market.market_end_ts_ms,
+                                    l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
                                 )
                             try:
@@ -2374,6 +2403,7 @@ class Collector:
                         market_end_ts_ms=market.market_end_ts_ms,
                         schema_version=self.config.schema_version,
                         l2_levels=self.config.l2_levels,
+                        l2_full=self._l2_full(),
                         one_sided_promotion=self._one_sided_promotion(),
                     )
                 except Exception:
@@ -2383,6 +2413,7 @@ class Collector:
                         window_index=market.window_index,
                         up_token_id=market.up_token_id, down_token_id=market.down_token_id,
                         market_end_ts_ms=market.market_end_ts_ms,
+                        l2_full=self._l2_full(),
                         one_sided_promotion=self._one_sided_promotion(),
                     )
                 try:
@@ -3339,6 +3370,7 @@ class Collector:
                                         up_token_id=m.up_token_id, down_token_id=m.down_token_id,
                                         market_end_ts_ms=m.market_end_ts_ms,
                                         schema_version=self.config.schema_version, l2_levels=self.config.l2_levels,
+                                        l2_full=self._l2_full(),
                                         one_sided_promotion=self._one_sided_promotion(),
                                     )
                                 except Exception:
@@ -3348,6 +3380,7 @@ class Collector:
                                         window_index=m.window_index,
                                         up_token_id=m.up_token_id, down_token_id=m.down_token_id,
                                         market_end_ts_ms=m.market_end_ts_ms,
+                                        l2_full=self._l2_full(),
                                         one_sided_promotion=self._one_sided_promotion(),
                                     )
                                 # New books start stale until first real data (fixes 5b live-with-nulls)
@@ -3522,9 +3555,11 @@ class Collector:
                                     "down_book_age_ms": getattr(book, "_down_book_age_ms", None),
                                 }
                                 # fill L2 and depths as NULLs to satisfy schema
+                                # (full width when l2_full so the group schema stays consistent)
+                                _snap_levels = self._export_l2_levels()
                                 for _oc in ("up", "down"):
                                     for _sk in ("bid", "ask"):
-                                        for _lvl in range(1, (getattr(self.config, "l2_levels", 20) or 20) + 1):
+                                        for _lvl in range(1, _snap_levels + 1):
                                             row[f"{_oc}_{_sk}_level_{_lvl}_price"] = None
                                             row[f"{_oc}_{_sk}_level_{_lvl}_size"] = None
                                         for _thc in (1, 5, 10):
@@ -4741,7 +4776,7 @@ class Collector:
                         data_dir=self.config.storage.data_dir,
                         assets=self.config.assets,
                         timeframe_labels=[test_tf],
-                        l2_levels=self.config.l2_levels,
+                        l2_levels=self._export_l2_levels(),
                         dataset_prefix=self.config.kaggle_dataset_for(test_tf),
                         dry_run=not _has_creds,
                     )
@@ -5362,7 +5397,7 @@ class Collector:
                                     data_dir=self.config.storage.data_dir,
                                     assets=self.config.assets,
                                     timeframe_labels=[tf],
-                                    l2_levels=self.config.l2_levels,
+                                    l2_levels=self._export_l2_levels(),
                                     dataset_prefix=self.config.kaggle_dataset_for(tf),
                                     dry_run=not _has_creds,
                                 )
@@ -5372,7 +5407,7 @@ class Collector:
                                 data_dir=self.config.storage.data_dir,
                                 assets=self.config.assets,
                                 timeframe_labels=[tf],
-                                l2_levels=self.config.l2_levels,
+                                l2_levels=self._export_l2_levels(),
                                 dataset_prefix=self.config.kaggle_dataset_for(tf),
                                 dry_run=not _has_creds,
                             )
