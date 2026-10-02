@@ -2855,7 +2855,11 @@ class Collector:
                                 planned_recycle = True
                                 print(f"[ws:{_label}] planned recycle — reconnecting")
                                 try:
-                                    self._planned_recycle_at = time.time()
+                                    _prm = getattr(self, "_planned_recycle_at", None)
+                                    if not isinstance(_prm, dict):
+                                        _prm = {}
+                                        self._planned_recycle_at = _prm
+                                    _prm[str(_label)] = time.time()
                                 except Exception:
                                     pass
                                 break
@@ -3292,7 +3296,19 @@ class Collector:
             try:
                 _skip_walk = False
                 try:
-                    _skip_walk = (time.time() - float(getattr(self, "_planned_recycle_at", 0) or 0)) < 90.0
+                    # One-shot: consume the flag so only the recycle's own
+                    # reconnect skips the walk — a later abnormal death must
+                    # still get its immediate walk.
+                    _pr_map = getattr(self, "_planned_recycle_at", None)
+                    if isinstance(_pr_map, dict) and _pr_map:
+                        _now_f = time.time()
+                        if any((_now_f - float(_v or 0)) < 90.0 for _v in _pr_map.values()):
+                            _skip_walk = True
+                        _pr_map.clear()
+                    elif _pr_map:
+                        if (time.time() - float(_pr_map)) < 90.0:
+                            _skip_walk = True
+                        self._planned_recycle_at = 0
                 except Exception:
                     _skip_walk = False
                 if not _skip_walk:
