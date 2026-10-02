@@ -2854,6 +2854,10 @@ class Collector:
                             if int(time.time() * 1000) - conn_established_ms > _recycle_ms:
                                 planned_recycle = True
                                 print(f"[ws:{_label}] planned recycle — reconnecting")
+                                try:
+                                    self._planned_recycle_at = time.time()
+                                except Exception:
+                                    pass
                                 break
                             # §13 raw archive + processing share ONE parse (PERF #4):
                             # previously json.loads ran once for archive and again
@@ -3280,8 +3284,19 @@ class Collector:
                 import random as _random
                 await asyncio.sleep(_random.uniform(0.0, 2.0))
             # Attempt REST resync for all stale books before reconnecting WS
+            # Fast path (perfect-collector): OUR planned recycle reheals via
+            # the fresh connection's full-book WS promotion in ~seconds — the
+            # REST walk only delays reconnect. Skip it when a planned recycle
+            # just fired (<90s ago); the 120s background heal catches books
+            # WS promotion misses. Abnormal (1006/server) deaths keep the walk.
             try:
-                await self._reconnect_resync_walk(shard_set, int(time.time() * 1000))
+                _skip_walk = False
+                try:
+                    _skip_walk = (time.time() - float(getattr(self, "_planned_recycle_at", 0) or 0)) < 90.0
+                except Exception:
+                    _skip_walk = False
+                if not _skip_walk:
+                    await self._reconnect_resync_walk(shard_set, int(time.time() * 1000))
             except Exception:
                 pass
             # Drain any buffered messages before reconnect
