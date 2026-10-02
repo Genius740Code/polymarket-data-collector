@@ -1025,6 +1025,72 @@ class Collector:
         except Exception:
             return None
 
+    async def _background_heal_tick(self, max_books: int = 4, stale_after_s: int = 60) -> int:
+        """Heal bounded stale-book backlog outside reconnects (never raises).
+
+        The reconnect walk heals one book per pass, so a large stale backlog
+        (drift/recycle flaps across 35 lanes) never drains and books sit stale
+        for minutes. This drives up to max_books heals per flush tick via the
+        same resync() path (1 POST each). Only books stale longer than
+        stale_after_s — fresh-stale heals via WS full-book promotion without
+        REST burn. Fast-fail gates (fetch_none-quiet / rate-limited / ended)
+        skip without escalation burn.
+        """
+        healed = 0
+        cands = []
+        try:
+            _items = list((self.books or {}).items())
+        except Exception:
+            return 0
+        for _cid, _book in _items:
+            if len(cands) >= max_books:
+                break
+            try:
+                _st = getattr(getattr(_book, "book_state", None), "value", "") or ""
+            except Exception:
+                continue
+            if _st == "live":
+                continue
+            try:
+                _rid = getattr(_book, "resync_id", None)
+                _ep = (getattr(self.resync, "_episodes", {}) or {}).get(_rid) if _rid else None
+                if _ep is not None and getattr(_ep, "disconnect_ts_utc", None):
+                    import datetime as _dtm_bh
+                    _disc = _dtm_bh.datetime.fromisoformat(str(_ep.disconnect_ts_utc).replace("Z", "+00:00"))
+                    _age = int((_dtm_bh.datetime.now(tz=_dtm_bh.timezone.utc) - _disc).total_seconds() * 1000)
+                    if _age < stale_after_s * 1000:
+                        continue
+            except Exception:
+                pass
+            try:
+                if self.resync.fetch_none_quiet(_cid):
+                    continue
+                if self.resync.rate_limited(_cid):
+                    continue
+                if self.resync.market_ended(_cid) is True:
+                    continue
+            except Exception:
+                pass
+            cands.append(_book)
+        for _book in cands:
+            try:
+                if not self._running:
+                    break
+            except Exception:
+                break
+            try:
+                _ep_id = self._ensure_episode_for_stale_book(_book, _book.asset, "background_heal")
+                try:
+                    if _ep_id in self.resync._episodes and self.resync._episodes[_ep_id].reconnect_ts_utc is None:
+                        self.resync.handle_reconnect(_ep_id)
+                except Exception:
+                    pass
+                if await self.resync.resync(_book.asset, _book.condition_id, self.books, _ep_id):
+                    healed += 1
+            except Exception:
+                continue
+        return healed
+
     async def _reconnect_resync_walk(self, shard_set: set, now_ms: int) -> None:
         """Attempt REST resync for all stale books of a shard before reconnecting WS.
 
@@ -3882,6 +3948,18 @@ class Collector:
             for _m in _mlist or []:
                 if not self._running:
                     return
+                # Quiet-book gate: a book receiving live WS frames cannot be
+                # drifted by definition — REST-vs-live diffs on a moving book
+                # are latency artifacts, not drift (prod: ~35 false drift
+                # episodes per 5min tick at tolerance 0.01). Only check books
+                # quiet for >60s, where a real divergence can hide.
+                try:
+                    _b = (self.books or {}).get(_m.condition_id)
+                    _rx = getattr(_b, "_last_frame_rx_ms", None) if _b is not None else None
+                    if _rx is not None and (int(_t_dt.time() * 1000) - int(_rx)) < 60000:
+                        continue
+                except Exception:
+                    pass
                 try:
                     await self.resync.periodic_drift_check(_a, _m.condition_id, self.books)
                 except Exception:
@@ -4096,6 +4174,19 @@ class Collector:
                 _superseded = self.resync.supersede_ended_market_episodes(self.books)
                 if _superseded:
                     print(f"[resync] sweep superseded {_superseded} ended-market episode(s)")
+                # Background heal (perfect-collector): the reconnect walk heals
+                # one book per pass, so a large stale backlog never drains.
+                # Heal up to 4 stale books per flush tick here (bounded REST:
+                # 1 POST each via _fetch_rest_book). Only books stale >60s —
+                # fresh-stale heals via WS promotion without REST burn. Skip
+                # fetch_none-quiet / rate-limited / ended markets (fast-fail,
+                # no escalation burn). Never raises.
+                try:
+                    _healed = await self._background_heal_tick(max_books=4, stale_after_s=60)
+                    if _healed:
+                        print(f"[resync] background healed {_healed} stale book(s)")
+                except Exception:
+                    pass
             except Exception:
                 pass
             # Use kaggle lock so flush never races with chunk upload's flush/export (§10A lossless)
