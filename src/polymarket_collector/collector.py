@@ -384,12 +384,10 @@ class Collector:
                                 self.books[state.current_condition_id] = book
                                 self._index_book(book)
                                 # CRITICAL (audit 2026-09-21): a cursor-recovered
-                                # stale book with a minted rid and no episode is
-                                # a guaranteed orphan — link a real episode now
-                                # (find-or-create: reuses an open one if the
-                                # disconnect path already made one).
+                                # stale book links a real episode (never an
+                                # orphan uuid4 — see _link_stale_book_episode).
                                 try:
-                                    self._ensure_episode_for_stale_book(book, asset, "cursor_recovery")
+                                    self._link_stale_book_episode(book, asset, "cursor_recovery")
                                 except Exception:
                                     pass
                                 self._collector_event(CollectorEventType.collector_restarted, {"asset": asset, "condition_id": state.current_condition_id, "age_ms": age_ms, "recovered": True})
@@ -1090,6 +1088,31 @@ class Collector:
             except Exception:
                 continue
         return healed
+
+    def _link_stale_book_episode(self, book, asset: str, reason: str) -> None:
+        """Mark a book stale and link its resync_id to a real episode (never raises).
+
+        Bare mark_stale(uuid4) orphans the row: snapshots carry a resync_id
+        that joins to no resync_episodes row (T1 attribution hole — 28.7%
+        null joins in prod). This mints the stale mark, ensures a joined
+        episode, then re-points the book at the joined id.
+        """
+        try:
+            book.mark_stale(resync_id=str(__import__("uuid").uuid4()))
+        except Exception:
+            pass
+        try:
+            _rid = self._ensure_episode_for_stale_book(book, asset, reason)
+            if _rid:
+                try:
+                    book.mark_stale(resync_id=_rid)
+                except Exception:
+                    try:
+                        book.resync_id = _rid
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     async def _reconnect_resync_walk(self, shard_set: set, now_ms: int) -> None:
         """Attempt REST resync for all stale books of a shard before reconnecting WS.
@@ -2392,10 +2415,7 @@ class Collector:
                                     l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
                                 )
-                            try:
-                                _nb.mark_stale(resync_id=str(uuid.uuid4()))
-                            except Exception:
-                                pass
+                                self._link_stale_book_episode(_nb, market.asset, "market_added")
                             self.books[market.condition_id] = _nb
                             self._index_book(_nb)
                         else:
@@ -2530,7 +2550,7 @@ class Collector:
                         one_sided_promotion=self._one_sided_promotion(),
                     )
                 try:
-                    _nb3.mark_stale(resync_id=str(uuid.uuid4()))
+                    self._link_stale_book_episode(_nb3, market.asset, "market_added")
                 except Exception:
                     pass
                 self.books[market.condition_id] = _nb3
@@ -3496,13 +3516,10 @@ class Collector:
                                         l2_full=self._l2_full(),
                                         one_sided_promotion=self._one_sided_promotion(),
                                     )
-                                # New books start stale until first real data (fixes 5b live-with-nulls)
-                                # HIGH (audit 2026-09-21): reuse the open episode
-                                # for this book when one exists so the stale rows
-                                # join to resync_episodes (was: orphan uuid4).
+                                # New books start stale until first real data (fixes 5b live-with-nulls).
+                                # Linked episode (never an orphan uuid4 — see _link_stale_book_episode).
                                 try:
-                                    _ep0 = self._episode_for_snapshot(m.asset, m.condition_id)
-                                    book.mark_stale(resync_id=_ep0 or str(uuid.uuid4()))
+                                    self._link_stale_book_episode(book, m.asset, "market_added")
                                 except Exception:
                                     pass
                                 self.books[m.condition_id] = book
@@ -3598,8 +3615,7 @@ class Collector:
                                     # keep book_state stale for this snapshot (will be reflected via snapshot)
                                     if getattr(book.book_state, "value", "") != "stale":
                                         try:
-                                            _epc = self._episode_for_snapshot(m.asset, m.condition_id)
-                                            book.mark_stale(resync_id=_epc or str(uuid.uuid4()))
+                                            self._link_stale_book_episode(book, m.asset, "book_anomaly_crossed")
                                         except Exception:
                                             pass
                             except Exception:
@@ -4182,7 +4198,7 @@ class Collector:
                 # fetch_none-quiet / rate-limited / ended markets (fast-fail,
                 # no escalation burn). Never raises.
                 try:
-                    _healed = await self._background_heal_tick(max_books=4, stale_after_s=60)
+                    _healed = await self._background_heal_tick(max_books=10, stale_after_s=60)
                     if _healed:
                         print(f"[resync] background healed {_healed} stale book(s)")
                 except Exception:

@@ -197,7 +197,10 @@ ws:
   # cutting churn ~11%. Do NOT raise past 280 without hot-swap (server kills
   # first -> unplanned disconnects, worse). Scheduler 6/tick cap kept (1013
   # protection); catch-up 120-bucket cap kept (p99 tick safety on loaded box).
-  recycle_interval_seconds: 270
+  # Phase-3 (2026-10-02): 270->210 — 1006 abnormal deaths match recycle count
+  # (~1:1), i.e. the server kills first anyway; recycling earlier preempts
+  # more kills. Re-observe 1006 rate; raise back if planned churn dominates.
+  recycle_interval_seconds: 210
   rest_book_url: https://clob.polymarket.com/book
   rest_market_url: https://clob.polymarket.com/markets
   resync_rest_backoff_initial_ms: 1000
