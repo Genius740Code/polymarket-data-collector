@@ -1089,6 +1089,31 @@ class Collector:
                 continue
         return healed
 
+    def _row_episode_id(self, book, asset: str, condition_id: str | None, reason: str):
+        """Joined resync_id for a snapshot row (never raises, never orphans).
+
+        Prefers the book's rid when it joins resync_episodes, else the newest
+        open episode, else ensures one (find-or-create). Returns None only
+        when no episode could be established — the row then carries NULL
+        (honest missing, never a fake uuid4 join).
+        """
+        try:
+            _rid = getattr(book, "resync_id", None)
+            if _rid and _rid in getattr(self.resync, "_episodes", {}):
+                return _rid
+        except Exception:
+            pass
+        try:
+            _found = self._episode_for_snapshot(asset, condition_id)
+            if _found:
+                return _found
+        except Exception:
+            pass
+        try:
+            return self._ensure_episode_for_stale_book(book, asset, reason)
+        except Exception:
+            return None
+
     def _link_stale_book_episode(self, book, asset: str, reason: str) -> None:
         """Mark a book stale and link its resync_id to a real episode (never raises).
 
@@ -3555,8 +3580,12 @@ class Collector:
                                             _rid = self.resync.handle_disconnect(m.asset, m.condition_id, "book_stalled", {m.condition_id: book})
                                         except Exception:
                                             _rid = None
+                                        if not _rid:
+                                            # handle_disconnect failed: ensure a joined
+                                            # episode (never an orphan uuid4).
+                                            _rid = self._ensure_episode_for_stale_book(book, m.asset, "book_stalled")
                                         try:
-                                            book.mark_stale(resync_id=_rid or str(uuid.uuid4()))
+                                            book.mark_stale(resync_id=_rid)
                                         except Exception:
                                             pass
                             except Exception:
@@ -3675,7 +3704,7 @@ class Collector:
                                     "market_time_remaining_ms": _remain,
                                     "is_rollover_window": _rollover_flag.get(m.condition_id, False),
                                     "book_state": _bs_val,
-                                    "resync_id": getattr(book, "resync_id", None) or self._episode_for_snapshot(m.asset, m.condition_id) or str(uuid.uuid4()),
+                                    "resync_id": self._row_episode_id(book, m.asset, m.condition_id, "snapshot_fallback"),
                                     # M8: unknown stays NULL (never fabricate False).
                                     "book_crossed": None,
                                     # 4.10 carry book age when available; NULL only
@@ -3728,7 +3757,9 @@ class Collector:
                                             _joins = False
                                         if not _joins:
                                             _brid = self._episode_for_snapshot(m.asset, m.condition_id) or _brid
-                                        row["resync_id"] = _brid or str(uuid.uuid4())
+                                        if not _brid or _brid not in getattr(self.resync, "_episodes", {}):
+                                            _brid = self._row_episode_id(book, m.asset, m.condition_id, "ws_down_downgrade")
+                                        row["resync_id"] = _brid
                                 # Enforce live=>NULL (defensive: if book carried a stale
                                 # rid into a live snapshot, drop it — spec §8).
                                 if row.get("book_state") == "live" and row.get("resync_id") is not None:
@@ -3754,7 +3785,9 @@ class Collector:
                                             _joins2 = False
                                         if not _joins2:
                                             _brid2 = self._episode_for_snapshot(m.asset, m.condition_id) or _brid2
-                                        row["resync_id"] = _brid2 or str(uuid.uuid4())
+                                        if not _brid2 or _brid2 not in getattr(self.resync, "_episodes", {}):
+                                            _brid2 = self._row_episode_id(book, m.asset, m.condition_id, "catchup_downgrade")
+                                        row["resync_id"] = _brid2
                             except Exception:
                                 pass
                             # P0 write-amp fix (weather audit 2026-09-21): skip
