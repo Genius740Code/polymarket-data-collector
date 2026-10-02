@@ -176,11 +176,11 @@ timeframes:
   # 2026-09-25: user-ordered fresh reseed on 100G data disk — all 5 lanes
   # (5m+15m+1h+4h+1d, 35 lanes). Disk headroom no longer the constraint;
   # watch RSS/leak + per-lane first verified upload instead.
+  # 2026-10-02 triage: 5 lanes -> 5m+1h (fleet death spiral: 47
+  # disconnects/min, scheduler_lag 20/min, live 0.2%, CPU 95%). 35 lanes
+  # back only after 2-lane live >80% for 24h + dual-WS wired. History above.
   - 5m
-  - 15m
   - 1h
-  - 4h
-  - 1d
 
 ws:
   full_book_diff_interval_seconds: 600
