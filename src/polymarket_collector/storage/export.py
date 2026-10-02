@@ -3297,7 +3297,7 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
 
     _stop_cap = _th.Event()
 
-    def _rss_cap_watch(_limit_mb: int = 700) -> None:
+    def _rss_cap_watch(_limit_mb: int = 1000) -> None:
         while not _stop_cap.wait(2):
             try:
                 with open("/proc/self/status") as _f:
