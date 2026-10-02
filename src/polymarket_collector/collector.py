@@ -4756,6 +4756,59 @@ class Collector:
         """
         evict_cutoff = now_ms - 6 * 3600 * 1000
         evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
+        # Lane-cut hygiene (2026-10-02): books of DISABLED lanes (e.g. 15m/4h/1d
+        # after a triage cut) never heal or promote — no discovery, no lane
+        # interest — but each recycle/1006 fans out per-book episodes over them
+        # and the snapshot loop keeps stamping stale rows. Evict immediately
+        # (history stays in parquet; re-enabling the lane rediscovers fresh).
+        # window_label None (legacy/placeholder) stays under the 6h rules.
+        try:
+            _enabled = set()
+            for _l in (self.rollover.enabled_lane_labels() or []):
+                try:
+                    _enabled.add(str(_l).strip().lower())
+                except Exception:
+                    pass
+        except Exception:
+            _enabled = set()
+        if _enabled:
+            for _cid, _m in list(self.markets.items()):
+                if _cid in evict_cids:
+                    continue
+                try:
+                    _wl = str(getattr(_m, "window_label", "") or "").strip().lower()
+                except Exception:
+                    _wl = ""
+                if not _wl:
+                    # Fall back to numeric window size (same plan §1.1 bands).
+                    try:
+                        _ws = int(getattr(_m, "window_size_seconds", 0) or 0)
+                    except Exception:
+                        _ws = 0
+                    if _ws >= 86400:
+                        _wl = "1d"
+                    elif _ws >= 14400:
+                        _wl = "4h"
+                    elif _ws >= 3600:
+                        _wl = "1h"
+                    elif _ws >= 900:
+                        _wl = "15m"
+                    elif _ws > 0:
+                        _wl = "5m"
+                if _wl and _wl not in _enabled and _cid not in evict_cids:
+                    evict_cids.append(_cid)
+        for _lcid in list(evict_cids):
+            # Supersede open episodes as lane_disabled (persisted + honest)
+            # so their stale rows join instead of dangling.
+            try:
+                for _rid, _ep in list(getattr(self.resync, "_episodes", {}).items()):
+                    try:
+                        if _ep is not None and _ep.condition_id == _lcid and not self.resync.is_finished(_rid):
+                            self.resync.supersede_episode(_rid, "lane_disabled_evict")
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         # Stale-healing fix (2026-09-26): orphan books (condition in NO market
         # record — cursor recovery for windows discovery never returns) are
         # invisible to the cutoff above and churn resync forever. Evict past
