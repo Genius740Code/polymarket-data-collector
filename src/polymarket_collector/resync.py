@@ -83,7 +83,7 @@ class ResyncManager:
     # points here (500 eps x 50k multi-KB msgs = GBs worst case). Overflow path
     # already counts + emits book_anomaly, so the tighter bound only converts
     # would-be-OOM into honest, counted drops. Revisit after RSS is flat.
-    MAX_BUFFERED_MSGS_PER_EPISODE = 5_000
+    MAX_BUFFERED_MSGS_PER_EPISODE = 2_000
     # C4 (audit 2026-09-16): max age of an episode's replay buffer. A resync
     # that never completes (expired-window 404 loop) kept every live WS
     # message feeding a dead deque for hours — 1.36M drops in one XRP
@@ -91,7 +91,10 @@ class ResyncManager:
     # longer appended (one `resync_buffer_retired` event, then silence) so
     # live traffic flows to books directly instead of loss-theater.
     # Multiple of the REST-escalation horizon so healthy slow resyncs fit.
-    BUFFER_AGE_FACTOR = 5
+    # (2026-10-02: 5->2 — replay only matters across a REST fetch (~seconds);
+    # 5min deadlines pinned ~200MB of parsed frames at 66 episodes/min mint.
+    # Honest accounting unchanged: retirement still emits its event.)
+    BUFFER_AGE_FACTOR = 2
 
     def __init__(
         self,
