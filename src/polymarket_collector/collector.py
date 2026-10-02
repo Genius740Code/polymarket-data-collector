@@ -4198,7 +4198,7 @@ class Collector:
                 # fetch_none-quiet / rate-limited / ended markets (fast-fail,
                 # no escalation burn). Never raises.
                 try:
-                    _healed = await self._background_heal_tick(max_books=10, stale_after_s=60)
+                    _healed = await self._background_heal_tick(max_books=40, stale_after_s=60)
                     if _healed:
                         print(f"[resync] background healed {_healed} stale book(s)")
                 except Exception:
