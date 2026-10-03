@@ -928,6 +928,60 @@ class Collector:
         except Exception:
             return ""
 
+    def _planned_recycle_hotswap(self, shard) -> None:
+        """Hot-swap a planned recycle: no stale marks, no episodes (never raises).
+
+        The fresh connection's full-book WS promotion relives books in
+        ~seconds; marking everything stale + minting per-book episodes turned
+        each 270s recycle into ~10s of stale rows per book (~49% of all stale
+        rows in prod). Rows stay live only while frames are fresh — the H3
+        quiet-book rule (10s) still marks stale + backdated book_stalled
+        episode if frames don't resume, and per-tick ages stay honest. One
+        ws_reconnect_attempt (planned) per asset keeps the swap observable.
+        """
+        try:
+            import time as _t_hs
+            _until = _t_hs.time() + 5.0
+        except Exception:
+            return
+        try:
+            _gd = getattr(self, "_recycle_grace_until", None)
+            if not isinstance(_gd, dict):
+                _gd = {}
+                self._recycle_grace_until = _gd
+        except Exception:
+            return
+        for _ca in shard or []:
+            try:
+                _au = str(_ca).upper()
+            except Exception:
+                continue
+            try:
+                _gd[_au] = _until
+            except Exception:
+                pass
+            try:
+                self._ws_connected[_au] = False
+            except Exception:
+                pass
+            try:
+                self.on_event(CollectorEventType.ws_reconnect_attempt, {
+                    "asset": _au, "planned": True, "hotswap_grace_s": 5.0,
+                })
+            except Exception:
+                pass
+
+    def _recycle_grace_live(self, asset_upper: str) -> bool:
+        """True while a planned-recycle hot-swap grace covers this asset."""
+        try:
+            _gd = getattr(self, "_recycle_grace_until", None)
+            if not isinstance(_gd, dict):
+                return False
+            import time as _t_hs2
+            return _t_hs2.time() < float(_gd.get(str(asset_upper).upper(), 0) or 0)
+        except Exception:
+            return False
+
     def _disconnect_asset_books(self, asset: str, reason: str) -> list:
         """Open disconnect episode(s) covering EVERY book of an asset.
 
@@ -3161,18 +3215,11 @@ class Collector:
                     for _ca in shard:
                         self._ws_connected[_ca.upper()] = False
                 if planned_recycle:
-                    # H3: planned recycles leave a trade gap in the swap window.
-                    # Emit a planned_recycle episode per asset (honest gap) — the
-                    # fresh connection's full book relives the books. ws_connected
-                    # =False already downgrades snapshots to stale for the window.
-                    # HIGH (audit 2026-09-21): cover ALL lanes via helper (was
-                    # act[0] only — the 1h lane got stale rows with no episode).
+                    # Hot-swap (perfect-collector): no stale marks, no
+                    # episodes — WS promotion relives in seconds; H3 catches
+                    # real failures. See _planned_recycle_hotswap.
                     try:
-                        for _ca in shard:
-                            try:
-                                self._disconnect_asset_books(_ca, reason="planned_recycle")
-                            except Exception:
-                                pass
+                        self._planned_recycle_hotswap(shard)
                     except Exception:
                         pass
                     planned_recycle = False
@@ -3205,14 +3252,10 @@ class Collector:
                     if self._running:
                         for _ca in shard:
                             self._ws_connected[_ca.upper()] = False
-                    # H3: record the recycle as an episode (trade-gap honest).
-                    # HIGH (audit 2026-09-21): all lanes, not act[0] only.
+                    # H3: recycle-race close is also OUR close — hot-swap it
+                    # (same as the clean-break path above, no episodes).
                     try:
-                        for _ca in shard:
-                            try:
-                                self._disconnect_asset_books(_ca, reason="planned_recycle")
-                            except Exception:
-                                pass
+                        self._planned_recycle_hotswap(shard)
                     except Exception:
                         pass
                     planned_recycle = False
@@ -3793,7 +3836,13 @@ class Collector:
                             # this row; book.mark_live() already clears book.resync_id.
                             try:
                                 _m_au = _au_by_asset.get(asset, m.asset.upper() if isinstance(m.asset, str) else m.asset)
-                                if not _ws_conn.get(_m_au, False) and row.get("book_state") == "live":
+                                # Hot-swap grace: right after OUR recycle the socket
+                                # flag is False but frames resume in ~seconds —
+                                # don't downgrade while grace covers the asset.
+                                # H3 still catches gaps past the quiet threshold.
+                                if (not _ws_conn.get(_m_au, False)
+                                        and row.get("book_state") == "live"
+                                        and not self._recycle_grace_live(_m_au)):
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
                                         # HIGH (audit 2026-09-21): reuse the real
