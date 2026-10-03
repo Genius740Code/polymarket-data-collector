@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .onchain import onchain_rows_from_fills
+from .onchain import collapse_onchain_unanimity, onchain_rows_from_fills
 from .storage.parquet_io import read_table
 from .storage.schemas import ONCHAIN_FILLS_SCHEMA
 
@@ -658,7 +658,10 @@ def export_pmdata_layout(
             "exchange_version": row.get("exchange_version"),
             "builder": row.get("builder"),
         })
-    for r in decoded_extra:
+    # First-class unanimity-join (spec §4): one row per (tx_hash, token_id);
+    # multi-maker / multi-taker / multi-side fills collapse to NULL, never guessed.
+    united = collapse_onchain_unanimity(decoded_extra)
+    for r in united:
         cid = r.get("condition_id")
         if not cid and r.get("token_id") and str(r["token_id"]) in token_to_cid:
             cid = token_to_cid[str(r["token_id"])]

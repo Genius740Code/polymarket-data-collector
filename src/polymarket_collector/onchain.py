@@ -189,6 +189,52 @@ def onchain_rows_from_fills(
     return rows
 
 
+def collapse_onchain_unanimity(rows: List[dict]) -> List[dict]:
+    """Collapse schema-shaped onchain rows to one first-class row per fill.
+
+    Group key is (tx_hash, token_id). Every other column keeps its value only
+    when ALL grouped rows agree on a single non-null value — any disagreement
+    (multi-maker / multi-taker / multi-side on one fill) becomes NULL, never
+    a guess. Groups sort by (tx_hash, token_id or "") for determinism. Pure
+    function, no RPC, never raises.
+    """
+    groups: Dict[tuple, List[dict]] = {}
+    order: List[tuple] = []
+    for r in rows or []:
+        try:
+            if not isinstance(r, dict) or not r.get("tx_hash"):
+                continue
+            tok = r.get("token_id")
+            key = (str(r["tx_hash"]).lower(), str(tok) if tok is not None else "")
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+        except Exception:
+            continue
+    out: List[dict] = []
+    for key in sorted(order):
+        try:
+            members = groups[key]
+            row: dict = {"tx_hash": key[0],
+                         "token_id": (key[1] or None)}
+            for col in ("condition_id", "maker", "taker", "price", "size",
+                        "fee", "side", "exchange_version", "builder"):
+                vals = set()
+                for m in members:
+                    try:
+                        v = m.get(col)
+                    except Exception:
+                        v = None
+                    if v is not None:
+                        vals.add(v)
+                row[col] = next(iter(vals)) if len(vals) == 1 else None
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
 def backfill_wallets_from_fills(rows: List[dict], fills: List[dict]) -> Dict[str, int]:
     """Fill null maker_wallet/taker_wallet/wallet by (tx_hash, token_id) join.
 

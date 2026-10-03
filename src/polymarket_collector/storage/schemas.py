@@ -232,6 +232,21 @@ CHAINLINK_TWAP_SCHEMA = pa.schema([
     pa.field("gap_max_ms_60s", pa.int64(), nullable=True),
     pa.field("source", pa.string(), nullable=False),
 ])
+# §6 chainlink_streams — direct Chainlink Data Streams rows (ingest/chainlink_direct.py).
+# Same shape as chainlink_events: report_id carries reportId/roundId when the
+# direct payload has one, else NULL (parse maps roundId -> report_id, never
+# guessed). Separate dataset so RTDS raw and direct rows never mix.
+CHAINLINK_STREAMS_SCHEMA = pa.schema([
+    pa.field("ts_source", pa.int64(), nullable=True),  # epoch ms (was string)
+    pa.field("ts_received_ns", pa.int64(), nullable=False),
+    pa.field("ts_received_ns_estimated", pa.bool_(), nullable=True),
+    pa.field("asset", pa.string(), nullable=False),
+    pa.field("event_id", pa.string(), nullable=False),
+    pa.field("symbol", pa.string(), nullable=True),
+    pa.field("source", pa.string(), nullable=True),
+    pa.field("price", pa.float64(), nullable=True),
+    pa.field("report_id", pa.string(), nullable=True),
+])
 # §6 chainlink_events — time first
 # twap/twap_window_seconds/round_id/sequence_number dropped 2026-09-05: the RTDS
 # payload carries none of them (100% null); rolling TWAP is a downstream derived
@@ -323,6 +338,7 @@ SCHEMAS = {
     "book_events": BOOK_EVENTS_SCHEMA,
     "trades": TRADES_SCHEMA,
     "chainlink_events": CHAINLINK_SCHEMA,
+    "chainlink_streams": CHAINLINK_STREAMS_SCHEMA,
     "l2_raw": L2_RAW_SCHEMA,
     "chainlink_twap": CHAINLINK_TWAP_SCHEMA,
     "onchain_fills": ONCHAIN_FILLS_SCHEMA,

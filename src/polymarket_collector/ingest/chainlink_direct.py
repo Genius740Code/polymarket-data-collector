@@ -17,11 +17,13 @@ Subscribed symbols: BTCUSD/ETHUSD/SOLUSD/XRPUSD/DOGEUSD/BNBUSD/HYPEUSD.
 """
 from __future__ import annotations
 
+import datetime
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..chainlink import ChainlinkEvent
+from ..storage.schemas import CHAINLINK_STREAMS_SCHEMA
 from ..validation import coerce_ts_source_ms
 
 
@@ -290,3 +292,189 @@ class ChainlinkDirectClient:
         if self.connect is None:
             raise RuntimeError("chainlink-direct: no connect transport injected; RTDS stays primary")
         await self.connect(self.symbols, self.subscribe_payload(), self.handle_message)
+
+
+# -- dataset wiring (RTDS stays primary; direct rows never mix into it) --------
+
+#: Hive dataset receiving direct-streams rows (same shape as
+#: chainlink_events; report_id carries reportId/roundId when present).
+STREAM_DATASET = "chainlink_streams"
+
+#: Direct TWAP passthrough sources -> window ms.
+TWAP_WINDOW_MS = {
+    "chainlink-direct-twap30s": 30_000,
+    "chainlink-direct-twap60s": 60_000,
+}
+
+#: Label the derived grid keeps when it stands in for unreachable direct rows.
+DERIVED_TWAP_SOURCE = "derived_chainlink_rtds"
+
+
+def event_to_stream_row(ev: Any) -> Optional[Dict[str, Any]]:
+    """Project a direct ChainlinkEvent onto the chainlink_streams row shape.
+
+    None when not a ChainlinkEvent — the caller drops it and counts it (an
+    honest gap, never a fabricated row). Field order/names follow
+    CHAINLINK_STREAMS_SCHEMA exactly.
+    """
+    try:
+        if not isinstance(ev, ChainlinkEvent):
+            return None
+        d = ev.to_dict()
+    except Exception:
+        return None
+    try:
+        names = list(CHAINLINK_STREAMS_SCHEMA.names)
+    except Exception:
+        return None
+    try:
+        return {k: d.get(k) for k in names}
+    except Exception:
+        return None
+
+
+def twap_window_ms(ev: Any) -> Optional[int]:
+    """TWAP window ms when ev is a direct TWAP passthrough row, else None."""
+    try:
+        src = getattr(ev, "source", None)
+        if src is None and isinstance(ev, dict):
+            src = ev.get("source")
+        if src is None:
+            return None
+        return TWAP_WINDOW_MS.get(str(src))
+    except Exception:
+        return None
+
+
+def _iso_ms(ms: int) -> Optional[str]:
+    try:
+        dt = datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def twap_passthrough_rows(events: Any, asset: Any = None) -> List[Dict[str, Any]]:
+    """Direct streams_twap30s/60s events -> CHAINLINK_TWAP_SCHEMA-shaped rows.
+
+    One row per message on the 1s grid: the message's own window carries its
+    price (``n_ticks=1`` counts the report), the other window stays NULL, and
+    ``gap_max_ms_60s`` stays NULL (one report says nothing about surrounding
+    coverage). Rows keep their direct source label so downstream can tell
+    passthrough apart from derived. Messages without a placeable timestamp are
+    dropped (counted upstream as gaps); a present-but-bad price stays NULL.
+    Never raises.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        items = list(events or [])
+    except Exception:
+        return []
+    try:
+        want = str(asset).strip().upper() if asset is not None else None
+    except Exception:
+        want = None
+    for ev in items:
+        try:
+            if not isinstance(ev, ChainlinkEvent):
+                continue
+            if want is not None and str(getattr(ev, "asset", "")).upper() != want:
+                continue
+            window = TWAP_WINDOW_MS.get(str(getattr(ev, "source", "")))
+            if window is None:
+                continue
+            ts = getattr(ev, "ts_source", None)
+            if not isinstance(ts, int) or isinstance(ts, bool):
+                continue
+            T = (ts // 1000) * 1000
+            iso = _iso_ms(T)
+            if iso is None:
+                continue
+            out.append({
+                "ts_window_end_ms": T,
+                "ts_window_end_utc": iso,
+                "ts_window_start_ms_60s": T - 60_000,
+                "asset": str(getattr(ev, "asset", "")).upper(),
+                "twap_30s": getattr(ev, "price", None) if window == 30_000 else None,
+                "twap_60s": getattr(ev, "price", None) if window == 60_000 else None,
+                "n_ticks_30s": 1 if window == 30_000 else None,
+                "n_ticks_60s": 1 if window == 60_000 else None,
+                "gap_max_ms_60s": None,
+                "source": getattr(ev, "source", None),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def select_twap_rows(direct_rows: Any, derived_rows: Any) -> List[Dict[str, Any]]:
+    """Passthrough-when-reachable: direct rows win when any exist, else the
+    derived grid stands in (already labelled ``derived_chainlink_rtds``).
+    Never raises; NULLs pass through untouched (gaps stay gaps).
+    """
+    try:
+        if direct_rows:
+            return list(direct_rows)
+    except Exception:
+        pass
+    try:
+        return list(derived_rows or [])
+    except Exception:
+        return []
+
+
+def twap_agreement(direct_rows: Any, derived_rows: Any, tick: Any) -> Dict[str, Any]:
+    """Gate helper: direct-vs-derived TWAP agreement within one tick.
+
+    Joins on (asset, ts_window_end_ms); compares each window only where BOTH
+    sides are non-null. NULLs are gaps, never disagreements. Never raises.
+    Returns {compared_30s, agreed_30s, compared_60s, agreed_60s,
+    max_abs_diff} with max_abs_diff NULL when nothing was comparable.
+    """
+    stats = {"compared_30s": 0, "agreed_30s": 0, "compared_60s": 0,
+             "agreed_60s": 0, "max_abs_diff": None}
+    try:
+        tol = float(tick)
+        if tol != tol or tol < 0:
+            return stats
+    except Exception:
+        return stats
+    try:
+        derived_by_key = {}
+        for r in derived_rows or []:
+            if not isinstance(r, dict):
+                continue
+            derived_by_key[(str(r.get("asset")).upper(), r.get("ts_window_end_ms"))] = r
+    except Exception:
+        return stats
+    try:
+        items = list(direct_rows or [])
+    except Exception:
+        return stats
+    for r in items:
+        try:
+            if not isinstance(r, dict):
+                continue
+            b = derived_by_key.get((str(r.get("asset")).upper(), r.get("ts_window_end_ms")))
+            if not isinstance(b, dict):
+                continue
+            for window, ckey, akey in (("twap_30s", "compared_30s", "agreed_30s"),
+                                       ("twap_60s", "compared_60s", "agreed_60s")):
+                a, bb = r.get(window), b.get(window)
+                try:
+                    if a is None or bb is None:
+                        continue
+                    af, bf = float(a), float(bb)
+                    if af != af or bf != bf:
+                        continue
+                except Exception:
+                    continue
+                d = abs(af - bf)
+                stats[ckey] += 1
+                if d <= tol:
+                    stats[akey] += 1
+                if stats["max_abs_diff"] is None or d > stats["max_abs_diff"]:
+                    stats["max_abs_diff"] = d
+        except Exception:
+            continue
+    return stats
