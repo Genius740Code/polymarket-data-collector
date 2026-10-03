@@ -85,7 +85,7 @@ l2_levels: 10
 # the writer/export widen the snapshot schema dynamically so no level
 # columns are lost. Default false — 10-level behavior unchanged (narrower
 # rows, cheaper staging/uploads). Opt in only with disk + Kaggle headroom.
-l2_full: false
+l2_full: true
 liquidity_filter:
   enabled: false
   min_liquidity: 1000
