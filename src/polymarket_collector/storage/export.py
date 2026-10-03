@@ -2482,7 +2482,7 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
         return table
 
 
-def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None, stats: Optional[dict] = None, deadline_s: Optional[float] = None, files: Optional[list] = None, reconcile: bool = True, pool_cache: Optional[dict] = None, writeback: bool = False) -> Optional[pa.Table]:
+def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None, stats: Optional[dict] = None, deadline_s: Optional[float] = None, files: Optional[list] = None, reconcile: bool = True, pool_cache: Optional[dict] = None, writeback: bool = False, cutoff_ts: Optional[float] = None) -> Optional[pa.Table]:
     """Read all parquet files for dataset (+ optional asset filter).
 
     timeframe_label: when set, keep only rows whose series_id matches
@@ -2501,6 +2501,9 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     leg pools across calls; writeback=True OPT-IN hive write-back (H4: default
     False — rewriting primary part files makes the same trade differ between
     Kaggle versions; enrichment lives in staging only).
+    cutoff_ts: isolation snapshot — hive files with mtime newer than this
+    belong to the next cycle (export_isolation.begin_snapshot). The
+    in-process fallback path must honor the same cutoff as the worker path.
     """
     base = data_dir / dataset
     if not base.exists():
@@ -2550,6 +2553,12 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
                 pass
         if p.name.endswith(".tmp"):
             continue
+        if cutoff_ts is not None:
+            try:
+                if p.stat().st_mtime > cutoff_ts:
+                    continue  # next cycle's input (isolation snapshot)
+            except OSError:
+                continue
         try:
             t = read_table(p)
             if t is None:
@@ -3819,7 +3828,8 @@ def export_per_asset_single_file(
                     tmp_path = out_path.with_suffix(".parquet.tmp")
                     try:
                         new_rows = _stream_export_asset_dataset(
-                            base, ds, au, tmp_path, timeframe_label, l2_levels, _mid_map
+                            base, ds, au, tmp_path, timeframe_label, l2_levels, _mid_map,
+                            cutoff_ts=cutoff_ts,
                         )
                     except Exception as e:
                         print(f"[export:stream] WARN {au} {ds} failed: {e}")
@@ -3867,7 +3877,7 @@ def export_per_asset_single_file(
                         pass
                     stats[rel_key] = 0
                     continue
-                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance, timeframe_label=timeframe_label)
+                table = _read_dataset_per_asset(base, ds, au, include_binance=include_binance, timeframe_label=timeframe_label, cutoff_ts=cutoff_ts)
                 new_rows = table.num_rows if (table is not None) else 0
                 # If prior has data, never replace it with fewer rows (empty read, transient error, or legitimate 0)
                 # This prevents 1a empty-file overwrite and guarantees cumulative history
@@ -5665,6 +5675,23 @@ def _export_and_upload_all_kaggle_impl(
     # files are immutable once written, so files with mtime <= build_start hold
     # exactly the rows the export read; later files belong to the NEXT export.
     build_start_ts = _time.time()
+    try:
+        # Isolation snapshot (export_isolation, WAL-cutoff design): staging
+        # reads see hive files at/below this cutoff only; the collector owns
+        # the pre-staging flush under its own lock (no writer handle here).
+        # Any isolation failure falls back to the plain clock above.
+        from .export_isolation import begin_snapshot as _begin_snapshot
+        from .export_isolation import write_snapshot_file as _write_snapshot_file
+
+        _snap = _begin_snapshot(base, datasets=None, assets=assets)
+        if isinstance(_snap, dict) and _snap.get("ok") and _snap.get("cutoff_ts"):
+            build_start_ts = float(_snap["cutoff_ts"])
+            try:
+                _write_snapshot_file(Path(staging).parent, _snap)
+            except Exception:
+                pass
+    except Exception:
+        pass
     _manifests: dict = {}
     prep = prepare_kaggle_staging_5m(data_dir, staging_dir=staging, assets=assets, l2_levels=l2_levels,
                                      dataset_prefix=dataset_prefix, timeframe_label=tf_label,
