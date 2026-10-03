@@ -46,6 +46,10 @@ from .storage.parquet_writer import ParquetWriter
 from .storage.raw_archive import RawArchive
 from .storage.l2_raw import append_row as _l2_raw_append_row
 from .validation import coerce_ts_source_ms, validate_ws_message
+# Dual-WS pool helpers (perfect-collector §3.2): pure payload/dedup/recycle
+# logic — the asyncio transport stays in this module. Total callers below
+# (every helper below never raises; a helper failure keeps single-socket).
+from .ingest import ws_pool as _ws_pool
 
 
 def _details_get(details: Any, key: str) -> Any:
@@ -242,6 +246,10 @@ class Collector:
         # real per-asset WS connection state — snapshots of a disconnected asset are
         # labeled stale even if the book was REST-healed (frozen book = not live data)
         self._ws_connected: Dict[str, bool] = {}
+        # Dual-WS (§3.2): shard label ("BTC" / "BTC+ETH") -> ShardPool holding
+        # the A/B pair's shared dedup + subscription bookkeeping. Lazily built
+        # by _ws_pool_for_shard; single-socket path never touches it.
+        self._shard_ws_pools: Dict[str, Any] = {}
         # resync episodes: hold latest state in RAM, persist each episode exactly once
         # (previously every state transition appended a new parquet row → double rows)
         self._episode_latest: Dict[str, dict] = {}
@@ -2454,8 +2462,347 @@ class Collector:
         except Exception:
             pass
 
+    # -- Dual-WS wiring (§3.2) -------------------------------------------------
+    # Thin total wrappers over ingest.ws_pool (pure logic lives there; the
+    # asyncio transport stays in this module). Every method never raises —
+    # worst case is single-socket behavior. Single-socket stays the default
+    # path AND the fallback (flag off, or no websockets library).
+
+    def _ws_dual_enabled(self) -> bool:
+        """True when the operator enabled the A/B pair for shard loops."""
+        try:
+            return bool(getattr(getattr(self.config, "ws", None), "dual_enabled", False))
+        except Exception:
+            return False
+
+    def _ws_mode(self) -> str:
+        """Transport selector for shard loops: "dual" or "single" (fallback).
+
+        Dual needs BOTH the flag and a websockets library — without either,
+        the loop runs the untouched single-socket path. Pure (no I/O).
+        """
+        try:
+            if self._ws_dual_enabled() and HAS_WEBSOCKETS:
+                return "dual"
+        except Exception:
+            pass
+        return "single"
+
+    def _ws_pool_for_shard(self, label: str, shard: List[str]) -> Any:
+        """ShardPool for a shard label, lazily built and never raising.
+
+        The pool's dedup window survives recycles (a redelivery can straddle
+        a swap); subscription state is per-connection (see _run_dual_conn),
+        so only the shard membership copy refreshes here.
+        """
+        try:
+            pool = self._shard_ws_pools.get(label)
+        except Exception:
+            pool = None
+        if pool is None:
+            try:
+                pool = _ws_pool.ShardPool(shard=list(shard))
+            except Exception:
+                return None
+            try:
+                self._shard_ws_pools[label] = pool
+            except Exception:
+                pass
+        else:
+            try:
+                pool.shard = list(shard)
+            except Exception:
+                pass
+        return pool
+
+    def _ws_initial_payload(self, tokens: List[str]) -> Dict[str, Any]:
+        """Initial subscribe payload via ws_pool (same wire shape as legacy)."""
+        try:
+            return dict(_ws_pool.build_initial_subscribe(list(tokens or [])))
+        except Exception:
+            pass
+        try:
+            seen: set = set()
+            toks: List[str] = []
+            for t in tokens or []:
+                s = str(t)
+                if s and s not in seen:
+                    seen.add(s)
+                    toks.append(s)
+        except Exception:
+            toks = []
+        return {"assets_ids": toks, "type": "market"}
+
+    def _ws_hot_add_payload(self, tokens: List[str]) -> Dict[str, Any]:
+        """operation:subscribe hot-add payload via ws_pool (same shape as legacy)."""
+        try:
+            return dict(_ws_pool.build_hot_add(list(tokens or [])))
+        except Exception:
+            pass
+        return {
+            "assets_ids": list(tokens or []),
+            "operation": "subscribe",
+            "type": "market",
+            "custom_feature_enabled": True,
+        }
+
+    def _ws_dual_recycle_due(self, conn_age_s: float) -> bool:
+        """True when a dual-pool connection passed OUR recycle ceiling.
+
+        Dual path uses ws_pool's ceiling (preempts the ~5min server kill);
+        the single-socket path keeps its own config-driven check untouched.
+        """
+        try:
+            return bool(_ws_pool.should_recycle(conn_age_s))
+        except Exception:
+            return False
+
+    def _ws_dual_silence_due(self, last_data_ns: Any, now_ns: int) -> bool:
+        """True when a dual-pool connection went data-silent past the watchdog."""
+        try:
+            return bool(_ws_pool.silence_exceeded(last_data_ns, now_ns))
+        except Exception:
+            return False
+
+    def _ws_frame_is_duplicate(self, label: str, shard: List[str], msg: Any) -> bool:
+        """True when the A/B pair already delivered this exact frame.
+
+        Dual-only: single-socket has no pair (no redelivery), so it always
+        returns False there and the frame flows exactly as before. Keyless
+        frames (no token, neither seq nor ts) always deliver — ws_pool never
+        dedupes on nothing.
+        """
+        try:
+            if not self._ws_dual_enabled():
+                return False
+            if not isinstance(msg, dict):
+                return False
+            pool = self._ws_pool_for_shard(label, shard)
+            if pool is None:
+                return False
+            return bool(pool.dedup.check_message(msg))
+        except Exception:
+            return False
+
     async def _run_shard_loop(self, shard: List[str], shard_idx: int = 0) -> None:
-        """Per-shard WS loop — Gamma discovery + shared CLOB WS connection.
+        """Shard-loop dispatcher: dual-WS pair or single-socket (fallback).
+
+        ``ws.dual_enabled`` (default off) selects the A/B pair sharing one
+        ShardPool; anything else — flag off, no websockets library, or a
+        dual-leg crash — runs the untouched single-socket loop below. The
+        fail-closed except keeps collection alive: a dual bug degrades to
+        single-socket, never to a dead shard task.
+        """
+        try:
+            if self._ws_mode() == "dual":
+                try:
+                    await self._run_shard_loop_dual(list(shard), shard_idx=shard_idx)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e_dual:
+                    try:
+                        if self.on_event:
+                            for _ca in list(shard):
+                                self.on_event(
+                                    CollectorEventType.book_anomaly,
+                                    {"asset": _ca, "reason": "dual_fallback_to_single",
+                                     "error": str(_e_dual)[:200]},
+                                )
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await self._run_shard_loop_single(list(shard), shard_idx=shard_idx)
+
+    def _handle_shard_frame(self, single_msg: dict, shard: List[str]) -> None:
+        """Apply one parsed WS frame to books/trades/resync buffers (never raises).
+
+        Shared by the single-socket loop and both dual-WS legs — identical
+        downstream handling either way (only the transport differs). Moved
+        verbatim out of the shard loop so the two transports cannot drift.
+        """
+        try:
+            # l2_raw (perfect §4): verbatim frame log before thresholds —
+            # every frame incl. tick_size_change / market_resolved (no book
+            # handlers for those).
+            try:
+                self._append_l2_raw(single_msg, shard)
+            except Exception:
+                pass
+            book = None
+            cid = single_msg.get("condition_id")
+            tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
+            book = self._lookup_book(cid, tok)
+
+            # H2 (audit 2026-09-18): fan price_changes entries out to EVERY
+            # owning book. One frame can carry entries for several markets
+            # (rollover dual-tracking); resolving only the top-level token
+            # silently dropped the other markets' deltas with no event. Each
+            # book applies the frame and picks its own entries natively.
+            _apply_books = []
+            if book is not None:
+                _apply_books = [book]
+            elif isinstance(single_msg.get("price_changes"), list):
+                _apply_books = self._fanout_books(single_msg)
+                if not _apply_books:
+                    try:
+                        self._emit_unroutable(single_msg, shard)
+                    except Exception:
+                        pass
+            # City attribution per applied book (prefers the book's asset —
+            # identical to the old label when known).
+            for book in _apply_books:
+                msg_asset = self._resolve_msg_asset(single_msg, book, shard)
+                try:
+                    applied, reason = book.apply_ws_message(single_msg)
+                    # H3: per-book liveness clock (shard watchdog is 30s whole-shard)
+                    if applied:
+                        try:
+                            self._last_frame_ns_per_book[book.condition_id] = time.time_ns()
+                        except Exception:
+                            pass
+                    # §4 book_events — threshold-driven BBO changes captured
+                    # inside apply_ws_message, drained here
+                    try:
+                        for ev in book.drain_pending_events():
+                            self._append_book_event(ev, book, msg_asset, single_msg)
+                    except Exception:
+                        pass
+                    # Emit sequence_gap event when gap detected §1A
+                    # LOW fix (audit 2026-09-21): explicit None checks (seq 0
+                    # is valid but falsy under `or` chaining) and distinct
+                    # expected vs received (was expected == received).
+                    if reason and "sequence_gap" in reason:
+                        _gseq_raw = single_msg.get("sequence_number")
+                        if _gseq_raw is None:
+                            _gseq_raw = single_msg.get("seq")
+                        try:
+                            _gseq_int = int(_gseq_raw) if _gseq_raw is not None else 0
+                        except (TypeError, ValueError):
+                            _gseq_int = 0
+                        _gtok = single_msg.get("token_id")
+                        if _gtok is None:
+                            _gtok = single_msg.get("asset_id")
+                        try:
+                            _glast = book.sequence_numbers.get(str(_gtok)) if _gtok is not None else None
+                        except Exception:
+                            _glast = None
+                        _gexp = (_glast + 1) if _glast is not None else _gseq_int
+                        if self.on_event:
+                            self.on_event(
+                                CollectorEventType.sequence_gap,
+                                {"asset": msg_asset, "condition_id": book.condition_id,
+                                 "expected": _gexp,
+                                 "received": _gseq_int,
+                                 "reason": reason},
+                            )
+                        # Trigger resync/disconnect lifecycle on gap
+                        try:
+                            self.resync.handle_sequence_gap(
+                                msg_asset, book.condition_id, self.books, expected=_gexp, received=_gseq_int
+                            )
+                        except Exception:
+                            pass
+                    # A4: hash-gated promotion refusal — content WAS applied,
+                    # so no resync; log as book_anomaly only.
+                    if reason and "book_hash" in reason:
+                        if self.on_event:
+                            self.on_event(
+                                CollectorEventType.book_anomaly,
+                                {"asset": msg_asset, "condition_id": book.condition_id,
+                                 "reason": reason},
+                            )
+                    if not applied and self.on_event:
+                        _rsn = str(reason or "")
+                        if "duplicate_event" in _rsn or "out_of_order_duplicate" in _rsn:
+                            # L5: transport redelivery noise — throttled (was
+                            # one full anomaly per dupe).
+                            try:
+                                _nk = f"{msg_asset}:{book.condition_id}"
+                                self._ws_noise_throttle[_nk] += 1
+                                _nc = self._ws_noise_throttle[_nk]
+                            except Exception:
+                                _nc = 0
+                            if _nc == 1 or _nc % 1000 == 0:
+                                self.on_event(
+                                    CollectorEventType.book_anomaly,
+                                    {"asset": msg_asset, "reason": reason, "dropped_total": _nc},
+                                )
+                        else:
+                            self.on_event(
+                                CollectorEventType.book_anomaly,
+                                {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
+                            )
+                            # M10: sanity/crossed failures mint an orphan
+                            # resync_id inside the book with no episode row.
+                            # Link it honestly: create the episode when missing.
+                            try:
+                                _rsn_l = str(reason or "").lower()
+                                if ("sanity" in _rsn_l or "crossed" in _rsn_l or "sequence_gap" in _rsn_l):
+                                    self._ensure_episode_for_stale_book(book, msg_asset, f"book_{reason}")
+                            except Exception:
+                                pass
+                    # CRITICAL backfill (audit 2026-09-21): the M10 path above
+                    # only runs when `applied` is False with a matching reason
+                    # — but _enforce_bbo H2 marks stale with an orphan rid while
+                    # returning (True, None). Unconditional find-or-create
+                    # closes that hole (idempotent: one dict lookup per
+                    # message, one episode per transition).
+                    try:
+                        if getattr(book.book_state, "value", "") == "stale":
+                            self._ensure_episode_for_stale_book(book, msg_asset, "stale_no_episode")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    if self.on_event:
+                        self.on_event(
+                            CollectorEventType.book_anomaly,
+                            {"asset": msg_asset, "ws_error": str(e)},
+                        )
+
+            # Message-level asset for the trade/resync paths below (first
+            # applied book's asset, else shard fallback).
+            try:
+                _msg_asset_all = self._resolve_msg_asset(
+                    single_msg, _apply_books[0] if _apply_books else None, shard)
+            except Exception:
+                try:
+                    _msg_asset_all = shard[0] if shard else "UNKNOWN"
+                except Exception:
+                    _msg_asset_all = "UNKNOWN"
+
+            # Trade handling — persist with wallet (no RPC) §5
+            try:
+                self._handle_trade_message(single_msg, _msg_asset_all, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
+            except Exception as e:
+                try:
+                    print(f"[ws] trade handle failed asset={_msg_asset_all}: {str(e)[:160]}")
+                except Exception:
+                    pass
+                try:
+                    self._collector_event(CollectorEventType.book_anomaly, {"asset": _msg_asset_all, "reason": "trade_handle_failed", "error": str(e)[:200]})
+                except Exception:
+                    pass
+
+            # Buffer message for resync/replay on disconnect (only under a
+            # genuinely OPEN episode: buffering live messages with no open
+            # episode piles them into an unconsumed per-asset deque — P0 leak
+            # 2026-09-08, ~22k msgs / 10 min, never replayed, ~110MB/min RSS)
+            try:
+                resync_id = self._replay_buffer_id(
+                    _msg_asset_all, single_msg.get("resync_id", "") or "")
+                if resync_id:
+                    self.resync.buffer_message(resync_id, single_msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    async def _run_shard_loop_single(self, shard: List[str], shard_idx: int = 0) -> None:
+        """Per-shard single-socket WS loop — Gamma discovery + shared CLOB WS connection.
 
         One connection carries the union of the shard's cities' tokens
         (initial subscribe + operation:subscribe hot-adds). Discovery,
@@ -2582,18 +2929,19 @@ class Collector:
                     return False
                 if ws_holder["subscribed_once"]:
                     # hot-add on the established connection (see R-1 note below)
-                    payload = json.dumps({
-                        "assets_ids": new_tokens,
-                        "operation": "subscribe",
-                        "type": "market",
-                        "custom_feature_enabled": True,
-                    })
+                    payload = json.dumps(self._ws_hot_add_payload(new_tokens))
                 else:
                     # Polymarket CLOB initial subscribe shape
-                    payload = json.dumps({"assets_ids": tokens, "type": "market"})
+                    payload = json.dumps(self._ws_initial_payload(tokens))
                 await ws.send(payload)
                 ws_holder["subscribed_once"] = True
                 subscribed_tokens.update(new_tokens)
+                try:
+                    _pool = self._ws_pool_for_shard(_label, shard)
+                    if _pool is not None:
+                        _pool.subs.mark_subscribed(new_tokens)
+                except Exception:
+                    pass
                 if self.on_event:
                     for _sa in shard:
                         try:
@@ -2784,6 +3132,14 @@ class Collector:
                     ws_holder["ws"] = ws
                     ws_holder["subscribed_once"] = False
                     ws_holder["subscribed_tokens"] = set()
+                    # Fresh connection: the server holds no subscriptions, so
+                    # the pool mirror restarts too (payloads rebuild in full).
+                    try:
+                        _pool0 = self._ws_pool_for_shard(_label, shard)
+                        if _pool0 is not None:
+                            _pool0.subs.reset()
+                    except Exception:
+                        pass
 
                     # Initial discovery before reading (ensure at least current market)
                     try:
@@ -2923,7 +3279,17 @@ class Collector:
                             # books relive from the fresh connection's full book
                             # and are honestly labeled stale during the ~1s swap
                             # (via the ws_connected downgrade in the snapshot loop).
-                            if int(time.time() * 1000) - conn_established_ms > _recycle_ms:
+                            _now_ms = int(time.time() * 1000)
+                            if self._ws_dual_enabled():
+                                # Dual path recycles on ws_pool's own ceiling
+                                # (preempts the ~5min server kill on OUR
+                                # schedule); single path keeps its config
+                                # check below, untouched.
+                                _recycle_due = self._ws_dual_recycle_due(
+                                    (_now_ms - conn_established_ms) / 1000.0)
+                            else:
+                                _recycle_due = (_now_ms - conn_established_ms) > _recycle_ms
+                            if _recycle_due:
                                 planned_recycle = True
                                 print(f"[ws:{_label}] planned recycle — reconnecting")
                                 try:
@@ -3002,191 +3368,17 @@ class Collector:
                             for single_msg in msgs:
                                 if not isinstance(single_msg, dict):
                                     continue
-                                # l2_raw (perfect §4): verbatim frame log before
-                                # thresholds — every frame incl. tick_size_change /
-                                # market_resolved (no book handlers for those).
+                                # Dual-WS (§3.2): the A/B pair carries the same
+                                # frames — drop whole-frame redeliveries here.
+                                # No-op on single-socket (no pair exists, the
+                                # helper returns False); keyless frames always
+                                # deliver (never deduped on nothing).
                                 try:
-                                    self._append_l2_raw(single_msg, shard)
+                                    if self._ws_frame_is_duplicate(_label, shard, single_msg):
+                                        continue
                                 except Exception:
                                     pass
-                                # Apply to order book — handles sequence gap detection,
-                                # level updates, and book_state transitions internally
-                                # Try condition_id first, then token_id/asset_id resolution via books scan.
-                                # I-root-cause fix: CLOB `price_change` messages carry NO top-level
-                                # token — only per-entry `asset_id` inside `price_changes`. The old
-                                # lookup got None and silently dropped EVERY delta (~56k msgs/run);
-                                # books then only moved on full `book` events, freezing ask sides.
-                                book = None
-                                cid = single_msg.get("condition_id")
-                                tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
-                                book = self._lookup_book(cid, tok)
-                                # H2 (audit 2026-09-18): fan price_changes entries
-                                # out to EVERY owning book. One frame can carry
-                                # entries for several markets (rollover
-                                # dual-tracking); resolving only the top-level
-                                # token silently dropped the other markets'
-                                # deltas with no event. Each book applies the
-                                # frame and picks its own entries natively.
-                                _apply_books = []
-                                if book is not None:
-                                    _apply_books = [book]
-                                elif isinstance(single_msg.get("price_changes"), list):
-                                    _apply_books = self._fanout_books(single_msg)
-                                    if not _apply_books:
-                                        try:
-                                            self._emit_unroutable(single_msg, shard)
-                                        except Exception:
-                                            pass
-                                # City attribution per applied book (prefers the
-                                # book's asset — identical to the old label when known).
-                                for book in _apply_books:
-                                    msg_asset = self._resolve_msg_asset(single_msg, book, shard)
-                                    try:
-                                        applied, reason = book.apply_ws_message(single_msg)
-                                        # H3: per-book liveness clock (shard watchdog is 30s whole-shard)
-                                        if applied:
-                                            try:
-                                                self._last_frame_ns_per_book[book.condition_id] = time.time_ns()
-                                            except Exception:
-                                                pass
-                                        # §4 book_events — threshold-driven BBO changes
-                                        # captured inside apply_ws_message, drained here
-                                        try:
-                                            for ev in book.drain_pending_events():
-                                                self._append_book_event(ev, book, msg_asset, single_msg)
-                                        except Exception:
-                                            pass
-                                        # Emit sequence_gap event when gap detected §1A
-                                        # LOW fix (audit 2026-09-21): explicit None
-                                        # checks (seq 0 is valid but falsy under
-                                        # `or` chaining) and distinct expected vs
-                                        # received (was expected == received).
-                                        if reason and "sequence_gap" in reason:
-                                            _gseq_raw = single_msg.get("sequence_number")
-                                            if _gseq_raw is None:
-                                                _gseq_raw = single_msg.get("seq")
-                                            try:
-                                                _gseq_int = int(_gseq_raw) if _gseq_raw is not None else 0
-                                            except (TypeError, ValueError):
-                                                _gseq_int = 0
-                                            _gtok = single_msg.get("token_id")
-                                            if _gtok is None:
-                                                _gtok = single_msg.get("asset_id")
-                                            try:
-                                                _glast = book.sequence_numbers.get(str(_gtok)) if _gtok is not None else None
-                                            except Exception:
-                                                _glast = None
-                                            _gexp = (_glast + 1) if _glast is not None else _gseq_int
-                                            if self.on_event:
-                                                self.on_event(
-                                                    CollectorEventType.sequence_gap,
-                                                    {"asset": msg_asset, "condition_id": book.condition_id,
-                                                     "expected": _gexp,
-                                                     "received": _gseq_int,
-                                                     "reason": reason},
-                                                )
-                                            # Trigger resync/disconnect lifecycle on gap
-                                            try:
-                                                self.resync.handle_sequence_gap(
-                                                    msg_asset, book.condition_id, self.books, expected=_gexp, received=_gseq_int
-                                                )
-                                            except Exception:
-                                                pass
-                                        # A4: hash-gated promotion refusal — content WAS
-                                        # applied, so no resync; log as book_anomaly only.
-                                        if reason and "book_hash" in reason:
-                                            if self.on_event:
-                                                self.on_event(
-                                                    CollectorEventType.book_anomaly,
-                                                    {"asset": msg_asset, "condition_id": book.condition_id,
-                                                     "reason": reason},
-                                                )
-                                        if not applied and self.on_event:
-                                            _rsn = str(reason or "")
-                                            if "duplicate_event" in _rsn or "out_of_order_duplicate" in _rsn:
-                                                # L5: transport redelivery noise — throttled
-                                                # (was one full anomaly per dupe).
-                                                try:
-                                                    _nk = f"{msg_asset}:{book.condition_id}"
-                                                    self._ws_noise_throttle[_nk] += 1
-                                                    _nc = self._ws_noise_throttle[_nk]
-                                                except Exception:
-                                                    _nc = 0
-                                                if _nc == 1 or _nc % 1000 == 0:
-                                                    self.on_event(
-                                                        CollectorEventType.book_anomaly,
-                                                        {"asset": msg_asset, "reason": reason, "dropped_total": _nc},
-                                                    )
-                                            else:
-                                                self.on_event(
-                                                    CollectorEventType.book_anomaly,
-                                                    {"asset": msg_asset, "reason": reason, "msg": str(single_msg)[:500]},
-                                                )
-                                                # M10: sanity/crossed failures mint an orphan
-                                                # resync_id inside the book with no episode row.
-                                                # Link it honestly: create the episode when missing.
-                                                try:
-                                                    _rsn_l = str(reason or "").lower()
-                                                    if ("sanity" in _rsn_l or "crossed" in _rsn_l or "sequence_gap" in _rsn_l):
-                                                        self._ensure_episode_for_stale_book(book, msg_asset, f"book_{reason}")
-                                                except Exception:
-                                                    pass
-                                        # CRITICAL backfill (audit 2026-09-21): the
-                                        # M10 path above only runs when `applied`
-                                        # is False with a matching reason — but
-                                        # _enforce_bbo H2 marks stale with an
-                                        # orphan rid while returning (True, None).
-                                        # Unconditional find-or-create closes that
-                                        # hole (idempotent: one dict lookup per
-                                        # message, one episode per transition).
-                                        try:
-                                            if getattr(book.book_state, "value", "") == "stale":
-                                                self._ensure_episode_for_stale_book(book, msg_asset, "stale_no_episode")
-                                        except Exception:
-                                            pass
-                                    except Exception as e:
-                                        if self.on_event:
-                                            self.on_event(
-                                                CollectorEventType.book_anomaly,
-                                                {"asset": msg_asset, "ws_error": str(e)},
-                                            )
-
-                                # Message-level asset for the trade/resync paths below
-                                # (first applied book's asset, else shard fallback).
-                                try:
-                                    _msg_asset_all = self._resolve_msg_asset(
-                                        single_msg, _apply_books[0] if _apply_books else None, shard)
-                                except Exception:
-                                    try:
-                                        _msg_asset_all = shard[0] if shard else "UNKNOWN"
-                                    except Exception:
-                                        _msg_asset_all = "UNKNOWN"
-
-                                # Trade handling — persist with wallet (no RPC) §5
-                                try:
-                                    self._handle_trade_message(single_msg, _msg_asset_all, now_ns=int(time.time_ns()), now_bucket_ms=int(time.time()*1000))
-                                except Exception as e:
-                                    try:
-                                        print(f"[ws] trade handle failed asset={_msg_asset_all}: {str(e)[:160]}")
-                                    except Exception:
-                                        pass
-                                    try:
-                                        self._collector_event(CollectorEventType.book_anomaly, {"asset": _msg_asset_all, "reason": "trade_handle_failed", "error": str(e)[:200]})
-                                    except Exception:
-                                        pass
-
-                                # Buffer message for resync/replay on disconnect
-                                # (only under a genuinely OPEN episode: buffering live
-                                # messages with no open episode piles them into an
-                                # unconsumed per-asset deque — P0 leak 2026-09-08,
-                                # ~22k msgs / 10 min, never replayed, ~110MB/min RSS)
-                                try:
-                                    resync_id = self._replay_buffer_id(
-                                        _msg_asset_all, single_msg.get("resync_id", "") or "")
-                                    if resync_id:
-                                        self.resync.buffer_message(resync_id, single_msg)
-                                except Exception:
-                                    pass
+                                self._handle_shard_frame(single_msg, shard)
                     finally:
                         # the discovery poller is NOT here — it is hoisted above
                         # the connect loop and must survive recycles/disconnects
@@ -3382,6 +3574,734 @@ class Collector:
             except Exception:
                 pass
             await asyncio.sleep(backoff_s)
+
+    # -- Dual-WS transport (§3.2) -------------------------------------------
+    # Additive only: the single-socket loop above is untouched. Both legs
+    # share one ShardPool (redelivery dedup) with per-leg subscribe state,
+    # and funnel frames through _handle_shard_frame — downstream handling
+    # cannot drift between transports.
+
+    def _register_market(self, market: MarketInfo) -> bool:
+        """Record a discovered market + book (sends nothing). Returns True if new.
+
+        Registration half of the shard loop's _on_market, shared by the dual
+        legs' discovery pollers — subscribing is the fan-out step below.
+        Same rows, same heals, same order as _on_market; never raises.
+        """
+        try:
+            if market.condition_id in self.markets:
+                return False
+            self.markets[market.condition_id] = market
+            try:
+                row = market.to_markets_row()
+                self.markets_log.append(row)
+            except Exception:
+                pass
+            if market.condition_id not in self.books:
+                try:
+                    _nb = OrderBookState(
+                        asset=market.asset,
+                        condition_id=market.condition_id,
+                        market_id=market.market_id,
+                        series_id=market.series_id,
+                        window_index=market.window_index,
+                        up_token_id=market.up_token_id,
+                        down_token_id=market.down_token_id,
+                        market_end_ts_ms=market.market_end_ts_ms,
+                        schema_version=self.config.schema_version,
+                        l2_levels=self.config.l2_levels,
+                        l2_full=self._l2_full(),
+                        one_sided_promotion=self._one_sided_promotion(),
+                    )
+                except Exception:
+                    _nb = OrderBookState(
+                        asset=market.asset, condition_id=market.condition_id,
+                        market_id=market.market_id, series_id=market.series_id,
+                        window_index=market.window_index,
+                        up_token_id=market.up_token_id, down_token_id=market.down_token_id,
+                        market_end_ts_ms=market.market_end_ts_ms,
+                        l2_full=self._l2_full(),
+                        one_sided_promotion=self._one_sided_promotion(),
+                    )
+                try:
+                    self._link_stale_book_episode(_nb, market.asset, "market_added")
+                except Exception:
+                    pass
+                self.books[market.condition_id] = _nb
+                self._index_book(_nb)
+            else:
+                # C1: a cursor-recovered book may hold placeholder token IDs —
+                # heal them from real discovery (same as _on_market).
+                try:
+                    _ex = self.books.get(market.condition_id)
+                    if _ex is not None and _ex.heal_tokens(market.up_token_id, market.down_token_id):
+                        self._unindex_book(market.condition_id)
+                        self._index_book(_ex)
+                        try:
+                            self._collector_event(CollectorEventType.book_anomaly, {"asset": market.asset, "condition_id": market.condition_id, "reason": "book_tokens_healed"})
+                        except Exception:
+                            pass
+                    if _ex is not None:
+                        try:
+                            _ex.heal_market_id(market.market_id)
+                        except Exception:
+                            pass
+                        # H1: heal cursor-NULL end time from the market object
+                        try:
+                            _ex.heal_market_end(getattr(market, "market_end_ts_ms", None))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
+
+    async def _dual_fanout_subscription(self, holder: dict, shard: List[str], label: str) -> bool:
+        """Subscribe the shard's token union on each live dual leg (never raises).
+
+        Per-leg subscribe state (holder["subs"][name]): a fresh leg gets the
+        full initial payload, an established leg hot-adds only the delta via
+        ws_pool builders (build_hot_add returns None when nothing is new, so
+        no resend). A down leg is skipped — it subscribes on its next
+        connect. ``holder`` is a plain dict, so tests drive it with recording
+        stand-ins (no network). Returns True when anything was sent.
+        """
+        try:
+            tokens: List[str] = []
+            per_asset_tokens: dict = {}
+            for _sa in shard:
+                _at: List[str] = []
+                for m in self.rollover.active_markets(_sa):
+                    if m.up_token_id:
+                        tokens.append(m.up_token_id)
+                        _at.append(m.up_token_id)
+                    if m.down_token_id:
+                        tokens.append(m.down_token_id)
+                        _at.append(m.down_token_id)
+                per_asset_tokens[_sa] = _at
+            if not tokens:
+                return False
+        except Exception:
+            return False
+        try:
+            subs = holder.get("subs") or {}
+        except Exception:
+            return False
+        sent_any = False
+        for _name in ("A", "B"):
+            try:
+                ws = holder.get(_name)
+            except Exception:
+                continue
+            if ws is None:
+                continue
+            try:
+                st = subs.get(_name)
+            except Exception:
+                continue
+            if st is None:
+                continue
+            try:
+                if getattr(st, "subscribed_once", False):
+                    payload = st.hot_add_payload(tokens)
+                    if payload is None:
+                        continue
+                else:
+                    payload = st.initial_payload(tokens)
+                await ws.send(json.dumps(payload))
+                sent_any = True
+            except Exception as _e:
+                if self.on_event:
+                    for _sa in shard:
+                        try:
+                            self.on_event(CollectorEventType.subscription_failed, {"asset": _sa, "leg": _name, "error": repr(_e)})
+                        except Exception:
+                            pass
+                continue
+            if self.on_event:
+                for _sa in shard:
+                    try:
+                        self.on_event(CollectorEventType.subscription_started, {"asset": _sa, "leg": _name, "tokens": per_asset_tokens.get(_sa, [])})
+                    except Exception:
+                        pass
+        return sent_any
+
+    async def _dual_leg_downtime(
+        self,
+        shard: List[str],
+        shard_set: set,
+        label: str,
+        name: str,
+        alive: Dict[str, bool],
+        alive_lock: Any,
+        down_handled: dict,
+        reason: str,
+        attempt: int,
+        retry_after_s: float,
+    ) -> None:
+        """Shared tail for a dual-leg drop (never raises; cancellation passes through).
+
+        Peer streaming → quiet flap: this leg reconnects with backoff, no
+        episodes, no stale marks, no REST walk (coverage never dropped).
+        Dual-down (both legs dark) → the single-socket abnormal path: the
+        first observer opens per-book disconnect episodes (same
+        _disconnect_asset_books call), then the REST resync walk (skipped
+        only when a planned recycle just fired — same 90s rule), then
+        reconnect with backoff.
+        """
+        try:
+            other = "B" if name == "A" else "A"
+            try:
+                async with alive_lock:
+                    try:
+                        alive[name] = False
+                    except Exception:
+                        pass
+                    try:
+                        peer_up = bool(alive.get(other))
+                    except Exception:
+                        peer_up = False
+                    first_down = False
+                    if not peer_up and not down_handled.get("epoch"):
+                        try:
+                            down_handled["epoch"] = True
+                        except Exception:
+                            pass
+                        first_down = True
+            except Exception:
+                peer_up = False
+                first_down = True
+            if peer_up:
+                # Flap under cover — reconnect this leg only.
+                if self.on_event:
+                    for _ca in shard:
+                        try:
+                            self.on_event(
+                                CollectorEventType.ws_reconnect_attempt,
+                                {"asset": _ca, "leg": name, "attempt": attempt,
+                                 "peer_covering": True, "reason": reason},
+                            )
+                        except Exception:
+                            pass
+            else:
+                if self._running:
+                    for _ca in shard:
+                        try:
+                            self._ws_connected[_ca.upper()] = False
+                        except Exception:
+                            pass
+                if first_down and self._running:
+                    for _ca in shard:
+                        try:
+                            self._disconnect_asset_books(_ca, reason=reason)
+                        except Exception:
+                            pass
+                if self.on_event and self._running:
+                    for _ca in shard:
+                        try:
+                            self.on_event(
+                                CollectorEventType.ws_reconnect_attempt,
+                                {"asset": _ca, "leg": name, "attempt": attempt,
+                                 "backoff_dual_down": True, "reason": reason},
+                            )
+                        except Exception:
+                            pass
+            if not self._running:
+                return
+            if not peer_up:
+                # Abnormal (dual-down) deaths keep the REST walk; OUR planned
+                # recycles re-heal via WS promotion (same 90s skip rule as
+                # the single-socket loop — shared _planned_recycle_at map).
+                try:
+                    _skip_walk = False
+                    try:
+                        _pr_map = getattr(self, "_planned_recycle_at", None)
+                        if isinstance(_pr_map, dict) and _pr_map:
+                            _now_f = time.time()
+                            if any((_now_f - float(_v or 0)) < 90.0 for _v in _pr_map.values()):
+                                _skip_walk = True
+                            _pr_map.clear()
+                        elif _pr_map:
+                            if (time.time() - float(_pr_map)) < 90.0:
+                                _skip_walk = True
+                            self._planned_recycle_at = 0
+                    except Exception:
+                        _skip_walk = False
+                    if not _skip_walk:
+                        await self._reconnect_resync_walk(shard_set, int(time.time() * 1000))
+                except Exception:
+                    pass
+            try:
+                initial_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_initial_ms", 500) or 500)
+            except Exception:
+                initial_backoff_ms = 500
+            try:
+                max_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_max_ms", 30000) or 30000)
+            except Exception:
+                max_backoff_ms = 30000
+            try:
+                backoff_s = min(
+                    max(
+                        exponential_backoff(attempt, initial_backoff_ms, max_backoff_ms, jitter=True),
+                        float(retry_after_s or 0.0),
+                    ),
+                    60,
+                )
+            except Exception:
+                backoff_s = 1.0
+            # K-4: stagger across assets — skipped when OTHER shards stream
+            # (same single-socket rule: a lone flap needs no dead air).
+            try:
+                _others = sum(
+                    1 for a in self.config.assets
+                    if a.upper() not in shard_set and self._ws_connected.get(a.upper())
+                )
+            except Exception:
+                _others = 0
+            if _others < 2:
+                try:
+                    import random as _random
+                    await asyncio.sleep(_random.uniform(0.0, 2.0))
+                except Exception:
+                    pass
+            try:
+                self.resync.buffer_message(str(uuid.uuid4()), None)  # no-op marker
+            except Exception:
+                pass
+            await asyncio.sleep(backoff_s)
+        except Exception:
+            pass
+
+    async def _run_dual_conn(
+        self,
+        shard: List[str],
+        shard_set: set,
+        label: str,
+        name: str,
+        holder: dict,
+        alive: Dict[str, bool],
+        alive_lock: Any,
+        down_handled: dict,
+    ) -> None:
+        """One leg ("A"/"B") of the dual-WS pair (returns only on stop).
+
+        Mirrors the single-socket connection lifecycle — backoff reconnects,
+        app-level PING heartbeat, data-staleness watchdog, OUR-schedule
+        recycle at the ws_pool ceiling, per-leg initial/hot-add subscribes —
+        and funnels frames through the shared _handle_shard_frame after the
+        pair-wide dedup. A leg lost under peer cover reconnects quietly; a
+        leg lost in dual-down runs the single-socket episode path via
+        _dual_leg_downtime.
+        """
+        other = "B" if name == "A" else "A"
+        ws_url = self.config.ws.url
+        try:
+            initial_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_initial_ms", 500) or 500)
+        except Exception:
+            initial_backoff_ms = 500
+        try:
+            max_backoff_ms = int(getattr(self.config.ws, "reconnect_backoff_max_ms", 30000) or 30000)
+        except Exception:
+            max_backoff_ms = 30000
+        attempt = 0
+        pool = self._ws_pool_for_shard(label, shard)
+
+        async def _reg(market: MarketInfo) -> None:
+            try:
+                self._register_market(market)
+            except Exception:
+                pass
+
+        while self._running:
+            _retry_after_s = 0.0
+            try:
+                # WS resilience: no library pings (the server answers RFC6455
+                # pings slowly) — the documented app-level text "PING" every
+                # 10s instead, sent only after the first subscribe (a PING
+                # before any subscribe earns close 1008).
+                async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
+                    conn_established_ms = int(time.time() * 1000)
+                    # Per-leg health flag for the backoff reset below.
+                    saw_data = False
+                    # Planned recycle: close is OURS — no disconnect episode,
+                    # no REST resync, no backoff; _planned_recycle_hotswap
+                    # keeps rows live under grace (same as single-socket).
+                    planned_recycle = False
+                    try:
+                        conn_id = f"{uuid.uuid4()}-{name}"
+                        for _ca in shard:
+                            self._conn_ids[_ca.upper()] = conn_id
+                            self._conn_ids[_ca] = conn_id
+                            self._ws_connected[_ca.upper()] = True
+                            self._collector_event(CollectorEventType.connected, {"asset": _ca.upper(), "connection_id": conn_id, "leg": name})
+                    except Exception:
+                        pass
+                    # Coverage accounting: only a transition from dual-down to
+                    # any-up closes pending episodes — a flap under peer cover
+                    # never opened any, so there is nothing to close.
+                    try:
+                        async with alive_lock:
+                            peer_up = bool(alive.get(other))
+                            alive[name] = True
+                            if not peer_up:
+                                down_handled["epoch"] = False
+                                for rid, ep in list(self.resync._episodes.items()):
+                                    if ep.asset in shard_set and ep.reconnect_ts_utc is None:
+                                        self.resync.handle_reconnect(rid)
+                    except Exception:
+                        pass
+                    # Fresh subscribe state for this leg; publish the live
+                    # socket so discovery pollers can hot-add tokens on it.
+                    holder[name] = ws
+                    try:
+                        holder["subs"][name].reset()
+                    except Exception:
+                        pass
+                    try:
+                        _pool_conn = pool.conn_a if (pool is not None and name == "A") else (pool.conn_b if pool is not None else None)
+                    except Exception:
+                        _pool_conn = None
+                    try:
+                        if _pool_conn is not None:
+                            _pool_conn.established_ns = int(time.time_ns())
+                    except Exception:
+                        pass
+
+                    # Initial discovery before reading (ensure at least current market)
+                    try:
+                        for _ia in shard:
+                            await self.rollover.check_and_roll_all(_ia, _reg)
+                        await self._dual_fanout_subscription(holder, shard, label)
+                    except Exception:
+                        pass
+
+                    last_data_ns = time.time_ns()
+
+                    async def _heartbeat() -> None:
+                        while self._running:
+                            await asyncio.sleep(10)
+                            try:
+                                _sub = holder.get("subs", {}).get(name)
+                                _once = bool(getattr(_sub, "subscribed_once", False))
+                            except Exception:
+                                _once = False
+                            if _once:
+                                try:
+                                    await ws.send("PING")
+                                except Exception:
+                                    return
+
+                    hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{label}-{name}")
+
+                    async def _staleness_watchdog() -> None:
+                        nonlocal last_data_ns
+                        while self._running:
+                            await asyncio.sleep(5)
+                            # Honor reconnect requests minted by repeated heal
+                            # failures (same bounded flag as single-socket;
+                            # first leg to tick consumes it — one fresh leg
+                            # relives the books).
+                            _req_pending = False
+                            for _ea in shard:
+                                try:
+                                    _rau = str(_ea).upper()
+                                except Exception:
+                                    _rau = _ea
+                                if self._shard_reconnect_requests.get(_rau):
+                                    self._shard_reconnect_requests[_rau] = False
+                                    _req_pending = True
+                            if _req_pending:
+                                print(f"[ws:{label}:{name}] reconnect requested (repeated heal failure) — resubscribing with full books", flush=True)
+                                try:
+                                    for _ea in shard:
+                                        self.on_event(CollectorEventType.book_anomaly, {"asset": _ea, "leg": name, "ws_error": "reconnect_requested_repeated_heal_failure"})
+                                except Exception as _e_ev:
+                                    print(f"[ws:{label}:{name}] reconnect-request event failed: {_e_ev}", flush=True)
+                                try:
+                                    _fc = getattr(ws, "fail_connection", None)
+                                    if callable(_fc):
+                                        _fc(4000)
+                                    else:
+                                        raise AttributeError("no fail_connection")
+                                except Exception:
+                                    try:
+                                        await asyncio.wait_for(ws.close(), timeout=2)
+                                    except Exception:
+                                        return
+                                continue
+                            # Dual silence window (ws_pool, 120s): one quiet
+                            # leg under peer cover is not urgent; per-book H3
+                            # (10s) still catches data death underneath.
+                            if self._ws_dual_silence_due(last_data_ns, time.time_ns()):
+                                # Loop-stall guard (same as single-socket): a
+                                # blocked event loop starves ALL legs at once —
+                                # wait it out instead of killing both.
+                                try:
+                                    bucket_lag_s = time.time() - (self._last_snapshot_bucket_ms or 0) / 1000
+                                except Exception:
+                                    bucket_lag_s = 0
+                                if bucket_lag_s > 15:
+                                    last_data_ns = time.time_ns()
+                                    continue
+                                print(f"[ws:{label}:{name}] data-staleness — forcing reconnect")
+                                try:
+                                    for _ea in shard:
+                                        self.on_event(CollectorEventType.book_anomaly, {"asset": _ea, "leg": name, "ws_error": "data_staleness_dual_forcing_reconnect"})
+                                except Exception:
+                                    pass
+                                try:
+                                    _fc2 = getattr(ws, "fail_connection", None)
+                                    if callable(_fc2):
+                                        _fc2(4000)
+                                    else:
+                                        raise AttributeError("no fail_connection")
+                                except Exception:
+                                    try:
+                                        await asyncio.wait_for(ws.close(), timeout=2)
+                                    except Exception:
+                                        return
+
+                    wd_task = asyncio.create_task(_staleness_watchdog(), name=f"ws-watchdog-{label}-{name}")
+
+                    try:
+                        async for message in ws:
+                            if not self._running:
+                                break
+                            # Proactive recycle on OUR schedule (ws_pool
+                            # ceiling, per-leg clocks — the pair never swaps
+                            # both legs on the same frame by construction of
+                            # independent ages; a same-tick swap degrades to
+                            # one dual-down walk, same as single-socket).
+                            if self._ws_dual_recycle_due((int(time.time() * 1000) - conn_established_ms) / 1000.0):
+                                planned_recycle = True
+                                print(f"[ws:{label}:{name}] planned recycle — reconnecting")
+                                try:
+                                    _prm = getattr(self, "_planned_recycle_at", None)
+                                    if not isinstance(_prm, dict):
+                                        _prm = {}
+                                        self._planned_recycle_at = _prm
+                                    _prm[str(f"{label}:{name}")] = time.time()
+                                except Exception:
+                                    pass
+                                break
+                            # §13 raw archive + processing share ONE parse
+                            # (same branches as single-socket).
+                            try:
+                                if isinstance(message, bytes):
+                                    try:
+                                        msg = json.loads(message)
+                                    except Exception:
+                                        try:
+                                            self.raw_archive.append(shard[0], message.decode(errors="ignore"))
+                                        except Exception:
+                                            pass
+                                        continue
+                                elif isinstance(message, str):
+                                    try:
+                                        msg = json.loads(message)
+                                    except Exception:
+                                        try:
+                                            self.raw_archive.append(shard[0], message)
+                                        except Exception:
+                                            pass
+                                        continue
+                                else:
+                                    msg = message  # type: ignore
+                            except Exception:
+                                continue
+                            # Any parsed frame counts as data liveness (the
+                            # plain-text PONG reply never reaches here).
+                            last_data_ns = time.time_ns()
+                            try:
+                                if _pool_conn is not None:
+                                    _pool_conn.note_frame(last_data_ns)
+                            except Exception:
+                                pass
+                            if not saw_data:
+                                # First data frame: this leg is healthy —
+                                # reset the reconnect backoff for the NEXT failure.
+                                saw_data = True
+                                attempt = 0
+                            # Handle list payloads (some WS frames are arrays of events)
+                            msgs = msg if isinstance(msg, list) else [msg]
+                            try:
+                                if isinstance(msg, (dict, list)):
+                                    _frame_asset = shard[0]
+                                    if self.raw_archive.enabled:
+                                        for _fm in msgs:
+                                            if isinstance(_fm, dict):
+                                                _frame_asset = self._resolve_msg_asset(_fm, None, shard)
+                                                break
+                                    self.raw_archive.append(_frame_asset, msg)  # type: ignore
+                            except Exception:
+                                pass
+                            for single_msg in msgs:
+                                if not isinstance(single_msg, dict):
+                                    continue
+                                # Pair-wide redelivery dedup (shared pool) —
+                                # same gate as single-socket (active here:
+                                # dual mode is on), then identical handling.
+                                try:
+                                    if self._ws_frame_is_duplicate(label, shard, single_msg):
+                                        continue
+                                except Exception:
+                                    pass
+                                self._handle_shard_frame(single_msg, shard)
+                    finally:
+                        holder[name] = None
+                        for _t in (hb_task, wd_task):
+                            try:
+                                _t.cancel()
+                            except Exception:
+                                pass
+                        for _t in (hb_task, wd_task):
+                            try:
+                                # BOUNDED: same 3s budget as single-socket —
+                                # never stall the leg loop on a zombie task.
+                                await asyncio.wait_for(asyncio.shield(_t), timeout=3)
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                # Connection closed — flap under cover reconnects quietly;
+                # dual-down runs the single-socket episode path.
+                if planned_recycle:
+                    try:
+                        self._planned_recycle_hotswap(shard)
+                    except Exception:
+                        pass
+                    planned_recycle = False
+                    continue
+                attempt += 1
+                await self._dual_leg_downtime(
+                    shard, shard_set, label, name, alive, alive_lock,
+                    down_handled, "ws_connection_close", attempt, 0.0)
+            except asyncio.CancelledError:
+                # Clean, expected shutdown — just exit
+                if not self._running:
+                    return
+                attempt += 1
+                await self._dual_leg_downtime(
+                    shard, shard_set, label, name, alive, alive_lock,
+                    down_handled, "ws_cancelled_reconnect", attempt, 0.0)
+            except websockets.exceptions.ConnectionClosed as _cc:
+                # Recycle race (same as single-socket): OUR-close recycle
+                # racing an in-flight frame raises here — hot-swap it, no
+                # episodes, no REST storm.
+                if locals().get("planned_recycle", False):
+                    try:
+                        self._planned_recycle_hotswap(shard)
+                    except Exception:
+                        pass
+                    continue
+                _cc_reason = "ws_connection_close"
+                try:
+                    _cc_code = getattr(_cc, "code", None)
+                    _cc_msg = getattr(_cc, "reason", None)
+                    if _cc_code is not None:
+                        _cc_reason = f"ws_connection_close:{_cc_code}:{_cc_msg}"
+                except Exception:
+                    pass
+                attempt += 1
+                await self._dual_leg_downtime(
+                    shard, shard_set, label, name, alive, alive_lock,
+                    down_handled, _cc_reason, attempt, 0.0)
+            except Exception as _e:
+                if self.on_event:
+                    for _ca in shard:
+                        try:
+                            self.on_event(CollectorEventType.book_anomaly, {"asset": _ca, "leg": name, "ws_error": str(_e)})
+                        except Exception:
+                            pass
+                # Handshake failures (HTTP 429): honor Retry-After, capped at
+                # 60s (same as single-socket).
+                try:
+                    _hdrs = None
+                    for _attr in ("headers", "response"):
+                        try:
+                            _cand = getattr(_e, _attr, None)
+                            if _cand is not None and hasattr(_cand, "get"):
+                                if _attr == "response" and hasattr(_cand, "headers"):
+                                    _cand = _cand.headers
+                                _hdrs = _cand
+                                break
+                        except Exception:
+                            continue
+                    if _hdrs is not None:
+                        _ra = _hdrs.get("retry-after") or _hdrs.get("Retry-After")
+                        if _ra is not None:
+                            _retry_after_s = max(0.0, min(60.0, float(str(_ra).strip().split(",")[0])))
+                except Exception:
+                    pass
+                attempt += 1
+                await self._dual_leg_downtime(
+                    shard, shard_set, label, name, alive, alive_lock,
+                    down_handled, "ws_error", attempt, _retry_after_s)
+
+    async def _run_shard_loop_dual(self, shard: List[str], shard_idx: int = 0) -> None:
+        """Per-shard dual-WS loop (§3.2): two sockets (A/B), one ShardPool.
+
+        Both connections carry the union of the shard's tokens (per-leg
+        initial subscribe + operation:subscribe hot-adds via ws_pool
+        builders). Redelivered frames dedupe across the pair; each leg
+        recycles on ws_pool's own ceiling on independent clocks. Discovery,
+        routing, books, snapshots and rows are per-market exactly as in the
+        single-socket loop — only the transport is doubled. The pool's dedup
+        window is never reset here (a redelivery can straddle a swap).
+        """
+        shard = list(shard)
+        shard_set = {a.upper() if isinstance(a, str) else a for a in shard}
+        _label = "+".join(shard)
+
+        async def _on_market_dual(market: MarketInfo) -> None:
+            try:
+                self._register_market(market)
+            except Exception:
+                pass
+            # Subscribe newly discovered tokens on each live leg (hot-add
+            # when established; no-op while a leg is down).
+            try:
+                await self._dual_fanout_subscription(_holder, shard, _label)
+            except Exception:
+                pass
+
+        for _da in shard:
+            async def _discovery_poller(_a=_da) -> None:
+                # Runs for the whole dual-loop lifetime, WS up OR down.
+                while self._running:
+                    try:
+                        await self.rollover.check_and_roll_all(_a, _on_market_dual)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(self.config.discovery_poll_interval_seconds)
+
+            _dt = asyncio.create_task(_discovery_poller(), name=f"discovery-{_da}-dual")
+            # stop() cancels everything in _tasks — the pollers must survive
+            # leg recycles and every reconnect (same as single-socket).
+            self._tasks.append(_dt)
+
+        # Stagger shard connects (same rule as single-socket — discovery
+        # pollers above already run during the wait).
+        if shard_idx > 0:
+            await asyncio.sleep(min(float(shard_idx) * 2.0, 10.0))
+            if not self._running:
+                return
+
+        _holder: dict = {
+            "A": None,
+            "B": None,
+            "subs": {"A": _ws_pool.ShardSubscriptions(), "B": _ws_pool.ShardSubscriptions()},
+        }
+        _alive: Dict[str, bool] = {"A": False, "B": False}
+        _alive_lock = asyncio.Lock()
+        # Dual-down epoch: only the first leg to observe both-dark opens
+        # episodes; reset when any leg restores coverage.
+        _down_handled: dict = {"epoch": False}
+        await asyncio.gather(
+            self._run_dual_conn(shard, shard_set, _label, "A", _holder, _alive, _alive_lock, _down_handled),
+            self._run_dual_conn(shard, shard_set, _label, "B", _holder, _alive, _alive_lock, _down_handled),
+        )
 
     async def _ws_message_loop(self, asset: str, ws_url: str, rest_fetcher) -> None:
         """WebSocket message loop for per-asset CLOB market channel.

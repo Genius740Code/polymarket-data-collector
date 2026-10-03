@@ -59,6 +59,11 @@ class WsConfig(BaseModel):
     # kill while cutting the churn ~1.6x. Swaps stay honest: the episode row
     # (planned_recycle) is the gap evidence.
     recycle_interval_seconds: int = 240
+    # Dual-WS transport (perfect-collector §3.2): two sockets (A/B) per shard
+    # sharing one ShardPool (redelivery dedup, proactive recycle, hot-add).
+    # Default off — the single-socket loop below stays the transport AND the
+    # fallback (flag off, or no websockets library, always runs single).
+    dual_enabled: bool = False
 
     @field_validator("cities_per_connection")
     @classmethod
