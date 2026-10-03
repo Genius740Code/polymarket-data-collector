@@ -1349,6 +1349,24 @@ class Collector:
             _last = 0.0
         if _last > 0.0 and (now_m - _last) < _COOLDOWN_S:
             return  # cooldown: one reconnect request per asset per minute
+        # Socket-alive gate (2026-10-03): an empty fresh book 404s REST
+        # forever (no makers yet) — that is honest thin liquidity, NOT a
+        # broken socket. If ANY same-asset book has frames within 30s, the
+        # socket flows and a reconnect only adds churn + gap. Drop it.
+        try:
+            import time as _t_now
+            _cut = int(_t_now.time() * 1000) - 30000
+            for _b in (getattr(self, "books", {}) or {}).values():
+                try:
+                    if str(getattr(_b, "asset", "")).upper() != au:
+                        continue
+                    _rx = int(getattr(_b, "_last_frame_rx_ms", 0) or 0)
+                except Exception:
+                    continue
+                if _rx >= _cut:
+                    return
+        except Exception:
+            pass
         try:
             self._shard_reconnect_last[au] = time.monotonic()
             self._shard_reconnect_requests[au] = True
@@ -4755,7 +4773,27 @@ class Collector:
            persisted (already in parquet, cannot change state).
         """
         evict_cutoff = now_ms - 6 * 3600 * 1000
-        evict_cids = [cid for cid, m in self.markets.items() if m.market_end_ts_ms < evict_cutoff]
+        # Resolved markets need no grace: settlement is final (chainlink or
+        # official) and snapshots/exports read parquet, not RAM. 6h x 288
+        # 5m-windows/day x 7 assets pinned ~500 dead books whose per-book
+        # episodes fanned out over EVERY recycle/1006. Keep 6h only for
+        # unresolved (stuck assessments need the registry).
+        resolved_cutoff = now_ms - 20 * 60 * 1000
+        evict_cids = []
+        for cid, m in self.markets.items():
+            try:
+                _end = int(getattr(m, "market_end_ts_ms", 0) or 0)
+            except Exception:
+                continue
+            try:
+                _resolved = str(getattr(m, "status", "") or "").lower() == "resolved"
+            except Exception:
+                _resolved = False
+            if _resolved:
+                if _end < resolved_cutoff:
+                    evict_cids.append(cid)
+            elif _end < evict_cutoff:
+                evict_cids.append(cid)
         # Lane-cut hygiene (2026-10-02): books of DISABLED lanes (e.g. 15m/4h/1d
         # after a triage cut) never heal or promote — no discovery, no lane
         # interest — but each recycle/1006 fans out per-book episodes over them
