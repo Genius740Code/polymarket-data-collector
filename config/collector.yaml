@@ -107,7 +107,7 @@ series_ids:
   XRP: XRP-5MIN
 snapshot_interval_ms: 500
 storage:
-  buffer_max_rows: 50000
+  buffer_max_rows: 80000
   compaction_schedule: daily
   compaction_temp_suffix: .tmp
   data_dir: ./data
@@ -119,7 +119,10 @@ storage:
   # zero-leeway emergency prune only deletes already-uploaded rows.
   disk_space_min_bytes: 1073741824
   flush_interval_seconds: 120
-  flush_row_count_threshold: 5000
+  # 2026-10-03: threshold 1500->5000->40000 — the threshold is GLOBAL fleet
+  # rows (not per-group): at ~300-500 rows/s, 5000 flushed every ~10s = 40+
+  # files/min that compaction can never merge. 40000 ~= interval-driven.
+  flush_row_count_threshold: 40000
   wal_dir: ./data/_wal
   wal_enabled: true
 synthetic_mode: false

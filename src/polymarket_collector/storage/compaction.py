@@ -304,6 +304,8 @@ def compact_all(data_dir: str | Path, datasets: list[str] | None = None, temp_su
             "book_events",
             "trades",
             "chainlink_events",
+            "chainlink_twap",
+            "l2_raw",
             "collector_events",
             "resync_episodes",
             "markets_log",
