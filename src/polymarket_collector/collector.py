@@ -4413,11 +4413,36 @@ class Collector:
         the RAM copy exists only for _nearest_chainlink settlement lookups.
         deque(maxlen=20000) evicts oldest arrival — identical to the old
         list + del[:n] window, without the memmove.
+
+        Also maintains a per-asset sorted ts index (bisect lookups — the
+        linear scan was 74% of collector CPU per py-spy 2026-10-03).
         """
         try:
-            self._chainlink_events.append({**row, "asset": asset, "_ts_ms": ts_ms})
+            ev = {**row, "asset": asset, "_ts_ms": ts_ms}
+            self._chainlink_events.append(ev)
         except Exception:
             # deque with maxlen never grows; this is defensive only.
+            return
+        try:
+            au = str(asset).upper()
+        except Exception:
+            return
+        try:
+            idx = getattr(self, "_cl_ts_by_asset", None)
+            if idx is None:
+                idx = self._cl_ts_by_asset = {}
+            import bisect as _bi
+            pair = idx.get(au)
+            if pair is None:
+                pair = idx[au] = ([], [])
+            _tsl, _evl = pair
+            _pos = _bi.bisect_right(_tsl, int(ts_ms or 0))
+            _tsl.insert(_pos, int(ts_ms or 0))
+            _evl.insert(_pos, ev)
+            if len(_tsl) > 6000:
+                del _tsl[:1000]
+                del _evl[:1000]
+        except Exception:
             pass
 
     def _nearest_chainlink(self, ts_ms: int, asset: str, max_delta_ms: int = 2000) -> Optional[dict]:
@@ -4427,8 +4452,10 @@ class Collector:
         knowable at the boundary and must never decide the settlement label.
         The asset filter is essential: without it every market settled against
         whichever symbol happened to be nearest (all six assets got BNB's price).
-        Linear scan preserved (order-agnostic, first-min tie-break) — 140k
-        checks/10s is negligible; bisect would change tie/out-of-order results.
+        Per-asset bisect index (see _note_chainlink_event): O(log n) instead
+        of the 20k linear scan (was 74% of CPU). Exact-ms ties resolve to the
+        latest tick rather than first-seen — same price feed, strictly more
+        point-in-time-correct.
         """
         best = None
         best_delta = None
@@ -4436,6 +4463,24 @@ class Collector:
             au = asset.upper()
         except Exception:
             au = asset
+        try:
+            import bisect as _bi2
+            _idx = getattr(self, "_cl_ts_by_asset", None) or {}
+            _pair = _idx.get(au)
+        except Exception:
+            _pair = None
+        if _pair is not None:
+            try:
+                _tsl, _evl = _pair
+                _pos = _bi2.bisect_right(_tsl, int(ts_ms)) - 1
+                if _pos >= 0:
+                    _ts0 = _tsl[_pos]
+                    _delta0 = int(ts_ms) - int(_ts0)
+                    if _delta0 >= 0 and _delta0 <= max_delta_ms:
+                        return _evl[_pos]
+                return None
+            except Exception:
+                pass
         for ev in self._chainlink_events:
             try:
                 if (ev.get("asset") or "").upper() != au:
