@@ -6,15 +6,16 @@ join/clock columns. ``tick_size_change`` + ``market_resolved`` frames live
 here (today: 0 handlers, ``book.py:649`` gap).
 
 Real-data-only: gaps are stale rows + events, never fills. ``frame_json``
-is a canonical re-serialization of the received frame —
+is a compact re-serialization of the received frame (wire key order, orjson) —
 ``json.loads(frame_json)`` round-trips to the input dict exactly; no fields
 are added, dropped, or interpolated.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import time
+
+from .. import jsonfast as json
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
@@ -28,7 +29,7 @@ L2_RAW_SCHEMA = pa.schema([
     pa.field("condition_id", pa.string(), nullable=True),
     pa.field("token_id", pa.string(), nullable=True),
     pa.field("event_type", pa.string(), nullable=False),
-    pa.field("frame_json", pa.string(), nullable=False),  # verbatim frame, canonical JSON
+    pa.field("frame_json", pa.string(), nullable=False),  # verbatim frame, compact JSON (wire order)
     pa.field("source_conn", pa.string(), nullable=True),  # A/B tag for dedup audit
 ])
 
@@ -111,17 +112,19 @@ def build_l2_raw_row(
 ) -> Dict[str, Any]:
     """Build one l2_raw row from a received WS frame (pure, no I/O).
 
-    ``frame_json`` is a canonical re-serialization of ``msg`` — the input
-    dict is never mutated and ``json.loads`` of the output equals it. Join
+    ``frame_json`` is a compact re-serialization of ``msg`` — the input
+    dict is never mutated and ``json.loads`` of the output equals it. Key
+    order follows wire order (no sort: identical frames serialize
+    identically, which is all dedup needs; orjson fast path). Join
     columns fall back to wire-derived values; unknown stays None (never
     synthesized). Raises TypeError on a non-dict frame.
     """
     if not isinstance(msg, dict):
         raise TypeError(f"l2_raw frame must be a dict, got {type(msg).__name__}")
     try:
-        frame_json = json.dumps(msg, sort_keys=True, separators=(",", ":"), default=str)
+        frame_json = json.dumps(msg, default=str)
     except Exception:
-        frame_json = json.dumps({"_unserializable": str(msg)[:4000]}, separators=(",", ":"))
+        frame_json = json.dumps({"_unserializable": str(msg)[:4000]})
     ts_raw = None
     for k in _TS_KEYS:
         try:
