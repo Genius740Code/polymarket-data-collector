@@ -129,6 +129,13 @@ class ParquetWriter:
         flush_interval_seconds: int = 60,
         flush_row_count_threshold: int = 5000,
         buffer_max_rows: int = 50000,
+        # Bounded-buffer patch 2026-10-04: l2_raw (verbatim multi-KB
+        # frame_json, ~86% of buffered rows) gets its own deque+cap so WS
+        # firehose backpressure can never starve snapshot/trade rows.
+        # Per-cycle l2 volume ~= 0.86 * flush threshold (34k at 40k), so
+        # the default 40000 stays out of the way while healthy and binds
+        # only when flush stalls. Worst-case RAM = buffer_max + l2_raw_max.
+        l2_raw_max_rows: int = 40000,
         wal_enabled: bool = True,
         wal_dir: str | Path | None = None,
         l2_levels: int = 10,
@@ -145,6 +152,7 @@ class ParquetWriter:
         self.flush_interval = flush_interval_seconds
         self.flush_threshold = flush_row_count_threshold
         self.buffer_max = buffer_max_rows
+        self.l2_raw_max = l2_raw_max_rows
         self.wal_enabled = wal_enabled
         self.wal_dir = Path(wal_dir) if wal_dir else self.data_dir / "_wal"
         self.l2_levels = l2_levels
@@ -154,6 +162,12 @@ class ParquetWriter:
         self.synthetic_mode = synthetic_mode
 
         self._buffer: deque[BufferedRow] = deque()
+        # l2_raw isolation deque (bounded-buffer patch 2026-10-04): verbatim
+        # WS frames buffer here under their own cap. flush() drains both
+        # deques through the same group/write path; failure-requeue routes
+        # rows back to their own deque so the hard ceiling
+        # (buffer_max + l2_raw_max) holds even when flushes keep failing.
+        self._l2_buffer: deque[BufferedRow] = deque()
         self._dropped_rows: Dict[str, int] = defaultdict(int)  # K-3: honest no-loss accounting
         # M2 (audit 2026-09-16): lag-retry double-appends made duplicate_event
         # the dominant collector_events row (~8/s, pure noise bloat). Drops
@@ -351,17 +365,38 @@ class ParquetWriter:
                         self._evict_total[dataset] = self._evict_total.get(dataset, 0) + _ev
                 except Exception:
                     pass
-            # Note: if append later fails (backpressure WAL failure) we keep key to avoid infinite retry dedup loop;
-            # caller will retry with same key and be deduped — this is idempotent and prevents duplicate WAL.
+            # Note: if append later refuses (hard-cap False) or the WAL fails,
+            # the reservation is RELEASED so the caller's retry re-spills +
+            # buffers (keeping it would dedupe the retry into a silent loss).
+            # A retry racing a redelivery may WAL a transient duplicate line;
+            # replay dedups via _seen_keys/on-disk keys, so at most one copy
+            # ever reaches Parquet.
 
-        # backpressure check — §10A never drops without WAL spill + fsync
-        if len(self._buffer) >= self.buffer_max:
+        # backpressure check — §10A HARD cap (bounded-buffer patch 2026-10-04):
+        # the cap is never exceeded — over-cap rows are NOT buffered (the old
+        # WAL-spill-then-buffer path grew _buffer unbounded: buf 2k→33k,
+        # rss 858MB → export rss-cap-abort, 2026-10-04). l2_raw appends check
+        # the isolation deque+cap so snapshot/trade rows are never starved by
+        # verbatim frames. Fail-closed order on cap hit: (1) attempt flush to
+        # make room, (2) WAL-spill+fsync the new row so a False return never
+        # loses it, (3) return False WITHOUT buffering (caller retries — the
+        # snapshot path retries once after a flush; l2_raw sheds the frame
+        # with a countable backpressure event). Counted drop (_dropped_rows)
+        # ONLY when the WAL itself failed. Flush-then-spill, not
+        # spill-then-flush: flush() truncates the WAL on success, so a
+        # pre-flush spill would be erased before the caller retries (silent
+        # loss — the bug class fixed below in the old comment); spilling
+        # after the flush guarantees the WAL holds the row at False return.
+        _is_l2 = (dataset == "l2_raw")
+        _cap_buf = self._l2_buffer if _is_l2 else self._buffer
+        _cap = self.l2_raw_max if _is_l2 else self.buffer_max
+        if len(_cap_buf) >= _cap:
             if self.on_event:
-                self._emit_event(CollectorEventType.backpressure, {"buffer_size": len(self._buffer), "buffer_max": self.buffer_max, "dataset": dataset, "dropped_total": self._dropped_rows.get(dataset, 0)})
+                self._emit_event(CollectorEventType.backpressure, {"buffer_size": len(_cap_buf), "buffer_max": _cap, "dataset": dataset, "dropped_total": self._dropped_rows.get(dataset, 0), "main_buffered": len(self._buffer), "l2_buffered": len(self._l2_buffer)})
             else:
                 import warnings
                 warnings.warn(
-                    f"Backpressure: buffer full ({len(self._buffer)}/{self.buffer_max}), dataset={dataset}; caller should block/retry",
+                    f"Backpressure: buffer full ({len(_cap_buf)}/{_cap}), dataset={dataset}; caller should block/retry",
                     stacklevel=2,
                 )
             if self.wal_enabled:
@@ -369,11 +404,19 @@ class ParquetWriter:
                     self.flush()
                 except Exception:
                     pass
-                if len(self._buffer) >= self.buffer_max:
-                    # Still full after flush — WAL-spill with fsync (buffer-before-WAL bug fixed: WAL first)
-                    # Dedup key already reserved, so WAL contains exactly one copy
+                if len(self._buffer) >= self.buffer_max or len(self._l2_buffer) >= self.l2_raw_max:
+                    # Still full after flush — WAL-spill+fsync the new row
+                    # (dedup key already reserved, so the WAL holds exactly
+                    # one copy), then refuse WITHOUT buffering.
                     try:
                         self._wal_append(dataset, row, asset, date_str)
+                        try:
+                            _fh = getattr(self, "_wal_f", None)
+                            if _fh is not None:
+                                _fh.flush()
+                                os.fsync(_fh.fileno())
+                        except Exception:
+                            pass
                     except Exception:
                         # WAL failed: remove reserved dedup key so retry can succeed after WAL recovers
                         if dedup_key is not None:
@@ -383,25 +426,17 @@ class ParquetWriter:
                                 pass
                         self._dropped_rows[dataset] = self._dropped_rows.get(dataset, 0) + 1
                         return False
-                    # CRITICAL fix (audit 2026-09-21): the spilled row must ALSO
-                    # sit in _buffer. flush() only persists _buffer and then
-                    # truncates the WAL — a WAL-only row was erased by the next
-                    # successful flush without ever reaching Parquet (silent
-                    # loss, 7/12 rows in repro). Over-cap buffering is bounded
-                    # in practice (backpressure event fires per append, operator
-                    # paged) and never silently drops per §10A.
-                    try:
-                        self._buffer.append(BufferedRow(
-                            dataset=dataset,
-                            asset=asset or row.get("asset"),
-                            date_str=date_str,
-                            row=row,
-                        ))
-                    except Exception:
-                        # buffer append must not fail; WAL still holds the row
-                        # and _wal_replay recovers it on restart (no silent loss)
-                        pass
-                    return True
+                    # WAL durable — release the reservation so the caller's
+                    # retry re-spills + buffers. Keeping it would dedupe the
+                    # retry into a silent loss: the row would sit WAL-only
+                    # until the next flush truncate erases it without ever
+                    # reaching Parquet. Never counted in _dropped_rows here.
+                    if dedup_key is not None:
+                        try:
+                            self._seen_keys[dataset].pop(dedup_key, None)
+                        except Exception:
+                            pass
+                    return False
                 # Flush made room — fall through to WAL+buffer path (dedup already reserved, don't re-add)
             else:
                 # WAL disabled: strict backpressure — remove reserved key so retry works
@@ -428,10 +463,15 @@ class ParquetWriter:
                 return False
 
         br = BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row)
-        self._buffer.append(br)
+        if dataset == "l2_raw":
+            self._l2_buffer.append(br)
+        else:
+            self._buffer.append(br)
 
-        # maybe flush
-        if len(self._buffer) >= self.flush_threshold or (time.monotonic() - self._last_flush_ts) >= self.flush_interval:
+        # maybe flush (combined occupancy: l2_raw is ~86% of rows — a
+        # main-only check would let the isolation deque grow to its own cap
+        # while threshold flushes never fire)
+        if (len(self._buffer) + len(self._l2_buffer)) >= self.flush_threshold or (time.monotonic() - self._last_flush_ts) >= self.flush_interval:
             try:
                 self.flush()
             except Exception as e:
@@ -461,8 +501,27 @@ class ParquetWriter:
         failing 5 consecutive flushes is dead-lettered (JSONL + event)
         instead of wedging the loop forever.
         """
-        if not self._buffer:
+        if not self._buffer and not self._l2_buffer:
             return 0
+        # l2_raw isolation: drain the verbatim-frame deque through the same
+        # group/write path (single-file change surface — no second writer).
+        # Drained first so group accounting stays unified; transient peak is
+        # still bounded by buffer_max + l2_raw_max, and failure-requeue
+        # below routes rows back to their own deque (_requeue_front).
+        if self._l2_buffer:
+            while self._l2_buffer:
+                self._buffer.append(self._l2_buffer.popleft())
+
+        def _requeue_front(br: BufferedRow) -> None:
+            # Preserve the l2_raw split across failure-requeue: a requeued
+            # l2 row returns to the isolation deque, never to _buffer, so
+            # the hard ceiling (buffer_max + l2_raw_max) holds even when
+            # flushes keep failing (drained-then-requeued rows stay counted
+            # against their own cap).
+            if br.dataset == "l2_raw":
+                self._l2_buffer.appendleft(br)
+            else:
+                self._buffer.appendleft(br)
         # group by (dataset, date_str, asset)
         groups: Dict[Tuple[str, str, Optional[str]], List[Dict[str, Any]]] = defaultdict(list)
         while self._buffer:
@@ -565,17 +624,17 @@ class ParquetWriter:
                         _batch_incomplete = True
                         for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
                             for r in reversed(r2):
-                                self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                                _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
                         break
                     # dead-letter write failed — requeue failing + later groups (no loss)
                     for (d2, ds2, a2), r2 in reversed(items[idx:]):
                         for r in reversed(r2):
-                            self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                            _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
                     raise
                 # re-queue failing group AND every unprocessed group front-first (no loss)
                 for (d2, ds2, a2), r2 in reversed(items[idx:]):
                     for r in reversed(r2):
-                        self._buffer.appendleft(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                        _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
                 raise
             finally:
                 # PERF RAM: release per-group Arrow/Py list peak promptly.

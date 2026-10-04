@@ -113,6 +113,14 @@ series_ids:
 snapshot_interval_ms: 500
 storage:
   buffer_max_rows: 80000
+  # 2026-10-04 bounded-buffer patch: own HARD cap for the l2_raw isolation
+  # deque (verbatim multi-KB frame_json, ~86% of buffered rows). Per-cycle
+  # l2 volume ~= 0.86 * 40000 threshold ~= 34k < 40k, so healthy flushes
+  # never trip it; it binds only when flush stalls. Worst-case buffer RAM
+  # = buffer_max_rows + l2_raw_max_rows. Wire-up in collector.py
+  # (l2_raw_max_rows=...) is a follow-up; the writer default applies until
+  # then. Do NOT raise past the threshold without redoing the cap math.
+  l2_raw_max_rows: 40000
   compaction_schedule: daily
   compaction_temp_suffix: .tmp
   data_dir: ./data

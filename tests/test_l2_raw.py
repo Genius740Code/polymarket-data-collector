@@ -103,12 +103,14 @@ def test_l2_raw_dedup_redelivery_across_conns():
         assert append_row(w, f, asset="BTC", source_conn="A", ts_received_ns=111) is True
         # Same frame redelivered on conn B with a fresh receive stamp dedupes.
         assert append_row(w, f, asset="BTC", source_conn="B", ts_received_ns=222) is True
-        assert len([b for b in w._buffer if b.dataset == "l2_raw"]) == 1
+        # l2_raw rows buffer in the isolation deque (bounded-buffer patch
+        # 2026-10-04), not the main _buffer.
+        assert len([b for b in w._l2_buffer if b.dataset == "l2_raw"]) == 1
         # A genuinely different frame (new exchange ts) is kept.
         f2 = dict(f)
         f2["timestamp"] = 1759300000001
         assert append_row(w, f2, asset="BTC", source_conn="B", ts_received_ns=333) is True
-        assert len([b for b in w._buffer if b.dataset == "l2_raw"]) == 2
+        assert len([b for b in w._l2_buffer if b.dataset == "l2_raw"]) == 2
         # Frames with no frame content never collapse to one key.
         assert dedup_key_for_row({}) is None
         assert dedup_key_for_row({"frame_json": ""}) is None

@@ -40,12 +40,22 @@ def test_wal_spill_rows_survive_flush_recovery():
                       flush_interval_seconds=9999)
     w.flush_threshold = 100000
     w._write_group = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    # Bounded-buffer patch 2026-10-04: the cap is HARD — the first 5 rows
+    # buffer (True), rows past the cap are WAL-spilled + REFUSED (False,
+    # never buffered, never counted lost). The caller retries after healing.
+    # (Migrated from the advisory-cap all-True assertion; the WAL-first
+    # fail-closed ordering is unchanged.)
     results = [w.append("collector_events", ev_row(f"e{i}", 1735689600000000000 + i))
                for i in range(12)]
-    assert all(results), "spilled rows must report True (durable in WAL+buffer)"
+    assert results[:5] == [True] * 5
+    assert results[5:] == [False] * 7, "over-cap rows must be refused, not buffered"
+    assert len(w._buffer) <= 5, "hard cap holds while flush fails"
     assert w._dropped_rows.get("collector_events", 0) == 0
-    # heal disk and flush: every WAL row must reach parquet
+    # heal disk and retry the refused rows (the False contract): every row
+    # must reach parquet exactly once.
     w._write_group = ParquetWriter._write_group.__get__(w)
+    for i in range(5, 12):
+        assert w.append("collector_events", ev_row(f"e{i}", 1735689600000000000 + i)) is True
     w.flush()
     disk = sum(pq.ParquetFile(f).metadata.num_rows
                for f in glob.glob(os.path.join(tmp, "collector_events/**/*.parquet"), recursive=True))
@@ -80,7 +90,12 @@ def test_writer_event_reentrancy_bounded():
     w.flush = lambda: (flushes.__setitem__(0, flushes[0] + 1), _orig())[1]
     for i in range(5):
         w.append("collector_events", ev_row(f"f{i}"))
-    assert w.append("collector_events", ev_row("trig")) is True  # no RecursionError
+    # Bounded-buffer patch 2026-10-04: buffer is at cap (5/5) with flush
+    # failing, so the 6th append is REFUSED (False, WAL-durable) instead of
+    # buffered — the reentrancy assertion is that the nested
+    # writer->markets_log->writer emission is suppressed + counted, never
+    # recursed (no RecursionError), and one append never stampedes flushes.
+    assert w.append("collector_events", ev_row("trig")) is False
     assert flushes[0] <= 2, f"one append must not stampede flushes, got {flushes[0]}"
 
 

@@ -94,6 +94,10 @@ class StorageConfig(BaseModel):
     flush_interval_seconds: int = 60
     flush_row_count_threshold: int = 5000
     buffer_max_rows: int = 50000
+    # Bounded-buffer patch 2026-10-04: own cap for the l2_raw isolation
+    # deque (verbatim WS frames, ~86% of rows). Per-cycle l2 volume ~=
+    # 0.86 * threshold, so 40000 stays out of the way while healthy.
+    l2_raw_max_rows: int = 40000
     wal_enabled: bool = True
     wal_dir: str = "./data/_wal"
     disk_space_check_interval_seconds: int = 30
