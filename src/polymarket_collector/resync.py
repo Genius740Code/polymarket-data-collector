@@ -544,6 +544,83 @@ class ResyncManager:
             return True
         return ep.resync_completed_ts_utc is not None or resync_id in self._escalated
 
+    # Backstop TTL for open episodes (2026-10-04): episodes that never reach
+    # a final state are invisible to the finished-only FIFO eviction, so
+    # _episodes/_episode_latest pin them forever (prod: eps pinned at the
+    # 500 cap, all never-final). The sweeps above only close episodes tied
+    # to healed/ended books; orphans on live-but-quiet feeds (window rolled
+    # while stale, fetch_none-quiet tokens, discovery-lag unknowns) match
+    # none of them. Past TTL with a dead buffer and no recent drive, the
+    # episode is closed as unresolved via the existing supersede path —
+    # honest resync_failed row + persisted terminal state, books untouched
+    # (still stale/resyncing), no snapshot fills: gaps stay gaps.
+    NEVER_FINAL_TTL_S = 3600.0
+    # A recent resync drive means the episode is still being worked (outage
+    # recovery, backoff) — never TTL-close those; each attempt refreshes
+    # resync_rest_fetch_ts_utc, so this only fires on truly abandoned ones.
+    NEVER_FINAL_QUIET_S = 900.0
+
+    def close_expired_unresolved(self, ttl_s: Optional[float] = None) -> int:
+        """Close abandoned never-final episodes as unresolved (never raises).
+
+        Qualifies only open episodes that are ALL of: older than TTL (by
+        disconnect_ts_utc, the honest gap start), buffer already dead
+        (nothing left to replay — young episodes keep a live buffer), and
+        with no resync drive in the last NEVER_FINAL_QUIET_S. Closing reuses
+        supersede_episode (resync_failed + persisted terminal row, added to
+        _escalated so future resync() drives no-op instead of burning retry
+        loops, buffer freed), then the finished FIFO eviction runs so the
+        RAM bound applies immediately. Returns episodes closed.
+        """
+        closed = 0
+        try:
+            try:
+                _ttl = float(ttl_s if ttl_s is not None else self.NEVER_FINAL_TTL_S)
+            except Exception:
+                _ttl = 3600.0
+            if not (_ttl > 0):
+                return 0
+            try:
+                import datetime as _dte
+                _now = _dte.datetime.now(tz=_dte.timezone.utc)
+            except Exception:
+                return 0
+            for rid in list(self._episodes.keys()):
+                try:
+                    if self.is_finished(rid):
+                        continue
+                    ep = self._episodes.get(rid)
+                    if ep is None:
+                        continue
+                    if self.buffer_live(rid):
+                        continue  # young or still replayable — normal paths own it
+                    try:
+                        _disc = _dte.datetime.fromisoformat(
+                            str(ep.disconnect_ts_utc or "").replace("Z", "+00:00"))
+                        _age_s = (_now - _disc).total_seconds()
+                    except Exception:
+                        continue  # unparseable clock — fail open, leave it
+                    if not (_age_s >= _ttl):
+                        continue
+                    try:
+                        _fts = str(getattr(ep, "resync_rest_fetch_ts_utc", None) or "")
+                        _last_fetch = _dte.datetime.fromisoformat(_fts.replace("Z", "+00:00")) if _fts else None
+                        if _last_fetch is not None and (_now - _last_fetch).total_seconds() < self.NEVER_FINAL_QUIET_S:
+                            continue  # driven recently — still being worked
+                    except Exception:
+                        pass
+                    if self.supersede_episode(rid, "never_final_ttl_expired", extra={"unresolved": True}):
+                        closed += 1
+                except Exception:
+                    continue
+            try:
+                self._evict_finished_episodes()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return closed
+
     def _evict_finished_episodes(self) -> None:
         """Bound _episodes/_buffers RAM: evict oldest FINISHED episodes when over cap.
 

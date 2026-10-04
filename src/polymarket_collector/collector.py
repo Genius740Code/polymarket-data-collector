@@ -221,6 +221,8 @@ class Collector:
         self._snapshot_task: Optional[asyncio.Task] = None
         self._clock_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
+        # 2026-10-04: independent resync-reaper timer (see _reaper_loop).
+        self._reaper_task: Optional[asyncio.Task] = None
         self._heartbeat_path = Path(config.storage.data_dir) / "heartbeat.json"
         self._threshold_config_id = str(uuid.uuid4())
         # per-asset connection tracking for collector_events §8 (avoid 100% null connection_id)
@@ -439,6 +441,44 @@ class Collector:
         except Exception:
             pass
 
+    # per-episode bookkeeping cap (2026-10-04): _episode_latest mirrors the
+    # finished-only FIFO discipline of ResyncManager._evict_finished_episodes
+    # (MAX_EPISODES=500). Final+persisted rows are already in parquet and can
+    # never change state; open or unwritten entries are never evicted here.
+    MAX_EPISODE_LATEST = 500
+
+    def _evict_finished_episode_latest(self) -> int:
+        """Evict oldest finished+persisted _episode_latest entries past cap (never raises).
+
+        Same finished-only FIFO discipline as _episodes: never evicts open
+        episodes or entries whose parquet append failed (not in
+        _episode_persisted — the only copy would be lost). Returns evicted.
+        """
+        try:
+            if len(self._episode_latest) <= self.MAX_EPISODE_LATEST:
+                return 0
+            excess = len(self._episode_latest) - self.MAX_EPISODE_LATEST
+            evicted = 0
+            for rid in list(self._episode_latest.keys()):
+                if evicted >= excess:
+                    break
+                try:
+                    if rid not in self._episode_persisted:
+                        continue
+                    _ep = self.resync._episodes.get(rid)
+                    _done = (_ep is None
+                             or _ep.resync_completed_ts_utc is not None
+                             or rid in self.resync._escalated)
+                except Exception:
+                    continue
+                if _done:
+                    self._episode_latest.pop(rid, None)
+                    self._episode_persisted.discard(rid)
+                    evicted += 1
+            return evicted
+        except Exception:
+            return 0
+
     def _persist_resync_episode(self, episode_dict: dict) -> None:
         """Persist resync episode transitions to ParquetWriter (resync_episodes dataset).
 
@@ -472,6 +512,12 @@ class Collector:
             else:
                 self._episode_persisted.discard(rid)
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "resync_episodes", "asset": episode_dict.get("asset")})
+            # Bound _episode_latest at insert (same finished-only FIFO as
+            # _episodes; open/unwritten entries are never evicted here).
+            try:
+                self._evict_finished_episode_latest()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2193,6 +2239,10 @@ class Collector:
         # periodic flush (§10A) — also covers §9A markets log compaction periodic
         self._flush_task = asyncio.create_task(self._flush_loop(), name="flush")
 
+        # 2026-10-04: independent resync reaper (60s RAM-hygiene cadence —
+        # see _reaper_loop; never touches the kaggle lock).
+        self._reaper_task = asyncio.create_task(self._reaper_loop(), name="reaper")
+
         # resolution stuck monitor (§6A) — unresolved > max wait
         self._resolution_task = asyncio.create_task(self._resolution_stuck_loop(), name="resolution_stuck")
 
@@ -2238,6 +2288,7 @@ class Collector:
             _watch("snapshots", self._snapshot_task, self._snapshot_loop)
             _watch("clock", self._clock_task, self._clock_loop)
             _watch("flush", self._flush_loop, self._flush_loop)
+            _watch("reaper", self._reaper_task, self._reaper_loop)
             _watch("resolution_stuck", self._resolution_task, self._resolution_stuck_loop)
             _watch("chainlink", self._chainlink_task, self._chainlink_loop)
             _watch("mem_report", self._mem_task, self._mem_report_loop)
@@ -2296,6 +2347,7 @@ class Collector:
             self._supervised[name] = (_nt, _factory)
             _nt.add_done_callback(lambda _t, _nn=name: self._task_died(_nn))
             _ref = {"snapshots": "_snapshot_task", "clock": "_clock_task", "flush": "_flush_task",
+                    "reaper": "_reaper_task",
                     "chainlink": "_chainlink_task", "resolution_stuck": "_resolution_task",
                     "mem_report": "_mem_task", "kaggle_upload": "_kaggle_task"}.get(name)
             if _ref:
@@ -5200,47 +5252,69 @@ class Collector:
             except Exception:
                 pass
 
+    # Independent resync-reaper cadence (2026-10-04): episode RAM hygiene on
+    # its own 60s timer, NOT coupled to the flush loop's tick. The flush tick
+    # runs _background_heal_tick (up to 40 sequential REST resync drives per
+    # tick) and parks its parquet flush on the kaggle lock during exports, so
+    # reaping on the flush cadence stalls exactly when RSS is highest. This
+    # sweep is RAM-only + episode-row appends via writer.append — the same
+    # lock-free path the WS handlers use mid-export — so it deliberately
+    # never acquires _kaggle_lock and never calls flush()/export()/prune().
+    REAPER_INTERVAL_S = 60.0
+
+    def _resync_reaper_tick(self) -> dict:
+        """One lock-free resync RAM-hygiene pass (never raises, never locks).
+
+        close_healed → reap_expired → supersede_ended → close_unresolved,
+        then both finished-only FIFO evictions (_episodes via ResyncManager,
+        _episode_latest here). Safe to call from any loop; sync code only,
+        so same-event-loop callers cannot interleave mid-sweep. Returns
+        {"closed","reaped","superseded","unresolved"} counts.
+        """
+        out = {"closed": 0, "reaped": 0, "superseded": 0, "unresolved": 0}
+        try:
+            out["closed"] = int(self.resync.close_healed_episodes(self.books) or 0)
+        except Exception:
+            pass
+        try:
+            out["reaped"] = int(self.resync.reap_expired_buffers() or 0)
+        except Exception:
+            pass
+        try:
+            out["superseded"] = int(self.resync.supersede_ended_market_episodes(self.books) or 0)
+        except Exception:
+            pass
+        try:
+            out["unresolved"] = int(self.resync.close_expired_unresolved() or 0)
+        except Exception:
+            pass
+        try:
+            self.resync._evict_finished_episodes()
+        except Exception:
+            pass
+        try:
+            self._evict_finished_episode_latest()
+        except Exception:
+            pass
+        return out
+
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.config.storage.flush_interval_seconds)
-            # HIGH (audit 2026-09-21): episode-lifecycle sweep — close open
-            # episodes whose books already healed via background REST heals or
-            # WS full-book promotion (those paths never reach resync(), so
-            # resync_completed_ts_utc stayed NULL and buffers leaked forever).
-            # Leak 2026-09-25: run BEFORE the kaggle-lock section. An export
-            # tick holds the lock for many minutes (measured 27min on the 1d
-            # lane — trades workers get a 420s Data-API budget each), and the
-            # loop parks at `async with` while it waits: with the sweep/reap
-            # below the lock, prod buffered 25k->332k msgs (+600MB RSS) during
-            # one export and the PM2 memory cap fired mid-export — cancelling
-            # the tick so slow lanes never verify. Episode RAM hygiene must not
-            # wait on the export lock (it never touches the flush/parquet path
-            # guarded by §10A; its _safe_persist appends are as safe as the
-            # WS-path appends that run during exports anyway).
+            # HIGH (audit 2026-09-21): episode-lifecycle sweep — now the
+            # shared _resync_reaper_tick (also driven every REAPER_INTERVAL_S
+            # by _reaper_loop, independent of this tick and of the kaggle
+            # lock). See _resync_reaper_tick for the lock-freedom contract.
             try:
-                _closed = self.resync.close_healed_episodes(self.books)
-                if _closed:
-                    print(f"[resync] sweep closed {_closed} healed episode(s)")
-                # Leak 2026-09-25 (steady-state RSS growth): the buffer age
-                # deadline was only enforced lazily — on the NEXT message for the
-                # same episode. Quiet feeds (window rolled while stale) never send
-                # that message, so expired deques pinned up to 5k parsed WS
-                # frames each forever (prod: 1494 never-final episodes in 2.9h).
-                # Actively reap expired buffers here; the retired episode's rows
-                # are already in parquet and its book stays honestly stale.
-                _reaped = self.resync.reap_expired_buffers()
-                if _reaped:
-                    print(f"[resync] reaped {_reaped} expired replay buffer(s)")
-                # Stale-epidemic fix (2026-09-25): books of markets ended <6h
-                # ago mint episodes per recycle/book_stalled that can never
-                # reach a final state (REST 404s forever; close_healed only
-                # closes books-live; the 6h eviction is the only exit) —
-                # 29,678 never-final episodes in one prod day. Supersede them
-                # here (honest final state, buffer freed) instead of leaving
-                # the flood open until the RAM tick.
-                _superseded = self.resync.supersede_ended_market_episodes(self.books)
-                if _superseded:
-                    print(f"[resync] sweep superseded {_superseded} ended-market episode(s)")
+                _r = self._resync_reaper_tick()
+                if _r.get("closed"):
+                    print(f"[resync] sweep closed {_r['closed']} healed episode(s)")
+                if _r.get("reaped"):
+                    print(f"[resync] reaped {_r['reaped']} expired replay buffer(s)")
+                if _r.get("superseded"):
+                    print(f"[resync] sweep superseded {_r['superseded']} ended-market episode(s)")
+                if _r.get("unresolved"):
+                    print(f"[resync] sweep closed {_r['unresolved']} expired episode(s) as unresolved")
                 # Background heal (perfect-collector): the reconnect walk heals
                 # one book per pass, so a large stale backlog never drains.
                 # Heal up to 4 stale books per flush tick here (bounded REST:
@@ -5318,6 +5392,25 @@ class Collector:
             # wired (throttled internally to full_book_diff_interval_seconds).
             try:
                 await self._periodic_drift_tick()
+            except Exception:
+                pass
+
+    async def _reaper_loop(self) -> None:
+        """Drive _resync_reaper_tick on its own cadence (never raises).
+
+        Independent of the flush loop (whose tick can stretch for minutes
+        under _background_heal_tick REST drives) and of the kaggle lock
+        (the tick never acquires it — see _resync_reaper_tick). Overlap
+        with the flush loop's own tick call is harmless: the tick is sync
+        and idempotent, so back-to-back passes just find nothing to do.
+        """
+        while self._running:
+            await asyncio.sleep(self.REAPER_INTERVAL_S)
+            try:
+                _r = self._resync_reaper_tick()
+                if _r.get("closed") or _r.get("reaped") or _r.get("superseded") or _r.get("unresolved"):
+                    print(f"[resync:reaper] closed={_r['closed']} reaped={_r['reaped']} "
+                          f"superseded={_r['superseded']} unresolved={_r['unresolved']}", flush=True)
             except Exception:
                 pass
 
@@ -5947,7 +6040,7 @@ class Collector:
             pass
         for t in self._tasks:
             t.cancel()
-        for attr in ["_snapshot_task","_clock_task","_flush_task","_resolution_task","_kaggle_task","_chainlink_task"]:
+        for attr in ["_snapshot_task","_clock_task","_flush_task","_reaper_task","_resolution_task","_kaggle_task","_chainlink_task"]:
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
