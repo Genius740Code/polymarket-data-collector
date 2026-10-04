@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .storage.parquet_io import read_table
@@ -476,7 +477,16 @@ def load_markets_maps(data_dir: str | Path) -> Tuple[Dict[str, dict], Dict[str, 
 def _list_partition_files(base: Path, dataset: str,
                           day_str: Optional[str],
                           asset_upper: Optional[str]) -> List[Path]:
-    """Hive files for (dataset, day, asset); partition-pruned, else scan."""
+    """Hive files for (dataset, day, asset); partition-pruned, else scan.
+
+    When ``day_str`` and ``asset_upper`` are both given the query is scoped:
+    the writer partitions every row under ``date={day}/asset={ASSET}`` (live
+    and backfilled alike), so an absent partition means zero in-scope rows
+    and an empty list is returned directly. Falling back to an unscoped
+    full-hive scan here would open every file in the dataset (thousands)
+    just to conclude the same thing and times out the CLI — unscoped
+    callers pass day/asset as None explicitly.
+    """
     try:
         root = base / dataset
         if not root.exists():
@@ -486,9 +496,8 @@ def _list_partition_files(base: Path, dataset: str,
                 f"date={day_str}/asset={asset_upper}/*.parquet"))
             pats.update(p for p in root.glob(
                 f"date={day_str}/asset={asset_upper.lower()}/*.parquet"))
-            pats = {p for p in pats if not p.name.endswith(".tmp")}
-            if pats:
-                return sorted(pats, key=str)
+            return sorted(
+                (p for p in pats if not p.name.endswith(".tmp")), key=str)
         files = [p for p in root.rglob("*.parquet")
                  if not p.name.endswith(".tmp")]
         return sorted(files, key=str)
@@ -513,6 +522,47 @@ def _read_key_columns(path: Path, columns: List[str]) -> Optional[pa.Table]:
         return None
 
 
+def _accumulate_coverage_table(
+    table: pa.Table,
+    is_backfill_file: bool,
+    cov: Dict[str, Dict[str, int]],
+) -> None:
+    """Fold one key-projected table into coverage counts (vectorized).
+
+    Counting rules are identical to the row loop in
+    :func:`live_condition_coverage`: rows without ``condition_id`` are
+    skipped; rows in a backfill-prefixed file (or carrying
+    ``source='backfill_pmxt'``) count as backfilled, all others as live.
+    Aggregation runs in pyarrow compute over distinct values, so per-file
+    cost is O(distinct conditions) Python steps instead of O(rows).
+    Raises on unexpected schemas — the caller falls back to the row loop.
+    """
+    cid = table.column("condition_id").combine_chunks()
+    valid = pc.and_(pc.is_valid(cid), pc.not_equal(cid, ""))
+    if is_backfill_file:
+        counts = pc.value_counts(pc.filter(cid, valid))
+        for v in counts.to_pylist():
+            entry = cov.setdefault(
+                str(v["values"]), {"live": 0, "backfilled": 0})
+            entry["backfilled"] += v["counts"]
+        return
+    if "source" not in table.schema.names:
+        counts = pc.value_counts(pc.filter(cid, valid))
+        for v in counts.to_pylist():
+            entry = cov.setdefault(
+                str(v["values"]), {"live": 0, "backfilled": 0})
+            entry["live"] += v["counts"]
+        return
+    src = table.column("source").combine_chunks()
+    is_bf = pc.fill_null(pc.equal(src, BACKFILL_SOURCE), False)
+    for mask, key in ((pc.invert(is_bf), "live"), (is_bf, "backfilled")):
+        counts = pc.value_counts(pc.filter(cid, pc.and_(valid, mask)))
+        for v in counts.to_pylist():
+            entry = cov.setdefault(
+                str(v["values"]), {"live": 0, "backfilled": 0})
+            entry[key] += v["counts"]
+
+
 def live_condition_coverage(
     data_dir: str | Path,
     day_str: Optional[str] = None,
@@ -535,23 +585,27 @@ def live_condition_coverage(
                     t = _read_key_columns(p, cols)
                     if t is None or t.num_rows == 0:
                         continue
-                    pylist = t.to_pylist()
-                    del t
                     is_backfill_file = p.name.startswith(BACKFILL_PREFIX)
-                    for r in pylist:
-                        try:
-                            cid = r.get("condition_id")
-                            if not cid:
+                    try:
+                        _accumulate_coverage_table(t, is_backfill_file, cov)
+                    except (OSError, ValueError, pa.ArrowException,
+                            TypeError, AttributeError, KeyError):
+                        pylist = t.to_pylist()
+                        for r in pylist:
+                            try:
+                                cid = r.get("condition_id")
+                                if not cid:
+                                    continue
+                                entry = cov.setdefault(
+                                    str(cid), {"live": 0, "backfilled": 0})
+                                if is_backfill_file or r.get("source") == BACKFILL_SOURCE:
+                                    entry["backfilled"] += 1
+                                else:
+                                    entry["live"] += 1
+                            except (TypeError, ValueError):
                                 continue
-                            entry = cov.setdefault(
-                                str(cid), {"live": 0, "backfilled": 0})
-                            if is_backfill_file or r.get("source") == BACKFILL_SOURCE:
-                                entry["backfilled"] += 1
-                            else:
-                                entry["live"] += 1
-                        except (TypeError, ValueError):
-                            continue
-                    del pylist
+                        del pylist
+                    del t
                 except (OSError, ValueError, pa.ArrowException) as e:
                     print(f"[backfill_pmxt] WARN coverage file skipped {p.name}: {e}")
                     continue
