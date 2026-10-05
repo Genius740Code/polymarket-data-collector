@@ -41,6 +41,16 @@ DEFAULT_COUNT_TOLERANCE = 0.02
 DEFAULT_TICK_SIZE = 0.01
 DEFAULT_JOIN_TOLERANCE_MS = 1000
 
+# Every column the compare accessors (row_mid / row_ts_ms / event_type_of)
+# read. Projection to this set keeps counts and diff math identical.
+DIFF_NEED_COLS = (
+    "event_type", "type",
+    "timestamp", "ts_source", "ts", "local_timestamp", "ts_received_ns",
+    "ask_prices", "asks", "ask", "best_ask",
+    "bid_prices", "bids", "bid", "best_bid",
+    "price",
+)
+
 
 def find_parquet_files(root: str | Path, slug: Optional[str] = None) -> List[Path]:
     """All ``*.parquet`` files under ``root`` preferring ``slug`` matches.
@@ -63,12 +73,30 @@ def find_parquet_files(root: str | Path, slug: Optional[str] = None) -> List[Pat
 
 
 def read_parquet_rows(paths: List[Path]) -> Tuple[List[dict], Dict[str, int]]:
-    """Read parquet files to row dicts. Unreadable files are counted, never raised."""
+    """Read parquet files to row dicts. Unreadable files are counted, never raised.
+
+    Column-projected to the compare inputs (mid/ts/event-type columns only):
+    full 842-column snapshot rows OOM small boxes, and every diff accessor
+    below touches only these columns, so counts and math are unchanged.
+    """
     rows: List[dict] = []
     stats = {"files_ok": 0, "files_failed": 0, "rows_read": 0}
     for p in paths:
         try:
-            table = pq.read_table(str(p))
+            try:
+                pf = pq.ParquetFile(str(p))
+                # NB: .schema is the thrift ParquetSchema (nested lists show
+                # as repeated `element` and lose their column names); the
+                # Arrow schema has the real top-level field names.
+                arrow_schema = getattr(pf, "schema_arrow", None) or pf.schema
+                have = set(arrow_schema.names)
+                want = [c for c in DIFF_NEED_COLS if c in have]
+                # want may be legitimately empty (raw snapshot files carry
+                # none of the compare columns): read zero columns so the
+                # row COUNT is preserved without materializing 800+ cols.
+                table = pq.read_table(str(p), columns=want)
+            except Exception:
+                table = pq.read_table(str(p))
             stats["files_ok"] += 1
             stats["rows_read"] += table.num_rows
             if table.num_rows:

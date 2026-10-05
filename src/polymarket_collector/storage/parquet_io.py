@@ -20,14 +20,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-def read_table(path: str | Path) -> Optional[pa.Table]:
+def read_table(path: str | Path, columns: Optional[List[str]] = None) -> Optional[pa.Table]:
     """Read a single parquet FILE without hive partition inference.
 
     Returns None on failure — callers should treat None as a read error, not
-    as "no rows", and log it loudly.
+    as "no rows", and log it loudly. ``columns`` optionally projects to a
+    subset (missing columns are the caller's problem — intersect first).
     """
     try:
-        return pq.ParquetFile(str(path)).read()
+        return pq.ParquetFile(str(path)).read(columns=columns)
     except Exception as e:
         print(f"[parquet_io] WARN failed to read {path}: {e}")
         return None

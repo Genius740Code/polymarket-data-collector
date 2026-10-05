@@ -39,7 +39,7 @@ import json
 import sys
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -258,6 +258,45 @@ def _load_markets_maps(base: Path) -> Tuple[Dict[str, dict], Dict[str, str]]:
 
 # -- hive reads --------------------------------------------------------------
 
+# Column projections: the ONLY columns the converters/filters below read.
+# Reading the full 800+ column snapshot rows materializes gigabytes and OOMs
+# small boxes (verified: full 143k-row read dies, projected reads in ~1s).
+# Projection is result-identical by construction: absent columns behave
+# exactly like legacy rows that never carried them (`in`-checks / .get()).
+_SNAPSHOT_BASE_COLS = (
+    "condition_id", "series_id", "asset",
+    "ts_snapshot_ns", "ts_snapshot_utc",
+    "up_ask", "up_ask_size", "up_bid", "up_bid_size",
+)
+_SNAPSHOT_LEVEL_COLS = tuple(
+    f"up_{side}_level_{lvl}_{kind}"
+    for lvl in range(1, 21)
+    for side in ("ask", "bid")
+    for kind in ("price", "size")
+)
+SNAPSHOT_NEED_COLS = frozenset(_SNAPSHOT_BASE_COLS + _SNAPSHOT_LEVEL_COLS)
+EVENTS_NEED_COLS = frozenset((
+    "condition_id", "series_id", "asset", "outcome", "event_type",
+    "ts_source", "ts_received_ns",
+    "new_best_bid", "new_best_ask", "new_bid_size", "new_ask_size",
+    "side", "exchange_best",
+))
+TRADES_NEED_COLS = frozenset((
+    "condition_id", "series_id", "asset", "outcome",
+    "token_id", "trade_id", "transaction_hash",
+    "price", "size", "fee", "side",
+    "ts_source", "ts_received_ns", "ts_backfilled_ns",
+))
+CHAINLINK_NEED_COLS = frozenset(("asset", "ts_source", "ts_received_ns"))
+ONCHAIN_NEED_COLS = frozenset(ONCHAIN_FILLS_SCHEMA.names)
+DATASET_NEED_COLS = {
+    "book_snapshots_500ms": SNAPSHOT_NEED_COLS,
+    "book_events": EVENTS_NEED_COLS,
+    "trades": TRADES_NEED_COLS,
+    "chainlink_events": CHAINLINK_NEED_COLS,
+    "onchain_fills": ONCHAIN_NEED_COLS,
+}
+
 
 def _list_hive_files(base: Path, dataset: str, asset_upper: Optional[str],
                      date_str: str) -> List[Path]:
@@ -280,12 +319,30 @@ def _list_hive_files(base: Path, dataset: str, asset_upper: Optional[str],
     return sorted(files, key=str)
 
 
-def _read_hive_rows(files: List[Path], stats: dict) -> List[dict]:
-    """Read parquet files to row dicts. Read errors are counted, never raised."""
+def _read_hive_rows(files: List[Path], stats: dict,
+                   columns: Optional[frozenset] = None) -> List[dict]:
+    """Read parquet files to row dicts. Read errors are counted, never raised.
+
+    ``columns`` projects to the needed subset (intersected per file, so
+    legacy vintages missing some level columns read fine); None reads all.
+    """
     rows: List[dict] = []
     for p in files:
         try:
-            t = read_table(p)
+            if columns is not None:
+                try:
+                    pf = pq.ParquetFile(str(p))
+                    # NB: .schema is the thrift ParquetSchema (nested lists
+                    # surface as repeated `element`); .schema_arrow carries
+                    # the real top-level field names.
+                    arrow_schema = getattr(pf, "schema_arrow", None) or pf.schema
+                    have = set(arrow_schema.names)
+                    want = [c for c in columns if c in have]
+                    t = read_table(p, columns=want or None)
+                except Exception:
+                    t = read_table(p)
+            else:
+                t = read_table(p)
             if t is None:
                 raise IOError(f"unreadable {p.name}")
             stats["files_ok"] += 1
@@ -492,6 +549,7 @@ def export_pmdata_layout(
     timeframe: str,
     date_str: str,
     extra_fills: Optional[List[dict]] = None,
+    only_slugs: Optional[Collection[str]] = None,
 ) -> dict:
     """Export one asset/lane/day to the PMData per-slug layout.
 
@@ -503,6 +561,12 @@ def export_pmdata_layout(
 
     ``extra_fills``: decoded OrderFilled logs (no new RPC in this task) merged
     into the onchain_fills grouping via onchain_rows_from_fills().
+    ``only_slugs``: bounded single-slice export — rows resolving to any other
+    slug are skipped + counted (``skipped_other_slug``). Per-slug parquet for
+    the wanted slugs is byte-identical to the unscoped run; only the manifest
+    totals cover the scoped slice. Reads stay bounded: partition-pruned
+    ``date={day}/asset={asset}`` files plus the single ``markets_latest``
+    file, column-projected to the converter inputs (see DATASET_NEED_COLS).
     Returns the manifest dict.
     """
     base = Path(data_dir)
@@ -536,10 +600,17 @@ def export_pmdata_layout(
             return None
         return _safe_slug(info.get("slug"))
 
+    def _slug_wanted(slug: str) -> bool:
+        if only_slugs is None or slug in only_slugs:
+            return True
+        stats["skipped_other_slug"] = stats.get("skipped_other_slug", 0) + 1
+        return False
+
     # ---- snapshots -> L2 ----
     ds = "book_snapshots_500ms"
     st: dict = {"files_ok": 0, "files_failed": 0, "rows_read": 0, "rows_kept": 0}
-    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st):
+    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st,
+                               columns=DATASET_NEED_COLS[ds]):
         cid = row.get("condition_id")
         if not _asset_ok(row.get("asset"), cid, asset_upper, cid_info, stats):
             continue
@@ -548,6 +619,8 @@ def export_pmdata_layout(
         slug = _slug_for(cid)
         if slug is None:
             stats["skipped_no_slug"] += 1
+            continue
+        if not _slug_wanted(slug):
             continue
         ns = _coerce_ns(row.get("ts_snapshot_ns"))
         ms = ns // 1_000_000 if ns is not None else _iso_to_ms(row.get("ts_snapshot_utc"))
@@ -563,7 +636,8 @@ def export_pmdata_layout(
     # ---- book_events -> L2 ----
     ds = "book_events"
     st = {"files_ok": 0, "files_failed": 0, "rows_read": 0, "rows_kept": 0}
-    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st):
+    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st,
+                               columns=DATASET_NEED_COLS[ds]):
         cid = row.get("condition_id")
         if not _asset_ok(row.get("asset"), cid, asset_upper, cid_info, stats):
             continue
@@ -572,6 +646,8 @@ def export_pmdata_layout(
         slug = _slug_for(cid)
         if slug is None:
             stats["skipped_no_slug"] += 1
+            continue
+        if not _slug_wanted(slug):
             continue
         pm, was_down = _book_event_to_pmdata(row, slug, asset_upper)
         if was_down:
@@ -591,7 +667,8 @@ def export_pmdata_layout(
     # ---- trades -> trades ----
     ds = "trades"
     st = {"files_ok": 0, "files_failed": 0, "rows_read": 0, "rows_kept": 0}
-    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st):
+    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st,
+                               columns=DATASET_NEED_COLS[ds]):
         cid = row.get("condition_id")
         if not _asset_ok(row.get("asset"), cid, asset_upper, cid_info, stats):
             continue
@@ -600,6 +677,8 @@ def export_pmdata_layout(
         slug = _slug_for(cid)
         if slug is None:
             stats["skipped_no_slug"] += 1
+            continue
+        if not _slug_wanted(slug):
             continue
         pm = _trade_to_pmdata(row, slug, asset_upper)
         place_ms = pm["timestamp"]
@@ -619,7 +698,8 @@ def export_pmdata_layout(
     # ---- chainlink_events: asset-level, counted only (no slug to attach to) ----
     ds = "chainlink_events"
     st = {"files_ok": 0, "files_failed": 0, "rows_read": 0, "rows_kept": 0}
-    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st):
+    for row in _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st,
+                               columns=DATASET_NEED_COLS[ds]):
         ra = row.get("asset")
         if ra is not None and str(ra).upper() != asset_upper:
             stats["skipped_other_asset"] = stats.get("skipped_other_asset", 0) + 1
@@ -641,7 +721,8 @@ def export_pmdata_layout(
     st = {"files_ok": 0, "files_failed": 0, "rows_read": 0, "rows_kept": 0}
     hive_onchain_rows: List[dict] = []
     if (base / ds).exists():
-        hive_onchain_rows = _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st)
+        hive_onchain_rows = _read_hive_rows(_list_hive_files(base, ds, asset_upper, date_str), st,
+                                            columns=DATASET_NEED_COLS[ds])
     decoded_extra = onchain_rows_from_fills(list(extra_fills or []), token_to_cid)
     for row in hive_onchain_rows:
         # Normalize through the same helper shape (passthrough for unknowns).
@@ -679,6 +760,8 @@ def export_pmdata_layout(
         slug = _slug_for(cid)
         if slug is None:
             stats["skipped_no_slug"] += 1
+            continue
+        if not _slug_wanted(slug):
             continue
         # Onchain rows carry no event clock: attribute by market-window overlap
         # with the export day (fallback: the market shipped other rows today).
