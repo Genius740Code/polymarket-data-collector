@@ -581,30 +581,34 @@ class Collector:
         wallet = taker or maker or generic
         return maker, taker, wallet
 
-    def _append_l2_raw(self, single_msg: dict, shard: List[str]) -> None:
+    def _append_l2_raw(self, single_msg: dict, shard: List[str], source_conn: Optional[str] = None) -> None:
         """Route one WS frame to l2_raw verbatim (perfect-collector hook).
 
         Runs BEFORE book/threshold handling so tick_size_change and
         market_resolved frames (no book handlers) are still captured.
         Join columns are best-effort; frame_json is always the verbatim
-        frame. Never raises — the WS loop must not die on an audit write.
+        frame. ``source_conn`` tags the delivering leg (single/A/B) for
+        dedup audit. Never raises — the WS loop must not die on an audit write.
         """
         try:
             try:
                 asset = self._resolve_msg_asset(single_msg, None, shard)
             except Exception:
                 asset = "UNKNOWN"
-            cid = single_msg.get("condition_id") or single_msg.get("conditionId")
+            cid = single_msg.get("condition_id") or single_msg.get("conditionId") or single_msg.get("market")
             try:
                 _b = self._lookup_book(
                     cid, single_msg.get("token_id") or single_msg.get("asset_id"))
                 if _b is not None:
                     cid = _b.condition_id
+                    if (not asset or asset == "UNKNOWN") and getattr(_b, "asset", None):
+                        asset = str(_b.asset)
             except Exception:
                 pass
             ok = _l2_raw_append_row(
                 self.writer, single_msg, asset=asset or "UNKNOWN",
                 condition_id=cid if isinstance(cid, str) else None,
+                source_conn=source_conn,
             )
             if not ok:
                 self._collector_event(CollectorEventType.backpressure, {"dataset": "l2_raw", "asset": asset})
@@ -2669,21 +2673,31 @@ class Collector:
             pass
         await self._run_shard_loop_single(list(shard), shard_idx=shard_idx)
 
-    def _handle_shard_frame(self, single_msg: dict, shard: List[str]) -> None:
+    def _handle_shard_frame(self, single_msg: dict, shard: List[str], source_conn: Optional[str] = None) -> None:
         """Apply one parsed WS frame to books/trades/resync buffers (never raises).
 
         Shared by the single-socket loop and both dual-WS legs — identical
         downstream handling either way (only the transport differs). Moved
         verbatim out of the shard loop so the two transports cannot drift.
+        ``source_conn`` is the delivering leg (single/A/B), stored on l2_raw.
         """
+        # WS routing rule (spec §4) — fail-OPEN to l2_raw, fail-CLOSED elsewhere:
+        # every dict frame is stored verbatim in l2_raw (incl. tick_size_change,
+        # market_resolved, and unknown future types, no thresholds). Only
+        # book-shaped frames (price_changes list, or bids/asks keys) may reach
+        # apply_ws_message; all other types feed l2_raw (+trades for fills) only.
         try:
-            # l2_raw (perfect §4): verbatim frame log before thresholds —
-            # every frame incl. tick_size_change / market_resolved (no book
-            # handlers for those).
             try:
-                self._append_l2_raw(single_msg, shard)
+                self._append_l2_raw(single_msg, shard, source_conn=source_conn)
             except Exception:
                 pass
+            # Structural book gate (mirrors book.py's two mutation paths) so
+            # foreign/unknown frames can never mutate books or mint episodes.
+            _is_book_frame = (
+                isinstance(single_msg.get("price_changes"), list)
+                or "bids" in single_msg
+                or "asks" in single_msg
+            )
             book = None
             cid = single_msg.get("condition_id")
             tok = single_msg.get("token_id") or single_msg.get("asset_id") or single_msg.get("asset")
@@ -2695,15 +2709,16 @@ class Collector:
             # silently dropped the other markets' deltas with no event. Each
             # book applies the frame and picks its own entries natively.
             _apply_books = []
-            if book is not None:
-                _apply_books = [book]
-            elif isinstance(single_msg.get("price_changes"), list):
-                _apply_books = self._fanout_books(single_msg)
-                if not _apply_books:
-                    try:
-                        self._emit_unroutable(single_msg, shard)
-                    except Exception:
-                        pass
+            if _is_book_frame:
+                if book is not None:
+                    _apply_books = [book]
+                elif isinstance(single_msg.get("price_changes"), list):
+                    _apply_books = self._fanout_books(single_msg)
+                    if not _apply_books:
+                        try:
+                            self._emit_unroutable(single_msg, shard)
+                        except Exception:
+                            pass
             # City attribution per applied book (prefers the book's asset —
             # identical to the old label when known).
             for book in _apply_books:
@@ -3430,7 +3445,7 @@ class Collector:
                                         continue
                                 except Exception:
                                     pass
-                                self._handle_shard_frame(single_msg, shard)
+                                self._handle_shard_frame(single_msg, shard, source_conn="single")
                     finally:
                         # the discovery poller is NOT here — it is hoisted above
                         # the connect loop and must survive recycles/disconnects
@@ -4199,7 +4214,7 @@ class Collector:
                                         continue
                                 except Exception:
                                     pass
-                                self._handle_shard_frame(single_msg, shard)
+                                self._handle_shard_frame(single_msg, shard, source_conn=name)
                     finally:
                         holder[name] = None
                         for _t in (hb_task, wd_task):
