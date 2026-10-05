@@ -11,6 +11,7 @@ burning requests.
 """
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -32,6 +33,77 @@ EndedMarketResolver = Callable[[str], Optional[Tuple[Optional[int], Optional[str
 HttpPostFn = Callable[[str, List[Dict[str, str]]], Awaitable[Any]]
 
 ENDED_STATUSES = frozenset({"closed", "resolved"})
+
+
+# Shared 429 discipline across heal callers (perfect-collector checkbox 3,
+# spec §3.3 task 4). Per-asset walkers must not each retry-blindly: one 429
+# parks ALL batched-heal POSTs behind a jittered exponential backoff so N
+# concurrent walkers burn 0 requests instead of N blind retries. Process-wide
+# (the CLOB rate limit is per-IP, shared by every lane), bounded [0.5, 60]s
+# like ResyncManager.note_rate_limited, total by construction (never raises).
+_heal_429_until: float = 0.0
+_heal_429_streak: int = 0
+
+
+def heal_rate_limited() -> bool:
+    """True while the shared batched-heal cooldown is active (no POST burn)."""
+    try:
+        return time.monotonic() < _heal_429_until
+    except Exception:
+        return False
+
+
+def note_heal_rate_limited(retry_after_s: float = 1.0) -> float:
+    """Record a 429 on the batched-heal path; returns the backoff applied.
+
+    Jittered exponential: base = min(60, 2**streak), applied =
+    uniform(0.5*base, base) clamped to [0.5, 60]. A huge Retry-After cannot
+    park healing forever; jitter spreads the walkers' retry starts.
+    """
+    global _heal_429_until, _heal_429_streak
+    try:
+        _heal_429_streak = int(_heal_429_streak) + 1
+    except Exception:
+        _heal_429_streak = 1
+    try:
+        hint = float(retry_after_s if retry_after_s is not None else 1.0)
+    except Exception:
+        hint = 1.0
+    try:
+        base = max(1.0, min(60.0, hint if hint > 0 else 1.0))
+        base = min(60.0, base * (2.0 ** max(0, _heal_429_streak - 1)))
+        applied = random.uniform(0.5 * base, base)
+        applied = max(0.5, min(60.0, float(applied)))
+    except Exception:
+        applied = 1.0
+    try:
+        _heal_429_until = time.monotonic() + applied
+    except Exception:
+        pass
+    return applied
+
+
+def reset_heal_rate_limit() -> None:
+    """Clear the shared cooldown (test hook only — never called in prod)."""
+    global _heal_429_until, _heal_429_streak
+    try:
+        _heal_429_until = 0.0
+        _heal_429_streak = 0
+    except Exception:
+        pass
+
+
+def _retry_after_of(resp: Any, default_s: float = 1.0) -> float:
+    """Read Retry-After off a response-like, bounded [0, 60] (never raises)."""
+    try:
+        headers = getattr(resp, "headers", None)
+        if headers is not None:
+            v = headers.get("retry-after") or headers.get("Retry-After")
+            if v is not None:
+                return max(0.0, min(60.0, float(str(v).strip().split(",")[0])))
+    except Exception:
+        pass
+    return default_s
 
 
 def chunk_tokens(token_ids: Sequence[str], batch_size: int = BOOKS_BATCH_SIZE) -> List[List[str]]:
@@ -203,10 +275,12 @@ async def heal_books_batched(
 ) -> HealResult:
     """Heal many tokens in one POST /books round-trip per batch.
 
-    Ended windows are superseded up front (no request burned). Transport
-    failures land in ``errors`` with the tokens in ``missing`` — the caller
-    owns backoff/retry; this helper never spins, never synthesizes books,
-    and never raises on wire errors.
+    Ended windows are superseded up front (no request burned). A shared
+    429 cooldown parks every caller behind one jittered backoff (no blind
+    per-walker retries). Transport failures land in ``errors`` with the
+    tokens in ``missing`` — the caller owns retry-after-cooldown; this
+    helper never spins, never synthesizes books, and never raises on wire
+    errors.
     """
     result = HealResult()
     plan = plan_heal(
@@ -216,6 +290,13 @@ async def heal_books_batched(
     if not plan.live_token_ids:
         return result
     for chunk in chunk_tokens(plan.live_token_ids, batch_size=batch_size):
+        # Shared 429 discipline: while ANY walker tripped the limit, burn
+        # zero requests — the chunk stays missing (caller keeps stale with
+        # its episode) instead of N blind retries deepening the limit.
+        if heal_rate_limited():
+            result.errors.append("rate_limited:shared-backoff")
+            result.missing.extend(chunk)
+            continue
         payload = [{"token_id": t} for t in chunk]
         try:
             resp = await http_post(url, payload)
@@ -228,6 +309,9 @@ async def heal_books_batched(
         except Exception:
             status = 200
         if status == 429:
+            # Shared (not per-token): every concurrent walker sees the same
+            # cooldown, so one 429 costs 1 backoff, not N retry storms.
+            note_heal_rate_limited(_retry_after_of(resp))
             result.errors.append("rate_limited:429")
             result.missing.extend(chunk)
             continue

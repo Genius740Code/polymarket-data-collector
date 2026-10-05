@@ -1787,13 +1787,80 @@ class Collector:
         # Try real REST first – fetch BOTH outcomes then apply atomically to avoid wiping other side
         merged: dict = {}
         any_success = False
-        _shared = self._get_rest_client()
+        # Batched POST /books first (perfect-collector checkbox 3, spec §3.3):
+        # one round-trip heals both tokens instead of 2 sequential GETs —
+        # this was the last per-token GET storm (the resync path in
+        # _fetch_rest_book already heals batched-first). Falls through to
+        # the GET loop below on any failure (never raises, never fills).
+        try:
+            from .ingest.heal import heal_books_batched
+            _m_up = getattr(market, "up_token_id", None)
+            _m_down = getattr(market, "down_token_id", None)
+            if _m_up and _m_down:
+                import httpx as _httpx_post
+                _shared_post = self._get_rest_client()
+
+                async def _post2(url: str, payload: list):
+                    if _shared_post is not None:
+                        return await _shared_post.post(url, json=payload)
+                    async with _httpx_post.AsyncClient(timeout=6) as _cpost:
+                        return await _cpost.post(url, json=payload)
+
+                try:
+                    _cid2 = book.condition_id
+                except Exception:
+                    _cid2 = None
+                try:
+                    _by_tok2 = {str(_m_up): _cid2, str(_m_down): _cid2}
+                except Exception:
+                    _by_tok2 = {}
+                _hr2 = await heal_books_batched(
+                    [str(_m_up), str(_m_down)],
+                    _post2,
+                    condition_by_token=_by_tok2,
+                    resolver=self._market_status_for_resync,
+                )
+                # Ended-window supersede is owned by the resync/walk paths —
+                # an all-superseded plan means "no heal, zero REST", not a
+                # GET fallback (whose 404s would feed fetch_none streaks).
+                if getattr(_hr2, "superseded", None) and not getattr(_hr2, "books", None):
+                    return False
+                _pb2 = getattr(_hr2, "books", None) or {}
+                _ok_post = True
+                for _o2, _tok2 in (("up", str(_m_up)), ("down", str(_m_down))):
+                    try:
+                        _e2 = _pb2.get(_tok2)
+                    except Exception:
+                        _e2 = None
+                    # Same both-outcomes gate as the GET loop below: a
+                    # 200-empty side is missing data (stays stale), never a
+                    # fill — the loop's `bids or asks` contract, verbatim.
+                    if (isinstance(_e2, dict) and isinstance(_e2.get("bids"), list)
+                            and isinstance(_e2.get("asks"), list)
+                            and (_e2.get("bids") or _e2.get("asks"))):
+                        merged[f"{_o2}_bids"] = _e2["bids"]
+                        merged[f"{_o2}_asks"] = _e2["asks"]
+                    else:
+                        _ok_post = False
+                        break
+                if _ok_post:
+                    any_success = True
+                else:
+                    merged = {}
+        except Exception:
+            merged = {}
+            any_success = False
+        # POST-healed books skip the GET loop entirely (the N→1 win: without
+        # this guard the fallback would re-burn the 2 GETs it just replaced).
+        _post_healed = bool(any_success and merged and all(
+            f"{_o}_{_s}" in merged for _o in ("up", "down") for _s in ("bids", "asks")))
+        _shared = self._get_rest_client() if not _post_healed else None
         async def _get(token_id: str):
             if _shared is not None:
                 return await _shared.get(self.config.ws.rest_book_url, params={"token_id": token_id})
             async with httpx.AsyncClient(timeout=4) as _client:
                 return await _client.get(self.config.ws.rest_book_url, params={"token_id": token_id})
-        for outcome, token_id in [("up", market.up_token_id), ("down", market.down_token_id)]:
+        for outcome, token_id in ([("up", market.up_token_id), ("down", market.down_token_id)] if not _post_healed else []):
             try:
                 resp = await _get(token_id)
                 if resp.status_code == 429:
