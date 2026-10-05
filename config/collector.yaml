@@ -199,6 +199,9 @@ timeframes:
   - 1h
 
 ws:
+  # Dual-WS A/B pair per shard (WS1, 2026-10-03 code; enabled 2026-10-05 first
+  # quiet window). Single-socket stays fallback (flag off or no lib).
+  dual_enabled: true
   full_book_diff_interval_seconds: 600
   full_book_diff_tolerance: 0.05
   max_resync_duration_seconds: 60
