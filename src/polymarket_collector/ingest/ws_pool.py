@@ -19,6 +19,13 @@ WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RECYCLE_TARGET_S = 270
 RECYCLE_MAX_S = 280
 
+# Dual-leg stagger: half the 270 target. B's recycle clock is A's +135s,
+# implemented as a leg-name-derived first-cycle offset in the due check
+# below (no threads/timers, no wall-clock anchor — a restart rebuilds
+# fresh counters with both legs reconnecting together, so the same phase
+# re-establishes purely from leg identity).
+RECYCLE_STAGGER_S = RECYCLE_TARGET_S // 2  # 135
+
 # Per-book silence watchdog: a token with no frame this long is presumed
 # data-dead (the shard-level socket can stay heartbeat-alive while market
 # data silently dies — py-clob-client#292).
@@ -260,6 +267,60 @@ def should_recycle(conn_age_s: float, max_s: float = RECYCLE_MAX_S) -> bool:
         return False
 
 
+def recycle_target_for_leg(leg: Any, cycle: int = 0) -> float:
+    """Per-leg OUR-close target: A always 270; B's first cycle 135, then 270.
+
+    Never raises; garbage leg/cycle falls back to the A target (early and
+    safe — an early recycle is a light relive, a late one risks the
+    server kill).
+    """
+    try:
+        if str(leg).upper() == "B":
+            try:
+                _c = int(cycle)
+            except Exception:
+                _c = 0
+            if _c <= 0:
+                return float(RECYCLE_TARGET_S - RECYCLE_STAGGER_S)
+        return float(RECYCLE_TARGET_S)
+    except Exception:
+        try:
+            return float(RECYCLE_TARGET_S)
+        except Exception:
+            return 270.0
+
+
+def recycle_due_for_leg(conn_age_s: float, leg: Any = None, cycle: int = 0) -> bool:
+    """True when a named dual leg is due for its staggered OUR-close recycle.
+
+    CEILING ARITHMETIC (age at OUR-close, every cycle, every leg):
+      A, any cycle: due at 270 <= 280 (10s headroom for swap jitter).
+      B, cycle 0:   due at 270-135 = 135 <= 280.
+      B, cycle >=1: due at 270 <= 280.
+    The naive stagger (B target = 270+135 = 405) EXCEEDS the 280
+    server-kill ceiling and is rejected; instead the +135 is a PHASE-START
+    offset — B's first interval is shortened by exactly the stagger — so
+    steady-state cadence is 270s per leg with recycles interleaved 135s
+    apart (simultaneous start: A at {270, 540, ...}, B at {135, 405, ...};
+    min separation 135s >> swap seconds, so at most one leg swaps). The
+    absolute ceiling is checked first: a stalled loop that misses its
+    target still recycles at 280, never past it (server-kill preemption).
+    leg=None keeps the legacy ceiling-only answer for untagged callers.
+    Never raises.
+    """
+    try:
+        if should_recycle(conn_age_s):
+            return True
+    except Exception:
+        pass
+    if leg is None:
+        return False
+    try:
+        return float(conn_age_s) >= float(recycle_target_for_leg(leg, cycle))
+    except Exception:
+        return False
+
+
 def silence_exceeded(
     last_data_ns: Optional[int], now_ns: int, timeout_s: float = SILENCE_WATCHDOG_S
 ) -> bool:
@@ -320,6 +381,11 @@ class ConnectionState:
     name: str
     established_ns: int = 0
     last_data_ns: Optional[int] = None
+    # Planned-recycle generations completed: the stagger's phase memory.
+    # Fresh 0 at process start (restart re-establishes the phase from leg
+    # identity); the transport increments it on every OUR-close recycle so
+    # B recycles short (135s) once, then every 270s like A.
+    recycles: int = 0
 
     def note_frame(self, now_ns: int) -> None:
         self.last_data_ns = int(now_ns)
@@ -330,8 +396,23 @@ class ConnectionState:
         except Exception:
             return 0.0
 
+    def recycle_target_s(self) -> float:
+        """This leg's staggered OUR-close target (B short-first, else 270)."""
+        try:
+            return recycle_target_for_leg(self.name, self.recycles)
+        except Exception:
+            return float(RECYCLE_TARGET_S)
+
     def needs_recycle(self, now_ns: int, max_s: float = RECYCLE_MAX_S) -> bool:
-        return should_recycle(self.age_s(now_ns), max_s)
+        try:
+            if should_recycle(self.age_s(now_ns), max_s):
+                return True
+        except Exception:
+            pass
+        try:
+            return self.age_s(now_ns) >= self.recycle_target_s()
+        except Exception:
+            return False
 
     def is_silent(self, now_ns: int, timeout_s: float = SILENCE_WATCHDOG_S) -> bool:
         return silence_exceeded(self.last_data_ns, now_ns, timeout_s)

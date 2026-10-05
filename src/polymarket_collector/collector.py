@@ -2602,14 +2602,19 @@ class Collector:
             "custom_feature_enabled": True,
         }
 
-    def _ws_dual_recycle_due(self, conn_age_s: float) -> bool:
+    def _ws_dual_recycle_due(self, conn_age_s: float, leg: Any = None, cycle: int = 0) -> bool:
         """True when a dual-pool connection passed OUR recycle ceiling.
 
         Dual path uses ws_pool's ceiling (preempts the ~5min server kill);
         the single-socket path keeps its own config-driven check untouched.
+        leg=None keeps the legacy ceiling-only answer (single-socket-with-
+        flag callers, old tests); a named leg ("A"/"B") gets the staggered
+        target (B short-first 135s, then 270s each — at most one leg swaps).
         """
         try:
-            return bool(_ws_pool.should_recycle(conn_age_s))
+            if leg is None:
+                return bool(_ws_pool.should_recycle(conn_age_s))
+            return bool(_ws_pool.recycle_due_for_leg(conn_age_s, leg, cycle))
         except Exception:
             return False
 
@@ -4136,11 +4141,19 @@ class Collector:
                             if not self._running:
                                 break
                             # Proactive recycle on OUR schedule (ws_pool
-                            # ceiling, per-leg clocks — the pair never swaps
-                            # both legs on the same frame by construction of
-                            # independent ages; a same-tick swap degrades to
-                            # one dual-down walk, same as single-socket).
-                            if self._ws_dual_recycle_due((int(time.time() * 1000) - conn_established_ms) / 1000.0):
+                            # ceiling, per-leg clocks). The legs are PHASE-
+                            # OFFSET by identity: B recycles short (135s)
+                            # once, then every 270s like A, so same-age legs
+                            # never hit the ceiling the same second (the
+                            # 2026-10-05 dual-down defect). A missed target
+                            # still trips the 280s ceiling first — a leg is
+                            # never past the server kill. Cycle read failure
+                            # degrades to 0 (earlier recycle, safe direction).
+                            try:
+                                _cycle = int(getattr(_pool_conn, "recycles", 0) or 0)
+                            except Exception:
+                                _cycle = 0
+                            if self._ws_dual_recycle_due((int(time.time() * 1000) - conn_established_ms) / 1000.0, leg=name, cycle=_cycle):
                                 planned_recycle = True
                                 print(f"[ws:{label}:{name}] planned recycle — reconnecting")
                                 try:
@@ -4238,6 +4251,13 @@ class Collector:
                         self._planned_recycle_hotswap(shard)
                     except Exception:
                         pass
+                    try:
+                        # Advance the stagger phase: B's next interval is the
+                        # full 270s (steady-state cadence 270 each, 135 apart).
+                        if _pool_conn is not None:
+                            _pool_conn.recycles = int(getattr(_pool_conn, "recycles", 0) or 0) + 1
+                    except Exception:
+                        pass
                     planned_recycle = False
                     continue
                 attempt += 1
@@ -4259,6 +4279,13 @@ class Collector:
                 if locals().get("planned_recycle", False):
                     try:
                         self._planned_recycle_hotswap(shard)
+                    except Exception:
+                        pass
+                    try:
+                        # Same phase advance as the clean-break path above
+                        # (this IS the planned recycle, just raced).
+                        if _pool_conn is not None:
+                            _pool_conn.recycles = int(getattr(_pool_conn, "recycles", 0) or 0) + 1
                     except Exception:
                         pass
                     continue
