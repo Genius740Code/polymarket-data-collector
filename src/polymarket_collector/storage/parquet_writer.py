@@ -33,7 +33,11 @@ from .parquet_io import read_table
 
 from ..enums import CollectorEventType
 from ..book import FULL_DEPTH_LEVELS
-from .l2_raw import dedup_key_for_row as _l2_raw_dedup_key
+from .l2_raw import (
+    build_l2_raw_row as _l2_raw_build_row,
+    dedup_key_for_row as _l2_raw_dedup_key,
+    widen_source_conn as _l2_raw_widen_conn,
+)
 from .schemas import SCHEMAS, snapshot_schema
 
 import sys as _sys
@@ -195,6 +199,14 @@ class ParquetWriter:
         # cids are sys.interned on insert/lookup so equality is identical.
         self._seen_keys: Dict[str, OrderedDict] = defaultdict(_OrderedSet)  # dataset -> OrderedDict[key, None]
         self._seen_order: Dict[str, deque] = defaultdict(deque)  # legacy alias, kept empty (see _seen_add/_seen_discard)
+        # Dual-leg diet (2026-10-06): l2_raw dedup-key -> buffered row dict for
+        # conn-bitmap widening. A redelivery appends nothing new — it widens
+        # the first-seen row's source_conn ("A" -> "A|B") in place. Values are
+        # REFS to buffered dicts (no copies); entries leave when their row
+        # flushes (flush drain pops by identity) or age past the cap below, so
+        # a widen can never touch an on-disk row — worst case a detached
+        # no-op. Same key space as _seen_keys["l2_raw"] (no key change).
+        self._l2_conn_index: Dict[Any, Dict[str, Any]] = {}
         # PERF: cache created output dirs (was mkdir per group per flush).
         self._mkdir_cache: Set[str] = set()
         self._wal_path = self.wal_dir / f"wal-{uuid.uuid4().hex}.jsonl"
@@ -318,6 +330,15 @@ class ParquetWriter:
         dedup_key = self._dedup_key(dataset, row)
         if dedup_key is not None:
             if dedup_key in self._seen_keys[dataset]:
+                if dataset == "l2_raw":
+                    # Diet: proven duplicate (same key) appends nothing new —
+                    # widen the buffered first-seen row's conn bitmap instead
+                    # (drops nothing, WAL/buffer counts unchanged). Never raises.
+                    try:
+                        _leg = row.get("source_conn") if isinstance(row, dict) else None
+                        self._widen_l2_conn(dedup_key, _leg)
+                    except Exception:
+                        pass
                 if dataset == "resync_episodes":
                     # upsert: replace existing buffered row if still in buffer, otherwise allow re-append for update
                     replaced = False
@@ -465,6 +486,8 @@ class ParquetWriter:
         br = BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row)
         if dataset == "l2_raw":
             self._l2_buffer.append(br)
+            if dedup_key is not None:
+                self._l2_index_add(dedup_key, row)
         else:
             self._buffer.append(br)
 
@@ -520,12 +543,29 @@ class ParquetWriter:
             # against their own cap).
             if br.dataset == "l2_raw":
                 self._l2_buffer.appendleft(br)
+                # Diet: the drain below unindexed this row — re-index so a
+                # redelivery keeps widening instead of missing. Never raises.
+                try:
+                    _rk = self._dedup_key("l2_raw", br.row)
+                    if _rk is not None:
+                        self._l2_index_add(_rk, br.row)
+                except Exception:
+                    pass
             else:
                 self._buffer.appendleft(br)
         # group by (dataset, date_str, asset)
         groups: Dict[Tuple[str, str, Optional[str]], List[Dict[str, Any]]] = defaultdict(list)
         while self._buffer:
             br = self._buffer.popleft()
+            if br.dataset == "l2_raw" and self._l2_conn_index:
+                # Diet: flushed rows leave the widen index (by identity, so a
+                # re-appended same-key row is never unindexed by a stale drain).
+                try:
+                    _lk = self._dedup_key("l2_raw", br.row)
+                    if _lk is not None and self._l2_conn_index.get(_lk) is br.row:
+                        del self._l2_conn_index[_lk]
+                except Exception:
+                    pass
             groups[(br.dataset, br.date_str, br.asset)].append(br.row)
 
         flushed = 0
@@ -1082,6 +1122,13 @@ class ParquetWriter:
                                     if date_str is None:
                                         date_str = _dt.datetime.now(tz=_dt.timezone.utc).date().isoformat()
                             self._buffer.append(BufferedRow(dataset=dataset, asset=asset or row.get("asset"), date_str=date_str, row=row))
+                            if dataset == "l2_raw" and dedup_key is not None:
+                                # Diet: replayed rows are live buffer content —
+                                # keep them widenable like fresh appends.
+                                try:
+                                    self._l2_index_add(dedup_key, row)
+                                except Exception:
+                                    pass
                             replayed += 1
                         else:
                             # malformed entry — count (M11), never silent
@@ -1203,6 +1250,77 @@ class ParquetWriter:
             if eid:
                 return (_is(eid),)
         return None
+
+    def _l2_index_add(self, key: Any, row: Dict[str, Any]) -> None:
+        """Index one buffered l2_raw row for conn-bitmap widening (never raises).
+
+        Same key space as ``_seen_keys["l2_raw"]`` (no key change); FIFO-capped
+        like it so the index stays bounded even when flushes stall.
+        """
+        try:
+            self._l2_conn_index[key] = row
+            while len(self._l2_conn_index) > self.MAX_DEDUP_KEYS_PER_DATASET:
+                try:
+                    self._l2_conn_index.pop(next(iter(self._l2_conn_index)))
+                except Exception:
+                    break
+        except Exception:
+            pass
+
+    def _widen_l2_conn(self, key: Any, leg: Any) -> bool:
+        """Widen the buffered l2_raw row's ``source_conn`` bitmap (never raises).
+
+        True when a leg was added (``"A"`` -> ``"A|B"``); False when the row
+        already left the buffer (flushed), was never buffered, or already
+        carries the leg. Mutates the buffered dict in place — no new row, no
+        WAL write (the WAL holds the first-seen tag; a crash between widen
+        and flush loses only the witness, never the frame).
+        """
+        try:
+            target = self._l2_conn_index.get(key)
+            if not isinstance(target, dict):
+                return False
+            try:
+                cur = target.get("source_conn")
+            except Exception:
+                return False
+            new = _l2_raw_widen_conn(cur, leg)
+            if new == cur:
+                return False
+            try:
+                target["source_conn"] = new
+            except Exception:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def note_l2_raw_redelivery(self, msg: Any, leg: Any) -> bool:
+        """Stamp a dual-leg redelivery onto the buffered first-seen row.
+
+        Transport entry point for the diet: the ws_pool gate already dropped
+        this frame (proven duplicate — same dedup key), so nothing is appended;
+        the delivering leg only widens the stored row's conn bitmap. Every
+        unique frame is still stored exactly once with full fidelity; keyless
+        frames (no dedup key) always return False and store nothing new here.
+        Never raises.
+        """
+        try:
+            if not isinstance(msg, dict):
+                return False
+            try:
+                row = _l2_raw_build_row(msg, asset="UNKNOWN")
+            except Exception:
+                return False
+            try:
+                key = _l2_raw_dedup_key(row)
+            except Exception:
+                return False
+            if key is None:
+                return False
+            return bool(self._widen_l2_conn(key, leg))
+        except Exception:
+            return False
 
     def _wal_append(self, dataset: str, row: Dict[str, Any], asset: Optional[str], date_str: Optional[str]) -> None:
         # PERF: compact separators (was default ', '/': '). WAL is internal;

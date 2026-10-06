@@ -30,7 +30,10 @@ L2_RAW_SCHEMA = pa.schema([
     pa.field("token_id", pa.string(), nullable=True),
     pa.field("event_type", pa.string(), nullable=False),
     pa.field("frame_json", pa.string(), nullable=False),  # verbatim frame, compact JSON (wire order)
-    pa.field("source_conn", pa.string(), nullable=True),  # A/B tag for dedup audit
+    # A/B tag for dedup audit; a cross-leg redelivery widens it to the
+    # "A|B" bitmap (readers split on "|"). Zero migration: existing rows
+    # keep their single tag verbatim, export passes it through untouched.
+    pa.field("source_conn", pa.string(), nullable=True),
 ])
 
 # Frames routed here by the collector hook (spec §4). Unknown types still
@@ -176,6 +179,69 @@ def dedup_key_for_row(row: Dict[str, Any]) -> Optional[Tuple]:
         return ("l2_raw", tok, et, h)
     except Exception:
         return None
+
+
+# Legs that share one ShardPool dedup window (dual-WS A/B pair). Only these
+# ever widen a bitmap: "single"-socket rows have no pair, and an unknown leg
+# leaves the stored value untouched (never fabricated).
+_DUAL_LEGS = ("A", "B")
+
+
+def widen_source_conn(existing: Any, leg: Any) -> Any:
+    """Widen a stored ``source_conn`` bitmap with one more delivering leg.
+
+    Pure, never raises. The second leg's redelivery appends no new row — it
+    only widens the first-seen row's bitmap (``"A"`` + ``"B"`` → ``"A|B"``),
+    so conn coverage survives while every unique frame is stored exactly
+    once with full fidelity. Canonical form is the sorted ``|``-join, so the
+    result is arrival-order independent (``"B"`` + ``"A"`` → ``"A|B"`` too)
+    and re-widening is a no-op. ``"single"`` rows (no pair exists) and
+    non-string values are returned verbatim; an unknown/empty leg, or a
+    missing frame tag (``None`` with no leg), leaves the value unchanged.
+    Readers split the bitmap on ``"|"``.
+    """
+    try:
+        if not isinstance(leg, str):
+            return existing
+        leg = leg.strip()
+        if leg not in _DUAL_LEGS:
+            return existing
+        if existing is None:
+            return leg
+        if not isinstance(existing, str):
+            return existing
+        parts = [p.strip() for p in existing.split("|")]
+        parts = [p for p in parts if p]
+        if "single" in parts:
+            return existing
+        if leg in parts and set(parts) <= set(_DUAL_LEGS):
+            return existing
+        widened = "|".join(sorted(set(parts) | {leg}))
+        if widened == existing:
+            return existing
+        return widened
+    except Exception:
+        try:
+            return existing
+        except Exception:
+            return None
+
+
+# DUAL-LEG DIET (2026-10-06) — per-day size projection at the current 7-asset
+# dual rate, measured on data/l2_raw/date=2026-10-05 (compacted):
+#   unique frames stored .... 87.6M rows/day (first-seen leg wins; 326,726-row
+#     sample: 0 exact-duplicate frame hashes, 0 (token,ts,type) keys shared
+#     across legs — every UNIQUE frame already stored exactly once)
+#   on-disk ................. 6.36 GB/day ~= 72.6 B/row (parquet snappy,
+#     dictionary-encoded; BTC 31.9M rows / 2.38 GB is the hottest lane)
+#   dual deliveries ........... ~= 2x rows (every frame arrives on BOTH legs;
+#     the loser is a redelivery and appends nothing new)
+#   counterfactual (no dedup) . ~= 175M rows/day ~= 12.7 GB/day ("same frame twice")
+#   after bitmap .............. 87.6M rows/day ~= 6.36 GB/day (delta ~= 0: the
+#     same rows, source_conn's dictionary gains one "A|B" value ~= +bytes per
+#     file, per-row codes unchanged) + dual-witness coverage on redelivery.
+# Growth stays firehose-volume-bound (unique frames), not redelivery-bound:
+# the diet's win is conn coverage without new rows, not fewer bytes.
 
 
 def append_row(writer: Any, msg: Dict[str, Any], *, asset: str, **kwargs: Any) -> bool:

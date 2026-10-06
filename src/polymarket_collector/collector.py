@@ -4291,6 +4291,14 @@ class Collector:
                                 # dual mode is on), then identical handling.
                                 try:
                                     if self._ws_frame_is_duplicate(label, shard, single_msg):
+                                        # Diet: the redelivery appends nothing
+                                        # new — stamp the buffered first-seen
+                                        # row's conn bitmap (A -> A|B) instead.
+                                        # Never raises; miss = single tag kept.
+                                        try:
+                                            self.writer.note_l2_raw_redelivery(single_msg, name)
+                                        except Exception:
+                                            pass
                                         continue
                                 except Exception:
                                     pass
