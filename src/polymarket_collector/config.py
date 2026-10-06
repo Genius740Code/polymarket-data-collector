@@ -104,6 +104,15 @@ class StorageConfig(BaseModel):
     disk_space_min_bytes: int = 1_073_741_824
     compaction_schedule: str = "daily"
     compaction_temp_suffix: str = ".tmp"
+    # l2_raw time-partitioned retention (move-to-quarantine, never direct
+    # delete). DISABLED by default: retention_days unset/None retains
+    # everything (merge is zero-behavior-change; nothing moves until an
+    # operator sets retention_days and restarts). The reaper below is the
+    # ONLY delete in the feature and is itself default-off (enabled AND
+    # disk-pressure gated, oldest-first, bounded per cycle).
+    l2_retention_days: int | None = None
+    l2_quarantine_reap_enabled: bool = False
+    l2_quarantine_max_deletes_per_cycle: int = 1
 
 
 class RawArchiveConfig(BaseModel):
