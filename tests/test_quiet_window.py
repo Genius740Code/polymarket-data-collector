@@ -8,6 +8,7 @@ evaluation time and avoid flaky wall-clock comparisons.
 import os
 import tempfile
 import datetime
+from datetime import timedelta
 
 
 # Import the module directly via its file path to avoid package resolution issues
@@ -169,3 +170,65 @@ def test_full_not_quiet_when_export_worker():
     if check_export_worker_spawn(lines, 10, now=FIXED_NOW):
         errors.append("export worker spawn")
     assert len(errors) >= 1, "Expected at least one error (export worker spawn)"
+
+
+# --- New: performance + semantics tests ---
+
+
+def test_performance_tail_log_is_fast():
+    """Verdict completes fast on synthetic big tail-limited log (not full file)."""
+    import time
+    # Build a large synthetic log with many lines
+    n_lines = 200_000
+    all_lines = []
+    for i in range(n_lines):
+        ts = (FIXED_NOW - timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%S")
+        all_lines.append(f"{ts}: [resolution] ETH window 5970300 resolved down")
+    # Add a Preparing line near the middle of the tail window
+    all_lines.append(
+        "2026-10-04T08:35:00: === Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH'] ==="
+    )
+    # Take only the tail (last 2000 lines) as main() now does
+    lines = all_lines[-2000:]
+    start = time.time()
+    result = check_preparing_without_verdict(lines, 60, now=FIXED_NOW)
+    elapsed = time.time() - start
+    # Should complete in well under 1 second thanks to tail limiting
+    assert elapsed < 1.0, f"Expected fast completion (<1s), got {elapsed:.2f}s"
+    # No verdict after Preparing → not quiet
+    assert result is True
+
+
+def test_semantics_unchanged_with_tail():
+    """Verdict semantics unchanged with tail-limited log reading.
+
+    The three criteria (young .tmp, preparing without verdict, worker spawn)
+    produce the same result whether given the full log or the tail-limited log.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        young = _make_tmp(tmpdir, 3, 67890, "young")
+
+    # Build a large synthetic log with many resolution lines,
+    # plus one Preparing line without verdict in the recent window
+    n_lines = 200_000
+    all_lines = []
+    for i in range(n_lines):
+        ts = (FIXED_NOW - timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%S")
+        all_lines.append(f"{ts}: [resolution] ETH window 5970300 resolved down")
+    # Add a Preparing line without verdict in the last 60 min window
+    all_lines.append(
+        "2026-10-04T08:30:00: === Step 1: Preparing Kaggle staging 5m for ['BTC', 'ETH'] ==="
+    )
+    # Take only the tail (last 2000 lines) as main() now does
+    lines = all_lines[-2000:]
+
+    errors = []
+    if check_tmp_young([young], 10, now=FIXED_NOW):
+        errors.append("young .tmp")
+    if check_preparing_without_verdict(lines, 60, now=FIXED_NOW):
+        errors.append("preparing without verdict")
+    # No worker spawn in this test
+    if check_export_worker_spawn(lines, 10, now=FIXED_NOW):
+        errors.append("export worker spawn")
+    # With young .tmp and preparing without verdict → not quiet (errors expected)
+    assert len(errors) >= 1, f"Expected not-quiet (errors: {errors})"

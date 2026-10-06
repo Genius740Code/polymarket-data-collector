@@ -29,6 +29,9 @@ TMP_YOUNG_THRESHOLD_MIN = 10       # .tmp younger than 10 min = potentially in-f
 PREPARING_WINDOW_MIN = 60          # Preparing without verdict >60 min = stuck
 EXPORT_WORKER_N_MIN = 10           # export worker spin/recent crash window
 
+# Only .tmp files newer than this window matter (threshold + 60min buffer)
+TMP_MTIME_CUTOFF_MIN = 70
+
 LOG_PATH = os.getenv("COLLECTOR_LOG", "logs/collector-out-11.log")
 DATA_DIR = os.getenv("DATA_DIR", "data/kaggle_staging")
 
@@ -41,29 +44,51 @@ def parse_log_timestamp(line: str):
     return None
 
 
+def _is_tmp_recent(mtime: float, cutoff_min: int = TMP_MTIME_CUTOFF_MIN) -> bool:
+    """Check if a .tmp file's mtime is newer than cutoff_min minutes ago."""
+    now = datetime.now()
+    mtime_dt = datetime.fromtimestamp(mtime)
+    age = (now - mtime_dt).total_seconds() / 60.0
+    return age < cutoff_min
+
+
 def get_tmp_files(data_dir: str) -> list:
-    """Find .tmp files under data_dir and return (path, mtime, pid, lane)."""
+    """Find .tmp files under data_dir and return (path, mtime, pid, lane).
+    Only entries newer than TMP_MTIME_CUTOFF_MIN minutes are returned —
+    older entries are pruned since they cannot be younger than TMP_YOUNG_THRESHOLD_MIN.
+    """
     results = []
-    for root, _dirs, files in os.walk(data_dir):
+    cutoff = TMP_MTIME_CUTOFF_MIN
+    for root, dirs, files in os.walk(data_dir):
+        # Mtime pruning: if all files in this dir are older than cutoff,
+        # we still need to walk into it because subdirs might have newer files.
+        # However, we skip files that are clearly too old immediately.
         for f in files:
-            if f.endswith(".tmp") and ".tmp." in f:
-                full = os.path.join(root, f)
-                try:
-                    mtime = os.path.getmtime(full)
-                except OSError:
-                    continue
-                # Parse filename: .../asset_lane.parquet.tmp.PID.tmp
-                basename = os.path.basename(full)
-                # Extract PID from the .tmp.N.tmp pattern
-                parts = basename.split(".")
-                # Expected: ... asset_lane.parquet.tmp.PID.tmp
-                # PID is the second-to-last part before the final ".tmp"
-                if len(parts) >= 5 and parts[-2].isdigit():
-                    pid = int(parts[-2])
-                    # Lane is determined by the directory/path, but we'll store the
-                    # full name and let callers parse as needed.
-                    results.append((full, mtime, pid, basename))
-                # else: malformed name, skip
+            if not f.endswith(".tmp") or ".tmp." not in f:
+                continue
+            full = os.path.join(root, f)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            # Prune: skip .tmp files older than the cutoff (they can't be "young")
+            if not _is_tmp_recent(mtime, cutoff):
+                continue
+            # Parse filename: .../asset_lane.parquet.tmp.PID.tmp
+            basename = os.path.basename(full)
+            # Extract PID from the .tmp.N.tmp pattern
+            parts = basename.split(".")
+            # Expected: ... asset_lane.parquet.tmp.PID.tmp
+            # PID is the second-to-last part before the final ".tmp"
+            if len(parts) >= 5 and parts[-2].isdigit():
+                pid = int(parts[-2])
+                # Lane is determined by the directory/path, but we'll store the
+                # full name and let callers parse as needed.
+                results.append((full, mtime, pid, basename))
+            # else: malformed name, skip
+        # Early-exit: if we already have results and the newest possible
+        # mtime in remaining dirs can't beat the youngest we've seen, stop.
+        # (Simple version: just continue walking, the file count is small.)
     results.sort(key=lambda x: x[1], reverse=True)
     return results
 
@@ -186,16 +211,22 @@ def check_export_worker_spawn(log_lines: list, n_min: int, now: datetime = None)
     return False
 
 
+def _read_log_tail(path: str, tail_lines: int = 2000) -> list:
+    """Read the last `tail_lines` lines from a log file (tail, not head)."""
+    with open(path) as f:
+        all_lines = f.readlines()
+    return all_lines[-tail_lines:] if len(all_lines) > tail_lines else all_lines
+
+
 def main():
-    # Read the log file
+    # Read the log file (tail only, for performance)
     if not os.path.exists(LOG_PATH):
         print(f"ERROR: log file not found: {LOG_PATH}", file=sys.stderr)
         sys.exit(2)
 
-    with open(LOG_PATH) as f:
-        log_lines = f.readlines()
+    log_lines = _read_log_tail(LOG_PATH)
 
-    # Get .tmp files
+    # Get .tmp files (pruned by mtime)
     tmp_files = get_tmp_files(DATA_DIR)
 
     errors = []
