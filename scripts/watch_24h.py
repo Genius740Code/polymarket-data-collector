@@ -1,9 +1,10 @@
 """Read-only watch: 24h live%, uploads flowing, [mem] rss/buf/eps, .tmp count.
 
 Reads parquet + logs only. Bounded samples — never a full-dataset scan.
-Usage: python3 scripts/watch_24h.py
+Usage: python3 scripts/watch_24h.py [--date YYYY-MM-DD]
 """
 import os
+import sys
 
 import pyarrow.parquet as pq
 
@@ -14,9 +15,37 @@ def _last_n_per_asset(asset_dir, n=3):
     return [os.path.join(asset_dir, f) for f in files[-n:]]
 
 
-def main():
-    data_dir = "data/book_snapshots_500ms/date=2026-10-04"
+def _parse_date():
+    """Resolve date: --date override > latest partition > fallback."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--date" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    # fallback to latest partition under data/book_snapshots_500ms/
+    latest = _latest_date("data/book_snapshots_500ms/")
+    if latest:
+        return latest
+    return "2026-10-04"
 
+
+def _latest_date(base_dir):
+    """Return the latest date partition directory under base_dir, or None."""
+    try:
+        dirs = [
+            D for D in os.listdir(base_dir)
+            if D.startswith("date=") and len(D.split("=")[1]) == 10
+        ]
+        if not dirs:
+            return None
+        return max(d.split("=")[1] for d in dirs)
+    except Exception:
+        return None
+
+
+date = _parse_date()
+data_dir = f"data/book_snapshots_500ms/date={date}"
+
+
+def main():
     # 24h live% via last-3-files-per-asset
     total_n = 0
     total_live = 0

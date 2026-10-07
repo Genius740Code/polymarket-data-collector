@@ -2,7 +2,7 @@
 
 Reads parquet only, never the live collector. Bounded samples (last-N files)
 so it finishes in seconds — never a full-dataset scan.
-Usage: python3 scripts/measure_1006_rate.py [date=2026-10-03] [n_ep_files=400]
+Usage: python3 scripts/measure_1006_rate.py [--date YYYY-MM-DD] [n_ep_files=400]
 """
 import glob
 import os
@@ -12,8 +12,53 @@ from datetime import datetime
 
 import pyarrow.parquet as pq
 
-date = sys.argv[1] if len(sys.argv) > 1 else "2026-10-03"
-n_ep = int(sys.argv[2]) if len(sys.argv) > 2 else 400
+
+def _latest_date(base_dir):
+    """Return the latest date partition directory under base_dir, or None."""
+    try:
+        dirs = [
+            D for D in os.listdir(base_dir)
+            if D.startswith("date=") and len(D.split("=")[1]) == 10
+        ]
+        if not dirs:
+            return None
+        return max(d.split("=")[1] for d in dirs)
+    except Exception:
+        return None
+
+
+def _parse_date():
+    """Resolve date: --date override > latest partition > fallback."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--date" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    # fallback to latest partition under data/book_snapshots_500ms/
+    latest = _latest_date("data/book_snapshots_500ms/")
+    if latest:
+        return latest
+    return "2026-10-03"
+
+
+def _parse_n_ep():
+    """Parse n_ep_files from positional arg after --date, or from sys.argv[1]."""
+    # If --date was used, n_ep is the next arg after the date value
+    # Otherwise, sys.argv[1] is the date, sys.argv[2] is n_ep
+    for i, arg in enumerate(sys.argv):
+        if arg == "--date" and i + 2 < len(sys.argv):
+            try:
+                return int(sys.argv[i + 2])
+            except ValueError:
+                return 400
+        if arg != "--date" and i == 1:
+            try:
+                return int(arg)
+            except ValueError:
+                return 400
+    return 400
+
+
+date = _parse_date()
+n_ep = _parse_n_ep()
 
 tot, rows = Counter(), 0  # live% from last-3 files per asset
 for asset in sorted(os.listdir(f"data/book_snapshots_500ms/date={date}")):
