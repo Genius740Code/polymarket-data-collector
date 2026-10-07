@@ -56,6 +56,7 @@ def iter_source_files(
     dataset: str,
     asset: Optional[str] = None,
     ts_col: Optional[str] = None,
+    seal_grace_s: Optional[float] = None,
 ) -> List[Path]:
     """Source files for (dataset, asset), oldest-first by date partition + mtime.
 
@@ -63,6 +64,11 @@ def iter_source_files(
     at the FILE level — the whole point). Ordering is approximate (exact
     cross-file order is not required: dedup is key-exact, batches are
     per-batch sorted, readers sort per E13).
+
+    seal_grace_s: when set, the read-side seal applies — files younger than
+    the grace (the still-open flush window) are excluded via
+    parquet_io.list_sealed_files. None (default) keeps the legacy
+    all-files behavior.
     """
     from .export import PER_ASSET_DATASETS  # local import: export imports this module too
 
@@ -81,6 +87,14 @@ def iter_source_files(
     # ts_col is accepted for API compat but intentionally IGNORED (see
     # _order_key): footer-timestamp ordering leaked ~1GB/pass.
     files.sort(key=_order_key)
+    if seal_grace_s is not None:
+        try:
+            from .parquet_io import list_sealed_files as _sealed
+
+            files = _sealed(files, seal_grace_s)
+            files.sort(key=_order_key)
+        except Exception:
+            pass
     return files
 
 
@@ -175,6 +189,7 @@ def stream_batches(
     batch_rows: int = 20000,
     stats: Optional[Dict] = None,
     cutoff_ts: Optional[float] = None,
+    seal_grace_s: Optional[float] = None,
 ) -> Iterator[pa.Table]:
     """Yield row-group batches (bounded RAM), oldest file first.
 
@@ -186,10 +201,12 @@ def stream_batches(
     failed_bytes / rows_read so the export-coverage manifest can fail closed
     on unreadable inputs without re-reading the hive. cutoff_ts: skip files
     newer than the export build start (they belong to the next cycle).
+    seal_grace_s: when set, the still-open flush window is excluded from the
+    source list (read-side seal); None keeps legacy all-files behavior.
     """
     import pyarrow.parquet as _pq
 
-    files = iter_source_files(data_dir, dataset, asset, ts_col)
+    files = iter_source_files(data_dir, dataset, asset, ts_col, seal_grace_s=seal_grace_s)
     if cutoff_ts is not None:
         kept = []
         for p in files:

@@ -45,8 +45,14 @@ def snapshot_files(
     dataset: str,
     asset_upper: Optional[str] = None,
     cutoff_ts: Optional[float] = None,
+    seal_grace_s: Optional[float] = None,
 ) -> List[Path]:
-    """Hive source files for (dataset, asset) visible at cutoff_ts. Metadata only. Total."""
+    """Hive source files for (dataset, asset) visible at cutoff_ts. Metadata only. Total.
+
+    seal_grace_s: when set, the read-side seal also applies — files younger
+    than the grace (the still-open flush window) are excluded. None keeps the
+    legacy cutoff-only behavior (no rows dropped by default).
+    """
     try:
         base = Path(data_dir)
         root = base / dataset
@@ -63,6 +69,14 @@ def snapshot_files(
         files = sorted(pats, key=str)
         if cutoff_ts is not None:
             files = [p for p in files if is_visible(p, cutoff_ts)]
+        if seal_grace_s is not None:
+            try:
+                from .parquet_io import list_sealed_files as _sealed
+
+                files = _sealed(files, seal_grace_s)
+                files = sorted(files, key=str)
+            except Exception:
+                pass
         return files
     except Exception:
         return []
