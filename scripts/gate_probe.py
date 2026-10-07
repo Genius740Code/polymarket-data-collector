@@ -41,7 +41,10 @@ class LaneResult:
     lane: str  # asset name
     files_sampled: int
     density_pct: float  # actual slots / expected slots * 100
-    complement_gt_01_pct: float  # share with complementarity deviation > 0.1pp
+    complement_gt_01_pct: float  # share with complementarity deviation > 0.1pp (all rows, continuity)
+    comp_live_gt_01_pct: float  # share with deviation > 0.1pp, live rows only
+    comp_stale_gt_01_pct: float  # share with deviation > 0.1pp, stale/resyncing rows
+    null_mid_count: int  # rows where any price is null (guarded, never imputed)
     dup_snapshot_id_count: int  # duplicate snapshot_id count
     offgrid_count: int  # off-grid ts count
     part_flag: bool  # PARTIAL -> lane hit timeout
@@ -213,13 +216,15 @@ def analyze_lane(
 
     density_pct = (actual_ingrid / expected * 100) if expected > 0 else 0.0
 
-    # Complementarity: share of sampled snapshots where
-    # abs((up_bid+up_ask)/2 + (down_bid+down_ask)/2 - 1) > 0.001
+    # Complementarity: split into live and stale rows
     # Guard nulls: count null-mid rows separately, never impute.
-
     null_mid_count = 0
-    complement_count = 0
-    checkable_count = 0
+    complement_count = 0  # overall complement count (kept for backward compat)
+    complement_count_live = 0
+    complement_checkable_live = 0
+    complement_count_stale = 0
+    complement_checkable_stale = 0
+    checkable_count = 0  # overall checkable count (kept for backward compat)
 
     for r in all_rows:
         ob = r["up_bid"]
@@ -229,6 +234,9 @@ def analyze_lane(
 
         # Check if any of the four prices is null (None or NaN)
         has_null = ob is None or ua is None or db is None or da is None
+        book_state = r.get("book_state", "live")
+        is_live = book_state == "live"
+
         if has_null:
             null_mid_count += 1
             continue  # never impute
@@ -241,12 +249,31 @@ def analyze_lane(
             null_mid_count += 1
             continue
 
-        checkable_count += 1
+        checkable_count += 1  # overall checkable count (kept for backward compat)
         if deviation > 0.001:
-            complement_count += 1
+            complement_count += 1  # overall complement count (kept for backward compat)
+
+        # Split by book_state for the new columns
+        if is_live:
+            complement_checkable_live += 1
+            if deviation > 0.001:
+                complement_count_live += 1
+        else:
+            # stale or resyncing
+            complement_checkable_stale += 1
+            if deviation > 0.001:
+                complement_count_stale += 1
 
     complement_gt_01_pct = (
         (complement_count / checkable_count * 100) if checkable_count > 0 else 0.0
+    )
+
+    comp_live_gt_01_pct = (
+        (complement_count_live / complement_checkable_live * 100) if complement_checkable_live > 0 else 0.0
+    )
+
+    comp_stale_gt_01_pct = (
+        (complement_count_stale / complement_checkable_stale * 100) if complement_checkable_stale > 0 else 0.0
     )
 
     # Orphans/dups: duplicate snapshot_id count
@@ -266,6 +293,9 @@ def analyze_lane(
         files_sampled=files_sampled,
         density_pct=round(density_pct, 2),
         complement_gt_01_pct=round(complement_gt_01_pct, 2),
+        comp_live_gt_01_pct=round(comp_live_gt_01_pct, 2),
+        comp_stale_gt_01_pct=round(comp_stale_gt_01_pct, 2),
+        null_mid_count=null_mid_count,
         dup_snapshot_id_count=dups,
         offgrid_count=offgrid_count,
         part_flag=part_flag,
@@ -442,12 +472,12 @@ def main() -> None:
     print()
 
     # Table header
-    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
-    print("-" * 50)
+    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
+    print("-" * 70)
 
     for lr in lane_results:
         part_str = "YES" if lr.part_flag else ""
-        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4}")
+        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4}")
 
     print()
     print(f"Uploads: {uploads.successful} successful, {uploads.failed} failed (last 60 min)")
