@@ -3036,6 +3036,70 @@ def _apply_market_id_map(table: pa.Table, mapping: Dict[str, str]) -> pa.Table:
         return table
 
 
+def _date_partition_of(path) -> str:
+    """`date=` partition label of a hive file path ("" when absent).
+
+    Pure helper (no reads): lets the streaming build work one date
+    partition at a time so transient decode garbage is released between
+    partitions instead of stacking across the whole history.
+    """
+    try:
+        for part in Path(path).parts:
+            if part.startswith("date="):
+                return part[5:]
+    except Exception:
+        pass
+    return ""
+
+
+def _group_paths_by_date(files) -> list:
+    """Group source files by date partition, preserving input order.
+
+    Pure helper: input is already oldest-first (date partition + mtime),
+    so groups come out oldest-first and global cross-file order is kept.
+    Returns [(date_label, [paths])].
+    """
+    groups: list = []
+    index: dict = {}
+    for p in files:
+        d = _date_partition_of(p)
+        if d in index:
+            groups[index[d]][1].append(p)
+        else:
+            index[d] = len(groups)
+            groups.append((d, [p]))
+    return groups
+
+
+def _projected_read_columns(file_col_names, schema, extra) -> "list | None":
+    """Columns to decode for one source file: output-schema columns plus
+    the filter columns the transform needs, intersected with what the file
+    actually holds (schema evolution: old files may lack new columns).
+
+    Pure helper. The writer normalizes missing columns to NULLs, so the
+    staged rows are identical to a full-width read — only the ~700
+    never-shipped hive columns are skipped at decode time.
+    """
+    try:
+        have = set(file_col_names or [])
+    except Exception:
+        return None
+    if not have:
+        return None
+    wanted: list = []
+    try:
+        for f in (schema or []):
+            n = f.name if hasattr(f, "name") else f
+            if n in have and n not in wanted:
+                wanted.append(n)
+    except Exception:
+        pass
+    for n in (extra or ()):
+        if n in have and n not in wanted:
+            wanted.append(n)
+    return wanted or None
+
+
 def _stream_export_asset_dataset(
     base: Path,
     ds: str,
@@ -3064,7 +3128,7 @@ def _stream_export_asset_dataset(
     clean hive — the clean hive (2.85M rows after 40h without prune) can no
     longer be concat-loaded, and its catch-up rebuild belongs off-peak.
     """
-    from .streaming import DedupState, stream_batches, write_batches
+    from .streaming import DedupState, iter_source_files, malloc_trim, write_batches
 
     src_ds = source_dataset or ds
     ts_col = {"book_snapshots_500ms": "ts_snapshot_ns"}.get(src_ds, "ts_received_ns")
@@ -3132,10 +3196,113 @@ def _stream_export_asset_dataset(
         return t
 
     def _gen():
-        for b in stream_batches(base, src_ds, asset_upper, ts_col=ts_col,
-                                transform=_transform, stats=io_stats,
-                                cutoff_ts=cutoff_ts):
-            yield b
+        # 2026-10-07 1h timeout: the shared hive holds 842-wide rows while
+        # staging needs ~122 columns, and thousands of tiny flush files make
+        # per-file open+full-decode dominate (>900s/worker on a loaded box).
+        # Same row content as stream_batches (same order, same transform,
+        # same stats accounting) but: (a) column-projected reads — only
+        # output-schema + filter columns are decoded; (b) one date partition
+        # at a time with explicit gc/trim between partitions so transients
+        # never stack; (c) progress logging every ~60s so a future stall is
+        # diagnosable from the worker log tail instead of a silent gap.
+        import gc as _gc_g
+        import time as _time_g
+
+        _files = iter_source_files(base, src_ds, asset_upper, ts_col)
+        if cutoff_ts is not None:
+            _kept = []
+            for _p in _files:
+                try:
+                    if _p.stat().st_mtime > cutoff_ts:
+                        continue
+                except OSError:
+                    continue
+                _kept.append(_p)
+            _files = _kept
+        if io_stats is not None:
+            io_stats["files_ok"] = 0
+            io_stats["files_failed"] = 0
+            io_stats["failed_bytes"] = 0
+            io_stats["rows_read"] = 0
+        _extra = ["series_id", "asset", "book_state", "condition_id", "market_id"]
+        _extra.extend(k for k in sort_keys if k not in _extra)
+        _groups = _group_paths_by_date(_files)
+        _total = len(_files)
+        _done = 0
+        _rows_out = 0
+        _t0 = _time_g.time()
+        _last_log = _t0
+        for _date, _paths in _groups:
+            for _p in _paths:
+                _done += 1
+                try:
+                    _pf = pq.ParquetFile(str(_p))
+                except Exception:
+                    if io_stats is not None:
+                        io_stats["files_failed"] += 1
+                        try:
+                            io_stats["failed_bytes"] += _p.stat().st_size
+                        except OSError:
+                            pass
+                    continue
+                try:
+                    _fcols = _pf.schema_arrow.names
+                except Exception:
+                    _fcols = None
+                _cols = _projected_read_columns(_fcols, schema, _extra)
+                try:
+                    _err = False
+                    _ok = False
+                    for _chunk in _pf.iter_batches(batch_size=20000, columns=_cols):
+                        _t = pa.Table.from_batches([_chunk])
+                        if _t.num_rows == 0:
+                            continue
+                        if io_stats is not None:
+                            io_stats["rows_read"] += _t.num_rows
+                        try:
+                            _t = _transform(_t)
+                        except Exception:
+                            _err = True
+                            continue
+                        if _t is None or _t.num_rows == 0:
+                            continue
+                        _ok = True
+                        _rows_out += _t.num_rows
+                        yield _t
+                        del _t
+                    if io_stats is not None:
+                        if _err:
+                            io_stats["files_failed"] += 1
+                            try:
+                                io_stats["failed_bytes"] += _p.stat().st_size
+                            except OSError:
+                                pass
+                        else:
+                            io_stats["files_ok"] += 1
+                    del _pf
+                except Exception:
+                    if io_stats is not None:
+                        io_stats["files_failed"] += 1
+                        try:
+                            io_stats["failed_bytes"] += _p.stat().st_size
+                        except OSError:
+                            pass
+                    _pf = None  # release promptly; rebound next file
+                    continue
+                _now = _time_g.time()
+                if _now - _last_log >= 60:
+                    _last_log = _now
+                    print(f"[export:worker] progress {asset_upper}/{ds} tf={timeframe_label}: "
+                          f"{_done}/{_total} files date={_date or '?'} rows={_rows_out} "
+                          f"elapsed={int(_now - _t0)}s", flush=True)
+            try:
+                _gc_g.collect()
+            except Exception:
+                pass
+            try:
+                malloc_trim()
+            except Exception:
+                pass
 
     healed_note = ""
     rows = write_batches(_gen(), tmp_path, schema=schema, stats=io_stats)
@@ -3434,7 +3601,7 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
                         # byte-bounded file groups (cached pools, global
                         # reconcile, single narrow write-back); peak ~one
                         # group regardless of history size. Data-API budget
-                        # 420s of the 900s worker timeout (honest NULLs past
+                        # 420s of the 1800s worker timeout (honest NULLs past
                         # it, healed next pass).
                         _n = _stream_export_trades_dataset(
                             base, _au, _tmp, _p.get("timeframe_label"),
@@ -3485,10 +3652,17 @@ def _build_in_subprocess(
     l2_levels: int,
     include_binance: bool,
     rolling_window: bool,
-    timeout_s: int = 900,
+    timeout_s: int = 1800,
     cutoff_ts: Optional[float] = None,
 ) -> Optional[Dict[str, dict]]:
-    """Run the per-(dataset,asset) tmp builds in a worker process."""
+    """Run the per-(dataset,asset) tmp builds in a worker process.
+
+    timeout_s (default 1800): the worker must finish inside this budget or
+    the parent fails closed (keeps prior staging). Raised 900->1800 on
+    2026-10-07: projected/partitioned snapshot scans complete far inside
+    this on a loaded box; the cap stays as a runaway backstop (never
+    removed) and progress lines in the worker log tail diagnose stalls.
+    """
     import json as _js
     import subprocess as _sp
     import tempfile as _tf
@@ -3524,7 +3698,15 @@ def _build_in_subprocess(
             return None
         return res
     except Exception as e:
-        print(f"[export:worker] spawn failed, caller falls back in-process: {e}")
+        _tail = ""
+        try:
+            if isinstance(e, _sp.TimeoutExpired):
+                _so = str(getattr(e, "stdout", None) or "")
+                _se = str(getattr(e, "stderr", None) or "")
+                _tail = f" stdout tail:\n{_so[-1500:]}\nstderr tail:\n{_se[-1500:]}"
+        except Exception:
+            pass
+        print(f"[export:worker] spawn failed, caller falls back in-process: {e}{_tail}")
         return None
     finally:
         for _p in (locals().get("_ppath"), locals().get("_rpath")):
