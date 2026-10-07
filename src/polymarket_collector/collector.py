@@ -52,6 +52,22 @@ from .validation import coerce_ts_source_ms, validate_ws_message
 from .ingest import ws_pool as _ws_pool
 
 
+# Dual-down episode-mint grace (2026-10-07 rolling-1006 fix): when the second
+# leg of a dual-WS pair drops, books go stale IMMEDIATELY (snapshot honesty
+# unchanged) but the per-book disconnect episode row is held for
+# DUAL_DOWN_EPISODE_GRACE_S. Rationale: rolling server-side 1006 kills land
+# ~1s apart while a leg reheals in ~9s (backoff + handshake + subscribe), so
+# every pair reads dual-down at observe time yet reheals inside the grace —
+# those blinks mint nothing (stale snapshots + collector_events remain as
+# complete evidence). Past the grace the outage is genuine: episodes persist
+# BACKDATED to the second-leg drop (disconnect_ts = drop, not mint), so the
+# gap evidence is identical to an immediate mint, only ~12s later. 12s sits
+# above the ~9s reheal with margin and inside the H3 quiet-book 10-15s
+# timescale; TTL/supersede/reaper key off disconnect_ts, so backdating keeps
+# them exact. Stagger untouched (decays under churn — separate workstream).
+DUAL_DOWN_EPISODE_GRACE_S = 12.0
+
+
 def _details_get(details: Any, key: str) -> Any:
     """Read a key from a collector_events ``details`` payload (JSON string or dict)."""
     if details is None:
@@ -252,6 +268,13 @@ class Collector:
         # the A/B pair's shared dedup + subscription bookkeeping. Lazily built
         # by _ws_pool_for_shard; single-socket path never touches it.
         self._shard_ws_pools: Dict[str, Any] = {}
+        # Dual-down grace (2026-10-07): shard label -> pending second-leg-drop
+        # record {"deadline_mono", "drop_ms", "reason", "minted"}. Armed on
+        # the first dual-down observation (stale-now, mint deferred), fired
+        # past the grace (backdated mint) or cleared silently on reheal.
+        # In-RAM only: a restart drops pending (episodes are honest either
+        # way — fresh drops re-arm). Single-socket path never touches it.
+        self._dual_down_pending: Dict[str, dict] = {}
         # resync episodes: hold latest state in RAM, persist each episode exactly once
         # (previously every state transition appended a new parquet row → double rows)
         self._episode_latest: Dict[str, dict] = {}
@@ -1040,7 +1063,9 @@ class Collector:
         except Exception:
             return False
 
-    def _disconnect_asset_books(self, asset: str, reason: str) -> list:
+    def _disconnect_asset_books(self, asset: str, reason: str,
+                                  last_frame_ms: Optional[int] = None,
+                                  stale_only: bool = False) -> list:
         """Open disconnect episode(s) covering EVERY book of an asset.
 
         HIGH fix (audit 2026-09-21): the old call sites passed
@@ -1051,7 +1076,31 @@ class Collector:
         episodes"). One episode per live book (per the manager's
         per-(asset, condition_id) model); a single asset-wide episode when no
         book is known.
+
+        last_frame_ms backdates disconnect_ts_utc to the actual drop
+        (detected_ts_utc keeps the wall-clock mint); None preserves the old
+        now-is-drop behaviour — existing callers pass nothing, byte-identical.
+
+        stale_only (dual-down grace arm, 2026-10-07): mark the asset's books
+        stale WITHOUT minting any episode (orphan rid by design — matches the
+        H2/cursor-recovery precedent; snapshots flow stale immediately while
+        the episode row waits out the grace). Returns [].
         """
+        if stale_only:
+            try:
+                au = asset.upper()
+            except Exception:
+                au = asset
+            try:
+                for _book in list((self.books or {}).values()):
+                    try:
+                        if getattr(_book, "asset", "").upper() == au:
+                            _book.mark_stale()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return []
         rids: list = []
         try:
             au = asset.upper()
@@ -1078,11 +1127,13 @@ class Collector:
             pass
         try:
             if not cids:
-                rids.append(self.resync.handle_disconnect(asset, None, reason=reason, books=self.books))
+                rids.append(self.resync.handle_disconnect(asset, None, reason=reason, books=self.books,
+                                                          last_frame_ms=last_frame_ms))
             else:
                 for _cid in cids:
                     try:
-                        rids.append(self.resync.handle_disconnect(asset, _cid, reason=reason, books=self.books))
+                        rids.append(self.resync.handle_disconnect(asset, _cid, reason=reason, books=self.books,
+                                                                 last_frame_ms=last_frame_ms))
                     except Exception:
                         continue
         except Exception:
@@ -3866,6 +3917,87 @@ class Collector:
                         pass
         return sent_any
 
+    def _dual_down_grace_arm(self, label: str, shard: List[str], reason: str) -> int:
+        """Arm the dual-down grace: stale-now, mint deferred (never raises).
+
+        Marks every book of the shard stale immediately (snapshot honesty is
+        unchanged — stale rows flow on the next tick) and records the
+        second-leg-drop instant. Returns drop_ms (wall clock, for backdate).
+        """
+        try:
+            drop_ms = int(time.time() * 1000)
+        except Exception:
+            drop_ms = 0
+        try:
+            for _ca in shard or []:
+                try:
+                    self._disconnect_asset_books(_ca, reason=reason, stale_only=True)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            self._dual_down_pending[str(label)] = {
+                "deadline_mono": time.monotonic() + float(DUAL_DOWN_EPISODE_GRACE_S),
+                "drop_ms": drop_ms,
+                "reason": reason,
+                "minted": False,
+            }
+        except Exception:
+            pass
+        return drop_ms
+
+    def _dual_down_grace_fire_if_due(self, label: str, shard: List[str]) -> bool:
+        """Mint backdated episodes once the grace expires (never raises).
+
+        Returns True when the REST walk may run: grace expired (episodes
+        just minted backdated to the second-leg drop, or already minted by an
+        earlier call) or no pending record (defensive — preserves the old
+        immediate-walk behaviour). Returns False while inside the grace: the
+        walk's find-or-create would mint a "reconnect_resync" episode at once
+        and defeat the grace, so the walk waits with the mint.
+        """
+        try:
+            rec = (self._dual_down_pending or {}).get(str(label))
+        except Exception:
+            return True
+        if not isinstance(rec, dict):
+            return True
+        try:
+            if rec.get("minted"):
+                return True
+            if time.monotonic() < float(rec.get("deadline_mono") or 0):
+                return False
+            drop_ms = rec.get("drop_ms")
+            try:
+                _drop = int(drop_ms) if drop_ms else None
+            except Exception:
+                _drop = None
+            _reason = rec.get("reason") or "ws_connection_close"
+            for _ca in shard or []:
+                try:
+                    self._disconnect_asset_books(_ca, reason=_reason, last_frame_ms=_drop)
+                except Exception:
+                    continue
+            rec["minted"] = True
+            return True
+        except Exception:
+            return True
+
+    def _dual_down_grace_clear(self, label: str) -> None:
+        """Silently drop a pending grace on reheal (never raises).
+
+        Called on the dual-down -> any-up transition: a blink that rehealed
+        inside the grace leaves NO episode row (stale snapshots +
+        collector_events stay as complete evidence). When the grace already
+        fired, the open episodes are closed by the existing handle_reconnect
+        loop — this only discards the pending record.
+        """
+        try:
+            (self._dual_down_pending or {}).pop(str(label), None)
+        except Exception:
+            pass
+
     async def _dual_leg_downtime(
         self,
         shard: List[str],
@@ -3931,11 +4063,14 @@ class Collector:
                         except Exception:
                             pass
                 if first_down and self._running:
-                    for _ca in shard:
-                        try:
-                            self._disconnect_asset_books(_ca, reason=reason)
-                        except Exception:
-                            pass
+                    # Dual-down grace (2026-10-07): stale-now, mint deferred.
+                    # Snapshots go stale on the next tick; the per-book episode
+                    # row waits out DUAL_DOWN_EPISODE_GRACE_S and — only for a
+                    # genuine outage — persists backdated to this drop.
+                    try:
+                        self._dual_down_grace_arm(label, shard, reason)
+                    except Exception:
+                        pass
                 if self.on_event and self._running:
                     for _ca in shard:
                         try:
@@ -3967,7 +4102,7 @@ class Collector:
                             self._planned_recycle_at = 0
                     except Exception:
                         _skip_walk = False
-                    if not _skip_walk:
+                    if not _skip_walk and self._dual_down_grace_fire_if_due(label, shard):
                         await self._reconnect_resync_walk(shard_set, int(time.time() * 1000))
                 except Exception:
                     pass
@@ -4085,6 +4220,14 @@ class Collector:
                             alive[name] = True
                             if not peer_up:
                                 down_handled["epoch"] = False
+                                # Dual-down grace reheal: a blink inside the
+                                # grace closes silently (no episode row); a
+                                # fired grace leaves open episodes for the
+                                # existing handle_reconnect loop below.
+                                try:
+                                    self._dual_down_grace_clear(label)
+                                except Exception:
+                                    pass
                                 for rid, ep in list(self.resync._episodes.items()):
                                     if ep.asset in shard_set and ep.reconnect_ts_utc is None:
                                         self.resync.handle_reconnect(rid)

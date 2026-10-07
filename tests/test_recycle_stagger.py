@@ -220,6 +220,10 @@ def test_flap_under_cover_still_quiet(tmp_path, monkeypatch):
 
 
 def test_dual_down_still_mints_honest_episodes(tmp_path, monkeypatch):
+    # Grace contract (2026-10-07 rolling-1006 fix): the first dual-down
+    # observer marks books stale immediately but HOLDS the episode row for
+    # DUAL_DOWN_EPISODE_GRACE_S; a still-dark pair past the grace mints the
+    # same honest per-book episode, backdated to the second-leg drop.
     col = _running_collector(tmp_path, monkeypatch)
     lock = asyncio.Lock()
     alive = {"A": False, "B": False}  # both dark
@@ -229,14 +233,30 @@ def test_dual_down_still_mints_honest_episodes(tmp_path, monkeypatch):
         ["BTC"], {"BTC"}, "BTC", "A", alive, lock,
         down, "ws_connection_close:1006:", 1, 0.0))
     assert down["epoch"] is True  # first observer opens the epoch
+    assert set(col.resync._episodes) - before == set()  # grace holds the mint
+    assert col._dual_down_pending.get("BTC") is not None  # ...but arms it
+    drop_ms = col._dual_down_pending["BTC"]["drop_ms"]
+    # Second observer in the same epoch mints nothing more (no fan-out).
+    asyncio.run(col._dual_leg_downtime(
+        ["BTC"], {"BTC"}, "BTC", "B", alive, lock,
+        down, "ws_connection_close:1006:", 1, 0.0))
+    assert set(col.resync._episodes) - before == set()
+    # Still dark past the grace: one honest episode, backdated to the drop.
+    col._dual_down_pending["BTC"]["deadline_mono"] -= 1000
+    asyncio.run(col._dual_leg_downtime(
+        ["BTC"], {"BTC"}, "BTC", "A", alive, lock,
+        down, "ws_connection_close:1006:", 2, 0.0))
     new = set(col.resync._episodes) - before
     assert len(new) == 1  # one book -> one honest episode (no fan-out)
     rid = next(iter(new))
     ep = col.resync._episodes[rid]
     assert "1006" in (ep.disconnect_reason or "")
+    import datetime as _dt
+    assert ep.disconnect_ts_utc == _dt.datetime.fromtimestamp(
+        drop_ms / 1000, tz=_dt.timezone.utc).isoformat().replace("+00:00", "Z")
     assert col.resync.is_finished(rid) is False
-    # Second observer in the same epoch mints nothing more (no fan-out).
+    # Further dark observations mint nothing more (no fan-out).
     asyncio.run(col._dual_leg_downtime(
         ["BTC"], {"BTC"}, "BTC", "B", alive, lock,
-        down, "ws_connection_close:1006:", 1, 0.0))
+        down, "ws_connection_close:1006:", 2, 0.0))
     assert set(col.resync._episodes) - before == new
