@@ -208,6 +208,102 @@ def _running_collector(tmp_path, monkeypatch):
     return col
 
 
+# -- stagger-collapse re-arm on joint unplanned reconnect (2026-10-07) ------
+
+def _steady_joint_pool(now_ns, a_recycles=2, b_recycles=3):
+    """Steady-state pool after a joint drop: both ages ~0, both counters ≥1."""
+    pool = ShardPool(shard=["ETH"])
+    pool.conn_a.established_ns = now_ns
+    pool.conn_a.recycles = a_recycles
+    pool.conn_b.established_ns = now_ns
+    pool.conn_b.recycles = b_recycles
+    return pool
+
+
+def _next_dues(pool, now_ns):
+    """Seconds from now until each leg's next planned recycle fires."""
+    return {
+        "A": pool.conn_a.established_ns / 1e9 + recycle_target_for_leg("A", pool.conn_a.recycles) - now_ns / 1e9,
+        "B": pool.conn_b.established_ns / 1e9 + recycle_target_for_leg("B", pool.conn_b.recycles) - now_ns / 1e9,
+    }
+
+
+def test_joint_reconnect_rearms_stagger_b_second(tmp_path):
+    """Joint drop, B reheals second: B resets to short-first, dues split."""
+    col = make_collector(tmp_path)
+    now_ns = time.time_ns()
+    pool = _steady_joint_pool(now_ns)
+    # Pre-fix state: equal targets → same-second dues (the collapse).
+    assert _next_dues(pool, now_ns)["A"] == _next_dues(pool, now_ns)["B"] == 270.0
+    # Transport order on B's connect: stamp own clock, then re-arm check.
+    pool.conn_b.established_ns = int(time.time_ns())
+    assert col._dual_rearm_stagger_on_connect(pool, "B") is True
+    assert pool.conn_b.recycles == 0
+    assert pool.conn_a.recycles == 2  # A untouched
+    dues = _next_dues(pool, pool.conn_b.established_ns)
+    assert dues["B"] == 135.0
+    assert dues["A"] >= 265.0  # stamped ~together, A still on 270
+    assert abs(dues["A"] - dues["B"]) >= 120.0
+
+
+def test_joint_reconnect_rearms_stagger_a_second(tmp_path):
+    """Joint drop, A reheals second: peer B still reset (order-independent)."""
+    col = make_collector(tmp_path)
+    now_ns = time.time_ns()
+    pool = ShardPool(shard=["ETH"])
+    # B rehealed first (~1s ago, as rolling 1006s land): peer A stale then.
+    pool.conn_b.established_ns = now_ns - int(1 * 1e9)
+    pool.conn_b.recycles = 3
+    pool.conn_a.established_ns = now_ns - int(300 * 1e9)  # pre-drop clock
+    pool.conn_a.recycles = 2
+    assert col._dual_rearm_stagger_on_connect(pool, "B") is False
+    assert pool.conn_b.recycles == 3  # first leg: no re-arm (peer stale)
+    # A reheals second: stamps own clock, peer B fresh → B rearmed.
+    pool.conn_a.established_ns = int(time.time_ns())
+    assert col._dual_rearm_stagger_on_connect(pool, "A") is True
+    assert pool.conn_b.recycles == 0
+    assert pool.conn_a.recycles == 2
+    dues = _next_dues(pool, pool.conn_a.established_ns)
+    assert abs(dues["A"] - dues["B"]) >= 120.0
+
+
+def test_single_leg_flap_rearms_nothing(tmp_path):
+    """Lone flap under peer cover: fresh leg, stale peer → counters kept."""
+    col = make_collector(tmp_path)
+    now_ns = time.time_ns()
+    pool = ShardPool(shard=["ETH"])
+    pool.conn_a.established_ns = now_ns - int(200 * 1e9)  # peer covering
+    pool.conn_a.recycles = 2
+    pool.conn_b.established_ns = now_ns  # B just flapped + rehealed
+    pool.conn_b.recycles = 2
+    assert col._dual_rearm_stagger_on_connect(pool, "B") is False
+    assert pool.conn_b.recycles == 2
+    assert pool.conn_a.recycles == 2
+    # Mirror image: A flaps while B covers.
+    pool.conn_b.established_ns = now_ns - int(200 * 1e9)
+    pool.conn_a.established_ns = now_ns
+    assert col._dual_rearm_stagger_on_connect(pool, "A") is False
+    assert pool.conn_a.recycles == 2
+    assert pool.conn_b.recycles == 2
+
+
+def test_rearm_helpers_never_raise(tmp_path):
+    col = make_collector(tmp_path)
+    now_ns = time.time_ns()
+    assert ws_pool.peer_fresh_for_rearm(now_ns, now_ns) is True
+    assert ws_pool.peer_fresh_for_rearm(now_ns - int(31 * 1e9), now_ns) is False
+    assert ws_pool.peer_fresh_for_rearm(0, now_ns) is False
+    assert ws_pool.peer_fresh_for_rearm("garbage", now_ns) is False
+    assert ws_pool.peer_fresh_for_rearm(None, None) is False
+    assert ws_pool.peer_fresh_for_rearm(now_ns, "garbage") is False
+    assert ws_pool.STAGGER_REARM_WINDOW_S == 30.0
+    assert col._dual_rearm_stagger_on_connect(None, "B") is False
+    assert col._dual_rearm_stagger_on_connect(object(), "B") is False
+    pool = ShardPool(shard=["ETH"])  # never established: no re-arm, no raise
+    assert col._dual_rearm_stagger_on_connect(pool, "B") is False
+    assert col._dual_rearm_stagger_on_connect(pool, "garbage") is False
+
+
 def test_flap_under_cover_still_quiet(tmp_path, monkeypatch):
     col = _running_collector(tmp_path, monkeypatch)
     before = len(col.resync._episodes)

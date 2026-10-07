@@ -31,6 +31,35 @@ RECYCLE_STAGGER_S = RECYCLE_TARGET_S // 2  # 135
 # data silently dies — py-clob-client#292).
 SILENCE_WATCHDOG_S = 120
 
+# Joint-reconnect re-arm window (2026-10-07 stagger-collapse fix): when a leg
+# (re)connects and its peer established within this window, both legs went
+# down together (rolling 1006s land ~1s apart, watchdog kills are near-
+# simultaneous) — the stagger phase is re-armed by resetting B to short-
+# first. A lone flap under peer cover sees a stale peer and rearms nothing.
+STAGGER_REARM_WINDOW_S = 30.0
+
+
+def peer_fresh_for_rearm(peer_established_ns: Any, now_ns: int,
+                         window_s: float = STAGGER_REARM_WINDOW_S) -> bool:
+    """True when the peer leg (re)connected recently (joint restart).
+
+    Pure + never raises: garbage/zero clocks return False (never established
+    is not fresh). Own leg is fresh by construction (just stamped), so peer
+    freshness alone identifies the joint case.
+    """
+    try:
+        _peer = int(peer_established_ns)
+        _now = int(now_ns)
+        if _peer <= 0 or _now <= 0:
+            return False
+        _win = float(window_s)
+        if not (_win > 0):
+            return False
+        _age_s = (_now - _peer) / 1e9
+        return 0.0 <= _age_s <= _win
+    except Exception:
+        return False
+
 
 def _dedupe_tokens(tokens: List[str]) -> List[str]:
     seen: Set[str] = set()

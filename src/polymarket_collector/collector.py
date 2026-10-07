@@ -2720,6 +2720,47 @@ class Collector:
             "custom_feature_enabled": True,
         }
 
+    def _dual_rearm_stagger_on_connect(self, pool: Any, name: str) -> bool:
+        """Re-arm the A/B stagger after a joint unplanned reconnect (never raises).
+
+        Steady state runs both legs at 270s with the phase held only in
+        ``ConnectionState.recycles`` (advanced on planned recycles). A joint
+        drop re-stamps both age clocks ~together with equal targets, so the
+        next planned recycles would fire the same second forever. When the
+        peer leg established within ``STAGGER_REARM_WINDOW_S`` (joint
+        restart), reset B to short-first (``recycles = 0``) regardless of
+        which leg just connected — restoring the 135-vs-270 split. A lone
+        flap under peer cover sees a stale peer and resets nothing.
+        Returns True when B was re-armed.
+        """
+        try:
+            if pool is None:
+                return False
+            _conn_b = getattr(pool, "conn_b", None)
+            if _conn_b is None:
+                return False
+            try:
+                _is_b = str(name).upper() == "B"
+                _other = getattr(pool, "conn_a", None) if _is_b else getattr(pool, "conn_b", None)
+                _peer_ns = int(getattr(_other, "established_ns", 0) or 0)
+            except Exception:
+                return False
+            try:
+                _now_ns = int(time.time_ns())
+            except Exception:
+                return False
+            if not _ws_pool.peer_fresh_for_rearm(_peer_ns, _now_ns):
+                return False
+            try:
+                if int(getattr(_conn_b, "recycles", 0) or 0) == 0:
+                    return False
+                _conn_b.recycles = 0
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
     def _ws_dual_recycle_due(self, conn_age_s: float, leg: Any = None, cycle: int = 0) -> bool:
         """True when a dual-pool connection passed OUR recycle ceiling.
 
@@ -4247,6 +4288,15 @@ class Collector:
                     try:
                         if _pool_conn is not None:
                             _pool_conn.established_ns = int(time.time_ns())
+                            # Stagger-collapse re-arm (2026-10-07): a joint
+                            # unplanned reconnect re-stamps both age clocks
+                            # ~together with equal steady-state targets, so
+                            # the next planned recycles would fire the same
+                            # second forever. When the peer is fresh (joint
+                            # restart), B goes short-first again (135-vs-270
+                            # split restored); a lone flap under peer cover
+                            # sees a stale peer and rearms nothing.
+                            self._dual_rearm_stagger_on_connect(pool, name)
                     except Exception:
                         pass
 
