@@ -356,3 +356,110 @@ def test_dual_down_still_mints_honest_episodes(tmp_path, monkeypatch):
         ["BTC"], {"BTC"}, "BTC", "B", alive, lock,
         down, "ws_connection_close:1006:", 2, 0.0))
     assert set(col.resync._episodes) - before == new
+
+
+# -- joint-drop reconnect decorrelation (B +5-15s dual-down extra) -----------
+
+def test_decorr_predicate_and_bounds():
+    assert ws_pool.DUAL_RECONNECT_JITTER_MIN_S == 5.0
+    assert ws_pool.DUAL_RECONNECT_JITTER_MAX_S == 15.0
+    assert ws_pool.dual_leg_decorr_due("B", False) is True
+    assert ws_pool.dual_leg_decorr_due("A", False) is False
+    assert ws_pool.dual_leg_decorr_due("B", True) is False
+    assert ws_pool.dual_leg_decorr_due("A", True) is False
+    assert ws_pool.dual_leg_decorr_due("garbage", False) is False
+    assert ws_pool.dual_leg_decorr_due(None, None) is False
+
+
+def _recording_collector(tmp_path, monkeypatch):
+    """Running collector with recorded (never waited) sleeps and a scripted
+    uniform draw: asset stagger draws 0.0, the dual-down extra draws 10.0."""
+    col = _running_collector(tmp_path, monkeypatch)
+    monkeypatch.setattr(collector_mod, "exponential_backoff", lambda *a, **k: 0.0)
+    sleeps: list = []
+
+    async def _rec(delay):
+        sleeps.append(float(delay))
+
+    monkeypatch.setattr(collector_mod.asyncio, "sleep", _rec)
+    import random as _random_mod
+    monkeypatch.setattr(
+        _random_mod, "uniform",
+        lambda a, b: (float(a) + float(b)) / 2.0 if float(b) > 2.0 else 0.0)
+    return col, sleeps
+
+
+def test_joint_drop_reconnects_separated(tmp_path, monkeypatch):
+    """Rolling-1006 shape: A drops first under apparent cover (fast, no
+    extra), B drops into dual-down (+10s scripted extra) — the reheals
+    land >=5s apart instead of the same second."""
+    col, sleeps = _recording_collector(tmp_path, monkeypatch)
+    lock = asyncio.Lock()
+    alive = {"A": True, "B": True}
+    down = {"epoch": False}
+    asyncio.run(col._dual_leg_downtime(
+        ["BTC"], {"BTC"}, "BTC", "A", alive, lock,
+        down, "ws_connection_close:1006:", 1, 0.0))
+    assert alive == {"A": False, "B": True}
+    a_total = sum(sleeps)
+    assert a_total == 0.0  # covered flap stays fast: zero added delay
+    del sleeps[:]
+    asyncio.run(col._dual_leg_downtime(
+        ["BTC"], {"BTC"}, "BTC", "B", alive, lock,
+        down, "ws_connection_close:1006:", 1, 0.0))
+    b_total = sum(sleeps)
+    assert 5.0 <= (b_total - a_total) <= 15.0
+
+
+def test_covered_flap_stays_fast(tmp_path, monkeypatch):
+    """Either leg flapping while its peer streams takes no extra delay."""
+    for leg, cover in (("B", {"A": True, "B": True}), ("A", {"A": True, "B": True})):
+        col, sleeps = _recording_collector(tmp_path, monkeypatch)
+        asyncio.run(col._dual_leg_downtime(
+            ["BTC"], {"BTC"}, "BTC", leg, dict(cover), asyncio.Lock(),
+            {"epoch": False}, "ws_connection_close", 1, 0.0))
+        assert sum(sleeps) == 0.0, (leg, sleeps)
+
+
+# -- frame-drought recycle fallback (5s watchdog wall-clock fire) ------------
+
+_EST = 1_700_000_000_000  # inline epoch-ms anchor (clocks only, no market data)
+
+
+def _conn(recycles):
+    return types.SimpleNamespace(recycles=recycles)
+
+
+def test_watchdog_recycle_due_uses_wall_clock(tmp_path):
+    col = make_collector(tmp_path)
+    # B short-first 135s: silent at 134s, due at 136s — zero frames needed.
+    assert col._dual_watchdog_recycle_due(_EST, "B", _conn(0), now_ms=_EST + 134_000) is False
+    assert col._dual_watchdog_recycle_due(_EST, "B", _conn(0), now_ms=_EST + 136_000) is True
+    # A on its 270s target.
+    assert col._dual_watchdog_recycle_due(_EST, "A", _conn(0), now_ms=_EST + 269_000) is False
+    assert col._dual_watchdog_recycle_due(_EST, "A", _conn(0), now_ms=_EST + 271_000) is True
+    # Ceiling first: any leg/cycle fires past 280s.
+    assert col._dual_watchdog_recycle_due(_EST, "B", _conn(9), now_ms=_EST + 281_000) is True
+    assert col._dual_watchdog_recycle_due(_EST, "Z", _conn(9), now_ms=_EST + 281_000) is True
+    # Unparseable clocks never fire (a missed tick retries in 5s).
+    assert col._dual_watchdog_recycle_due("garbage", "B", _conn(0), now_ms=_EST + 136_000) is False
+    assert col._dual_watchdog_recycle_due(_EST, "B", _conn(0), now_ms="garbage") is False
+    assert col._dual_watchdog_recycle_due(None, "A", None) is False
+    assert col._dual_watchdog_recycle_due(_EST + 10_000, "A", _conn(0), now_ms=_EST) is False
+
+
+def test_watchdog_ticks_fire_on_schedule_without_frames(tmp_path):
+    """Scripted 5s watchdog ticks, zero frames throughout: B fires on its
+    short-first tick (135s), steady legs on their 270s tick — neither leg
+    sails past target waiting for a frame that never comes."""
+    col = make_collector(tmp_path)
+    for leg, cycles, expect in (("B", 0, 135), ("A", 0, 270), ("B", 3, 270)):
+        fired_at = None
+        tick = 0
+        while tick <= 300:
+            if col._dual_watchdog_recycle_due(
+                    _EST, leg, _conn(cycles), now_ms=_EST + tick * 1000):
+                fired_at = tick
+                break
+            tick += 5
+        assert fired_at == expect, (leg, cycles, fired_at)

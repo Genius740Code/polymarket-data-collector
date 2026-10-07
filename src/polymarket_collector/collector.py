@@ -2777,6 +2777,38 @@ class Collector:
         except Exception:
             return False
 
+    def _dual_watchdog_recycle_due(
+        self, conn_established_ms: Any, name: str, pool_conn: Any, now_ms: Any = None,
+    ) -> bool:
+        """Wall-clock planned-recycle check for the 5s watchdog tick (never raises).
+
+        Frame-drought fallback: the per-frame due check inside
+        ``async for message in ws`` never runs with zero frames, so both
+        legs sail past target and trip together on the first resumed
+        frame. This tick-side check fires on schedule from wall-clock age
+        instead. Ceiling first (via _ws_dual_recycle_due); unparseable
+        clocks return False (a missed tick retries in 5s). Both clocks go
+        through validation.coerce_ts_source_ms.
+        """
+        try:
+            _now = coerce_ts_source_ms(now_ms) if now_ms is not None else int(time.time() * 1000)
+            _est = coerce_ts_source_ms(conn_established_ms)
+            if _now is None or _est is None:
+                return False
+            _age_s = (int(_now) - int(_est)) / 1000.0
+            if not (_age_s >= 0):
+                return False
+        except Exception:
+            return False
+        try:
+            _cycle = int(getattr(pool_conn, "recycles", 0) or 0)
+        except Exception:
+            _cycle = 0
+        try:
+            return bool(self._ws_dual_recycle_due(_age_s, leg=name, cycle=_cycle))
+        except Exception:
+            return False
+
     def _ws_dual_silence_due(self, last_data_ns: Any, now_ns: int) -> bool:
         """True when a dual-pool connection went data-silent past the watchdog."""
         try:
@@ -4165,6 +4197,19 @@ class Collector:
                 )
             except Exception:
                 backoff_s = 1.0
+            # Joint-drop decorrelation (rolling 1006s land ~1s apart):
+            # both legs run this backoff and reheal the same second,
+            # re-syncing age clocks. B takes +5-15s extra on UNPLANNED
+            # dual-down reconnects so the pair reheals apart; a flap
+            # under peer cover stays fast (no added delay while covered).
+            try:
+                if _ws_pool.dual_leg_decorr_due(name, peer_up):
+                    import random as _random
+                    backoff_s = float(backoff_s) + float(_random.uniform(
+                        float(_ws_pool.DUAL_RECONNECT_JITTER_MIN_S),
+                        float(_ws_pool.DUAL_RECONNECT_JITTER_MAX_S)))
+            except Exception:
+                pass
             # K-4: stagger across assets — skipped when OTHER shards stream
             # (same single-socket rule: a lone flap needs no dead air).
             try:
@@ -4327,9 +4372,47 @@ class Collector:
                     hb_task = asyncio.create_task(_heartbeat(), name=f"ws-heartbeat-{label}-{name}")
 
                     async def _staleness_watchdog() -> None:
-                        nonlocal last_data_ns
+                        nonlocal last_data_ns, planned_recycle
                         while self._running:
                             await asyncio.sleep(5)
+                            # Frame-drought fallback (wall clock): the
+                            # planned-recycle due check lives inside
+                            # `async for message in ws` below — with zero
+                            # frames both legs sail past target and trip
+                            # together on the first resumed frame. Fire on
+                            # schedule from this 5s tick instead (planned
+                            # path: hot-swap, no episodes — same branch as
+                            # the frame-driven fire). Checked before the
+                            # silence kill so a jointly-due leg recycles
+                            # planned rather than reconnecting unplanned.
+                            try:
+                                _wd_fire = self._dual_watchdog_recycle_due(
+                                    conn_established_ms, name, _pool_conn)
+                            except Exception:
+                                _wd_fire = False
+                            if _wd_fire:
+                                planned_recycle = True
+                                print(f"[ws:{label}:{name}] planned recycle — reconnecting")
+                                try:
+                                    _prm = getattr(self, "_planned_recycle_at", None)
+                                    if not isinstance(_prm, dict):
+                                        _prm = {}
+                                        self._planned_recycle_at = _prm
+                                    _prm[str(f"{label}:{name}")] = time.time()
+                                except Exception:
+                                    pass
+                                try:
+                                    _fcr = getattr(ws, "fail_connection", None)
+                                    if callable(_fcr):
+                                        _fcr(4000)
+                                    else:
+                                        raise AttributeError("no fail_connection")
+                                except Exception:
+                                    try:
+                                        await asyncio.wait_for(ws.close(), timeout=2)
+                                    except Exception:
+                                        return
+                                continue
                             # Honor reconnect requests minted by repeated heal
                             # failures (same bounded flag as single-socket;
                             # first leg to tick consumes it — one fresh leg

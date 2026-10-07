@@ -39,6 +39,29 @@ SILENCE_WATCHDOG_S = 120
 STAGGER_REARM_WINDOW_S = 30.0
 
 
+# Joint-drop reconnect decorrelation (rolling 1006s land ~1s apart):
+# both legs run the same unplanned backoff and reheal the same second,
+# re-syncing age clocks. B takes this extra on dual-down reconnects
+# only; a flap under peer cover stays fast (no added delay).
+DUAL_RECONNECT_JITTER_MIN_S = 5.0
+DUAL_RECONNECT_JITTER_MAX_S = 15.0
+
+
+def dual_leg_decorr_due(leg: Any, peer_up: Any) -> bool:
+    """True when this leg's unplanned reconnect takes the decorrelation extra.
+
+    B only, and only while the peer is dark (dual-down). A lone flap
+    under peer cover returns False (stays fast). Never raises; garbage
+    returns False (fail fast, no added delay).
+    """
+    try:
+        if bool(peer_up):
+            return False
+        return str(leg).upper() == "B"
+    except Exception:
+        return False
+
+
 def peer_fresh_for_rearm(peer_established_ns: Any, now_ns: int,
                          window_s: float = STAGGER_REARM_WINDOW_S) -> bool:
     """True when the peer leg (re)connected recently (joint restart).
