@@ -4344,6 +4344,7 @@ def prepare_kaggle_staging_5m(
     rolling_window: bool = False,
     cutoff_ts: Optional[float] = None,
     manifests: Optional[dict] = None,
+    datasets: List[str] | None = None,
 ) -> dict:
     """Prepare Kaggle staging folder for 5m-only upload.
 
@@ -4370,6 +4371,7 @@ def prepare_kaggle_staging_5m(
         data_dir, out_dir=staging, assets=assets, l2_levels=l2_levels,
         include_binance=False, timeframe_label=timeframe_label, rolling_window=rolling_window,
         cutoff_ts=cutoff_ts, manifests=manifests,
+        **({"datasets": datasets} if datasets is not None else {}),
     )
     # Real data only: never merge synthetic prior Kaggle data. If local hive is empty after
     # clean delete, staging stays empty/minimal (3 globals). Merge disabled per AGENT.md.
@@ -4409,6 +4411,118 @@ def prepare_kaggle_staging_5m(
     if manifests is not None:
         _ret["manifests"] = manifests
     return _ret
+
+
+def _write_staging_manifest(staging: Path, dataset_slug: str, timeframe_label: str) -> Optional[Path]:
+    """First-upload proof: per-file rows + sha256 beside dataset-metadata.json.
+
+    The "first-upload proof" gate step is a READ of staging-manifest.json —
+    never a rebuild. Best-effort and never raises: row counts come from
+    parquet footers (no data reads) and per-file failures are recorded
+    inline instead of aborting the manifest. Only *.parquet staging files
+    are hashed (metadata json excluded).
+    """
+    import datetime as _dt_m
+    import hashlib as _hl_m
+
+    staging = Path(staging)
+    files: list = []
+    try:
+        _names = sorted(p.name for p in staging.glob("*.parquet") if p.is_file())
+    except Exception:
+        _names = []
+    for _n in _names:
+        _p = staging / _n
+        _entry: dict = {"name": _n, "rows": None, "sha256": None, "bytes": None}
+        try:
+            _entry["rows"] = int(pq.read_metadata(str(_p)).num_rows)
+        except Exception as _e:
+            _entry["rows_error"] = repr(_e)[:200]
+        try:
+            _entry["bytes"] = int(_p.stat().st_size)
+            _h = _hl_m.sha256()
+            with open(_p, "rb") as _f:
+                for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                    _h.update(_chunk)
+            _entry["sha256"] = _h.hexdigest()
+        except Exception as _e:
+            _entry["sha256_error"] = repr(_e)[:200]
+        files.append(_entry)
+    try:
+        _total = sum(e["rows"] for e in files if isinstance(e.get("rows"), int))
+    except Exception:
+        _total = None  # totals never raise
+    manifest = {
+        "dataset": dataset_slug,
+        "timeframe": timeframe_label,
+        "built_at_utc": _dt_m.datetime.now(_dt_m.timezone.utc).isoformat(),
+        "builder": "bounded-worker (08ea3d4: column-projected, date-partitioned, 60s progress, 1800s timeout/420s api budget, fail-closed, tmp+rename)",
+        "total_rows": _total,
+        "files": files,
+    }
+    try:
+        import json as _js_m
+
+        _tmp = staging / "staging-manifest.json.tmp"
+        _tmp.write_text(_js_m.dumps(manifest, indent=2))
+        _os_replace_safe(_tmp, staging / "staging-manifest.json")
+        return staging / "staging-manifest.json"
+    except Exception as _e:
+        print(f"[export] WARN staging manifest unwritable: {_e}")
+        return None
+
+
+def prepare_kaggle_staging_15m(
+    data_dir: str | Path,
+    staging_dir: str | Path | None = None,
+    assets: List[str] | None = None,
+    l2_levels: int = 10,
+    dataset_prefix: str = "gghgg1/polymarket-15m-crypto",
+    rolling_window: bool = False,
+    cutoff_ts: Optional[float] = None,
+    manifests: Optional[dict] = None,
+    datasets: List[str] | None = None,
+    enabled: bool = False,
+) -> dict:
+    """Prepare Kaggle staging for the 15m lane — BUILT but LOCKED (disabled).
+
+    Thin wrapper over prepare_kaggle_staging_5m (same bounded-worker path:
+    column-projected reads, date-partitioned streaming, 60s progress logs,
+    1800s worker timeout / 420s Data-API budget, RSS cap, fail-closed
+    coverage manifests, atomic tmp+rename; ts_source coerced to int64
+    epoch-ms by _normalize_ts_source_int in the streaming transform).
+    No 4h/1d builder is added here — out of scope.
+
+    Enablement is a double gate, never automatic: the caller must pass
+    enabled=True AND the operator must have run
+      python -m polymarket_collector.verify_gate --probe-timeframes --timeframes 15m
+    (15m ENABLE) with 24h live >80% on 5m/1h. Without enabled=True this
+    raises RuntimeError and builds nothing (fail-closed).
+
+    On success also writes staging-manifest.json (per-file rows + sha256)
+    so first-upload proof is a read, not a re-run. Real data only: the
+    lane filter ({ASSET}-15m series) passes hive rows through; nothing is
+    invented — honest gaps stay gaps.
+    """
+    if not enabled:
+        raise RuntimeError(
+            "15m lane LOCKED: pass enabled=True only after "
+            "`verify_gate --probe-timeframes --timeframes 15m` reports ENABLE "
+            "and 24h live >80% on 5m/1h (see config/collector.yaml timeframes comment)."
+        )
+    prep = prepare_kaggle_staging_5m(
+        data_dir, staging_dir=staging_dir, assets=assets, l2_levels=l2_levels,
+        dataset_prefix=dataset_prefix, timeframe_label="15m",
+        rolling_window=rolling_window, cutoff_ts=cutoff_ts, manifests=manifests,
+        **({"datasets": datasets} if datasets is not None else {}),
+    )
+    try:
+        _mp = _write_staging_manifest(Path(prep["staging_path"]), dataset_prefix, "15m")
+    except Exception as _e:
+        print(f"[export] WARN 15m staging manifest failed (best-effort): {_e}")
+        _mp = None
+    prep["staging_manifest"] = str(_mp) if _mp else None
+    return prep
 
 
 def _try_merge_prior_kaggle_staging(staging: Path, dataset: str, assets: List[str] | None, l2_levels: int = 10) -> None:

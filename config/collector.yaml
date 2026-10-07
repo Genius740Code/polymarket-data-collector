@@ -195,6 +195,23 @@ timeframes:
   # 2026-10-02 triage: 5 lanes -> 5m+1h (fleet death spiral: 47
   # disconnects/min, scheduler_lag 20/min, live 0.2%, CPU 95%). 35 lanes
   # back only after 2-lane live >80% for 24h + dual-WS wired. History above.
+  # 2026-10-07 15m lane BUILT, LOCKED (not enabled): staging builder is
+  # storage/export.py prepare_kaggle_staging_15m — thin wrapper over the
+  # 08ea3d4 bounded-worker path (column-projected, date-partitioned, 60s
+  # progress logs, 1800s worker timeout / 420s Data-API budget, fail-closed,
+  # tmp+rename). 4h/1d builders OUT OF SCOPE — their kaggle_staging dirs are
+  # stale pre-2026-09-21 five-lane remnants, leave untouched.
+  # ENABLE (explicit flag + gate, never auto):
+  #   python -m polymarket_collector.verify_gate --probe-timeframes --timeframes 15m
+  # must report 15m ENABLE, AND 24h live >80% on 5m/1h (now ~16%: NOT met);
+  # then uncomment `- 15m` below AND pass enabled=True to the staging call.
+  # First-upload proof is a read: staging-manifest.json (per-file rows +
+  # sha256) is written beside dataset-metadata.json.
+  # RETENTION MATH (3 lanes): cadence 3x1800s = 1.5h vs 6h retention = 4x
+  # headroom (>= 2x guard requirement: stays silent). Data disk 98G / 62G
+  # free; 15m staging bounded ~= 5m staging (1.7G worst case). No retention
+  # change; guard stays silent-deny (fail-closed prune) — do NOT weaken it.
+  # - 15m  # LOCKED — see above
   - 5m
   - 1h
 
