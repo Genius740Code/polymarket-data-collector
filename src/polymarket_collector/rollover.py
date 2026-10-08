@@ -1062,6 +1062,15 @@ class RolloverManager:
             was_next_none = state.next is None
             state.current = state.next
             state.next = None
+            # 2026-10-08 fresh-window fast discovery: promotion is the settle
+            # event observable inside this manager — drop the discovery
+            # throttle so the next tick polls Gamma for the fresh window
+            # immediately instead of riding out backoff grown on the old one.
+            state.last_discovery_attempt_ms = None
+            try:
+                discovery._backoff_s = discovery.poll_interval
+            except Exception:
+                pass
             state.is_rollover_window = False
             state.rollover_miss_logged = False
             state.rollover_started_for_ts = None
@@ -1224,6 +1233,46 @@ class RolloverManager:
             if ev and first_event is None:
                 first_event = ev
         return first_event
+
+    def notify_settlement(self, asset: str, now_ms: Optional[int] = None, tf: Optional[str] = None) -> int:
+        """Immediate-discovery trigger for resolution-settle events (2026-10-08).
+
+        Mass resolution opens a fresh window whose makers have not quoted yet:
+        without this, the poll loop waits out discovery backoff grown on the
+        old window before even asking Gamma for the new slug. Drops the
+        per-lane throttle (last attempt + backoff) so the next check_and_roll
+        polls immediately. tf=None resets every enabled lane for the asset.
+        Returns lanes reset. Never raises.
+        """
+        reset = 0
+        try:
+            au = asset.upper()
+        except Exception:
+            return 0
+        try:
+            lanes = [(tf or "").lower()] if tf else self.enabled_lane_labels()
+        except Exception:
+            return 0
+        for lane in lanes:
+            try:
+                state = self.states.get((au, lane))
+                disc = self.discoveries.get(lane)
+                if state is None or disc is None:
+                    continue
+                state.last_discovery_attempt_ms = None
+                try:
+                    disc._backoff_s = disc.poll_interval
+                except Exception:
+                    pass
+                reset += 1
+            except Exception:
+                continue
+        if reset and self.on_event:
+            try:
+                self.on_event("settlement_discovery", {"asset": au, "lanes": reset})
+            except Exception:
+                pass
+        return reset
 
     def active_markets(self, asset: str) -> List[MarketInfo]:
         """Union of current+next across ENABLED lanes for the asset (1 or 2 per

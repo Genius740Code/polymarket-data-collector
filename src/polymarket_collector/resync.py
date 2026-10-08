@@ -58,6 +58,39 @@ def _now_iso() -> str:
     return datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# WS-provisional promotion (2026-10-08): a never-before-seen market whose REST
+# L2 returns None (fresh window, makers not quoting yet) reads stale for
+# minutes while WS streams. After WS_PROVISIONAL_MIN_FRAMES consecutive
+# consistent WS book frames (identical two-sided sane top-of-book), the book
+# may read live provisionally. Snapshots carry no provenance column
+# (book_state + resync_id only), so promotion still requires a real two-sided
+# book and the provisional origin is recorded on the resync_completed event
+# for downstream to distinguish. No frames observed → no promotion
+# (fail-closed: no book is ever marked live without observed levels).
+WS_PROVISIONAL_MIN_FRAMES = 3
+
+
+def ws_provisional_eligible(bid: Any, ask: Any) -> bool:
+    """Two-sided sane gate for provisional promotion (total, never raises).
+
+    Accepts only finite prices with 0 <= bid < ask <= 1. One-sided books,
+    crossed books, NaN/None and out-of-range levels are refused — the caller
+    keeps the book stale. Bounds alone reject NaN/inf (all comparisons on
+    NaN are False, inf exceeds 1).
+    """
+    try:
+        b = float(bid)
+        a = float(ask)
+    except (TypeError, ValueError):
+        return False
+    except Exception:
+        return False
+    try:
+        return bool(0.0 <= b < a <= 1.0)
+    except Exception:
+        return False
+
+
 def exponential_backoff(attempt: int, initial_ms: int, max_ms: int, jitter: bool = True) -> float:
     """Return backoff in seconds for attempt (0-indexed)."""
     delay_ms = min(initial_ms * (2 ** attempt), max_ms)
@@ -140,6 +173,15 @@ class ResyncManager:
         # entry so the reconnect walk is not starved (each dead drive used to
         # burn the full max_resync_duration per book before the WS reconnect).
         self._rate_limited_until: Dict[str, float] = {}
+        # WS-provisional promotion (2026-10-08): condition_id ->
+        # {"bid": float, "ask": float, "streak": int} of consecutive consistent
+        # WS book frames. Popped on promotion or REST verification; overflow
+        # evicts the oldest entry (map stays bounded under lane churn).
+        self._ws_provisional: Dict[str, dict] = {}
+        # Conditions ever verified by a successful REST fetch. Provisional
+        # promotion is reserved for never-before-seen markets — a book REST
+        # once verified stays under REST discipline. Opportunistically pruned.
+        self._rest_verified: Dict[str, float] = {}
         # 2026-09-25 stale-epidemic fix: per-asset newest LIVE buffer id.
         # newest_open_buffer_id() runs on EVERY WS message; the old
         # reversed(list(_episodes.keys())) scan allocated an O(N) list per
@@ -257,6 +299,192 @@ class ResyncManager:
             self._fetch_none_quiet_until.pop(str(condition_id), None)
         except Exception:
             pass
+        # REST truth supersedes any provisional streak for this condition and
+        # records it as REST-verified, so later degradations keep REST
+        # discipline instead of re-entering the provisional path.
+        try:
+            cid = str(condition_id)
+        except Exception:
+            return
+        try:
+            self._ws_provisional.pop(cid, None)
+        except Exception:
+            pass
+        try:
+            if len(self._rest_verified) >= 2000:
+                for _k in list(self._rest_verified.keys())[:1000]:
+                    self._rest_verified.pop(_k, None)
+            self._rest_verified[cid] = time.monotonic()
+        except Exception:
+            pass
+
+    def reset_ws_provisional(self, condition_id: str) -> None:
+        """Drop the provisional frame streak for a condition (never raises)."""
+        try:
+            self._ws_provisional.pop(str(condition_id), None)
+        except Exception:
+            pass
+
+    def note_ws_frame(self, condition_id: str, bid: Any, ask: Any) -> int:
+        """Record one WS book frame's top-of-book; returns the consecutive streak.
+
+        An eligible frame identical to the previous one extends the streak; a
+        changed top-of-book restarts it at 1; an ineligible frame clears it to
+        0 (same-tick consistency). Never raises.
+        """
+        try:
+            cid = str(condition_id)
+        except Exception:
+            return 0
+        try:
+            if not ws_provisional_eligible(bid, ask):
+                self._ws_provisional.pop(cid, None)
+                return 0
+            b = float(bid)
+            a = float(ask)
+        except Exception:
+            try:
+                self._ws_provisional.pop(cid, None)
+            except Exception:
+                pass
+            return 0
+        try:
+            prev = self._ws_provisional.get(cid)
+            if isinstance(prev, dict) and prev.get("bid") == b and prev.get("ask") == a:
+                try:
+                    streak = int(prev.get("streak", 0) or 0) + 1
+                except Exception:
+                    streak = 1
+            else:
+                streak = 1
+            if cid not in self._ws_provisional and len(self._ws_provisional) >= 2000:
+                try:
+                    self._ws_provisional.pop(next(iter(self._ws_provisional)), None)
+                except Exception:
+                    pass
+            self._ws_provisional[cid] = {"bid": b, "ask": a, "streak": streak}
+            return streak
+        except Exception:
+            return 0
+
+    def should_promote_provisional(self, condition_id: str) -> bool:
+        """True once N consecutive consistent frames are banked (never raises).
+
+        Refuses REST-verified conditions (REST discipline owns those) and
+        anything below WS_PROVISIONAL_MIN_FRAMES — revalidating the banked
+        frame so a corrupted entry can never promote.
+        """
+        try:
+            cid = str(condition_id)
+        except Exception:
+            return False
+        try:
+            if cid in self._rest_verified:
+                return False
+            cur = self._ws_provisional.get(cid)
+            if not isinstance(cur, dict):
+                return False
+            try:
+                streak = int(cur.get("streak", 0) or 0)
+            except Exception:
+                return False
+            if streak < WS_PROVISIONAL_MIN_FRAMES:
+                return False
+            return ws_provisional_eligible(cur.get("bid"), cur.get("ask"))
+        except Exception:
+            return False
+
+    def try_ws_provisional_promote(
+        self,
+        condition_id: str,
+        books: Dict[str, Any],
+        bid: Any,
+        ask: Any,
+        resync_id: Optional[str] = None,
+    ) -> bool:
+        """Promote a REST-blind fresh-market book on consistent WS frames.
+
+        Records the frame via note_ws_frame and, once should_promote holds,
+        marks the book live — but only on a real two-sided book (the eligible
+        gate above); a missing book returns False and stays stale
+        (fail-closed). Already-live returns True with no event. On promotion
+        the linked open episode (when supplied) is completed honestly and a
+        resync_completed event carries provisional=True + verified="ws" so
+        downstream distinguishes it from REST-verified heals via
+        collector_events (snapshots have no provenance column). Never raises.
+        """
+        try:
+            cid = str(condition_id)
+        except Exception:
+            return False
+        try:
+            self.note_ws_frame(cid, bid, ask)
+        except Exception:
+            return False
+        if not self.should_promote_provisional(cid):
+            return False
+        try:
+            book = (books or {}).get(cid)
+        except Exception:
+            return False
+        if book is None:
+            return False
+        try:
+            _st = getattr(getattr(book, "book_state", None), "value", "")
+        except Exception:
+            return False
+        if _st == "live":
+            return True
+        if _st not in ("stale", "resyncing"):
+            return False
+        try:
+            book.mark_live()
+        except Exception:
+            return False
+        try:
+            if self.on_book_state_change:
+                self.on_book_state_change(book, BookState.live)
+        except Exception:
+            pass
+        try:
+            self._ws_provisional.pop(cid, None)
+        except Exception:
+            pass
+        if resync_id is not None:
+            try:
+                if not self.is_finished(resync_id):
+                    ep = self._episodes.get(resync_id)
+                    if ep is not None:
+                        if ep.reconnect_ts_utc is None:
+                            try:
+                                self.handle_reconnect(resync_id)
+                            except Exception:
+                                pass
+                        ep.resync_completed_ts_utc = _now_iso()
+                        if self.on_event:
+                            try:
+                                self.on_event(CollectorEventType.resync_completed, ep.to_dict())
+                            except Exception:
+                                pass
+                        self._safe_persist(ep.to_dict(), "ws_provisional_completed")
+                        self._buffers.pop(resync_id, None)
+                        self._buffer_deadline.pop(resync_id, None)
+                        self._buffer_retired.discard(resync_id)
+            except Exception:
+                pass
+        if self.on_event:
+            try:
+                self.on_event(CollectorEventType.resync_completed, {
+                    "resync_id": resync_id,
+                    "asset": getattr(book, "asset", None),
+                    "condition_id": cid,
+                    "provisional": True,
+                    "verified": "ws",
+                    "frames": WS_PROVISIONAL_MIN_FRAMES,
+                })
+            except Exception:
+                pass
+        return True
 
     def market_ended(self, condition_id: str):
         """True if the condition's window ended, False if open, None if unknown.
