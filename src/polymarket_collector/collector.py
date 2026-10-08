@@ -3025,6 +3025,39 @@ class Collector:
                             CollectorEventType.book_anomaly,
                             {"asset": msg_asset, "ws_error": str(e)},
                         )
+                # WS-provisional promotion (2026-10-08): a fresh market whose
+                # REST L2 returns None reads stale while WS streams. After 3
+                # consecutive consistent two-sided sane frames the book may
+                # read live provisionally — gaps only, never a downgrade or
+                # an override of a REST-verified book (REST discipline owns
+                # those; the gate below never banks a frame on them and
+                # try_ refuses them too). try_ records the frame itself via
+                # note_ws_frame, so no separate note call here (that would
+                # bank two frames per message). Best-effort, never raises.
+                try:
+                    _pcid = getattr(book, "condition_id", None)
+                    _pstate = getattr(getattr(book, "book_state", None), "value", "")
+                    try:
+                        _rest_seen = _pcid in (getattr(self.resync, "_rest_verified", None) or {})
+                    except Exception:
+                        _rest_seen = False
+                    if _pcid and _pstate in ("stale", "resyncing") and not _rest_seen:
+                        try:
+                            _ptops = book.tops()
+                            _pb, _pa = _ptops[0][0], _ptops[1][0]
+                            if _pb is None or _pa is None:
+                                _pb, _pa = _ptops[2][0], _ptops[3][0]
+                        except Exception:
+                            _pb, _pa = None, None
+                        if _pb is not None and _pa is not None:
+                            try:
+                                self.resync.try_ws_provisional_promote(
+                                    _pcid, self.books, _pb, _pa,
+                                    resync_id=getattr(book, "resync_id", None))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             # Message-level asset for the trade/resync paths below (first
             # applied book's asset, else shard fallback).
@@ -6246,6 +6279,15 @@ class Collector:
                         self.markets_log.append(row)
                         self._resolved_cids.add(cid)
                         print(f"[resolution] {m.asset} window {m.window_index} resolved {outcome} (settlement {end_price} vs open {start_price})")
+                        # Settle-triggered immediate discovery poll (2026-10-08):
+                        # mass resolution opens a fresh window — drop the lane
+                        # throttle so Gamma is polled at once, not after old
+                        # backoff. Best-effort: never slows or breaks resolve.
+                        try:
+                            self.rollover.notify_settlement(
+                                m.asset, tf=getattr(m, "window_label", None))
+                        except Exception:
+                            pass
                     elif now_ms >= m.market_end_ts_ms + wait_ms and cid not in self._resolution_stuck_emitted:
                         self._resolution_stuck_emitted.add(cid)
                         self._collector_event(CollectorEventType.resolution_stuck, {
