@@ -1253,12 +1253,14 @@ class Collector:
         return healed
 
     def _row_episode_id(self, book, asset: str, condition_id: str | None, reason: str):
-        """Joined resync_id for a snapshot row (never raises, never orphans).
+        """Joined resync_id for a snapshot row: ROW-ONLY (never raises, never mutates).
 
-        Prefers the book's rid when it joins resync_episodes, else the newest
-        open episode, else ensures one (find-or-create). Returns None only
-        when no episode could be established — the row then carries NULL
-        (honest missing, never a fake uuid4 join).
+        Reuses the book's rid when it joins resync_episodes, else the newest
+        open episode, else the book's last-known rid (or None). Never mints
+        an episode and never touches RAM liveness (no handle_disconnect, no
+        mark_stale, no resync_id re-point) — liveness is owned solely by the
+        WS/REST/promotion paths. A row may therefore carry an orphan rid or
+        NULL; that is the book's honest tag, never a fabricated join.
         """
         try:
             _rid = getattr(book, "resync_id", None)
@@ -1273,7 +1275,7 @@ class Collector:
         except Exception:
             pass
         try:
-            return self._ensure_episode_for_stale_book(book, asset, reason)
+            return getattr(book, "resync_id", None)
         except Exception:
             return None
 
