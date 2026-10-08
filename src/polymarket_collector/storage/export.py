@@ -1279,6 +1279,24 @@ def _backfill_null_series_ids(table, data_dir, dataset: str = ""):
         return table, 0
 
 
+def _union_field_add(union_fields: dict, union_order: list, name: str, ftype) -> None:
+    """Trades pre-pass union-schema accumulate (pure, module level for tests).
+
+    Columns only ever accumulate; first non-null type wins — identical to the
+    legacy concat-promote output schema for the common case. Named helper so
+    the rule is pinned by tests; output schema semantics unchanged.
+    Never raises.
+    """
+    try:
+        if name not in union_fields:
+            union_fields[name] = ftype
+            union_order.append(name)
+        elif union_fields[name] == pa.null() and ftype != pa.null():
+            union_fields[name] = ftype
+    except Exception:
+        pass
+
+
 def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, *,
                                   deadline_s=None, cutoff_ts=None, io_stats=None) -> int:
     """Bounded-RAM streaming trades staging build (2026-09-11).
@@ -1350,8 +1368,15 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
             return True
         return r.get("outcome") in (None, "", "unknown")
 
+    try:
+        from ..validation import coerce_ts_source_ms as _coerce_ms
+    except Exception:
+        _coerce_ms = None
+
     def _ts_ms_of(v):
         try:
+            if _coerce_ms is not None:
+                return _coerce_ms(v)
             f = float(v)
             return int(f if f > 1e11 else f * 1000)
         except Exception:
@@ -1374,11 +1399,20 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     # FileMetaData.schema, which pins ~250KB/call in pyarrow 25).
     _union_fields: dict = {}
     _union_order: list = []
+    # C7 follow-up (rss-cap-abort 2026-10-08: all 6 TRADES workers died in
+    # THIS pre-pass over thousands of tiny hive files): footer schema reads
+    # are leak-free, but each read_table + to_pylist leaves ~2MB of
+    # freed-but-untrimmed glibc heap — the same growth that tripped the cap
+    # before stream_batches got its trim. Trim every 25 files (was 100: a
+    # ~200MB sawtooth on top of a ~1GB collector) + progress every 100 files
+    # (60s-pattern fields: files/elapsed/rss) so stalls are visible in the
+    # worker log tail. have-set/ctx stay COMPLETE (every file still visited);
+    # union semantics unchanged (columns accumulate, first non-null wins).
+    _TRIM_EVERY = 25
+    _pre_t0 = _time_s.time()
+    _pre_n = len(files)
     for _pre_i, p in enumerate(files):
-        # C7 follow-up: the pre-pass opens every hive file (3526 tiny BTC
-        # trades files) with no heap return — same 2MB/file untrimmed growth
-        # that tripped the rss-cap before stream_batches got its trim.
-        if _pre_i and _pre_i % 100 == 0:
+        if _pre_i and _pre_i % _TRIM_EVERY == 0:
             try:
                 _gc_s.collect()
             except Exception:
@@ -1387,6 +1421,19 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                 _malloc_trim()
             except Exception:
                 pass
+        if _pre_i and _pre_i % 100 == 0:
+            try:
+                _rss = None
+                with open("/proc/self/status") as _sf:
+                    for _sl in _sf:
+                        if _sl.startswith("VmRSS:"):
+                            _rss = int(_sl.split()[1]) // 1024
+                            break
+            except Exception:
+                _rss = None
+            print(f"[export:worker] progress {asset_upper}/trades pre-pass: "
+                  f"{_pre_i}/{_pre_n} files elapsed={int(_time_s.time() - _pre_t0)}s"
+                  + (f" rss={_rss}MB" if _rss is not None else ""), flush=True)
         try:
             try:
                 _sch = pq.read_schema(str(p))
@@ -1394,11 +1441,7 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                 _sch = None
             if _sch is not None:
                 for _fld in _sch:
-                    if _fld.name not in _union_fields:
-                        _union_fields[_fld.name] = _fld.type
-                        _union_order.append(_fld.name)
-                    elif _union_fields[_fld.name] == pa.null() and _fld.type != pa.null():
-                        _union_fields[_fld.name] = _fld.type
+                    _union_field_add(_union_fields, _union_order, _fld.name, _fld.type)
             try:
                 t = pq.read_table(str(p), columns=[c for c in _PRE_COLS
                                                    if _sch is None or c in _sch.names])
