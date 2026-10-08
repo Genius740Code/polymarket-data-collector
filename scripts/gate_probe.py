@@ -32,6 +32,20 @@ SEVEN_ASSETS = ["BTC", "ETH", "SOL", "DOGE", "HYPE", "XRP", "BNB"]
 GRID_NS = 500_000_000
 
 # ---------------------------------------------------------------------------
+# Named thresholds with rationale comments
+# ---------------------------------------------------------------------------
+
+# Deviation must exceed a quarter of the combined spread AND the 0.001 floor.
+# Combined spread = (up_ask - up_bid) + (down_ask - down_bid); this flags
+# complementarity that exceeds what illiquidity (wide spreads) alone would cause.
+SPREAD_FRAC = 0.25
+
+# Minimum deviation threshold for complementarity checks; prevents flagging
+# rows where the midpoint is essentially at 1.0 even with small floating-point
+# drift.
+DEV_FLOOR = 0.001
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -45,6 +59,10 @@ class LaneResult:
     comp_live_gt_01_pct: float  # share with deviation > 0.1pp, live rows only
     comp_stale_gt_01_pct: float  # share with deviation > 0.1pp, stale/resyncing rows
     null_mid_count: int  # rows where any price is null (guarded, never imputed)
+    comp_spread_norm_pct: float  # live rows flagged by CompSpreadNorm (> quarter spread + 0.001 floor)
+    live_null_no_book_count: int  # live rows where all 4 prices are null (pre-discovery, stale-like)
+    live_null_partial_count: int  # live rows where some but not all prices are null (real anomaly)
+    live_null_partial_examples: List[int]  # up to 3 example ts_ns of LiveNullPartial rows
     dup_snapshot_id_count: int  # duplicate snapshot_id count
     offgrid_count: int  # off-grid ts count
     part_flag: bool  # PARTIAL -> lane hit timeout
@@ -226,6 +244,14 @@ def analyze_lane(
     complement_checkable_stale = 0
     checkable_count = 0  # overall checkable count (kept for backward compat)
 
+    # CompSpreadNorm tracking for live rows with all-4-prices present
+    comp_spread_norm_count = 0  # live rows flagged by CompSpreadNorm
+
+    # Live null-mid classification
+    live_null_no_book_count = 0  # live rows where all 4 prices are null
+    live_null_partial_count = 0  # live rows where some but not all are null
+    live_null_partial_examples: List[int] = []  # up to 3 example ts_ns
+
     for r in all_rows:
         ob = r["up_bid"]
         ua = r["up_ask"]
@@ -238,13 +264,25 @@ def analyze_lane(
         is_live = book_state == "live"
 
         if has_null:
-            null_mid_count += 1
+            null_mid_count += 1  # guarded, never impute (existing behavior)
+
+            # Classify live null mid rows
+            if is_live:
+                all_null = (ob is None and ua is None and db is None and da is None)
+                if all_null:
+                    live_null_no_book_count += 1
+                else:
+                    live_null_partial_count += 1
+                    if len(live_null_partial_examples) < 3:
+                        live_null_partial_examples.append(r["ts_snapshot_ns"])
             continue  # never impute
 
-        # All four present — compute midpoint complementarity
+        # All four present — compute midpoint complementarity and CompSpreadNorm
         try:
-            mid = (float(ob) + float(ua)) / 2.0 + (float(db) + float(da)) / 2.0
-            deviation = abs(mid - 1.0)
+            up_mid = (float(ob) + float(ua)) / 2.0
+            down_mid = (float(db) + float(da)) / 2.0
+            deviation = abs(up_mid + down_mid - 1.0)
+            combined_spread = (float(ua) - float(ob)) + (float(da) - float(db))
         except (TypeError, ValueError):
             null_mid_count += 1
             continue
@@ -253,11 +291,19 @@ def analyze_lane(
         if deviation > 0.001:
             complement_count += 1  # overall complement count (kept for backward compat)
 
+        # CompSpreadNorm: flag live row when deviation exceeds quarter spread + 0.001 floor
+        spread_norm_flag = deviation > max(DEV_FLOOR, SPREAD_FRAC * combined_spread)
+        if is_live and spread_norm_flag:
+            comp_spread_norm_count += 1
+
         # Split by book_state for the new columns
         if is_live:
             complement_checkable_live += 1
             if deviation > 0.001:
                 complement_count_live += 1
+            # CompSpreadNorm count for live rows
+            if spread_norm_flag:
+                comp_spread_norm_count += 1
         else:
             # stale or resyncing
             complement_checkable_stale += 1
@@ -296,6 +342,12 @@ def analyze_lane(
         comp_live_gt_01_pct=round(comp_live_gt_01_pct, 2),
         comp_stale_gt_01_pct=round(comp_stale_gt_01_pct, 2),
         null_mid_count=null_mid_count,
+        comp_spread_norm_pct=round(
+            (comp_spread_norm_count / complement_checkable_live * 100) if complement_checkable_live > 0 else 0.0, 2
+        ),
+        live_null_no_book_count=live_null_no_book_count,
+        live_null_partial_count=live_null_partial_count,
+        live_null_partial_examples=live_null_partial_examples,
         dup_snapshot_id_count=dups,
         offgrid_count=offgrid_count,
         part_flag=part_flag,
@@ -472,12 +524,13 @@ def main() -> None:
     print()
 
     # Table header
-    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
+    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'CompNorm%':>8} {'LiveNoBook':>9} {'LivePartial':>10} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
     print("-" * 70)
 
     for lr in lane_results:
         part_str = "YES" if lr.part_flag else ""
-        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4}")
+        examples_str = ", ".join(str(ts) for ts in lr.live_null_partial_examples[:3]) if lr.live_null_partial_examples else ""
+        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.comp_spread_norm_pct:>8.1f} {lr.live_null_no_book_count:>9} {lr.live_null_partial_count:>10} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4} {examples_str}")
 
     print()
     print(f"Uploads: {uploads.successful} successful, {uploads.failed} failed (last 60 min)")

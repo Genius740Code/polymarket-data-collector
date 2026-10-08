@@ -11,6 +11,7 @@ import sys
 import os
 import pytest
 from pathlib import Path
+from typing import List
 
 # Add scripts to path so we can import gate_probe
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -19,6 +20,8 @@ from gate_probe import (
     compute_expected_slots,
     compute_actual_slots,
     GRID_NS,
+    DEV_FLOOR,
+    SPREAD_FRAC,
     analyze_lane,
     parse_uploads,
     # UploadVerdict,  # unused at module level; used inline
@@ -182,7 +185,7 @@ def test_null_mid_count_guard():
     ]
     for ob, ua, db, da in prices:
         has_null = ob is None or ua is None or db is None or da is None
-        assert has_null, f"should have detected null"
+        assert has_null, "should have detected null"
     # All present should not trigger has_null
     ob, ua, db, da = 0.5, 0.5, 0.5, 0.5
     has_null = ob is None or ua is None or db is None or da is None
@@ -214,6 +217,101 @@ def test_complement_threshold_edge_001():
     # The key semantic tested: the > 0.001 comparison in analyze_lane
     # correctly classifies rows. The exact 0.001 boundary is a floating point
     # artifact; the test verifies the predicate works for clear cases.
+
+
+def test_comp_spread_norm_wide_spread_pass():
+    """CompSpreadNorm: wide spread should not flag when deviation is small.
+
+    When combined_spread is wide, SPREAD_FRAC * combined_spread raises the
+    threshold above the deviation, so the row is NOT flagged. This prevents
+    false complementarity flags due to ordinary illiquidity.
+    """
+    # up_mid=0.55, down_mid=0.45 -> deviation=0.0
+    # combined_spread = 0.1 + 0.1 = 0.2
+    # threshold = max(0.001, 0.25*0.2) = 0.05
+    # 0.0 > 0.05? No -> NOT flagged (wide-spread pass)
+    ob, ua, db, da = 0.5, 0.6, 0.4, 0.5
+    up_mid = (ob + ua) / 2.0
+    down_mid = (db + da) / 2.0
+    deviation = abs(up_mid + down_mid - 1.0)
+    combined_spread = (ua - ob) + (da - db)
+    threshold = max(DEV_FLOOR, SPREAD_FRAC * combined_spread)
+    flag = deviation > threshold
+    assert flag == False, f"wide spread should not flag, got flag={flag}, deviation={deviation}, threshold={threshold}"
+
+
+def test_comp_spread_norm_tight_spread_breach():
+    """CompSpreadNorm: tight spread should flag modest deviation.
+
+    When combined_spread is narrow, SPREAD_FRAC * combined_spread is small,
+    so even a modest deviation exceeds the threshold and the row IS flagged.
+    """
+    # up_mid=0.5025, down_mid=0.5 -> deviation=0.0025
+    # combined_spread = 0.005 + 0.0 = 0.005
+    # threshold = max(0.001, 0.25*0.005) = 0.00125
+    # 0.0025 > 0.00125? Yes -> flagged (tight-spread breach)
+    ob, ua, db, da = 0.5, 0.505, 0.5, 0.5
+    up_mid = (ob + ua) / 2.0
+    down_mid = (db + da) / 2.0
+    deviation = abs(up_mid + down_mid - 1.0)
+    combined_spread = (ua - ob) + (da - db)
+    threshold = max(DEV_FLOOR, SPREAD_FRAC * combined_spread)
+    flag = deviation > threshold
+    assert flag == True, f"tight spread should flag, got flag={flag}, deviation={deviation}, threshold={threshold}"
+
+
+def test_live_null_split():
+    """LiveNullNoBook vs LiveNullPartial classification by null pattern.
+
+    LiveNullNoBook: all four prices are null (pre-discovery, stale-like).
+    LiveNullPartial: some but not all prices are null (real anomaly).
+    """
+    # Simulate the classification logic from analyze_lane
+    live_null_no_book_count = 0
+    live_null_partial_count = 0
+    live_null_partial_examples: List[int] = []
+
+    # Row where all 4 prices are null, book_state=live
+    r1_ob, r1_ua, r1_db, r1_da = None, None, None, None
+    r1_is_live = True
+    has_null = r1_ob is None or r1_ua is None or r1_db is None or r1_da is None
+    if has_null and r1_is_live:
+        all_null = (r1_ob is None and r1_ua is None and r1_db is None and r1_da is None)
+        if all_null:
+            live_null_no_book_count += 1
+        else:
+            live_null_partial_count += 1
+            live_null_partial_examples.append(12345)
+
+    # Row where only up_ask is null, book_state=live
+    r2_ob, r2_ua, r2_db, r2_da = 0.5, None, 0.5, 0.5
+    r2_is_live = True
+    has_null = r2_ob is None or r2_ua is None or r2_db is None or r2_da is None
+    if has_null and r2_is_live:
+        all_null = (r2_ob is None and r2_ua is None and r2_db is None and r2_da is None)
+        if all_null:
+            live_null_no_book_count += 1
+        else:
+            live_null_partial_count += 1
+            live_null_partial_examples.append(67890)
+
+    # Row where up_bid is null but others present, book_state=live
+    r3_ob, r3_ua, r3_db, r3_da = None, 0.5, 0.5, 0.5
+    r3_is_live = True
+    has_null = r3_ob is None or r3_ua is None or r3_db is None or r3_da is None
+    if has_null and r3_is_live:
+        all_null = (r3_ob is None and r3_ua is None and r3_db is None and r3_da is None)
+        if all_null:
+            live_null_no_book_count += 1
+        else:
+            live_null_partial_count += 1
+            live_null_partial_examples.append(11111)
+
+    assert live_null_no_book_count == 1, f"expected 1 LiveNullNoBook, got {live_null_no_book_count}"
+    assert live_null_partial_count == 2, f"expected 2 LiveNullPartial, got {live_null_partial_count}"
+    assert len(live_null_partial_examples) == 2
+    assert 67890 in live_null_partial_examples
+    assert 11111 in live_null_partial_examples
 
 
 def test_parse_uploads_healthy():
