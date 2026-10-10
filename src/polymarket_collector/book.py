@@ -781,7 +781,10 @@ class OrderBookState:
                 promotable = (has_bid and has_ask) or (self.one_sided_promotion and (has_bid or has_ask))
                 if promotable:
                     if self._well_formed_hash(msg.get("hash")):
+                        _rid = self.resync_id
                         self.mark_live()
+                        if _rid is not None:
+                            self.resync_id = _rid
                     elif self.one_sided_promotion:
                         # Weather decision (audit 2026-09-22): CLOB sends no
                         # hash on ~96% of weather `book` frames, so the strict
@@ -791,7 +794,10 @@ class OrderBookState:
                         # hash — honest via book_anomaly, levels are real
                         # exchange data, never fabricated. Crypto
                         # (one_sided_promotion=False) stays hash-gated.
+                        _rid = self.resync_id
                         self.mark_live()
+                        if _rid is not None:
+                            self.resync_id = _rid
                         promo_note = (f"book_hash_missing_promoted_anyway outcome={outcome} "
                                       f"hash={msg.get('hash')!r} — one-sided weather promotion, levels real")
                     else:
