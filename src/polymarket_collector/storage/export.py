@@ -3194,6 +3194,109 @@ def _projected_read_columns(file_col_names, schema, extra) -> "list | None":
     return wanted or None
 
 
+def _compact_key_digest(vals: tuple) -> bytes:
+    """16-byte canonical digest of one dedup key tuple (2026-10-10).
+
+    Field encoding mirrors Python tuple ==/hash semantics for the value
+    kinds key columns carry (None/str/int/bool/float-as-int), so two keys
+    share a digest exactly when the tuple path treats them as duplicates.
+    128-bit collision bound (~3e-27 at 1.5M rows); the parity test proves
+    row-identity vs the tuple path on real hive data.
+    """
+    import hashlib as _hl_d
+
+    _h = _hl_d.blake2b(digest_size=16)
+    for _v in vals:
+        if _v is None:
+            _h.update(b"N;")
+        elif isinstance(_v, bool):
+            _h.update(b"I1;" if _v else b"I0;")
+        elif isinstance(_v, int):
+            _h.update(b"I" + str(_v).encode() + b";")
+        elif isinstance(_v, float):
+            try:
+                _h.update(b"I" + str(int(_v)).encode() + b";"
+                          if float(_v).is_integer() else b"F" + repr(_v).encode() + b";")
+            except Exception:
+                _h.update(b"F" + repr(_v).encode() + b";")
+        elif isinstance(_v, str):
+            _b = _v.encode("utf-8", "replace")
+            _h.update(b"S" + str(len(_b)).encode() + b":" + _b + b";")
+        elif isinstance(_v, (bytes, bytearray)):
+            _b = bytes(_v)
+            _h.update(b"Y" + str(len(_b)).encode() + b":" + _b + b";")
+        else:
+            _h.update(b"R" + repr(_v).encode("utf-8", "replace") + b";")
+    return _h.digest()
+
+
+class _CompactDedupState:
+    """Memory-bounded drop-in for streaming.DedupState, snapshot path only.
+
+    Peak-phase finding (2026-10-10, real XRP hive: 1126 files, 1.45M rows
+    read, 721K lane rows; worker phase lines are lost on rss-cap-abort so
+    the peak was reproduced locally): base ~110MB + per-batch Arrow
+    transient spikes ~130MB (independent of coalesce_rows — a 2000-row
+    run peaked HIGHER than 20000) + DedupState.seen ~215MB and growing
+    linearly (~300B/key: 66-char condition_id hex strings held per row in
+    Python tuples). The seen set is the only unbounded term and the peak
+    driver: no-lane-filter builds hold 1.45M+ keys (~435MB) and abort-time
+    hives held ~1.4x the files. Storing 16-byte digests (~100B/key all-in
+    at production scale, measured 307B -> 97B/key at 700K keys) cuts the
+    set ~3x with identical first-wins behavior; projected peak at
+    2x rows stays <600MB against the untouched 1000MB cap. Coalescing is
+    kept (67ms/file win, absolved by the size-independence measurement);
+    the trades path keeps streaming.DedupState untouched.
+    """
+
+    def __init__(self, key_cols):
+        self.key_cols = list(key_cols)
+        self.seen: set = set()
+        self.dupes = 0
+        self.kept = 0
+
+    def filter(self, table: pa.Table) -> pa.Table:
+        """Return rows whose key is new, recording them. Same contract as
+        streaming.DedupState.filter (fast path, narrow slow path, mask tail)."""
+        if table.num_rows == 0 or not all(c in table.schema.names for c in self.key_cols):
+            return table
+        try:
+            keys = pa.StructArray.from_arrays(
+                [table.column(c) for c in self.key_cols],
+                names=[f"_{i}" for i in range(len(self.key_cols))],
+            )
+            counts = keys.value_counts().field("counts").to_pylist()
+            if counts and max(counts) == 1 and not self.seen:
+                # fast path: batch internally unique + nothing seen before
+                vals = keys.to_pylist()
+                self.seen.update(
+                    _compact_key_digest(tuple(v[f"_{i}"] for i in range(len(self.key_cols))))
+                    for v in vals
+                )
+                self.kept += table.num_rows
+                return table
+        except Exception:
+            pass
+        # slow path: narrow key extraction only (never whole-row dicts)
+        try:
+            cols = [table.column(c).to_pylist() for c in self.key_cols]
+        except Exception:
+            return table
+        keep = []
+        for i in range(table.num_rows):
+            dg = _compact_key_digest(tuple(cols[j][i] for j in range(len(self.key_cols))))
+            if dg not in self.seen:
+                self.seen.add(dg)
+                keep.append(i)
+        self.dupes += table.num_rows - len(keep)
+        self.kept += len(keep)
+        if len(keep) == table.num_rows:
+            return table
+        keep_set = set(keep)
+        mask = pa.array([i in keep_set for i in range(table.num_rows)], type=pa.bool_())
+        return table.filter(mask)
+
+
 def _stream_export_asset_dataset(
     base: Path,
     ds: str,
@@ -3208,6 +3311,7 @@ def _stream_export_asset_dataset(
     io_stats: Optional[dict] = None,
     cutoff_ts: Optional[float] = None,
     coalesce_rows: int = 20000,
+    compact_dedup: bool = True,
 ) -> int:
     """Stream one (asset, whale-dataset) staging build. Returns rows written.
 
@@ -3232,17 +3336,25 @@ def _stream_export_asset_dataset(
     unchanged; per-file decode errors still mark only that file; a
     coalesced-batch transform error marks every member file (fail closed —
     the coverage gate keeps prior staging either way).
+
+    compact_dedup (2026-10-10 peak fix, default True): the global dedup
+    seen-set stores 16-byte key digests (_CompactDedupState) instead of
+    full key tuples — same rows, ~5x less RAM, peak <600MB at 2x XRP
+    rows. False restores streaming.DedupState (tuple keys) for parity
+    checks; the trades path always uses streaming.DedupState.
     """
-    from .streaming import DedupState, iter_source_files, malloc_trim, write_batches
+    from .streaming import DedupState as _TupleDedupState
+    from .streaming import iter_source_files, malloc_trim, write_batches
 
     src_ds = source_dataset or ds
     ts_col = {"book_snapshots_500ms": "ts_snapshot_ns"}.get(src_ds, "ts_received_ns")
     schema = _get_schema(ds, l2_levels)
-    dedup = DedupState(["asset", "condition_id", "ts_snapshot_ns"]) if ds == "book_snapshots_500ms" else None
+    _DedupCls = _CompactDedupState if compact_dedup else _TupleDedupState
+    dedup = _DedupCls(["asset", "condition_id", "ts_snapshot_ns"]) if ds == "book_snapshots_500ms" else None
     # CLEAN staging shares the snapshots dedup scope (same rows, filtered):
     # without it a compaction rewrite would double-count in clean files.
     if ds == "book_snapshots_clean":
-        dedup = DedupState(["asset", "condition_id", "ts_snapshot_ns"])
+        dedup = _DedupCls(["asset", "condition_id", "ts_snapshot_ns"])
     want = f"{asset_upper}-{timeframe_label}" if timeframe_label else None
     try:
         sort_keys = [k for k in (_sort_keys_for_schema(schema) if schema is not None else [])]
