@@ -1,23 +1,32 @@
 {
-  "n": 0,
+  "n": 1,
   "win%": 0.0,
   "total": 0.0,
   "avg": 0.0,
   "t": 0.0,
-  "coverage%": 0.0,
+  "coverage%": 100.0,
   "skip_breakdown": {
     "stale_old": 0,
-    "spread_high": 5,
-    "other": 5095,
+    "spread_high": 0,
+    "other": 296,
     "post_resolution": 0,
-    "null_quote": 896
+    "null_quote": 301
   },
-  "cex_gated": 47,
-  "theta": 4.0,
+  "cex_gated": 225,
+  "theta": 2.0,
   "fee_rate": 0.07,
   "ask_max": 0.9,
   "max_shares": 100,
-  "T_s": 15,
-  "sample_every": 100,
-  "binance_available": true
+  "T_s": 30,
+  "sample_every": 1,
+  "binance_available": true,
+  "chosen_hours": [
+    "2026-10-09 11:00"
+  ],
+  "chosen_live_shares": [
+    "47.5%"
+  ],
+  "settlement_resolved": 2170,
+  "settlement_total": 2170,
+  "disagreement_count": 0
 }
