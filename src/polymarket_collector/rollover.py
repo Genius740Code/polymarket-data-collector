@@ -231,6 +231,10 @@ class RolloverState:
     # loop2-iter1: mid-window recovery probe bookkeeping
     consecutive_failures: int = 0  # polls with no market while current is None
     last_probe_ms: Optional[int] = None
+    # pre-warm bounded retry (2026-10-10): own 10s throttle + per-window stop
+    # marker so the settle-independent next-slug poll is bounded.
+    prewarm_last_attempt_ms: Optional[int] = None
+    prewarm_done_for_ts: Optional[int] = None
 
     def needs_rollover_lookahead(self, now_ms: int, lead_ms: int) -> bool:
         if not self.current:
@@ -1092,7 +1096,10 @@ class RolloverManager:
             after = state.current.market_end_ts_ms if state.current else now_ms
             # rate-limited polling — don't tight-loop (§1 #7)
             if state.last_discovery_attempt_ms and (now_ms - state.last_discovery_attempt_ms) < int(discovery._backoff_s * 1000):
-                return None
+                # Main poll throttled — fall through to the settle-independent
+                # pre-warm retry (own 10s throttle, bounded stop) instead of
+                # idling until backoff clears.
+                return await self.prewarm_next_window(asset, subscribe_fn, now_ms=now_ms, tf=tf)
             state.last_discovery_attempt_ms = now_ms
             # throttle rollover_started — emit once per window, not every poll (fixes 65k spam)
             # initial discovery phase does NOT emit rollover_started (would spam until first market found)
@@ -1233,6 +1240,110 @@ class RolloverManager:
             if ev and first_event is None:
                 first_event = ev
         return first_event
+
+    # Pre-warm bounded retry (2026-10-10): settle-independent next-slug poll.
+    # Next-window slugs are deterministic (_slug_for is a pure function of
+    # asset + window ts, verified live on Gamma), but Gamma indexes a fresh
+    # slug late — after the lead-window lookahead started and sometimes after
+    # settle. This retries the exact NEXT slug on its own 10s cadence from
+    # T-lead onward with a hard stop at window end +60s, consulting no
+    # settlement state at all. On discovery it subscribes and routes through
+    # the existing notify_settlement path so the fresh window polls at once.
+    PREWARM_RETRY_MS = 10_000
+    PREWARM_STOP_AFTER_END_MS = 60_000
+
+    async def prewarm_next_window(
+        self,
+        asset: str,
+        subscribe_fn: Callable,
+        now_ms: Optional[int] = None,
+        tf: Optional[str] = None,
+    ) -> Optional[str]:
+        """Bounded settle-independent poll for the deterministic NEXT slug.
+
+        Active only in [current.end - lead, current.end + 60s]; at most one
+        Gamma GET per 10s per lane; never raises (returns None on any error).
+        Returns "market_added" on discovery, else None.
+        """
+        try:
+            au = asset.upper()
+            lane = (tf or self.primary_tf).lower()
+            discovery = self.discoveries[lane]
+            lead_ms = int(self.lane_lead_ms[lane])
+            state = self.states[(au, lane)]
+            now = now_ms if now_ms is not None else int(time.time() * 1000)
+        except Exception:
+            return None
+        try:
+            cur = state.current
+            if cur is None:
+                return None  # initial discovery owns the no-current case
+            if state.next is not None:
+                state.prewarm_done_for_ts = int(cur.market_end_ts_ms)
+                return None
+            end_ms = int(cur.market_end_ts_ms)
+            if state.prewarm_done_for_ts == end_ms:
+                return None
+            if now < end_ms - lead_ms:
+                return None  # before T-lead: lookahead has not started
+            if now > end_ms + self.PREWARM_STOP_AFTER_END_MS:
+                state.prewarm_done_for_ts = end_ms  # bounded stop: give up
+                return None
+            if (
+                state.prewarm_last_attempt_ms is not None
+                and now - state.prewarm_last_attempt_ms < self.PREWARM_RETRY_MS
+            ):
+                return None
+            state.prewarm_last_attempt_ms = now
+            # rollover_started emission mirrors the lookahead path (once per
+            # target window) so audits count pre-warm and poll discovery once.
+            should_emit = state.rollover_started_for_ts != end_ms
+            if should_emit and self.on_event:
+                try:
+                    self.on_event("rollover_started", {"asset": au, "after_ts_ms": end_ms})
+                except Exception:
+                    pass
+                state.rollover_started_for_ts = end_ms
+            # strict_adjacent: only the adjacent slug is eligible while the
+            # window is live (no-skip rule — never adopt a farther window).
+            found = await discovery.fetch_next_market(au, end_ms, strict_adjacent=True)
+            if found is None:
+                return None
+            state.prewarm_done_for_ts = end_ms
+            state.rollover_started_for_ts = None
+            state.next = found
+            if state.current is not None:
+                state.is_rollover_window = True
+            try:
+                await subscribe_fn(found)
+            except Exception as e:
+                if self.on_event:
+                    try:
+                        self.on_event("subscription_failed", {
+                            "asset": au,
+                            "condition_id": found.condition_id,
+                            "error": repr(e),
+                        })
+                    except Exception:
+                        pass
+            if self.on_event:
+                try:
+                    self.on_event("market_added", {
+                        "asset": au,
+                        "condition_id": found.condition_id,
+                        "via": "prewarm",
+                    })
+                except Exception:
+                    pass
+            # Existing settle path: drops the lane throttle (+ emits
+            # settlement_discovery) so the fresh window is polled at once.
+            try:
+                self.notify_settlement(au, tf=lane)
+            except Exception:
+                pass
+            return "market_added"
+        except Exception:
+            return None
 
     def notify_settlement(self, asset: str, now_ms: Optional[int] = None, tf: Optional[str] = None) -> int:
         """Immediate-discovery trigger for resolution-settle events (2026-10-08).
