@@ -7,6 +7,7 @@ S1 PARAMETERS LOCKED (assert equality with docs/S1_CEX_LEADLAG_SPEC.md):
   MAX_ASK=0.90, FEE_R=0.07. No deviations — assert equality in comment block below.
 """
 import csv
+import gc
 import glob as _glob
 import json
 import os
@@ -173,7 +174,7 @@ seen_conditions = set()
 # Accumulators
 total_rows = 0
 live_rows = 0
-total_generated = 0
+generated = 0          # total rows entering the sequential loop (after static filters)
 signals_taken = 0
 wins = 0
 total_pnl = 0.0
@@ -236,6 +237,7 @@ for fi, f in enumerate(hour_files):
                        t_rem_mask & ask_max_mask & ask_pos_mask & depth_mask)
 
         n_pass = int(static_pass.sum())
+        generated += n_pass      # track total rows entering sequential loop
         pass_indices = df.index[static_pass.values]
 
         # --- Sequential loop over rows passing static filters ---
@@ -274,16 +276,16 @@ for fi, f in enumerate(hour_files):
             # --- CEX ret(BIN_T) ---
             if binance_available:
                 t_idx = int(ts_ns / 1_000_000)  # ns -> ms for Binance index
-                B_t = binance_closes.get(t_idx, None)
-                B_tminT = binance_closes.get(t_idx - BIN_T * 1000, None)
+                # Round to nearest second since Binance 1s closes are at integer-second boundaries
+                t_idx_rounded = (t_idx // 1000) * 1000
+                B_t = binance_closes.get(t_idx_rounded, None)
+                B_tminT = binance_closes.get(t_idx_rounded - BIN_T * 1000, None)
                 if B_t is None or B_tminT is None:
                     cex_gated += 1
-                    skip_counts["other"] += 1
                     continue
                 cex_ret = (B_t / B_tminT) - 1.0
             else:
                 cex_gated += 1
-                skip_counts["other"] += 1
                 continue
 
             # --- theta: cex_ret > theta ---
@@ -313,7 +315,6 @@ for fi, f in enumerate(hour_files):
                 continue
 
             # --- one position per expiry (first-fire-wins) ---
-            total_generated += 1
             signals_taken += 1
             reason = "signal"
 
@@ -346,7 +347,7 @@ for fi, f in enumerate(hour_files):
 
         # Explicit del and gc between files
         del df, t, pf
-        import gc; gc.collect()
+        gc.collect()
 
         if (fi + 1) % 20 == 0:
             print(f"Processed {fi+1}/{len(hour_files)} files, "
@@ -364,7 +365,21 @@ n = signals_taken
 win_pct = (wins / n * 100) if n else 0.0
 avg_pnl = total_pnl / n if n else 0.0
 t_stat = 0.0
-coverage_pct = (n / total_generated * 100) if total_generated else 0.0
+coverage_pct = (n / generated * 100) if generated else 0.0
+
+# invariant: taken + skips + gated must equal generated exactly
+inv_total = signals_taken + sum(skip_counts.values()) + cex_gated
+if inv_total != generated:
+        taken = signals_taken
+        skips = sum(skip_counts.values())
+        gated = cex_gated
+        print(
+                f"INVARIANT MISMATCH: taken={taken}, "
+                f"skips={skips}, gated={gated}, "
+                f"generated={generated}",
+                file=sys.stderr,
+            )
+        exit(2)
 
 # Disagreement count
 disagreement_count = 0
@@ -396,6 +411,9 @@ summary = {
     "binance_available": binance_available,
     "chosen_hours": [target_hour],
     "chosen_live_shares": [f"{live_rows/total_rows*100:.1f}%" if total_rows > 0 else "0.0%"],
+    # live share: 47.5% counts rows with book_state=="live" per the 500ms grid;
+    # a different metric (99.5% "footer") may count full-tick Snapshots or differ
+    # by hour-boundary timezone alignment — see the task note on row population mismatch.
     "settlement_resolved": sum(1 for v in settlement.values() if v is not None),
     "settlement_total": len(settlement),
     "disagreement_count": disagreement_count,
@@ -412,7 +430,7 @@ total_display = f"total=${total_pnl:.4f}"
 avg_display = f"avg=${avg_pnl:.6f}"
 t_display = f"t={t_stat:.3f}"
 print(f"{n_display}, {win_display}, {total_display}, {avg_display}, {t_display}", flush=True)
-print(f"coverage%={coverage_pct:.2f}% ({n} taken vs {total_generated} generated)", flush=True)
+print(f"coverage%={coverage_pct:.2f}% ({n} taken vs {generated} generated)", flush=True)
 print(f"skip breakdown: {skip_counts}", flush=True)
 print(f"CEX-gated (no Binance data): {cex_gated}", flush=True)
 h_display = f"chosen hours: {[(target_hour, f'{live_rows/total_rows*100:.1f}%')]}"

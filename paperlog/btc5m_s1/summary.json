@@ -4,15 +4,15 @@
   "total": 0.0,
   "avg": 0.0,
   "t": 0.0,
-  "coverage%": 100.0,
+  "coverage%": 0.17,
   "skip_breakdown": {
     "stale_old": 0,
     "spread_high": 0,
-    "other": 296,
+    "other": 138,
     "post_resolution": 0,
     "null_quote": 301
   },
-  "cex_gated": 225,
+  "cex_gated": 158,
   "theta": 2.0,
   "fee_rate": 0.07,
   "ask_max": 0.9,
