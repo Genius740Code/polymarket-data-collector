@@ -178,9 +178,11 @@ class ResyncManager:
         # WS book frames. Popped on promotion or REST verification; overflow
         # evicts the oldest entry (map stays bounded under lane churn).
         self._ws_provisional: Dict[str, dict] = {}
-        # Conditions ever verified by a successful REST fetch. Provisional
-        # promotion is reserved for never-before-seen markets — a book REST
-        # once verified stays under REST discipline. Opportunistically pruned.
+        # Conditions REST-verified since their last REST success. Provisional
+        # promotion is refused for them (REST discipline owns confirmed
+        # books); a genuine fetch_none (200-empty/404) lifts the entry so a
+        # REST-dead book may re-enter the provisional path until REST
+        # re-confirms (note_fetch_ok re-arms). Bounded + total.
         self._rest_verified: Dict[str, float] = {}
         # 2026-09-25 stale-epidemic fix: per-asset newest LIVE buffer id.
         # newest_open_buffer_id() runs on EVERY WS message; the old
@@ -280,6 +282,26 @@ class ResyncManager:
         """Record a fetch_none; returns streak. >=5 enters 1h terminal quiet."""
         try:
             k = str(condition_id)
+            # Veto relaxation (measured prod 2026-10-10): a genuine REST
+            # failure (200-empty/404 — timeouts and 429s never reach here)
+            # for a condition REST-verified since its last success lifts
+            # the provisional veto. Evidence: span 16:33:59-16:36:43Z held
+            # 2.25 of 17.70 stale-row-minutes (12.7%) on REST-verified
+            # markets whose REST had gone fetch_none while WS streamed a
+            # sane two-sided book (0x91cbeded…: 69s contiguous stale run,
+            # frames applied throughout) — the one-strike-and-forever veto
+            # kept REST-dead books stale for minutes per burst. Membership
+            # is what both should_promote_provisional and the collector's
+            # call-site gate read, so popping it re-opens the provisional
+            # path (promotion still needs 3 consistent frames + two-sided
+            # sanity; provenance stays provisional=True). note_fetch_ok
+            # re-arms on the next REST success or WS-freshness clear, so
+            # REST-healthy confirmed books keep REST discipline. Total:
+            # guarded pop on a plain dict cannot raise.
+            try:
+                self._rest_verified.pop(k, None)
+            except Exception:
+                pass
             n = int(self._fetch_none_streak.get(k, 0) or 0) + 1
             self._fetch_none_streak[k] = n
             if n >= 5:
@@ -301,7 +323,9 @@ class ResyncManager:
             pass
         # REST truth supersedes any provisional streak for this condition and
         # records it as REST-verified, so later degradations keep REST
-        # discipline instead of re-entering the provisional path.
+        # discipline — until a later genuine fetch_none lifts the entry
+        # again (see note_fetch_none) and REST re-confirms on the next
+        # success.
         try:
             cid = str(condition_id)
         except Exception:
@@ -370,9 +394,10 @@ class ResyncManager:
     def should_promote_provisional(self, condition_id: str) -> bool:
         """True once N consecutive consistent frames are banked (never raises).
 
-        Refuses REST-verified conditions (REST discipline owns those) and
-        anything below WS_PROVISIONAL_MIN_FRAMES — revalidating the banked
-        frame so a corrupted entry can never promote.
+        Refuses REST-verified conditions (REST discipline owns those — a
+        genuine fetch_none since the last REST success lifts the entry, see
+        note_fetch_none) and anything below WS_PROVISIONAL_MIN_FRAMES —
+        revalidating the banked frame so a corrupted entry can never promote.
         """
         try:
             cid = str(condition_id)
