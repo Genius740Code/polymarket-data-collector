@@ -25,6 +25,16 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
+try:
+    import httpx
+    HAS_HTTpx = True
+except ImportError:
+    HAS_HTTpx = False
+
+REST_TIMEOUT = httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=2.0) if HAS_HTTpx else None
+
+from .ingest.heal import note_heal_rate_limited
+
 from .book import Level, OrderBookState, snapshot_bucket_ms
 from .clock import check_clock_drift, is_clock_issue
 from .config import CollectorConfig
@@ -332,7 +342,7 @@ class Collector:
             try:
                 import httpx as _httpx
 
-                self._http_rest = _httpx.AsyncClient(timeout=6)
+                self._http_rest = _httpx.AsyncClient(timeout=REST_TIMEOUT)
             except Exception:
                 self._http_rest = None
         return self._http_rest
@@ -1720,7 +1730,7 @@ class Collector:
                 async def _post(url: str, payload: list):
                     if _shared0 is not None:
                         return await _shared0.post(url, json=payload)
-                    async with httpx.AsyncClient(timeout=6) as _c0:
+                    async with httpx.AsyncClient(timeout=REST_TIMEOUT) as _c0:
                         return await _c0.post(url, json=payload)
 
                 _by_tok = {}
@@ -1759,7 +1769,7 @@ class Collector:
             shared = self._get_rest_client()
             if shared is not None:
                 return shared, False
-            return httpx.AsyncClient(timeout=6), True
+            return httpx.AsyncClient(timeout=REST_TIMEOUT), True
         if m:
             _c, _own = _client()
             try:
@@ -1779,7 +1789,10 @@ class Collector:
                                     # streak (5 cumulative → 1h terminal quiet, renewed
                                     # forever → unhealable book).
                                     _ra = _retry_after_s_of(resp, 1.0)
-                                    await asyncio.sleep(_ra)
+                                    await asyncio.sleep(min(_ra, 2.0))
+                                    if _ra > 2.0:
+                                        note_heal_rate_limited(_ra)
+                                        return
                                     resp = await client.get(
                                         self.config.ws.rest_book_url,
                                         params={"token_id": token_id},
@@ -1817,7 +1830,10 @@ class Collector:
                                 # 429 backoff (WS/stale fix 2026-09-26): retry the
                                 # SAME token after the backoff (see owned branch).
                                 _ra = _retry_after_s_of(resp, 1.0)
-                                await asyncio.sleep(_ra)
+                                await asyncio.sleep(min(_ra, 2.0))
+                                if _ra > 2.0:
+                                    note_heal_rate_limited(_ra)
+                                    return
                                 resp = await client.get(
                                     self.config.ws.rest_book_url,
                                     params={"token_id": token_id},
@@ -1971,7 +1987,7 @@ class Collector:
                 async def _post2(url: str, payload: list):
                     if _shared_post is not None:
                         return await _shared_post.post(url, json=payload)
-                    async with _httpx_post.AsyncClient(timeout=6) as _cpost:
+                    async with _httpx_post.AsyncClient(timeout=REST_TIMEOUT) as _cpost:
                         return await _cpost.post(url, json=payload)
 
                 try:
@@ -2058,7 +2074,7 @@ class Collector:
         async def _get(token_id: str):
             if _shared is not None:
                 return await _shared.get(self.config.ws.rest_book_url, params={"token_id": token_id})
-            async with httpx.AsyncClient(timeout=4) as _client:
+            async with httpx.AsyncClient(timeout=REST_TIMEOUT) as _client:
                 return await _client.get(self.config.ws.rest_book_url, params={"token_id": token_id})
         for outcome, token_id in ([("up", market.up_token_id), ("down", market.down_token_id)] if (not _post_healed and not _limited_now) else []):
             try:
@@ -2072,7 +2088,10 @@ class Collector:
                     # after the backoff; a persistent 429 records bounded
                     # rate-limit backoff (NOT fetch_none).
                     _ra = _retry_after_s_of(resp, 1.0)
-                    await asyncio.sleep(_ra)
+                    await asyncio.sleep(min(_ra, 2.0))
+                    if _ra > 2.0:
+                        note_heal_rate_limited(_ra)
+                        return
                     resp = await _get(token_id)
                 if resp.status_code == 429:
                     # persistent 429: bounded rate-limit backoff (NOT fetch_none).
