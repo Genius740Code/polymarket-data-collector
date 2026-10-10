@@ -729,7 +729,13 @@ class OrderBookState:
                     self._down_last_update_ns = self._last_update_ns
             # E6: per-outcome update clocks stamped above; snapshot() ages from them.
             self._emit_bbo_events(pre_bbo, touched, msg)
-            return True, None
+            # Finding #4: a stale/resyncing book can revive here — _enforce_bbo
+            # H2 marks stale on price_change, while a full `book` frame or REST
+            # may be unavailable during fresh-window blind spells. Promote only
+            # on real exchange tops (helper checks both outcomes two-sided,
+            # sane, uncrossed, exchange-consistent); live books untouched.
+            promo_note = self._maybe_promote_on_price_change(ex_bbo)
+            return True, promo_note
 
         outcome = self._outcome_for_token(token_id) if token_id else None
         if outcome and ("bids" in msg or "asks" in msg):
@@ -804,6 +810,59 @@ class OrderBookState:
             "bid": bid, "bid_size": bid_size,
             "ask": ask, "ask_size": ask_size,
         }
+
+    def _maybe_promote_on_price_change(
+        self, ex_bbo: Dict[str, Dict[str, Optional[float]]]
+    ) -> Optional[str]:
+        """Revive a stale/resyncing book from real price_change tops (finding #4).
+
+        The price_changes branch previously never promoted: a book marked
+        stale by _enforce_bbo H2 could only revive via a full `book` frame
+        or REST, both unavailable during fresh-window blind spells. Promote
+        only when BOTH outcomes hold two-sided, sane (0 <= bid < ask <= 1),
+        uncrossed tops that agree with the frame's exchange-reported bests.
+        Live books are never touched, nothing is ever demoted, and no quote
+        is created — every value compared here rests on the wire already.
+        Never raises (honest stale on any unexpected shape).
+        """
+        try:
+            if getattr(self.book_state, "value", "") == "live":
+                return None
+            if not ex_bbo:
+                return None
+            for outcome in ("up", "down"):
+                book = self.up if outcome == "up" else self.down
+                bid, _ = book.bids.best_top()
+                ask, _ = book.asks.best_top()
+                if bid is None or ask is None:
+                    return None
+                try:
+                    b = float(bid)
+                    a = float(ask)
+                except (TypeError, ValueError):
+                    return None
+                if not (0.0 <= b < a <= 1.0):
+                    return None
+                if book.bids.crossed_with(book.asks):
+                    return None
+                ex = ex_bbo.get(outcome)
+                if ex is not None:
+                    for side, mine in (("bid", b), ("ask", a)):
+                        rep = ex.get(side)
+                        if rep is None:
+                            continue
+                        try:
+                            r = float(rep)
+                        except (TypeError, ValueError):
+                            return None
+                        if r <= 0.0 or (side == "ask" and r >= 1.0):
+                            continue  # empty-side sentinel, not a best
+                        if abs(mine - r) > 1e-9:
+                            return None
+            self.mark_live()
+            return "price_change_promotion both outcomes two-sided, uncrossed, exchange-consistent"
+        except Exception:
+            return None
 
     def _enforce_bbo(self, outcome: str, ex: Dict[str, Optional[float]], msg: dict | None = None, tick: float = 1e-9) -> None:
         """Compare the book's top-of-book to the exchange-reported best_bid/best_ask.
