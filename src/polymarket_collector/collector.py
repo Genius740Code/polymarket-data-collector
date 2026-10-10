@@ -5525,6 +5525,13 @@ class Collector:
                                         self._ws_noise_throttle[_ek] = 1
                                     except Exception:
                                         pass
+                                    try:
+                                        self._collector_event(
+                                            "book_empty_skipped",
+                                            {"asset": m.asset, "condition_id": m.condition_id, "empty_skip_key": _ek},
+                                        )
+                                    except Exception:
+                                        pass
                                     continue
                                 try:
                                     self._ws_noise_throttle[_ek] = 1
