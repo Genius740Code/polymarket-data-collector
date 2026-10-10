@@ -5918,6 +5918,237 @@ class Collector:
             pass
         return out
 
+    # Background-heal tick bounds — finding #7 (2026-10-09 audit, re-verified
+    # in code): _flush_loop used to AWAIT _background_heal_tick(max_books=40)
+    # inline — up to 40 SEQUENTIAL resync() drives, each allowed up to
+    # max_resync_duration_seconds (config/collector.yaml:224 = 60s), before
+    # its parquet flush: scheduler-lag coupling on a saturated 2-core box,
+    # plus slow-consumer-close risk. The flush loop now only SCHEDULES a
+    # detached, bounded pass (_schedule_heal_tick_pass) and proceeds to the
+    # flush independent of heal outcomes. Bounds:
+    #   * HEAL_TICK_CONCURRENCY — GLOBAL in-flight drive cap (2 of the 2-3
+    #     law: two parallel POSTs drain the backlog ~2x the old sequential
+    #     walk while leaving the 2-core box headroom for its own WS work);
+    #   * HEAL_TICK_PASS_BUDGET_S — wall-clock budget per pass: no NEW
+    #     drive starts past the deadline; drives already started finish
+    #     detached and emit their heal events whenever they land
+    #     (fail-closed evidence semantics unchanged);
+    #   * per-book in-flight guard — detached passes never double-drive the
+    #     same book (the old inline tick was sequential, so overlap was
+    #     impossible by construction; detached drives need it explicit).
+    HEAL_TICK_CONCURRENCY = 2
+    HEAL_TICK_PASS_BUDGET_S = 20.0
+    HEAL_TICK_MAX_BOOKS = 40
+    HEAL_TICK_STALE_AFTER_S = 60
+
+    def _heal_tick_clock(self) -> float:
+        """Monotonic clock for the pass budget (seam for timed tests)."""
+        return time.monotonic()
+
+    def _heal_tick_state(self):
+        """Shared heal-tick bookkeeping, built once (never raises).
+
+        {"sem": global in-flight drive cap, "tasks": strong refs for every
+        scheduled task (the loop only keeps weak refs — never let a drive
+        be garbage-collected mid-REST), "inflight": condition_ids that have
+        a live drive task}.
+        """
+        try:
+            _st = getattr(self, "_heal_tick_priv", None)
+            if _st is None:
+                _cap = max(1, min(3, int(self.HEAL_TICK_CONCURRENCY)))
+                _st = {"sem": asyncio.Semaphore(_cap), "tasks": set(), "inflight": set()}
+                self._heal_tick_priv = _st
+            return _st
+        except Exception:
+            return None
+
+    def _heal_tick_candidates(self, max_books: int, stale_after_s: int):
+        """Stale-book candidates for one bounded pass (never raises).
+
+        Selection gates mirror _background_heal_tick verbatim: skip live
+        books; skip fresh disconnects (< stale_after_s — fresh-stale heals
+        via WS full-book promotion without REST burn); fast-fail
+        fetch_none-quiet / rate-limited / ended markets so no escalation
+        burn starts at all. Capped at max_books.
+        """
+        cands = []
+        try:
+            _items = list((self.books or {}).items())
+        except Exception:
+            return cands
+        for _cid, _book in _items:
+            if len(cands) >= max_books:
+                break
+            try:
+                _st = getattr(getattr(_book, "book_state", None), "value", "") or ""
+            except Exception:
+                continue
+            if _st == "live":
+                continue
+            try:
+                _rid = getattr(_book, "resync_id", None)
+                _ep = (getattr(self.resync, "_episodes", {}) or {}).get(_rid) if _rid else None
+                if _ep is not None and getattr(_ep, "disconnect_ts_utc", None):
+                    _disc = datetime.datetime.fromisoformat(
+                        str(_ep.disconnect_ts_utc).replace("Z", "+00:00"))
+                    _age = int((datetime.datetime.now(tz=datetime.timezone.utc) - _disc).total_seconds() * 1000)
+                    if _age < stale_after_s * 1000:
+                        continue
+            except Exception:
+                pass
+            try:
+                if self.resync.fetch_none_quiet(_cid):
+                    continue
+                if self.resync.rate_limited(_cid):
+                    continue
+                if self.resync.market_ended(_cid) is True:
+                    continue
+            except Exception:
+                pass
+            cands.append(_book)
+        return cands
+
+    def _schedule_heal_tick_pass(self) -> None:
+        """Schedule one detached, bounded heal pass (never raises, never blocks).
+
+        Called from the flush loop (finding #7): the loop does NOT wait on
+        heal outcomes — it hands the stale backlog to a separate task and
+        proceeds to the parquet flush immediately. At most one pass is
+        scheduled at a time; the pass itself only STARTS drives and returns
+        (no awaits), so passes never stack behind slow REST either.
+        """
+        try:
+            if bool(getattr(self, "_heal_tick_pass_pending", False)):
+                return
+            shared = self._heal_tick_state()
+            if not shared:
+                return
+            try:
+                _books = self._heal_tick_candidates(
+                    int(self.HEAL_TICK_MAX_BOOKS), int(self.HEAL_TICK_STALE_AFTER_S))
+            except Exception:
+                return
+            if not _books:
+                return
+            self._heal_tick_pass_pending = True
+            try:
+                _pt = asyncio.create_task(self._heal_tick_pass(shared, _books))
+            except Exception:
+                self._heal_tick_pass_pending = False
+                return
+            shared["tasks"].add(_pt)
+            _pt.add_done_callback(lambda t: shared["tasks"].discard(t))
+        except Exception:
+            pass
+
+    async def _heal_tick_pass(self, shared, books) -> None:
+        """Start this pass's drives, then return WITHOUT waiting (never raises).
+
+        Budget rule (finding #7): once the pass clock passes its deadline no
+        NEW drives start — remaining candidates wait for the next flush tick.
+        Drives already started are never awaited here: they finish detached
+        and emit their heal events whenever they land.
+        """
+        pass_state = {"pending": 0, "healed": 0}
+        try:
+            _deadline = self._heal_tick_clock() + float(self.HEAL_TICK_PASS_BUDGET_S)
+            for _book in books:
+                try:
+                    if not self._running:
+                        break
+                except Exception:
+                    break
+                if self._heal_tick_clock() >= _deadline:
+                    break
+                try:
+                    _cid = str(getattr(_book, "condition_id", "") or "")
+                except Exception:
+                    _cid = ""
+                if not _cid:
+                    continue
+                try:
+                    if _cid in shared["inflight"]:
+                        continue
+                    shared["inflight"].add(_cid)
+                except Exception:
+                    pass
+                try:
+                    _t = asyncio.create_task(self._heal_tick_drive(_book, shared, pass_state))
+                except Exception:
+                    try:
+                        shared["inflight"].discard(_cid)
+                    except Exception:
+                        pass
+                    continue
+                shared["tasks"].add(_t)
+                pass_state["pending"] = int(pass_state["pending"]) + 1
+                _t.add_done_callback(
+                    lambda t, ps=pass_state, c=_cid: self._heal_tick_drive_done(t, shared, ps, c))
+        finally:
+            try:
+                self._heal_tick_pass_pending = False
+            except Exception:
+                pass
+
+    async def _heal_tick_drive(self, book, shared, pass_state) -> None:
+        """One heal drive under the global gate (never raises, runs detached).
+
+        Same drive body as _background_heal_tick — ensure the book's episode
+        join, stamp reconnect if missing, one bounded resync() REST drive —
+        so a completed heal emits exactly the events the inline tick
+        emitted; only the scheduling changed (detached from the flush loop,
+        capped by the shared semaphore).
+        """
+        try:
+            async with shared["sem"]:
+                try:
+                    if not self._running:
+                        return
+                except Exception:
+                    return
+                try:
+                    _ep_id = self._ensure_episode_for_stale_book(book, book.asset, "background_heal")
+                    try:
+                        if _ep_id in self.resync._episodes and self.resync._episodes[_ep_id].reconnect_ts_utc is None:
+                            self.resync.handle_reconnect(_ep_id)
+                    except Exception:
+                        pass
+                    if await self.resync.resync(book.asset, book.condition_id, self.books, _ep_id):
+                        try:
+                            pass_state["healed"] = int(pass_state.get("healed", 0)) + 1
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _heal_tick_drive_done(self, task, shared, pass_state, cid) -> None:
+        """Detached-drive bookkeeping (loop-thread callback; never raises)."""
+        try:
+            shared["tasks"].discard(task)
+        except Exception:
+            pass
+        try:
+            if cid:
+                shared["inflight"].discard(cid)
+        except Exception:
+            pass
+        try:
+            _ = task.exception()  # observe; the drive body never raises anyway
+        except Exception:
+            pass
+        try:
+            _pending = int(pass_state.get("pending", 0)) - 1
+            pass_state["pending"] = _pending
+            if _pending <= 0:
+                _healed = int(pass_state.get("healed", 0) or 0)
+                if _healed > 0:
+                    print(f"[resync] background healed {_healed} stale book(s)")
+        except Exception:
+            pass
+
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.config.storage.flush_interval_seconds)
@@ -5937,15 +6168,18 @@ class Collector:
                     print(f"[resync] sweep closed {_r['unresolved']} expired episode(s) as unresolved")
                 # Background heal (perfect-collector): the reconnect walk heals
                 # one book per pass, so a large stale backlog never drains.
-                # Heal up to 4 stale books per flush tick here (bounded REST:
-                # 1 POST each via _fetch_rest_book). Only books stale >60s —
-                # fresh-stale heals via WS promotion without REST burn. Skip
-                # fetch_none-quiet / rate-limited / ended markets (fast-fail,
-                # no escalation burn). Never raises.
+                # Finding #7 (2026-10-09): this block used to AWAIT
+                # _background_heal_tick(max_books=40) inline — up to 40
+                # SEQUENTIAL resync() drives, each up to
+                # max_resync_duration_seconds (60s), parking the parquet
+                # flush behind heal REST traffic (scheduler-lag coupling on
+                # a saturated 2-core box; slow-consumer-close risk). Now the
+                # loop only SCHEDULES a detached, bounded pass (global drive
+                # concurrency 2, 20s start budget) and proceeds to the
+                # flush below independent of heal outcomes — started drives
+                # finish detached and still emit their events. Never raises.
                 try:
-                    _healed = await self._background_heal_tick(max_books=40, stale_after_s=60)
-                    if _healed:
-                        print(f"[resync] background healed {_healed} stale book(s)")
+                    self._schedule_heal_tick_pass()
                 except Exception:
                     pass
             except Exception:
