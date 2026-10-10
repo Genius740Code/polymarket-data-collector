@@ -1310,7 +1310,8 @@ class RolloverManager:
             if found is None:
                 return None
             state.prewarm_done_for_ts = end_ms
-            state.rollover_started_for_ts = None
+            # Once-per-window guard stays set: discovery must not re-arm the
+            # window (clearing here re-emitted rollover_started on re-entry).
             state.next = found
             if state.current is not None:
                 state.is_rollover_window = True

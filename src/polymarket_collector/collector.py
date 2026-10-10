@@ -3373,7 +3373,12 @@ class Collector:
                                     l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
                             )
-                            self._link_stale_book_episode(_nb, market.asset, "market_added")
+                            try:
+                                _nb_live = getattr(getattr(_nb, "book_state", None), "value", "") == "live"
+                            except Exception:
+                                _nb_live = False
+                            if not _nb_live:
+                                self._link_stale_book_episode(_nb, market.asset, "market_added")
                             self.books[market.condition_id] = _nb
                             self._index_book(_nb)
                         else:

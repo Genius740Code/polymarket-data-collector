@@ -859,7 +859,16 @@ class OrderBookState:
                             continue  # empty-side sentinel, not a best
                         if abs(mine - r) > 1e-9:
                             return None
+            _rid = self.resync_id
             self.mark_live()
+            if _rid is not None:
+                # Link, don't orphan: mark_live() clears resync_id, which
+                # would detach the open episode while the book reads live
+                # (the WS-provisional path closes its episode via
+                # resync_completed instead). Retaining lets the
+                # healed-episode sweep complete it honestly and keeps row
+                # tags joined to the episode.
+                self.resync_id = _rid
             return "price_change_promotion both outcomes two-sided, uncrossed, exchange-consistent"
         except Exception:
             return None
