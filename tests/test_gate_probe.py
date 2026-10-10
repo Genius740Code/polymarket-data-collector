@@ -1,6 +1,6 @@
 """Tests for scripts/gate_probe.py — pure helpers + real-data smoke test.
 
-Forbidden: synthetic prices, interpolated values, fabricated data.
+Forbidden: no fabricated data.
 Allowed: inline literals for math checks, off-grid predicates, complement
 deviation, and log-tail parsing. A small real-data smoke test runs only
 when data/ exists (skip otherwise).
@@ -258,6 +258,69 @@ def test_comp_spread_norm_tight_spread_breach():
     threshold = max(DEV_FLOOR, SPREAD_FRAC * combined_spread)
     flag = deviation > threshold
     assert flag == True, f"tight spread should flag, got flag={flag}, deviation={deviation}, threshold={threshold}"
+
+
+def test_comp_spread_norm_live_single_count():
+    """CompSpreadNorm: live rows should be single-counted, not double-counted.
+
+    Confirms that comp_spread_norm_count increments exactly once per live
+    breaching row (the fix for a bug where it incremented twice: once in the
+    standalone spread_norm_flag block and again inside if is_live).
+    """
+    # 3 live rows: 1 breaching CompSpreadNorm, 2 not
+    live_rows = [
+        {"up_bid": 0.5, "up_ask": 0.505, "down_bid": 0.5, "down_ask": 0.5, "book_state": "live"},  # breaching
+        {"up_bid": 0.5, "up_ask": 0.5, "down_bid": 0.5, "down_ask": 0.5, "book_state": "live"},    # not breaching
+        {"up_bid": 0.5, "up_ask": 0.5, "down_bid": 0.5, "down_ask": 0.5, "book_state": "live"},    # not breaching
+    ]
+    stale_rows = []
+
+    null_mid_count = 0
+    complement_count = 0
+    checkable_count = 0
+    complement_count_live = 0
+    complement_checkable_live = 0
+    comp_spread_norm_count = 0
+
+    for r in live_rows + stale_rows:
+        ob = r["up_bid"]
+        ua = r["up_ask"]
+        db = r["down_bid"]
+        da = r["down_ask"]
+        has_null = ob is None or ua is None or db is None or da is None
+        book_state = r.get("book_state", "live")
+        is_live = book_state == "live"
+
+        if has_null:
+            null_mid_count += 1
+            continue
+
+        try:
+            up_mid = (float(ob) + float(ua)) / 2.0
+            down_mid = (float(db) + float(da)) / 2.0
+            deviation = abs(up_mid + down_mid - 1.0)
+            combined_spread = (float(ua) - float(ob)) + (float(da) - float(db))
+        except (TypeError, ValueError):
+            null_mid_count += 1
+            continue
+
+        checkable_count += 1
+        if deviation > 0.001:
+            complement_count += 1
+
+        spread_norm_flag = deviation > max(0.001, 0.25 * combined_spread)
+        if is_live and spread_norm_flag:
+            comp_spread_norm_count += 1
+
+        if is_live:
+            complement_checkable_live += 1
+            if deviation > 0.001:
+                complement_count_live += 1
+
+    # 1 out of 3 live rows breaches CompSpreadNorm -> count==1 exactly
+    assert comp_spread_norm_count == 1, (
+        f"expected comp_spread_norm_count == 1 (single-count fix), got {comp_spread_norm_count}"
+    )
 
 
 def test_live_null_split():

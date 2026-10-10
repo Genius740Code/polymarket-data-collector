@@ -301,9 +301,6 @@ def analyze_lane(
             complement_checkable_live += 1
             if deviation > 0.001:
                 complement_count_live += 1
-            # CompSpreadNorm count for live rows
-            if spread_norm_flag:
-                comp_spread_norm_count += 1
         else:
             # stale or resyncing
             complement_checkable_stale += 1
