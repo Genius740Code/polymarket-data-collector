@@ -1852,10 +1852,31 @@ class Collector:
                             if resp.status_code == 429:
                                 # 429 backoff (WS/stale fix 2026-09-26): retry the
                                 # SAME token after the backoff (see owned branch).
+                                # Capped-sleep scale mirrors the owned branch
+                                # exactly: only _slept seconds were actually
+                                # waited — the shared note scales to the sleep
+                                # while the per-book backoff keeps the full
+                                # hint (bounded [0.5, 60] inside) and the
+                                # outcome records rate_limited (a 429 never
+                                # feeds a fetch_none streak).
                                 _ra = _retry_after_s_of(resp, 1.0)
-                                await asyncio.sleep(min(_ra, 2.0))
+                                _slept = min(_ra, 2.0)
+                                await asyncio.sleep(_slept)
                                 if _ra > 2.0:
-                                    note_heal_rate_limited(_ra)
+                                    try:
+                                        _rl_cs = getattr(self.resync, "note_rate_limited", None)
+                                        if callable(_rl_cs):
+                                            _rl_cs(condition_id, _ra)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        _od_cs = getattr(self, "_heal_last_outcome", None)
+                                        if not isinstance(_od_cs, dict):
+                                            _od_cs = self._heal_last_outcome = {}
+                                        _od_cs[condition_id] = "rate_limited"
+                                    except Exception:
+                                        pass
+                                    note_heal_rate_limited(_slept)
                                     return
                                 resp = await client.get(
                                     self.config.ws.rest_book_url,
@@ -2109,11 +2130,25 @@ class Collector:
                     # streak grew on transient 429s (5 → 1h terminal quiet,
                     # renewed forever → unhealable book). Retry the SAME token
                     # after the backoff; a persistent 429 records bounded
-                    # rate-limit backoff (NOT fetch_none).
+                    # rate-limit backoff (NOT fetch_none). Capped-sleep scale
+                    # mirrors the owned _fetch_rest_book branch exactly: only
+                    # _slept seconds were actually waited — the shared note
+                    # scales to the sleep while the per-book backoff keeps
+                    # the full hint (bounded [0.5, 60] inside) and the
+                    # outcome records rate_limited (a 429 never feeds a
+                    # fetch_none streak).
                     _ra = _retry_after_s_of(resp, 1.0)
-                    await asyncio.sleep(min(_ra, 2.0))
+                    _slept = min(_ra, 2.0)
+                    await asyncio.sleep(_slept)
                     if _ra > 2.0:
-                        note_heal_rate_limited(_ra)
+                        try:
+                            _rl_cs = getattr(self.resync, "note_rate_limited", None)
+                            if callable(_rl_cs):
+                                _rl_cs(book.condition_id, _ra)
+                        except Exception:
+                            pass
+                        _record_outcome("rate_limited")
+                        note_heal_rate_limited(_slept)
                         return
                     resp = await _get(token_id)
                 if resp.status_code == 429:
@@ -5543,12 +5578,13 @@ class Collector:
                             if _bbo_empty and row.get("book_state") != "live":
                                 try:
                                     _ek = f"empty_skip:{m.condition_id}"
-                                    _last = self._ws_noise_throttle.get(_ek, 0)
                                 except Exception:
-                                    _last = 0
                                     _ek = f"empty_skip:{m.condition_id}"
-                                # keep-alive: 1 per ~60 ticks (≈60s at 1s weather cadence, ≈30s at 500ms)
-                                if _tick % 60 != 0 and _last:
+                                # keep-alive: 1 per ~60 ticks (≈60s at 1s weather cadence, ≈30s at 500ms).
+                                # The event fires ONLY on the keep-alive tick (which falls through
+                                # and appends the row below); every other tick skips silently —
+                                # emitting per skip (~2/s/market) bloated never-pruned collector_events.
+                                if _tick % 60 == 0:
                                     try:
                                         self._ws_noise_throttle[_ek] = 1
                                     except Exception:
@@ -5560,11 +5596,12 @@ class Collector:
                                         )
                                     except Exception:
                                         pass
+                                else:
+                                    try:
+                                        self._ws_noise_throttle[_ek] = 1
+                                    except Exception:
+                                        pass
                                     continue
-                                try:
-                                    self._ws_noise_throttle[_ek] = 1
-                                except Exception:
-                                    pass
                             result = self.writer.append("book_snapshots_500ms", row, asset=m.asset)
                             if not result:
                                 # P0 tick-drop fix: append False means WAL failed
