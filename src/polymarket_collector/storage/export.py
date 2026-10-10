@@ -1297,6 +1297,51 @@ def _union_field_add(union_fields: dict, union_order: list, name: str, ftype) ->
         pass
 
 
+def _phase_timed_iter(src, label: str):
+    """Log-only phase split for a staging batch stream (2026-10-10).
+
+    Wraps the generator handed to write_batches with two clocks: time
+    inside the generator (file open/decode + transform = aggregate phase)
+    vs time between yields (writer per-batch normalize + amortized
+    row-group flush = write phase). At exhaustion it prints one
+    elapsed-seconds line per phase, same shape as the 60s progress lines,
+    so a slow lane decomposes into scan/aggregate/write in the worker log
+    tail. Instrumentation only: every batch is yielded unchanged, in
+    order; the final writer close/rename (after StopIteration) is not
+    counted on the write clock.
+    """
+    import time as _time_ph
+
+    _t_in = _time_ph.time()
+    _agg_s = 0.0
+    _rows_ph = 0
+    _batches = 0
+    try:
+        for _b in src:
+            _now = _time_ph.time()
+            _agg_s += _now - _t_in
+            _batches += 1
+            if _b is not None:
+                _rows_ph += _b.num_rows
+            yield _b
+            _t_in = _time_ph.time()
+    finally:
+        _wr_s = _time_ph.time() - _t_in
+        _rss = None
+        try:
+            with open("/proc/self/status") as _sf:
+                for _sl in _sf:
+                    if _sl.startswith("VmRSS:"):
+                        _rss = int(_sl.split()[1]) // 1024
+                        break
+        except Exception:
+            _rss = None
+        print(f"[export:worker] phase {label} aggregate: batches={_batches} "
+              f"rows={_rows_ph} elapsed={int(_agg_s)}s"
+              + (f" rss={_rss}MB" if _rss is not None else ""), flush=True)
+        print(f"[export:worker] phase {label} write: elapsed={int(_wr_s)}s", flush=True)
+
+
 def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, *,
                                   deadline_s=None, cutoff_ts=None, io_stats=None) -> int:
     """Bounded-RAM streaming trades staging build (2026-09-11).
@@ -1521,6 +1566,11 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     if io_stats is not None:
         io_stats["files_failed"] += _pre_failed
         io_stats["failed_bytes"] += _pre_failed_bytes
+    # 2026-10-10 phase timing (log line only): footer+narrow pre-pass is the
+    # scan phase of the trades build; measured 2026-10-10 at ~13ms/file
+    # (footer ~4ms + narrow read ~9ms) — a small share next to the group pass.
+    print(f"[export:worker] phase {asset_upper}/trades scan: {_pre_n} files "
+          f"elapsed={int(_time_s.time() - _pre_t0)}s", flush=True)
     fee_rate = {cid: (next(iter(s)) if len(s) == 1 else None) for cid, s in fee_rates.items()}
     series_mode = {}
     for cid, cnt in series_counts.items():
@@ -1650,7 +1700,8 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
         except Exception as e:
             print(f"[export] WARN zero-trade reconcile failed: {e}")
 
-    n = write_batches(_gen(), tmp_path, schema=_union_schema, stats=io_stats)
+    n = write_batches(_phase_timed_iter(_gen(), f"{asset_upper}/trades"),
+                      tmp_path, schema=_union_schema, stats=io_stats)
     del pool_cache, taker_cache, seen_dd, have, ctx_by_cid, markets_order
     _gc_s.collect()
     # single narrow write-back at the end (NULLs filled only, atomic per file)
@@ -3156,6 +3207,7 @@ def _stream_export_asset_dataset(
     source_dataset: Optional[str] = None,
     io_stats: Optional[dict] = None,
     cutoff_ts: Optional[float] = None,
+    coalesce_rows: int = 20000,
 ) -> int:
     """Stream one (asset, whale-dataset) staging build. Returns rows written.
 
@@ -3170,6 +3222,16 @@ def _stream_export_asset_dataset(
     snapshots hive (live + not-disputed filter per batch) instead of the
     clean hive — the clean hive (2.85M rows after 40h without prune) can no
     longer be concat-loaded, and its catch-up rebuild belongs off-peak.
+
+    coalesce_rows (2026-10-10 dominant-phase fix, measured split: aggregate
+    ~49% / scan ~34% / write ~12% of per-file time): tiny flush files average
+    ~70-180 rows, so a per-file _transform plus the writer's per-batch
+    schema normalize pay ~122-column fixed costs once per tiny file. Decoded
+    chunks now accumulate to ~coalesce_rows before ONE transform+yield.
+    Row content, oldest-first order and dedup first-wins semantics are
+    unchanged; per-file decode errors still mark only that file; a
+    coalesced-batch transform error marks every member file (fail closed —
+    the coverage gate keeps prior staging either way).
     """
     from .streaming import DedupState, iter_source_files, malloc_trim, write_batches
 
@@ -3251,6 +3313,7 @@ def _stream_export_asset_dataset(
         import gc as _gc_g
         import time as _time_g
 
+        _scan_t0 = _time_g.time()
         _files = iter_source_files(base, src_ds, asset_upper, ts_col)
         if cutoff_ts is not None:
             _kept = []
@@ -3271,10 +3334,77 @@ def _stream_export_asset_dataset(
         _extra.extend(k for k in sort_keys if k not in _extra)
         _groups = _group_paths_by_date(_files)
         _total = len(_files)
+        # 2026-10-10 phase timing (log line only): listing+grouping is the
+        # scan phase — metadata-only, measured in single-digit seconds even
+        # at ~2000 files, so it is reported on its own line and excluded
+        # from the aggregate clock below by construction (elapsed here is
+        # small; the per-file open/footer cost stays in aggregate where it
+        # is paid).
+        print(f"[export:worker] phase {asset_upper}/{ds} scan: {_total} files "
+              f"elapsed={int(_time_g.time() - _scan_t0)}s", flush=True)
         _done = 0
         _rows_out = 0
         _t0 = _time_g.time()
         _last_log = _t0
+        # 2026-10-10 coalescing state (see docstring): decoded chunks wait
+        # for one transform+yield per ~coalesce_rows rows. _pending_src
+        # carries (file index, file bytes) per chunk so a failed coalesced
+        # batch can attribute every DISTINCT member file — fail closed.
+        _pending: list = []
+        _pending_src: list = []
+        _pending_rows = 0
+
+        def _co_flush():
+            nonlocal _pending, _pending_src, _pending_rows, _rows_out
+            if not _pending:
+                return
+            _members = _pending
+            _srcs = _pending_src
+            _pending = []
+            _pending_src = []
+            _pending_rows = 0
+            try:
+                _co = _members[0] if len(_members) == 1 else pa.concat_tables(
+                    _members, promote_options="default")
+            except Exception:
+                # mixed vintages cannot concat — per-member transform, the
+                # pre-2026-10-10 behavior (the writer normalizes per batch
+                # with per-field casts exactly as before). Only a failing
+                # member is dropped; the others ship.
+                for _m, _src1 in zip(_members, _srcs):
+                    try:
+                        _m2 = _transform(_m)
+                    except Exception:
+                        if io_stats is not None:
+                            io_stats["files_failed"] += 1
+                            io_stats["failed_bytes"] += _src1[1]
+                        continue
+                    if _m2 is not None and _m2.num_rows > 0:
+                        _rows_out += _m2.num_rows
+                        yield _m2
+                    del _m2
+                return
+            try:
+                _co = _transform(_co)
+            except Exception as _ce:
+                # fail closed: every distinct member file's rows drop with
+                # the batch (overcounting a twice-failing file is fine —
+                # the gate fails on ANY failed file)
+                if io_stats is not None:
+                    _fids = {_f for _f, _ in _srcs}
+                    _sz_by: dict = {}
+                    for _f, _sz2 in _srcs:
+                        _sz_by.setdefault(_f, _sz2)
+                    io_stats["files_failed"] += len(_fids)
+                    io_stats["failed_bytes"] += sum(_sz_by.values())
+                print(f"[export] WARN coalesced transform failed ({_ce}) — "
+                      f"{len(_srcs)} batches dropped (fail closed)")
+                return
+            if _co is not None and _co.num_rows > 0:
+                _rows_out += _co.num_rows
+                yield _co
+            del _co
+
         for _date, _paths in _groups:
             for _p in _paths:
                 _done += 1
@@ -3293,45 +3423,47 @@ def _stream_export_asset_dataset(
                 except Exception:
                     _fcols = None
                 _cols = _projected_read_columns(_fcols, schema, _extra)
+                _sz_p = 0
                 try:
-                    _err = False
-                    _ok = False
+                    _sz_p = _p.stat().st_size
+                except OSError:
+                    pass
+                _mark = len(_pending)
+                _mark_rows = _pending_rows
+                try:
                     for _chunk in _pf.iter_batches(batch_size=20000, columns=_cols):
                         _t = pa.Table.from_batches([_chunk])
                         if _t.num_rows == 0:
                             continue
                         if io_stats is not None:
                             io_stats["rows_read"] += _t.num_rows
-                        try:
-                            _t = _transform(_t)
-                        except Exception:
-                            _err = True
-                            continue
-                        if _t is None or _t.num_rows == 0:
-                            continue
-                        _ok = True
-                        _rows_out += _t.num_rows
-                        yield _t
-                        del _t
-                    if io_stats is not None:
-                        if _err:
-                            io_stats["files_failed"] += 1
-                            try:
-                                io_stats["failed_bytes"] += _p.stat().st_size
-                            except OSError:
-                                pass
-                        else:
-                            io_stats["files_ok"] += 1
+                        _pending.append(_t)
+                        _pending_src.append((_done, _sz_p))
+                        _pending_rows += _t.num_rows
+                        if _pending_rows >= coalesce_rows:
+                            yield from _co_flush()
                     del _pf
                 except Exception:
+                    # decode error mid-file: roll this file's still-pending
+                    # chunks back (already-flushed ones are gone from here,
+                    # exactly like the pre-2026-10-10 path where earlier
+                    # chunks had already shipped; the file is failed either
+                    # way and the coverage gate keeps prior staging).
+                    # _pending_rows is RESTORED to the file-start snapshot,
+                    # not decremented: chunks flushed mid-file already left
+                    # the pending count, so subtracting this file's total
+                    # contribution could drive it negative and skew every
+                    # later threshold check.
+                    del _pending[_mark:]
+                    del _pending_src[_mark:]
+                    _pending_rows = _mark_rows
                     if io_stats is not None:
                         io_stats["files_failed"] += 1
-                        try:
-                            io_stats["failed_bytes"] += _p.stat().st_size
-                        except OSError:
-                            pass
+                        io_stats["failed_bytes"] += _sz_p
                     _pf = None  # release promptly; rebound next file
                     continue
+                if io_stats is not None:
+                    io_stats["files_ok"] += 1
                 _now = _time_g.time()
                 if _now - _last_log >= 60:
                     _last_log = _now
@@ -3346,9 +3478,12 @@ def _stream_export_asset_dataset(
                 malloc_trim()
             except Exception:
                 pass
+        # tail flush: rows below the coalesce threshold still ship
+        yield from _co_flush()
 
     healed_note = ""
-    rows = write_batches(_gen(), tmp_path, schema=schema, stats=io_stats)
+    rows = write_batches(_phase_timed_iter(_gen(), f"{asset_upper}/{ds}"),
+                         tmp_path, schema=schema, stats=io_stats)
     if dedup is not None and (dedup.dupes or ds == "book_snapshots_500ms"):
         healed_note = f" (dedup dropped {dedup.dupes})" if dedup.dupes else ""
     if healed_note:
