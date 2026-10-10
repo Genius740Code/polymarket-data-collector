@@ -1562,6 +1562,36 @@ class Collector:
                 _bs_after = getattr(getattr(book, "book_state", None), "value", "")
                 if _bs_after not in ("stale", "resyncing"):
                     return
+            # WS-freshness clear (pmdata-parity audit fix 1): a real WS
+            # book-content frame proves the venue exposes this book, so a
+            # banked fetch_none streak/quiet is stale evidence — drop it via
+            # note_fetch_ok instead of letting it suppress this heal. The
+            # per-book frame clock is stamped on every applied WS frame.
+            try:
+                from .ingest.heal import note_ws_book_content as _note_ws_content
+                _ns = (getattr(self, "_last_frame_ns_per_book", None) or {}).get(book.condition_id)
+                if _ns is not None and (time.time_ns() - int(_ns)) < 10_000_000_000:
+                    _note_ws_content(self.resync, book.condition_id)
+            except Exception:
+                pass
+            # Attempt cap (pmdata-parity audit fix 1): at most ~1 REST attempt
+            # per 5s per book — a 5-minute fresh window must not burn its
+            # whole budget in seconds. Skipped attempts burn nothing and
+            # record nothing (no strike on a cap skip).
+            try:
+                _la = getattr(self, "_heal_last_attempt_monotonic", None)
+                if not isinstance(_la, dict):
+                    _la = self._heal_last_attempt_monotonic = {}
+                _now_m = time.monotonic()
+                try:
+                    _prev = float(_la.get(book.condition_id, 0.0) or 0.0)
+                except Exception:
+                    _prev = 0.0
+                if (_now_m - _prev) < 5.0:
+                    return
+                _la[book.condition_id] = _now_m
+            except Exception:
+                pass
             # Stale-healing fix (2026-09-26): never hammer REST for a market
             # whose window already ended (404s forever, feeds fetch_none
             # streaks). The walk/supersede paths own ended markets.
@@ -1591,13 +1621,26 @@ class Collector:
                     # by the fetcher; the no-L2 streak must not grow.
                     pass
                 else:
-                    _streak = self.resync.note_fetch_none(book.condition_id)
-                    # Reconnect on repeated heal failure (2026-09-26): a
-                    # current-market book whose REST heal keeps failing
-                    # waits forever — request the bounded shard reconnect
-                    # so the fresh full book relives it.
-                    if int(_streak or 0) >= 3:
-                        self.request_shard_reconnect(book.asset, reason="repeated_heal_failure")
+                    # Strike discipline (pmdata-parity audit fix 1): ONLY a
+                    # genuine 200-empty/404 grows the no-L2 streak.
+                    # Timeouts, transport errors and bad bodies are unknown
+                    # (the book may be fine — REST just did not answer), and
+                    # rate-limited/superseded rounds record nothing.
+                    _outcome = "unknown"
+                    try:
+                        _outcome = str((getattr(self, "_heal_last_outcome", None) or {}).get(book.condition_id, "unknown"))
+                    except Exception:
+                        _outcome = "unknown"
+                    if _outcome != "genuine_empty":
+                        pass
+                    else:
+                        _streak = self.resync.note_fetch_none(book.condition_id)
+                        # Reconnect on repeated heal failure (2026-09-26): a
+                        # current-market book whose REST heal keeps failing
+                        # waits forever — request the bounded shard reconnect
+                        # so the fresh full book relives it.
+                        if int(_streak or 0) >= 3:
+                            self.request_shard_reconnect(book.asset, reason="repeated_heal_failure")
         except Exception:
             pass
 
@@ -1644,6 +1687,27 @@ class Collector:
         import httpx
         m = self.markets.get(condition_id)
         merged: dict = {}
+        # Shared 429 discipline (pmdata-parity audit fix 2): while ANY heal
+        # caller tripped the shared cooldown, burn zero requests here too —
+        # the GET fallback below used to bypass the POST cooldown entirely.
+        # A bounded per-condition backoff is recorded so this drive retries
+        # after backoff instead of feeding a fetch_none streak.
+        try:
+            from .ingest.heal import heal_backoff_remaining, heal_rate_limited
+            if m is not None and heal_rate_limited():
+                try:
+                    _rl0 = getattr(self.resync, "note_rate_limited", None)
+                    if callable(_rl0):
+                        try:
+                            _rem0 = float(heal_backoff_remaining())
+                        except Exception:
+                            _rem0 = 1.0
+                        _rl0(condition_id, max(0.5, min(60.0, _rem0 or 1.0)))
+                except Exception:
+                    pass
+                return None
+        except Exception:
+            pass
         # Batched POST /books first (perfect-collector heal): one round-trip
         # for both tokens instead of 2 GETs — collapses the fetch_none/429
         # storm under multi-lane load. Any failure falls through to the GET
@@ -1845,11 +1909,62 @@ class Collector:
         # this was the last per-token GET storm (the resync path in
         # _fetch_rest_book already heals batched-first). Falls through to
         # the GET loop below on any failure (never raises, never fills).
+        # Outcome flags for strike discipline (pmdata-parity audit fix 1):
+        # the caller grows the fetch_none streak ONLY on "genuine_empty".
+        _outcome_flags = {"genuine": False, "unknown": False, "limited": False}
+        _limited_at_entry = False
         try:
-            from .ingest.heal import heal_books_batched
+            from .ingest.heal import (
+                classify_heal_failure as _classify,
+                heal_backoff_remaining as _heal_rem,
+                heal_books_batched,
+                heal_rate_limited as _heal_limited,
+                note_heal_success as _heal_ok,
+            )
+        except Exception:
+            _classify = None
+            _heal_rem = None
+            heal_books_batched = None
+            _heal_limited = None
+            _heal_ok = None
+
+        def _record_outcome(_o: str) -> None:
+            try:
+                _od = getattr(self, "_heal_last_outcome", None)
+                if not isinstance(_od, dict):
+                    _od = self._heal_last_outcome = {}
+                try:
+                    _cid0 = book.condition_id
+                except Exception:
+                    _cid0 = None
+                if _cid0 is not None:
+                    _od[_cid0] = str(_o)
+            except Exception:
+                pass
+
+        def _note_backoff() -> None:
+            # Shared-cooldown early return still tells the resync manager we
+            # are rate-limited (bounded), so the drive retries after backoff
+            # instead of feeding a fetch_none streak.
+            try:
+                _rl0 = getattr(self.resync, "note_rate_limited", None)
+                if callable(_rl0):
+                    try:
+                        _rem0 = float(_heal_rem()) if callable(_heal_rem) else 1.0
+                    except Exception:
+                        _rem0 = 1.0
+                    _rl0(book.condition_id, max(0.5, min(60.0, _rem0 or 1.0)))
+            except Exception:
+                pass
+
+        try:
+            try:
+                _limited_at_entry = bool(_heal_limited()) if callable(_heal_limited) else False
+            except Exception:
+                _limited_at_entry = False
             _m_up = getattr(market, "up_token_id", None)
             _m_down = getattr(market, "down_token_id", None)
-            if _m_up and _m_down:
+            if _m_up and _m_down and heal_books_batched is not None and not _limited_at_entry:
                 import httpx as _httpx_post
                 _shared_post = self._get_rest_client()
 
@@ -1877,6 +1992,7 @@ class Collector:
                 # an all-superseded plan means "no heal, zero REST", not a
                 # GET fallback (whose 404s would feed fetch_none streaks).
                 if getattr(_hr2, "superseded", None) and not getattr(_hr2, "books", None):
+                    _record_outcome("superseded")
                     return False
                 _pb2 = getattr(_hr2, "books", None) or {}
                 _ok_post = True
@@ -1900,20 +2016,51 @@ class Collector:
                     any_success = True
                 else:
                     merged = {}
+                    # Classify the POST failure for strike discipline: only
+                    # genuine 200-empty/404 may grow the fetch_none streak.
+                    try:
+                        _pc = str(_classify(getattr(_hr2, "errors", None))) if callable(_classify) else "unknown"
+                    except Exception:
+                        _pc = "unknown"
+                    if _pc == "rate_limited":
+                        _outcome_flags["limited"] = True
+                    elif _pc == "genuine_empty":
+                        _outcome_flags["genuine"] = True
+                    else:
+                        _outcome_flags["unknown"] = True
+            elif _limited_at_entry:
+                # Shared cooldown was already active: no POST burned.
+                _outcome_flags["limited"] = True
         except Exception:
             merged = {}
             any_success = False
+            _outcome_flags["unknown"] = True
         # POST-healed books skip the GET loop entirely (the N→1 win: without
         # this guard the fallback would re-burn the 2 GETs it just replaced).
         _post_healed = bool(any_success and merged and all(
             f"{_o}_{_s}" in merged for _o in ("up", "down") for _s in ("bids", "asks")))
+        if _limited_at_entry and not _post_healed:
+            # Shared 429 discipline (pmdata-parity audit fix 2): while the
+            # shared cooldown is active, skip the POST *and* the GET fallback
+            # — the fallback used to bypass the cooldown and re-burn 2 GETs
+            # per book on every heal.
+            _note_backoff()
+            _record_outcome("rate_limited")
+            return False
+        # A POST round that tripped the shared limit parks the GET fallback
+        # too: re-check (heal_books_batched records the 429 before we return
+        # here), so a mid-call 429 does not immediately re-burn 2 GETs.
+        try:
+            _limited_now = bool(_heal_limited()) if callable(_heal_limited) else False
+        except Exception:
+            _limited_now = False
         _shared = self._get_rest_client() if not _post_healed else None
         async def _get(token_id: str):
             if _shared is not None:
                 return await _shared.get(self.config.ws.rest_book_url, params={"token_id": token_id})
             async with httpx.AsyncClient(timeout=4) as _client:
                 return await _client.get(self.config.ws.rest_book_url, params={"token_id": token_id})
-        for outcome, token_id in ([("up", market.up_token_id), ("down", market.down_token_id)] if not _post_healed else []):
+        for outcome, token_id in ([("up", market.up_token_id), ("down", market.down_token_id)] if (not _post_healed and not _limited_now) else []):
             try:
                 resp = await _get(token_id)
                 if resp.status_code == 429:
@@ -1933,6 +2080,7 @@ class Collector:
                     _rl_note = getattr(self.resync, "note_rate_limited", None)
                     if callable(_rl_note):
                         _rl_note(book.condition_id, _retry_after_s_of(resp, 1.0))
+                    _outcome_flags["limited"] = True
                     continue
                 if resp.status_code == 200:
                     j = resp.json()
@@ -1942,7 +2090,26 @@ class Collector:
                         merged[f"{outcome}_bids"] = bids
                         merged[f"{outcome}_asks"] = asks
                         any_success = True
+                        # Any 2xx with data proves the venue serves REST —
+                        # drop the shared 429 streak (audit fix 2).
+                        try:
+                            if callable(_heal_ok):
+                                _heal_ok()
+                        except Exception:
+                            pass
+                    else:
+                        # Genuine 200-empty side: missing data (stays stale),
+                        # never a fill — may feed the fetch_none streak.
+                        _outcome_flags["genuine"] = True
+                elif resp.status_code == 404:
+                    # Genuine 404: the token exposes no book.
+                    _outcome_flags["genuine"] = True
+                else:
+                    # Any other status is unknown (transient), never a strike.
+                    _outcome_flags["unknown"] = True
             except Exception:
+                # Timeouts/transport/bad-body are unknown, never a strike.
+                _outcome_flags["unknown"] = True
                 continue
         # M8: require BOTH outcomes — a single-sided heal leaves the other side
         # on pre-disconnect levels while the book reads live.
@@ -1977,9 +2144,16 @@ class Collector:
                 self._last_frame_ns_per_book[book.condition_id] = _t_h.time_ns()
             except Exception:
                 pass
+            _record_outcome("ok")
             return True
         # REST failed or empty — never fabricate data (synthetic permanently disabled)
         # Book remains in its current state (likely stale/null) - downstream should handle
+        if _outcome_flags.get("limited"):
+            _record_outcome("rate_limited")
+        elif _outcome_flags.get("genuine") and not _outcome_flags.get("unknown"):
+            _record_outcome("genuine_empty")
+        else:
+            _record_outcome("unknown")
         return False
 
     def _beat(self, force: bool = False) -> None:
@@ -5096,10 +5270,28 @@ class Collector:
                                 _crossed = False
                             if bucket == _first_bucket:
                                 try:
-                                    if (_up_b is None or _up_a is None or _dn_b is None or _dn_a is None) and book.condition_id not in self._heal_inflight:
-                                        self._heal_inflight.add(book.condition_id)
-                                        _bt = asyncio.create_task(self._heal_book_bg(book, m))
-                                        _bt.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
+                                    if ((_up_b is None or _up_a is None or _dn_b is None or _dn_a is None) and book.condition_id not in self._heal_inflight):
+                                        # First-bucket gate (pmdata-parity audit fix 3):
+                                        # live one-sided books (0.999/NaN tops) are
+                                        # NOT heal candidates — without a
+                                        # book_state gate they fired a heal every
+                                        # tick. Stale/resyncing only, paced per
+                                        # book (min interval), via the shared
+                                        # should_heal_trigger helper.
+                                        from .ingest.heal import should_heal_trigger as _should_heal_trigger
+                                        _bs0 = getattr(getattr(book, "book_state", None), "value", "")
+                                        _hlt = getattr(self, "_heal_last_trigger_monotonic", None)
+                                        if not isinstance(_hlt, dict):
+                                            _hlt = self._heal_last_trigger_monotonic = {}
+                                        try:
+                                            _now_m0 = time.monotonic()
+                                        except Exception:
+                                            _now_m0 = 0.0
+                                        if _should_heal_trigger(_bs0, book.condition_id, _hlt, _now_m0):
+                                            _hlt[book.condition_id] = _now_m0
+                                            self._heal_inflight.add(book.condition_id)
+                                            _bt = asyncio.create_task(self._heal_book_bg(book, m))
+                                            _bt.add_done_callback(lambda _t, cid=book.condition_id: self._heal_inflight.discard(cid))
                                 except Exception:
                                     pass
                                 # K-1(root): REST heal as a BACKGROUND task — the inline

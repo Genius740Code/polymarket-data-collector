@@ -43,14 +43,62 @@ ENDED_STATUSES = frozenset({"closed", "resolved"})
 # like ResyncManager.note_rate_limited, total by construction (never raises).
 _heal_429_until: float = 0.0
 _heal_429_streak: int = 0
+# Last 429 event (monotonic): the streak decays once the wire has been clean
+# for _HEAL_429_CLEAN_S — a handful of lifetime 429s must never park heals
+# behind U(30,60)s forever.
+_heal_429_last_event: float = 0.0
+_HEAL_429_CLEAN_S: float = 60.0
+
+# Heal pacing (pmdata-parity audit): per-book minimum interval between
+# first-bucket trigger starts, and a tighter per-book REST-attempt cap so a
+# 5-minute fresh window cannot burn its whole REST budget in seconds.
+HEAL_TRIGGER_MIN_INTERVAL_S: float = 30.0
+HEAL_ATTEMPT_CAP_S: float = 5.0
+
+
+def heal_backoff_remaining() -> float:
+    """Seconds left on the shared batched-heal cooldown (0 when clear)."""
+    try:
+        return max(0.0, float(_heal_429_until) - time.monotonic())
+    except Exception:
+        return 0.0
 
 
 def heal_rate_limited() -> bool:
     """True while the shared batched-heal cooldown is active (no POST burn)."""
+    global _heal_429_streak
     try:
-        return time.monotonic() < _heal_429_until
+        now = time.monotonic()
     except Exception:
         return False
+    try:
+        if now < _heal_429_until:
+            return True
+    except Exception:
+        return False
+    # Decay: the wire has been clean past the cooldown — a stale lifetime
+    # streak must not park future heals. Reset once, total.
+    try:
+        if int(_heal_429_streak or 0) > 0 and (now - float(_heal_429_last_event or 0.0)) > _HEAL_429_CLEAN_S:
+            _heal_429_streak = 0
+    except Exception:
+        pass
+    return False
+
+
+def note_heal_success() -> None:
+    """Record a 2xx on the heal path: the limit lifted, drop streak+cooldown.
+
+    Any 2xx proves the shared IP limit is not currently tripped, so the
+    exponential streak resets instead of growing forever. Total (never
+    raises); worst case is a retained backoff.
+    """
+    global _heal_429_until, _heal_429_streak
+    try:
+        _heal_429_until = 0.0
+        _heal_429_streak = 0
+    except Exception:
+        pass
 
 
 def note_heal_rate_limited(retry_after_s: float = 1.0) -> float:
@@ -60,7 +108,7 @@ def note_heal_rate_limited(retry_after_s: float = 1.0) -> float:
     uniform(0.5*base, base) clamped to [0.5, 60]. A huge Retry-After cannot
     park healing forever; jitter spreads the walkers' retry starts.
     """
-    global _heal_429_until, _heal_429_streak
+    global _heal_429_until, _heal_429_streak, _heal_429_last_event
     try:
         _heal_429_streak = int(_heal_429_streak) + 1
     except Exception:
@@ -80,15 +128,94 @@ def note_heal_rate_limited(retry_after_s: float = 1.0) -> float:
         _heal_429_until = time.monotonic() + applied
     except Exception:
         pass
+    try:
+        _heal_429_last_event = time.monotonic()
+    except Exception:
+        pass
     return applied
 
 
 def reset_heal_rate_limit() -> None:
     """Clear the shared cooldown (test hook only — never called in prod)."""
-    global _heal_429_until, _heal_429_streak
+    global _heal_429_until, _heal_429_streak, _heal_429_last_event
     try:
         _heal_429_until = 0.0
         _heal_429_streak = 0
+        _heal_429_last_event = 0.0
+    except Exception:
+        pass
+
+
+def classify_heal_failure(errors: Any) -> str:
+    """Classify a failed heal round: rate_limited | genuine_empty | unknown.
+
+    Only a genuine 200-empty/404 (token exposes no book) may feed a
+    fetch_none streak. Timeouts, transport errors, bad bodies and non-404
+    statuses are *unknown* — the book may be fine, REST just did not
+    answer. A 200 whose body omits the token carries no error entry and is
+    genuine-empty. Total (never raises); unparseable input is unknown.
+    """
+    try:
+        errs = list(errors or [])
+    except Exception:
+        return "unknown"
+    try:
+        for e in errs:
+            if str(e).startswith("rate_limited"):
+                return "rate_limited"
+    except Exception:
+        return "unknown"
+    try:
+        if not errs:
+            return "genuine_empty"
+        if all(str(e).startswith("bad_status:404") for e in errs):
+            return "genuine_empty"
+    except Exception:
+        return "unknown"
+    return "unknown"
+
+
+def should_heal_trigger(
+    book_state_value: Any,
+    condition_id: Any,
+    last_starts: Any,
+    now_monotonic: float,
+    min_interval_s: float = HEAL_TRIGGER_MIN_INTERVAL_S,
+) -> bool:
+    """First-bucket heal gate: stale/resyncing books only, paced per book.
+
+    Live one-sided books (0.999/NaN tops) must not fire a heal every tick —
+    a live book is not a heal candidate. Stale/resyncing books re-fire at
+    most once per min_interval_s. Pure read over last_starts (the caller
+    records the start); total, never raises.
+    """
+    try:
+        if str(book_state_value or "").lower() not in ("stale", "resyncing"):
+            return False
+    except Exception:
+        return False
+    try:
+        last = float((last_starts or {}).get(str(condition_id), 0.0) or 0.0)
+    except Exception:
+        last = 0.0
+    try:
+        return (float(now_monotonic) - last) >= float(min_interval_s)
+    except Exception:
+        return True
+
+
+def note_ws_book_content(resync_mgr: Any, condition_id: Any) -> None:
+    """A real WS book-content frame clears REST suppression (total).
+
+    Fresh WS data flowing for a book proves the venue exposes it — a
+    fetch_none streak/quiet banked earlier is stale evidence and must not
+    keep REST parked. Delegates to note_fetch_ok (clears streak + quiet);
+    never raises; a missing manager is a no-op.
+    """
+    try:
+        fn = getattr(resync_mgr, "note_fetch_ok", None)
+        if callable(fn):
+            fn(condition_id)
     except Exception:
         pass
 
@@ -319,6 +446,10 @@ async def heal_books_batched(
             result.errors.append(f"bad_status:{status}")
             result.missing.extend(chunk)
             continue
+        # Any 2xx proves the shared limit lifted — drop streak+cooldown so
+        # old 429s never park future heals (parse faults below still land
+        # the tokens in missing, honestly unhealed).
+        note_heal_success()
         try:
             body = resp.json() if hasattr(resp, "json") else resp
             if callable(body):
