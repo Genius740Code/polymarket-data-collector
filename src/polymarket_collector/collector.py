@@ -3349,8 +3349,8 @@ class Collector:
                                     market_end_ts_ms=market.market_end_ts_ms,
                                     l2_full=self._l2_full(),
                                     one_sided_promotion=self._one_sided_promotion(),
-                                )
-                                self._link_stale_book_episode(_nb, market.asset, "market_added")
+                            )
+                            self._link_stale_book_episode(_nb, market.asset, "market_added")
                             self.books[market.condition_id] = _nb
                             self._index_book(_nb)
                         else:
