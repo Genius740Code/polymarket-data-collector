@@ -1789,9 +1789,32 @@ class Collector:
                                     # streak (5 cumulative → 1h terminal quiet, renewed
                                     # forever → unhealable book).
                                     _ra = _retry_after_s_of(resp, 1.0)
-                                    await asyncio.sleep(min(_ra, 2.0))
+                                    _slept = min(_ra, 2.0)
+                                    await asyncio.sleep(_slept)
                                     if _ra > 2.0:
-                                        note_heal_rate_limited(_ra)
+                                        # Capped-sleep scale (consistency fix):
+                                        # only _slept seconds were actually
+                                        # waited — the shared note scales to
+                                        # the sleep so one 60s hint does not
+                                        # over-park the shared cooldown, while
+                                        # the per-book backoff keeps the full
+                                        # hint (bounded [0.5, 60] inside) and
+                                        # the outcome records rate_limited (a
+                                        # 429 never feeds a fetch_none streak).
+                                        try:
+                                            _rl_cs = getattr(self.resync, "note_rate_limited", None)
+                                            if callable(_rl_cs):
+                                                _rl_cs(condition_id, _ra)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _od_cs = getattr(self, "_heal_last_outcome", None)
+                                            if not isinstance(_od_cs, dict):
+                                                _od_cs = self._heal_last_outcome = {}
+                                            _od_cs[condition_id] = "rate_limited"
+                                        except Exception:
+                                            pass
+                                        note_heal_rate_limited(_slept)
                                         return
                                     resp = await client.get(
                                         self.config.ws.rest_book_url,
@@ -5999,6 +6022,17 @@ class Collector:
         burn starts at all. Capped at max_books.
         """
         cands = []
+        # Shared-cooldown gate (consistency fix): while ANY heal caller
+        # tripped the shared 429 cooldown, scheduling drives only feeds
+        # resync retry loops (the fetcher returns None immediately) — the
+        # pre-fix gates below mirror _background_heal_tick but never saw
+        # the shared cooldown. Zero candidates: no REST burn at all.
+        try:
+            from .ingest.heal import heal_rate_limited as _heal_shared_limited
+            if callable(_heal_shared_limited) and _heal_shared_limited():
+                return []
+        except Exception:
+            pass
         try:
             _items = list((self.books or {}).items())
         except Exception:
@@ -6124,7 +6158,11 @@ class Collector:
         join, stamp reconnect if missing, one bounded resync() REST drive —
         so a completed heal emits exactly the events the inline tick
         emitted; only the scheduling changed (detached from the flush loop,
-        capped by the shared semaphore).
+        capped by the shared semaphore). Gated like _heal_book_bg: the 5s
+        attempt cap, the shared-429 early-return, and outcome recording
+        (the detached drive used to call resync() directly, bypassing all
+        three — capless drives per flush tick, 60s retry-loop spins during
+        the shared cooldown, and unrecorded outcomes).
         """
         try:
             async with shared["sem"]:
@@ -6133,6 +6171,57 @@ class Collector:
                         return
                 except Exception:
                     return
+                # Attempt cap (pmdata-parity audit fix 1, verbatim from
+                # _heal_book_bg): at most ~1 REST attempt per 5s per book.
+                # Skipped attempts burn nothing and record nothing.
+                try:
+                    _la = getattr(self, "_heal_last_attempt_monotonic", None)
+                    if not isinstance(_la, dict):
+                        _la = self._heal_last_attempt_monotonic = {}
+                    _now_m = time.monotonic()
+                    try:
+                        _prev = float(_la.get(book.condition_id, 0.0) or 0.0)
+                    except Exception:
+                        _prev = 0.0
+                    if (_now_m - _prev) < 5.0:
+                        return
+                    _la[book.condition_id] = _now_m
+                except Exception:
+                    pass
+                # Shared 429 discipline (pmdata-parity audit fix 2, verbatim
+                # from the _limited_at_entry branch): while the shared
+                # cooldown is active, no resync drive starts — a bounded
+                # per-book backoff is noted (the drive retries after backoff
+                # instead of feeding a fetch_none streak) and the outcome
+                # records rate_limited.
+                try:
+                    from .ingest.heal import (
+                        heal_backoff_remaining as _heal_rem_d,
+                        heal_rate_limited as _heal_lim_d,
+                    )
+                    _lim_d = bool(_heal_lim_d()) if callable(_heal_lim_d) else False
+                except Exception:
+                    _lim_d = False
+                    _heal_rem_d = None
+                if _lim_d:
+                    try:
+                        _rl_d = getattr(self.resync, "note_rate_limited", None)
+                        if callable(_rl_d):
+                            try:
+                                _rem_d = float(_heal_rem_d()) if callable(_heal_rem_d) else 1.0
+                            except Exception:
+                                _rem_d = 1.0
+                            _rl_d(book.condition_id, max(0.5, min(60.0, _rem_d or 1.0)))
+                    except Exception:
+                        pass
+                    try:
+                        _od_d = getattr(self, "_heal_last_outcome", None)
+                        if not isinstance(_od_d, dict):
+                            _od_d = self._heal_last_outcome = {}
+                        _od_d[book.condition_id] = "rate_limited"
+                    except Exception:
+                        pass
+                    return
                 try:
                     _ep_id = self._ensure_episode_for_stale_book(book, book.asset, "background_heal")
                     try:
@@ -6140,7 +6229,28 @@ class Collector:
                             self.resync.handle_reconnect(_ep_id)
                     except Exception:
                         pass
-                    if await self.resync.resync(book.asset, book.condition_id, self.books, _ep_id):
+                    _ok_d = await self.resync.resync(book.asset, book.condition_id, self.books, _ep_id)
+                    # Outcome recording (strike-discipline vocabulary): ok on
+                    # success; rate_limited when the per-book backoff is
+                    # active (no strike — already noted above); unknown
+                    # otherwise (never invent genuine_empty — only the
+                    # fetcher may classify a genuine miss).
+                    try:
+                        _od2 = getattr(self, "_heal_last_outcome", None)
+                        if not isinstance(_od2, dict):
+                            _od2 = self._heal_last_outcome = {}
+                        if _ok_d:
+                            _od2[book.condition_id] = "ok"
+                        else:
+                            try:
+                                _rl_fn_d = getattr(self.resync, "rate_limited", None)
+                                _was_rl_d = bool(_rl_fn_d(book.condition_id)) if callable(_rl_fn_d) else False
+                            except Exception:
+                                _was_rl_d = False
+                            _od2[book.condition_id] = "rate_limited" if _was_rl_d else "unknown"
+                    except Exception:
+                        pass
+                    if _ok_d:
                         try:
                             pass_state["healed"] = int(pass_state.get("healed", 0)) + 1
                         except Exception:
