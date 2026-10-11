@@ -3327,14 +3327,15 @@ def _stream_export_asset_dataset(
     clean hive — the clean hive (2.85M rows after 40h without prune) can no
     longer be concat-loaded, and its catch-up rebuild belongs off-peak.
 
-    coalesce_rows (2026-10-10 dominant-phase fix, measured split: aggregate
-    ~49% / scan ~34% / write ~12% of per-file time): tiny flush files average
-    ~70-180 rows, so a per-file _transform plus the writer's per-batch
-    schema normalize pay ~122-column fixed costs once per tiny file. Decoded
-    chunks now accumulate to ~coalesce_rows before ONE transform+yield.
-    Row content, oldest-first order and dedup first-wins semantics are
-    unchanged; per-file decode errors still mark only that file; a
-    coalesced-batch transform error marks every member file (fail closed —
+    coalesce_rows (default 20000; kept as the ROW-GROUP CEILING, not an
+    accumulation target): decoded chunks are transformed+yielded one by one
+    as decoded (zero accumulation — the 2026-10-10 _pending list that held
+    ~coalesce_rows decoded rows alongside the writer's own row-group buffer
+    is gone after the XRP worker still blew the untouched 1000MB cap at
+    1500+ files). The writer coalesces the small yields into sane row groups
+    bounded by this ceiling. Row content, oldest-first order and dedup
+    first-wins semantics are unchanged; per-file decode errors still mark
+    only that file; a chunk transform error marks its own file (fail closed —
     the coverage gate keeps prior staging either way).
 
     compact_dedup (2026-10-10 peak fix, default True): the global dedup
@@ -3458,64 +3459,25 @@ def _stream_export_asset_dataset(
         _rows_out = 0
         _t0 = _time_g.time()
         _last_log = _t0
-        # 2026-10-10 coalescing state (see docstring): decoded chunks wait
-        # for one transform+yield per ~coalesce_rows rows. _pending_src
-        # carries (file index, file bytes) per chunk so a failed coalesced
-        # batch can attribute every DISTINCT member file — fail closed.
-        _pending: list = []
-        _pending_src: list = []
-        _pending_rows = 0
-
-        def _co_flush():
-            nonlocal _pending, _pending_src, _pending_rows, _rows_out
-            if not _pending:
-                return
-            _members = _pending
-            _srcs = _pending_src
-            _pending = []
-            _pending_src = []
-            _pending_rows = 0
-            try:
-                _co = _members[0] if len(_members) == 1 else pa.concat_tables(
-                    _members, promote_options="default")
-            except Exception:
-                # mixed vintages cannot concat — per-member transform, the
-                # pre-2026-10-10 behavior (the writer normalizes per batch
-                # with per-field casts exactly as before). Only a failing
-                # member is dropped; the others ship.
-                for _m, _src1 in zip(_members, _srcs):
-                    try:
-                        _m2 = _transform(_m)
-                    except Exception:
-                        if io_stats is not None:
-                            io_stats["files_failed"] += 1
-                            io_stats["failed_bytes"] += _src1[1]
-                        continue
-                    if _m2 is not None and _m2.num_rows > 0:
-                        _rows_out += _m2.num_rows
-                        yield _m2
-                    del _m2
-                return
-            try:
-                _co = _transform(_co)
-            except Exception as _ce:
-                # fail closed: every distinct member file's rows drop with
-                # the batch (overcounting a twice-failing file is fine —
-                # the gate fails on ANY failed file)
-                if io_stats is not None:
-                    _fids = {_f for _f, _ in _srcs}
-                    _sz_by: dict = {}
-                    for _f, _sz2 in _srcs:
-                        _sz_by.setdefault(_f, _sz2)
-                    io_stats["files_failed"] += len(_fids)
-                    io_stats["failed_bytes"] += sum(_sz_by.values())
-                print(f"[export] WARN coalesced transform failed ({_ce}) — "
-                      f"{len(_srcs)} batches dropped (fail closed)")
-                return
-            if _co is not None and _co.num_rows > 0:
-                _rows_out += _co.num_rows
-                yield _co
-            del _co
+        # 2026-10-10 zero-accumulation streaming (peak fix): each decoded
+        # chunk is transformed and yielded immediately — no decoded batch is
+        # EVER held across files. coalesce_rows is now only the row-group
+        # CEILING handed to the writer (see the write_batches call), not an
+        # accumulation target. The old _pending list held ~coalesce_rows
+        # decoded rows while the writer held another row group plus a concat
+        # transient on each side; now at most one decoded chunk (~one source
+        # file) plus the writer's single bounded row group are alive at once.
+        # Unchanged: row content, oldest-first order, dedup first-wins
+        # (sequential filter over the same row order keeps the same set),
+        # per-batch sort (readers sort anyway per E13), fail-closed per-file
+        # accounting (a chunk that cannot transform drops its own file; the
+        # "coalesced transform failed" log token is kept so worker-log
+        # monitors keep matching). The writer's per-batch normalize to the
+        # FIXED output schema is the late-type promotion fallback — no
+        # union-schema discovery is needed, so no prefix sampling can lose a
+        # vintage (null-typed columns cast up to the fixed type:
+        # first-non-null-wins for the common case, proven by the full-vintage
+        # parity run).
 
         for _date, _paths in _groups:
             for _p in _paths:
@@ -3540,39 +3502,49 @@ def _stream_export_asset_dataset(
                     _sz_p = _p.stat().st_size
                 except OSError:
                     pass
-                _mark = len(_pending)
-                _mark_rows = _pending_rows
+                _file_ok = True
                 try:
                     for _chunk in _pf.iter_batches(batch_size=20000, columns=_cols):
                         _t = pa.Table.from_batches([_chunk])
+                        del _chunk
                         if _t.num_rows == 0:
+                            del _t
                             continue
                         if io_stats is not None:
                             io_stats["rows_read"] += _t.num_rows
-                        _pending.append(_t)
-                        _pending_src.append((_done, _sz_p))
-                        _pending_rows += _t.num_rows
-                        if _pending_rows >= coalesce_rows:
-                            yield from _co_flush()
+                        try:
+                            _t2 = _transform(_t)
+                        except Exception as _te:
+                            # fail closed: this file's rows drop (a chunk of
+                            # the same file that already shipped stays
+                            # shipped — same as the old already-flushed
+                            # case); the coverage gate fails on ANY failed
+                            # file either way. Single-chunk batches blame
+                            # exactly this file, no overcounting.
+                            print(f"[export] WARN coalesced transform failed ({_te}) — "
+                                  f"1 batches dropped (fail closed)")
+                            if io_stats is not None:
+                                io_stats["files_failed"] += 1
+                                io_stats["failed_bytes"] += _sz_p
+                            del _t
+                            _file_ok = False
+                            break
+                        del _t
+                        if _t2 is not None and _t2.num_rows > 0:
+                            _rows_out += _t2.num_rows
+                            yield _t2
+                        del _t2
                     del _pf
                 except Exception:
-                    # decode error mid-file: roll this file's still-pending
-                    # chunks back (already-flushed ones are gone from here,
-                    # exactly like the pre-2026-10-10 path where earlier
-                    # chunks had already shipped; the file is failed either
-                    # way and the coverage gate keeps prior staging).
-                    # _pending_rows is RESTORED to the file-start snapshot,
-                    # not decremented: chunks flushed mid-file already left
-                    # the pending count, so subtracting this file's total
-                    # contribution could drive it negative and skew every
-                    # later threshold check.
-                    del _pending[_mark:]
-                    del _pending_src[_mark:]
-                    _pending_rows = _mark_rows
+                    # decode error mid-file: earlier chunks already shipped
+                    # (same as the old already-flushed case); the file is
+                    # failed and the coverage gate keeps prior staging.
                     if io_stats is not None:
                         io_stats["files_failed"] += 1
                         io_stats["failed_bytes"] += _sz_p
                     _pf = None  # release promptly; rebound next file
+                    continue
+                if not _file_ok:
                     continue
                 if io_stats is not None:
                     io_stats["files_ok"] += 1
@@ -3590,12 +3562,13 @@ def _stream_export_asset_dataset(
                 malloc_trim()
             except Exception:
                 pass
-        # tail flush: rows below the coalesce threshold still ship
-        yield from _co_flush()
+        # no tail flush: zero accumulation means every decoded chunk has
+        # already been transformed and yielded above.
 
     healed_note = ""
     rows = write_batches(_phase_timed_iter(_gen(), f"{asset_upper}/{ds}"),
-                         tmp_path, schema=schema, stats=io_stats)
+                         tmp_path, schema=schema, stats=io_stats,
+                         row_group_rows=coalesce_rows)
     if dedup is not None and (dedup.dupes or ds == "book_snapshots_500ms"):
         healed_note = f" (dedup dropped {dedup.dupes})" if dedup.dupes else ""
     if healed_note:

@@ -1,15 +1,19 @@
-"""Export worker phase timing + snapshot coalescing (2026-10-10).
+"""Export worker phase timing + snapshot streaming aggregate (2026-10-10).
 
 Measured per-file split on the real hive (uncontended, ~180-row flush
 files): scan/footer (open+footer+schema+project) ~34%, aggregate
 (decode+transform kernels) ~49%, write (per-batch normalize + amortized
-row-group flush) ~12% — aggregate dominates, so the fix coalesces decoded
-chunks to ~coalesce_rows before one transform+yield. These tests pin:
+row-group flush) ~12% — aggregate dominates. The 2026-10-10 accumulator
+that held ~coalesce_rows decoded rows before one transform+yield is GONE
+(zero accumulation: the XRP worker still blew the untouched 1000MB cap at
+1500+ files): every decoded chunk is transformed+yielded immediately and
+coalesce_rows is only the row-group CEILING handed to the writer. These
+tests pin:
 
 - the log-only phase lines (scan/aggregate/write elapsed seconds),
-- coalescing row-content parity vs the per-file path,
-- fail-closed accounting when a coalesced batch cannot transform,
-- the per-member fallback when mixed vintages cannot concat,
+- row-content parity across writer row-group ceilings (coalesce_rows),
+- fail-closed accounting when a chunk cannot transform,
+- mixed vintages: only the failing member file drops, good ones ship,
 - the 1000MB rss cap and worker budget staying untouched.
 """
 
@@ -112,7 +116,9 @@ def test_stream_snapshot_logs_all_three_phase_lines(tmp_path, capsys):
     assert io.get("files_ok") == 3 and io.get("files_failed", 0) == 0
     logged = capsys.readouterr().out
     assert "phase BTC/book_snapshots_500ms scan: 3 files elapsed=" in logged
-    assert "phase BTC/book_snapshots_500ms aggregate: batches=1 rows=6 elapsed=" in logged
+    # zero accumulation: one yield per decoded file chunk (3 files), the
+    # writer coalesces them into row groups bounded by coalesce_rows
+    assert "phase BTC/book_snapshots_500ms aggregate: batches=3 rows=6 elapsed=" in logged
     assert "phase BTC/book_snapshots_500ms write: elapsed=" in logged
 
 
@@ -161,11 +167,13 @@ def test_coalesced_batch_transform_failure_fails_closed(tmp_path, capsys):
     assert "coalesced transform failed" in capsys.readouterr().out
 
 
-def test_mixed_vintages_fall_back_per_member(tmp_path, capsys):
-    # one wrong-typed file written FIRST so it coalesces with a good file:
-    # concat of the two vintages raises -> per-member fallback (the
-    # pre-2026-10-10 behavior): only the failing member is dropped and
-    # counted, the good members still ship, silently like the old path.
+def test_mixed_vintages_drop_only_failing_member(tmp_path, capsys):
+    # one wrong-typed file written FIRST: its chunk fails the lane filter at
+    # transform (int64 series_id vs string lane mask) and drops ONLY that
+    # file, counted failed, fail closed. The good files' chunks already
+    # yielded/still yield untouched — mixed vintages can never concat-fail
+    # the batch because nothing is ever held across files. The loud
+    # fail-closed token is kept so worker-log monitors keep matching.
     base = _snap_hive(tmp_path, n_files=2, rows_per_file=2)
     d = base / "book_snapshots_500ms" / "date=2026-10-10" / "asset=BTC"
     ss = snapshot_schema(10)
@@ -187,7 +195,7 @@ def test_mixed_vintages_fall_back_per_member(tmp_path, capsys):
     assert io.get("files_failed") == 1
     assert set(pq.read_table(str(tmp)).column("series_id").to_pylist()) == {"BTC-5m"}
     out = capsys.readouterr().out
-    assert "coalesced transform failed" not in out  # fallback, not batch-drop
+    assert "coalesced transform failed" in out  # loud per-chunk fail-closed drop
     assert "phase BTC/book_snapshots_500ms aggregate: batches=2 rows=4" in out
 
 
