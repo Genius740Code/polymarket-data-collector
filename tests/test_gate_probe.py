@@ -619,6 +619,107 @@ def test_gate_verdict_breaches_use_comp_norm():
 
 
 # ---------------------------------------------------------------------------
+# Dual live-share diagnostics (P1) — quotable-adjusted live% alongside raw
+# ---------------------------------------------------------------------------
+
+
+def test_quotable_adjusted_excludes_unquotable_slots(tmp_path):
+    """(a) Unquotable slots are excluded from the adjusted denominator.
+
+    Slot 1 holds only an all-null live row (pre-discovery, no book) -> that
+    slot is NOT quotable, so its row must drop out of the LiveQuotable%
+    denominator while still counting in RawLive%.
+    """
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5, "live"),  # slot 0: full book -> quotable, live
+        _snap(GRID_NS, 2, None, None, None, None, "live"),  # slot 1: all-null -> NOT quotable, live
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "stale"),  # slot 2: full book -> quotable, stale
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    # RawLive%: 2 of 3 rows are live (slots 0 and 1) -> 66.67
+    assert result.raw_live_pct == pytest.approx(66.67)
+    # Slot 1 is unquotable: adjusted denominator = rows in slots 0+2 only;
+    # 1 live of 2 rows -> 50.0 (would be 66.67 if slot 1 were included).
+    assert result.live_quotable_pct == 50.0
+    assert result.quotable_slots == 2
+    assert result.live_quotable_pct != result.raw_live_pct
+
+
+def test_all_quotable_adjusted_equals_raw(tmp_path):
+    """(b) When every sampled slot is quotable, LiveQuotable% == RawLive%."""
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5, "live"),
+        _snap(GRID_NS, 2, 0.5, 0.5, 0.5, 0.5, "stale"),  # stale row still confers quotability
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "live"),
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    assert result.quotable_slots == 3
+    assert result.raw_live_pct == pytest.approx(66.67)
+    assert result.live_quotable_pct == result.raw_live_pct
+
+
+def test_quotable_null_vs_zero(tmp_path):
+    """(c) Null-vs-zero respected: None never confers quotability, 0.0 does.
+
+    Only the slot holding the all-zero row may be quotable: 0.0 is a present
+    price, while a None anywhere in the other rows' books excludes them.
+    """
+    rows = [
+        _snap(0, 1, 0.0, 0.0, 0.0, 0.0, "live"),  # 0.0 prices are non-null -> slot quotable
+        _snap(GRID_NS, 2, 0.5, 0.5, 0.5, None, "live"),  # one None -> slot NOT quotable
+        _snap(2 * GRID_NS, 3, None, None, None, None, "stale"),  # all None -> slot NOT quotable
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    assert result.quotable_slots == 1  # only slot 0, via the 0.0-price row
+    # Adjusted denominator = 1 row (the zero row, live) -> 100.0
+    assert result.live_quotable_pct == 100.0
+    # RawLive% still counts both live rows over all 3 rows -> 66.67
+    assert result.raw_live_pct == pytest.approx(66.67)
+
+
+def test_quotable_no_quotable_slots_guard(tmp_path):
+    """Edge: zero quotable slots -> LiveQuotable% 0.0 (denominator guard)."""
+    rows = [_snap(0, 1, None, None, None, None, "live")]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    assert result.quotable_slots == 0
+    assert result.live_quotable_pct == 0.0
+    assert result.raw_live_pct == 100.0  # the single all-null row is book_state=live
+
+
+def test_quotable_only_flag_filters_live_share(tmp_path):
+    """--quotable-only filters the live-share computation to quotable slots.
+
+    With the flag, RawLive% reports the quotable-adjusted share (here 50.0,
+    the unquotable slot's live row excluded) instead of the raw 66.67; the
+    CompNorm% gate metric is identical in both modes.
+    """
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5, "live"),
+        _snap(GRID_NS, 2, None, None, None, None, "live"),
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "stale"),
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    raw = analyze_lane(tmp_path, "BTC", max_files=48)
+    filtered = analyze_lane(tmp_path, "BTC", max_files=48, quotable_only=True)
+
+    assert raw.raw_live_pct == pytest.approx(66.67)  # default: raw live share
+    assert filtered.raw_live_pct == 50.0  # flag: live share computed over quotable slots only
+    assert filtered.raw_live_pct == filtered.live_quotable_pct
+    # LiveQuotable% is the adjusted share in both modes
+    assert raw.live_quotable_pct == filtered.live_quotable_pct == 50.0
+    # Gate metric untouched by the flag
+    assert raw.comp_spread_norm_pct == filtered.comp_spread_norm_pct == 0.0
+
+
+# ---------------------------------------------------------------------------
 # Real-data smoke test (skip if data/ doesn't exist)
 # ---------------------------------------------------------------------------
 

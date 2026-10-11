@@ -8,6 +8,14 @@ arbitrary). Density%: honest tick census — distinct on-grid timestamps over th
 sampled span. Gate verdict: keyed on CompNorm% (spread-normalized live share);
 the raw Comp>0.1% column is continuity-only and does not gate.
 
+Dual live-share diagnostics (P1): RawLive% = share of sampled rows with
+book_state='live'. LiveQuotable% = the same share restricted to quotable 500ms
+slots — a slot is QUOTABLE when >=1 sampled lane row in it has all 4 prices
+non-null (null-vs-zero respected: None excludes the row from conferring
+quotability, 0.0 still counts as present). Diagnostics only — never gate.
+--quotable-only filters the live-share computation to quotable slots; the
+default output prints BOTH raw and adjusted.
+
 EXIT 0 always on success (measurement REPORTS, never fails the gate). Exit 2 only
 on bad args / missing date partition.
 """
@@ -83,6 +91,10 @@ class LaneResult:
     offgrid_count: int  # off-grid ts count
     part_flag: bool  # PARTIAL -> lane hit timeout
     span_ns: int  # sampled span: max ts - min ts (ns)
+    # --- Dual live-share diagnostics (P1): never gate, report-only ---
+    quotable_slots: int = 0  # distinct 500ms slots with >=1 all-4-prices-non-null row
+    raw_live_pct: float = 0.0  # live rows / all sampled rows * 100 (raw live share)
+    live_quotable_pct: float = 0.0  # live rows in quotable slots / rows in quotable slots * 100
 
 
 @dataclass
@@ -162,11 +174,14 @@ def analyze_lane(
     snap_dir: Path,
     asset: str,
     max_files: int,
+    quotable_only: bool = False,
 ) -> LaneResult:
     """Analyse one asset lane: newest-file sample + projected-column reads.
 
     Samples the newest `max_files` parquet files by mtime, reads only the
     projected columns, and scores complementarity split by book_state.
+    With `quotable_only=True` the live-share computation is filtered to
+    quotable slots (RawLive% then reports the quotable-adjusted share).
     """
     sampled = newest_parquet_files(snap_dir, max_files)
     if not sampled:
@@ -187,6 +202,9 @@ def analyze_lane(
             offgrid_count=0,
             part_flag=False,
             span_ns=0,
+            quotable_slots=0,
+            raw_live_pct=0.0,
+            live_quotable_pct=0.0,
         )
 
     # For complementarity: we need to sample rows from each file,
@@ -266,6 +284,9 @@ def analyze_lane(
             offgrid_count=0,
             part_flag=False,
             span_ns=0,
+            quotable_slots=0,
+            raw_live_pct=0.0,
+            live_quotable_pct=0.0,
         )
 
     # --- Sampled span + honest tick census (distinct on-grid timestamps) ---
@@ -373,6 +394,41 @@ def analyze_lane(
 
     part_flag = False  # will be set by caller if timeout hit
 
+    # --- Dual live-share diagnostics (P1): quotable slots, raw + adjusted ---
+    # A 500ms slot is QUOTABLE when >=1 sampled lane row in it has all 4
+    # prices non-null. Null-vs-zero respected: None never confers quotability,
+    # 0.0 is a present price and does. Diagnostics only — never gate.
+    slot_of: List[int] = [r["ts_snapshot_ns"] // GRID_NS for r in all_rows]
+    quotable_slot_set: Set[int] = set()
+    for r, slot in zip(all_rows, slot_of):
+        if (
+            r["up_bid"] is not None
+            and r["up_ask"] is not None
+            and r["down_bid"] is not None
+            and r["down_ask"] is not None
+        ):
+            quotable_slot_set.add(slot)
+
+    rows_in_quotable = 0
+    live_rows_total = 0
+    live_rows_in_quotable = 0
+    for r, slot in zip(all_rows, slot_of):
+        is_live = r["book_state"] == "live"
+        if is_live:
+            live_rows_total += 1
+        if slot in quotable_slot_set:
+            rows_in_quotable += 1
+            if is_live:
+                live_rows_in_quotable += 1
+
+    raw_live_pct = (live_rows_total / len(all_rows) * 100) if all_rows else 0.0
+    live_quotable_pct = (
+        (live_rows_in_quotable / rows_in_quotable * 100) if rows_in_quotable > 0 else 0.0
+    )
+    if quotable_only:
+        # --quotable-only: filter the live-share computation to quotable slots
+        raw_live_pct = live_quotable_pct
+
     return LaneResult(
         lane=asset,
         files_sampled=files_sampled,
@@ -391,6 +447,9 @@ def analyze_lane(
         offgrid_count=offgrid_count,
         part_flag=part_flag,
         span_ns=span_ns,
+        quotable_slots=len(quotable_slot_set),
+        raw_live_pct=round(raw_live_pct, 2),
+        live_quotable_pct=round(live_quotable_pct, 2),
     )
 
 
@@ -527,6 +586,9 @@ def main() -> None:
                     help=f"Max parquet files per lane (default {DEFAULT_MAX_FILES_PER_LANE}, cap {MAX_FILES_PER_LANE_CAP})")
     ap.add_argument("--timeout-s", type=int, default=DEFAULT_TIMEOUT_S,
                     help=f"Abort lane scan past budget s (default {DEFAULT_TIMEOUT_S})")
+    ap.add_argument("--quotable-only", action="store_true",
+                    help="Filter the live-share computation to quotable slots (RawLive%% then reports "
+                         "the quotable-adjusted share; default prints BOTH raw and adjusted)")
 
     args = ap.parse_args()
 
@@ -563,7 +625,7 @@ def main() -> None:
 
     for asset in assets:
         snap_dir = data_root / "book_snapshots_500ms" / f"date={date_str}" / f"asset={asset}"
-        result = analyze_lane(snap_dir, asset, max_files)
+        result = analyze_lane(snap_dir, asset, max_files, quotable_only=args.quotable_only)
         # If we hit the file cap and there are more files, set PARTIAL flag
         # Count total available parquet files
         if snap_dir.exists():
@@ -587,16 +649,19 @@ def main() -> None:
     print("CompNorm% gates the complementarity verdict (spread-normalized live share);")
     print("Comp>0.1% is continuity-only (raw deviation, illiquidity-sensitive, does NOT gate);")
     print("CompLive/CompStale split Comp>0.1% by book_state (diagnostics).")
+    print("QSlots/LiveQuotable%/RawLive% are the dual live-share diagnostics — a 500ms slot is")
+    print("quotable when >=1 sampled row in it has all 4 prices non-null (None excludes, 0.0 counts);")
+    print("LiveQuotable% excludes unquotable slots from its denominator. Diagnostics only, never gate.")
     print()
 
     # Table header
-    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'CompNorm%':>8} {'LiveNoBook':>9} {'LivePartial':>10} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
-    print("-" * 70)
+    print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'CompNorm%':>8} {'QSlots':>6} {'LiveQuotable%':>13} {'RawLive%':>8} {'LiveNoBook':>9} {'LivePartial':>10} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
+    print("-" * 110)
 
     for lr in lane_results:
         part_str = "YES" if lr.part_flag else ""
         examples_str = ", ".join(str(ts) for ts in lr.live_null_partial_examples[:3]) if lr.live_null_partial_examples else ""
-        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.comp_spread_norm_pct:>8.1f} {lr.live_null_no_book_count:>9} {lr.live_null_partial_count:>10} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4} {examples_str}")
+        print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.comp_spread_norm_pct:>8.1f} {lr.quotable_slots:>6} {lr.live_quotable_pct:>13.1f} {lr.raw_live_pct:>8.1f} {lr.live_null_no_book_count:>9} {lr.live_null_partial_count:>10} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4} {examples_str}")
 
     print()
     breaches = breaching_lanes(lane_results)
