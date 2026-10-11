@@ -762,3 +762,76 @@ def test_smoke_real_data():
         assert verdict.status in ("HEALTHY", "DEGRADED", "UNKNOWN")
         assert verdict.failed >= 0
         assert verdict.successful >= 0
+
+
+# ---------------------------------------------------------------------------
+# NaN-as-null guard — a float-NaN price is null, never a checkable price.
+# A literal NaN passes an `is None` guard, then deviation=NaN silently fails
+# every `> threshold` comparison, undercounting complementarity and null-mid.
+# (Footer read of the 12 newest 2026-10-11 BTC files found 0 NaN / 202 None
+# in 2257 rows — the hole is LATENT, but guarded.)
+# ---------------------------------------------------------------------------
+
+
+def test_nan_price_counts_as_null_mid(tmp_path):
+    """A float-NaN price is null: the row counts as null-mid, never checkable."""
+    nan = float("nan")
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5, "live"),  # clean, deviation 0
+        _snap(GRID_NS, 2, nan, 0.5, 0.5, 0.5, "live"),  # NaN up_bid -> null-mid
+        _snap(2 * GRID_NS, 3, 0.3, 0.3, 0.3, 0.3, "live"),  # deviation 0.4 -> breach
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    # The NaN row must count as null-mid. Pre-fix it slid through the
+    # `is None` guard as "checkable" with deviation=NaN (never > 0.001).
+    assert result.null_mid_count == 1
+    # Only the two clean rows are checkable; the 0.3-row breaches -> 50.0.
+    # Pre-fix the NaN row diluted the denominator (3 checkable -> 33.33).
+    assert result.complement_gt_01_pct == 50.0
+    assert result.comp_live_gt_01_pct == 50.0
+
+
+def test_nan_live_row_classifies_no_book_partial(tmp_path):
+    """NaN live rows classify LiveNullNoBook/LiveNullPartial exactly like None,
+    and NaN never confers slot quotability."""
+    nan = float("nan")
+    rows = [
+        # slot 0: all four NaN, live -> LiveNullNoBook; slot NOT quotable
+        _snap(0, 1, nan, nan, nan, nan, "live"),
+        # slot 1: one NaN price, live -> LiveNullPartial; slot NOT quotable
+        _snap(GRID_NS, 2, 0.5, nan, 0.5, 0.5, "live"),
+        # slot 2: clean row -> the only quotable slot
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "stale"),
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    assert result.null_mid_count == 2
+    assert result.live_null_no_book_count == 1
+    assert result.live_null_partial_count == 1
+    assert result.live_null_partial_examples == [GRID_NS]
+    # NaN-as-null never confers quotability: only slot 2 is quotable
+    # (pre-fix, `is not None` let both NaN slots confer -> 3).
+    assert result.quotable_slots == 1
+
+
+def test_all_none_rows_behavior_unchanged(tmp_path):
+    """Regression guard: all-None rows keep their exact pre-fix semantics."""
+    rows = [
+        _snap(0, 1, None, None, None, None, "live"),  # all None -> no-book
+        _snap(GRID_NS, 2, None, 0.5, 0.5, 0.5, "live"),  # partial None
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "live"),  # clean
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    assert result.null_mid_count == 2
+    assert result.live_null_no_book_count == 1
+    assert result.live_null_partial_count == 1
+    assert result.live_null_partial_examples == [GRID_NS]
+    assert result.quotable_slots == 1
+    # The single checkable row has deviation 0 -> no breach anywhere.
+    assert result.complement_gt_01_pct == 0.0
+    assert result.comp_spread_norm_pct == 0.0

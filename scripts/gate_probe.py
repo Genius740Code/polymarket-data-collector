@@ -11,8 +11,8 @@ the raw Comp>0.1% column is continuity-only and does not gate.
 Dual live-share diagnostics (P1): RawLive% = share of sampled rows with
 book_state='live'. LiveQuotable% = the same share restricted to quotable 500ms
 slots — a slot is QUOTABLE when >=1 sampled lane row in it has all 4 prices
-non-null (null-vs-zero respected: None excludes the row from conferring
-quotability, 0.0 still counts as present). Diagnostics only — never gate.
+non-null (null-vs-zero respected: None or float-NaN excludes the row from
+conferring quotability — NaN is null — 0.0 still counts as present). Diagnostics only — never gate.
 --quotable-only filters the live-share computation to quotable slots; the
 default output prints BOTH raw and adjusted.
 
@@ -22,6 +22,7 @@ on bad args / missing date partition.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,19 @@ DEV_FLOOR = 0.001
 # combined_spread)). The gate requires complementarity <= 0.1%; the raw
 # Comp>0.1% column is continuity-only and never gates the verdict.
 COMP_NORM_GATE_PCT = 0.1
+
+
+def _is_null_price(v) -> bool:
+    """True when a price is null: None or float-NaN.
+
+    pyarrow float64 columns surface both parquet NULLs (-> Python None) and
+    float-NaN sentinels. Both mean "no price" and must count as null-mid
+    (guarded, never imputed); a bare NaN would otherwise pass an `is None`
+    check, make deviation=NaN, and silently fail every `> threshold`
+    comparison, undercounting complementarity and null-mid. None semantics
+    are unchanged.
+    """
+    return v is None or (isinstance(v, float) and math.isnan(v))
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -322,7 +336,12 @@ def analyze_lane(
         da = r["down_ask"]
 
         # Check if any of the four prices is null (None or NaN)
-        has_null = ob is None or ua is None or db is None or da is None
+        has_null = (
+            _is_null_price(ob)
+            or _is_null_price(ua)
+            or _is_null_price(db)
+            or _is_null_price(da)
+        )
         book_state = r["book_state"]
         is_live = book_state == "live"
 
@@ -331,7 +350,12 @@ def analyze_lane(
 
             # Classify live null mid rows
             if is_live:
-                all_null = (ob is None and ua is None and db is None and da is None)
+                all_null = (
+                    _is_null_price(ob)
+                    and _is_null_price(ua)
+                    and _is_null_price(db)
+                    and _is_null_price(da)
+                )
                 if all_null:
                     live_null_no_book_count += 1
                 else:
@@ -396,16 +420,17 @@ def analyze_lane(
 
     # --- Dual live-share diagnostics (P1): quotable slots, raw + adjusted ---
     # A 500ms slot is QUOTABLE when >=1 sampled lane row in it has all 4
-    # prices non-null. Null-vs-zero respected: None never confers quotability,
-    # 0.0 is a present price and does. Diagnostics only — never gate.
+    # prices non-null. Null-vs-zero respected: None and float-NaN never confer
+    # quotability (NaN is null), 0.0 is a present price and does. Diagnostics
+    # only — never gate.
     slot_of: List[int] = [r["ts_snapshot_ns"] // GRID_NS for r in all_rows]
     quotable_slot_set: Set[int] = set()
     for r, slot in zip(all_rows, slot_of):
         if (
-            r["up_bid"] is not None
-            and r["up_ask"] is not None
-            and r["down_bid"] is not None
-            and r["down_ask"] is not None
+            not _is_null_price(r["up_bid"])
+            and not _is_null_price(r["up_ask"])
+            and not _is_null_price(r["down_bid"])
+            and not _is_null_price(r["down_ask"])
         ):
             quotable_slot_set.add(slot)
 
