@@ -1,18 +1,19 @@
 {
-  "n": 1,
-  "win%": 0.0,
-  "total": 0.0,
-  "avg": 0.0,
-  "t": 0.0,
-  "coverage%": 0.17,
+  "n": 3,
+  "win%": 66.67,
+  "total": 16.95,
+  "avg": 5.6509,
+  "t": 1.275,
+  "coverage%": 0.09,
+  "generated": 3169,
   "skip_breakdown": {
     "stale_old": 0,
     "spread_high": 0,
-    "other": 138,
+    "other": 2020,
     "post_resolution": 0,
-    "null_quote": 301
+    "null_quote": 1146
   },
-  "cex_gated": 158,
+  "cex_gated": 0,
   "theta": 2.0,
   "fee_rate": 0.07,
   "ask_max": 0.9,
@@ -20,13 +21,42 @@
   "T_s": 30,
   "sample_every": 1,
   "binance_available": true,
+  "binance_closes": 10983,
+  "pnl_accounting": "unchanged baseline signed-cost (win:+cost_total, loss:-cost_total)",
+  "dates": [
+    "2026-10-10",
+    "2026-10-11"
+  ],
   "chosen_hours": [
-    "2026-10-09 11:00"
+    "2026-10-10 06:00",
+    "2026-10-10 12:00",
+    "2026-10-11 05:00"
   ],
-  "chosen_live_shares": [
-    "47.5%"
-  ],
-  "settlement_resolved": 2170,
-  "settlement_total": 2170,
-  "disagreement_count": 0
+  "chosen_live_shares": {
+    "2026-10-10 06:00": 61.21,
+    "2026-10-10 12:00": 68.61,
+    "2026-10-11 05:00": 73.95
+  },
+  "scan_live_shares": {
+    "2026-10-10 06:00": 61.21,
+    "2026-10-10 12:00": 68.61,
+    "2026-10-11 05:00": 73.95
+  },
+  "hour_rows": {
+    "2026-10-10 06:00": 14381,
+    "2026-10-10 12:00": 13986,
+    "2026-10-11 05:00": 14389
+  },
+  "hour_taken": {
+    "2026-10-10 06:00": 2,
+    "2026-10-10 12:00": 1,
+    "2026-10-11 05:00": 0
+  },
+  "settlement_resolved": 3057,
+  "settlement_total": 3057,
+  "trades_settled": 3,
+  "chainlink_cross_checked": 1,
+  "chainlink_unchecked": 2,
+  "disagreement_count": 0,
+  "peak_rss_mb": 229.68
 }
