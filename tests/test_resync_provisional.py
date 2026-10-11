@@ -69,6 +69,60 @@ def test_changed_tick_restarts_streak():
     mgr.note_ws_frame("c1", 0.45, 0.47)
     assert mgr.note_ws_frame("c1", 0.46, 0.48) == 1
     assert mgr.should_promote_provisional("c1") is False
+    # P2 (2026-10-11): the changed frame still banked an ELIGIBLE run —
+    # moving two-sided frames are real streaming — but without a genuine
+    # fetch_none cluster the identical-frame rule keeps REST-agnostic
+    # discipline: run alone must NOT promote.
+    assert mgr._ws_provisional["c1"]["run"] == 3
+    assert mgr.should_promote_provisional("c1") is False
+
+
+def test_fetch_none_cluster_promotes_moving_frames():
+    """P2 unblock: inside a genuine fetch_none cluster, consecutive two-sided
+    frames promote even though the top moves every frame (plain 5-minute
+    windows are liquid — the identical-frame streak can never reach MIN, so
+    the provisional path sat dead while REST was blind; P2 windows: 130-297s
+    stale with zero provisional markers)."""
+    events = []
+    mgr = _mgr(events)
+    mgr.note_fetch_none("c1")  # genuine 200-empty/404: cluster open, veto lifted
+    assert mgr.note_ws_frame("c1", 0.45, 0.47) == 1
+    assert mgr.note_ws_frame("c1", 0.46, 0.48) == 1  # moving top
+    assert mgr.should_promote_provisional("c1") is False
+    assert mgr.note_ws_frame("c1", 0.44, 0.49) == 1  # run=3 → eligible
+    assert mgr.should_promote_provisional("c1") is True
+    books = {"c1": _book("c1")}
+    books["c1"].mark_stale(resync_id="r1")
+    assert mgr.try_ws_provisional_promote("c1", books, 0.45, 0.46) is True
+    assert books["c1"].book_state.value == "live"
+    prov = [d for t, d in events
+            if getattr(t, "value", t) == "resync_completed" and d.get("provisional") is True]
+    assert prov, "cluster promotion must still carry provisional provenance"
+
+
+def test_moving_frames_without_cluster_stay_stale():
+    """Fail-closed counterweight: 3 moving frames on a book with healthy REST
+    evidence (no fetch_none strike) never promote — only identical frames do."""
+    events = []
+    mgr = _mgr(events)
+    mgr.note_ws_frame("c1", 0.45, 0.47)
+    mgr.note_ws_frame("c1", 0.46, 0.48)
+    mgr.note_ws_frame("c1", 0.44, 0.49)
+    assert mgr.should_promote_provisional("c1") is False
+
+
+def test_ineligible_frame_resets_run_too():
+    """A one-sided/NaN frame clears the whole banked entry (both counters)."""
+    events = []
+    mgr = _mgr(events)
+    mgr.note_ws_frame("c1", 0.45, 0.47)
+    mgr.note_ws_frame("c1", 0.46, 0.48)
+    assert mgr.note_ws_frame("c1", 0.999, None) == 0
+    assert "c1" not in mgr._ws_provisional
+    mgr.note_fetch_none("c1")
+    mgr.note_ws_frame("c1", 0.45, 0.47)
+    mgr.note_ws_frame("c1", 0.46, 0.48)
+    assert mgr.should_promote_provisional("c1") is False  # run restarted at 1
 
 
 def test_ineligible_frame_clears_streak():

@@ -26,6 +26,23 @@ def snapshot_bucket_ms(unix_ms: int, interval_ms: int = 500) -> int:
     return (unix_ms // interval_ms) * interval_ms
 
 
+def recovery_marker(phase: str, **fields: object) -> None:
+    """P2 recovery marker (2026-10-11): one stdout line per recovery phase.
+
+    Format: ``[recovery] phase=<name> key=value ...`` — a stable prefix the
+    timing runs grep from collector stdout so a fresh window's phases are READ
+    (gap_promote -> window_discovered -> fetch_none strikes -> book_live)
+    instead of inferred from live% samples. Diagnostics only: it never
+    changes state, never raises, and writes nothing to data/. None-valued
+    fields are omitted; empty phase payloads stay well-formed.
+    """
+    try:
+        parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+        print(f"[recovery] phase={phase} {parts}".rstrip(), flush=True)
+    except Exception:
+        pass
+
+
 # PERF 2026-09-12 (#19): bucket_ms -> ISO string cache. snapshot() runs per
 # book per tick (28 books × 2Hz); the bucket string is identical for every
 # book in the same tick, so format once and reuse. snapshot_id stays uuid4
@@ -577,12 +594,25 @@ class OrderBookState:
             self.resync_id = str(uuid.uuid4())
 
     def mark_live(self) -> None:
+        _was_stale_since = self._stale_since_ms
         self.book_state = BookState.live
         # keep resync_id for tagging snapshots in rest of bucket? spec says resync_id
         # groups snapshots affected by episode — so we retain it for one more snapshot
         # then clear on next snapshot call. For simplicity clear now.
         self.resync_id = None
         self._stale_since_ms = None
+        # P2 recovery marker (2026-10-11): one line per stale->live revival
+        # with the outage duration — the live-tick outage the timing runs
+        # measure end-to-end, attributed per book. Fires on every revival
+        # path (REST heal, resync replay, full-book/price-change/WS-
+        # provisional promotion) because they all pass through here. A book
+        # that was never stale stays silent (fresh-born books emit nothing).
+        if _was_stale_since is not None:
+            try:
+                recovery_marker("book_live", asset=self.asset, cid=self.condition_id,
+                                stale_ms=int(time.time() * 1000) - int(_was_stale_since))
+            except Exception:
+                pass
 
     # -- apply message (with validation) -----------------------------------
     def apply_ws_message(self, msg: dict) -> Tuple[bool, Optional[str]]:

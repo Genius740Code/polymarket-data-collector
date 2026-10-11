@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo as _ZoneInfo
 
+from .book import recovery_marker
+
 _ET = _ZoneInfo("America/New_York")
 
 
@@ -235,6 +237,13 @@ class RolloverState:
     # marker so the settle-independent next-slug poll is bounded.
     prewarm_last_attempt_ms: Optional[int] = None
     prewarm_done_for_ts: Optional[int] = None
+    # P2 gap-tail (2026-10-11): the fresh window's start (== the ended
+    # window's end) recorded at a GAPPED promote, so pre-warm can poll the
+    # fresh slug on its own 10s cadence across [T, T+60s] — after the
+    # promote nulls `current` the old pre-warm tail was unreachable and
+    # plain 5-minute windows (always gapped: Gamma indexes fresh 5m slugs
+    # ~36s after open, past the 30s lead) had no pre-warm coverage at all.
+    prewarm_gap_after_ms: Optional[int] = None
 
     def needs_rollover_lookahead(self, now_ms: int, lead_ms: int) -> bool:
         if not self.current:
@@ -1063,6 +1072,7 @@ class RolloverManager:
         # Promotion: current ended, next becomes current (even if next is None -> gap)
         if state.should_promote(now_ms):
             prev_cid = state.current.condition_id if state.current else None
+            prev_end_ms = state.current.market_end_ts_ms if state.current else None
             was_next_none = state.next is None
             state.current = state.next
             state.next = None
@@ -1078,6 +1088,18 @@ class RolloverManager:
             state.is_rollover_window = False
             state.rollover_miss_logged = False
             state.rollover_started_for_ts = None
+            if was_next_none and prev_end_ms is not None:
+                # P2 gap-tail (2026-10-11): a gapped promote nulls current
+                # before the pre-warm tail could run — record the fresh
+                # window start so prewarm_next_window covers [T, T+60s] for
+                # it (see the gap-tail branch there), and emit the stall
+                # marker so the timing run sees the exact promote wall-clock.
+                state.prewarm_gap_after_ms = int(prev_end_ms)
+                try:
+                    recovery_marker("gap_promote", asset=asset, tf=tf,
+                                    window_ts=int(prev_end_ms) // 1000)
+                except Exception:
+                    pass
             if self.on_event:
                 if was_next_none and prev_cid:
                     self.on_event("coverage_gap", {"asset": asset, "prev_condition_id": prev_cid, "now": now_ms})
@@ -1094,12 +1116,27 @@ class RolloverManager:
             # stays False so research filters don't include pre-discovery noise.
             # Flag is set below once state.next is assigned, cleared on promote.
             after = state.current.market_end_ts_ms if state.current else now_ms
-            # rate-limited polling — don't tight-loop (§1 #7)
+            # P2 pre-warm entry-gate fix (2026-10-11): pre-warm used to run
+            # only on THROTTLED lookahead ticks. The 5m/15m lanes' discovery
+            # interval equals the poller cadence (2s/5s vs 2s), so the main
+            # poll fired every tick, the throttle was never entered, and
+            # pre-warm NEVER ran for them — the timing evidence (zero prewarm
+            # markers across every window) is this gate, not Gamma. Attempt
+            # pre-warm on every lookahead tick in its active span: it owns a
+            # 10s cadence + hard window bounds, so Gamma load stays flat, and
+            # the gap-tail branch below extends coverage to the fresh window
+            # of a gapped promote. Never blocks the main poll (await-only on
+            # its own 10s turns).
+            try:
+                _pw_ev = await self.prewarm_next_window(asset, subscribe_fn, now_ms=now_ms, tf=tf)
+            except Exception:
+                _pw_ev = None
+            if _pw_ev:
+                return _pw_ev
+            # rate-limited polling — don't tight-loop (§1 #7); pre-warm has
+            # already self-throttled this tick above.
             if state.last_discovery_attempt_ms and (now_ms - state.last_discovery_attempt_ms) < int(discovery._backoff_s * 1000):
-                # Main poll throttled — fall through to the settle-independent
-                # pre-warm retry (own 10s throttle, bounded stop) instead of
-                # idling until backoff clears.
-                return await self.prewarm_next_window(asset, subscribe_fn, now_ms=now_ms, tf=tf)
+                return None
             state.last_discovery_attempt_ms = now_ms
             # throttle rollover_started — emit once per window, not every poll (fixes 65k spam)
             # initial discovery phase does NOT emit rollover_started (would spam until first market found)
@@ -1134,6 +1171,22 @@ class RolloverManager:
                             self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": repr(e)})
                     if self.on_event:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
+                    # P2 recovery marker (2026-10-11): the discovery phase of
+                    # this window, with the lag past its open — gapped
+                    # promotes are re-discovered late (Gamma indexes fresh
+                    # slugs past the lead), and the timing run must see WHEN
+                    # adoption happened and via which path. Clearing the gap
+                    # bookkeeping here also stops the pre-warm gap-tail poll.
+                    try:
+                        _gap_after = state.prewarm_gap_after_ms
+                        state.prewarm_gap_after_ms = None
+                        recovery_marker(
+                            "window_discovered", asset=asset, tf=tf,
+                            window_ts=int(getattr(next_market, "market_start_ts_ms", 0) or 0) // 1000,
+                            via="poll" + ("_gap" if _gap_after is not None else ""),
+                            lag_ms=now_ms - int(getattr(next_market, "market_start_ts_ms", 0) or 0))
+                    except Exception:
+                        pass
                     return "market_added"
                 else:
                     state.next = next_market
@@ -1148,6 +1201,15 @@ class RolloverManager:
                             self.on_event("subscription_failed", {"asset": asset, "condition_id": next_market.condition_id, "error": repr(e)})
                     if self.on_event:
                         self.on_event("market_added", {"asset": asset, "condition_id": next_market.condition_id})
+                    # P2 recovery marker: lookahead hit — the W3-style fast
+                    # path (discovered during lead, negative lag = early).
+                    try:
+                        recovery_marker(
+                            "window_discovered", asset=asset, tf=tf,
+                            window_ts=int(getattr(next_market, "market_start_ts_ms", 0) or 0) // 1000,
+                            via="poll", lag_ms=now_ms - int(getattr(next_market, "market_start_ts_ms", 0) or 0))
+                    except Exception:
+                        pass
                     return "rollover_started" if should_emit_rollover else "market_added"
             else:
                 # No synthetic fallback - distinguish discovered late vs no market existed (§1 #6)
@@ -1203,6 +1265,15 @@ class RolloverManager:
                                     self.on_event("subscription_failed", {"asset": asset, "condition_id": probed.condition_id, "error": repr(e)})
                             if self.on_event:
                                 self.on_event("market_added", {"asset": asset, "condition_id": probed.condition_id, "via": "recovery_probe"})
+                            try:
+                                state.prewarm_gap_after_ms = None
+                                recovery_marker(
+                                    "window_discovered", asset=asset, tf=tf,
+                                    window_ts=int(getattr(probed, "market_start_ts_ms", 0) or 0) // 1000,
+                                    via="recovery_probe",
+                                    lag_ms=now_ms - int(getattr(probed, "market_start_ts_ms", 0) or 0))
+                            except Exception:
+                                pass
                             return "market_added"
                 # If we're past market_end_ts + max_gap and still no next, it's a coverage_gap
                 if state.current and now_ms > state.current.market_end_ts_ms + self.max_gap_ms:
@@ -1261,8 +1332,12 @@ class RolloverManager:
     ) -> Optional[str]:
         """Bounded settle-independent poll for the deterministic NEXT slug.
 
-        Active only in [current.end - lead, current.end + 60s]; at most one
-        Gamma GET per 10s per lane; never raises (returns None on any error).
+        Active in [current.end - lead, current.end + 60s] while current is
+        set, AND — P2 gap-tail (2026-10-11) — in [T, T+60s] after a gapped
+        promote (current is None, prewarm_gap_after_ms set), polling the
+        fresh window's own slug so plain 5-minute windows get the same
+        early-subscribe the hourly lane gets. At most one Gamma GET per 10s
+        per lane; never raises (returns None on any error).
         Returns "market_added" on discovery, else None.
         """
         try:
@@ -1277,7 +1352,75 @@ class RolloverManager:
         try:
             cur = state.current
             if cur is None:
-                return None  # initial discovery owns the no-current case
+                # P2 gap-tail branch (2026-10-11): a GAPPED promote nulls
+                # current before the [T, T+60s] tail could run, so plain
+                # 5-minute windows — which promote gapped every time because
+                # Gamma indexes fresh 5m slugs ~36s after open, past the 30s
+                # lead — had NO pre-warm coverage at all (the hourly lane
+                # only looked covered because its 360s lead spans the lag).
+                # Poll the fresh window's own deterministic slug on the same
+                # 10s cadence until T+60s; adopt via state.current so the
+                # book is subscribed the moment Gamma serves it. The
+                # initial-discovery poll races us — whoever adopts first
+                # wins, and the loser re-checks current before touching
+                # anything (no double subscribe).
+                gap_after = state.prewarm_gap_after_ms
+                if gap_after is None:
+                    return None  # initial discovery owns the no-current case
+                if now > int(gap_after) + self.PREWARM_STOP_AFTER_END_MS:
+                    state.prewarm_gap_after_ms = None  # bounded stop: give up
+                    return None
+                if (
+                    state.prewarm_last_attempt_ms is not None
+                    and now - state.prewarm_last_attempt_ms < self.PREWARM_RETRY_MS
+                ):
+                    return None
+                state.prewarm_last_attempt_ms = now
+                found = await discovery.fetch_next_market(au, int(gap_after), strict_adjacent=True)
+                if found is None:
+                    return None
+                state.prewarm_gap_after_ms = None
+                if state.current is not None:
+                    return None  # the initial poll won the race — nothing to adopt
+                state.current = found
+                state.is_rollover_window = False
+                try:
+                    await subscribe_fn(found)
+                except Exception as e:
+                    if self.on_event:
+                        try:
+                            self.on_event("subscription_failed", {
+                                "asset": au,
+                                "condition_id": found.condition_id,
+                                "error": repr(e),
+                            })
+                        except Exception:
+                            pass
+                if self.on_event:
+                    try:
+                        self.on_event("market_added", {
+                            "asset": au,
+                            "condition_id": found.condition_id,
+                            "via": "prewarm_gap",
+                        })
+                    except Exception:
+                        pass
+                try:
+                    recovery_marker(
+                        "window_discovered", asset=au, tf=lane,
+                        window_ts=int(getattr(found, "market_start_ts_ms", 0) or 0) // 1000,
+                        via="prewarm_gap",
+                        lag_ms=now - int(getattr(found, "market_start_ts_ms", 0) or 0))
+                except Exception:
+                    pass
+                # Settle path: drops the lane throttle (+ emits
+                # settlement_discovery) so the lookahead for the window
+                # AFTER this one starts at once.
+                try:
+                    self.notify_settlement(au, tf=lane)
+                except Exception:
+                    pass
+                return "market_added"
             if state.next is not None:
                 state.prewarm_done_for_ts = int(cur.market_end_ts_ms)
                 return None
@@ -1336,6 +1479,14 @@ class RolloverManager:
                     })
                 except Exception:
                     pass
+            try:
+                recovery_marker(
+                    "window_discovered", asset=au, tf=lane,
+                    window_ts=int(getattr(found, "market_start_ts_ms", 0) or 0) // 1000,
+                    via="prewarm",
+                    lag_ms=now - int(getattr(found, "market_start_ts_ms", 0) or 0))
+            except Exception:
+                pass
             # Existing settle path: drops the lane throttle (+ emits
             # settlement_discovery) so the fresh window is polled at once.
             try:
@@ -1382,6 +1533,14 @@ class RolloverManager:
         if reset and self.on_event:
             try:
                 self.on_event("settlement_discovery", {"asset": au, "lanes": reset})
+            except Exception:
+                pass
+        if reset:
+            # P2 recovery marker (2026-10-11): the timing runs grep marker
+            # names that must actually appear in the log — emit the settle
+            # path's firing with its lane count so its phase is observable.
+            try:
+                recovery_marker("notify_settlement", asset=au, lanes=reset)
             except Exception:
                 pass
         return reset

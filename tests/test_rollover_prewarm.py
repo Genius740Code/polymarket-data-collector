@@ -303,3 +303,196 @@ async def test_throttled_lookahead_tick_falls_through_to_prewarm():
     assert await mgr.check_and_roll("BTC", subscribe, now_ms=now_ms) == "market_added"
     assert subscribed == ["pre"]
     assert state.next is not None and state.next.condition_id == "pre"
+
+
+# --- P2 (2026-10-11): entry-gate + gap-tail coverage + recovery markers ------
+
+@pytest.mark.asyncio
+async def test_prewarm_runs_on_unthrottled_lookahead_tick(capsys):
+    """P2 entry-gate: the 5m lane's poller cadence equals its discovery
+    interval (2s == 2s), so throttle-only wiring meant pre-warm NEVER ran for
+    plain 5-minute windows (zero prewarm markers across every P2 window).
+    It must attempt on EVERY lookahead tick — its own 10s cadence bounds load."""
+    events = []
+    mgr = _mgr(events)
+    state = mgr.states[("BTC", "5m")]
+    now_ms = int(time.time() * 1000)
+    state.current = _market("cur", 10_000, window_index=3)  # inside 30s lead
+    # main poll NOT throttled (last attempt older than the 2s backoff) — the
+    # old code went straight to the main poll and never touched pre-warm
+    state.last_discovery_attempt_ms = now_ms - 3_000
+    mgr.discoveries["5m"]._backoff_s = 2.0
+    fresh = _market("pre", 310_000, window_index=4)
+
+    calls = []
+
+    async def stub_fetch(asset, after_ts_ms, strict_adjacent=False):
+        calls.append((asset, after_ts_ms, strict_adjacent))
+        return fresh
+
+    mgr.discoveries["5m"].fetch_next_market = stub_fetch  # type: ignore
+
+    subscribed = []
+
+    async def subscribe(market):
+        subscribed.append(market.condition_id)
+
+    assert await mgr.check_and_roll("BTC", subscribe, now_ms=now_ms) == "market_added"
+    # adopted VIA PRE-WARM (the old code adopted via the main poll: no via)
+    kinds = [(t, d.get("via")) for t, d in events if t == "market_added"]
+    assert ("market_added", "prewarm") in kinds
+    assert len(calls) == 1
+    assert state.next is not None and state.next.condition_id == "pre"
+    out = capsys.readouterr().out
+    assert "[recovery] phase=window_discovered asset=BTC tf=5m" in out
+    assert "via=prewarm" in out
+
+
+@pytest.mark.asyncio
+async def test_gapped_promote_records_gap_then_prewarm_adopts(capsys):
+    """P2 gap-tail: a gapped promote (plain 5m windows promote gapped every
+    time — Gamma indexes fresh 5m slugs ~36s past the 30s lead) used to null
+    current before pre-warm's [T, T+60s] tail could run. The gap bookkeeping
+    must let pre-warm adopt the fresh window even while the main poll sits on
+    grown backoff (429-style), emitting the phase markers."""
+    events = []
+    mgr = _mgr(events)
+    state = mgr.states[("BTC", "5m")]
+    cur = _market("cur", -1_000, window_index=7)  # ended → gapped promote
+    state.current = cur
+    end_ms = cur.market_end_ts_ms
+    fresh = _market("fresh", 299_000, window_index=8)
+
+    async def stub_fetch(asset, after_ts_ms, strict_adjacent=False):
+        assert asset == "BTC" and after_ts_ms == end_ms and strict_adjacent is True
+        return fresh
+
+    mgr.discoveries["5m"].fetch_next_market = stub_fetch  # type: ignore
+
+    subscribed = []
+
+    async def subscribe(market):
+        subscribed.append(market.condition_id)
+
+    # 1) gapped promote: coverage_gap + gap bookkeeping + stall marker
+    assert await mgr.check_and_roll("BTC", subscribe, now_ms=end_ms + 1_000) == "coverage_gap"
+    assert state.current is None
+    assert state.prewarm_gap_after_ms == end_ms
+    assert f"[recovery] phase=gap_promote asset=BTC tf=5m window_ts={end_ms // 1000}" in capsys.readouterr().out
+
+    # 2) main poll parked on grown backoff; pre-warm gap-tail adopts at once
+    state.last_discovery_attempt_ms = end_ms + 30_000
+    mgr.discoveries["5m"]._backoff_s = 120.0
+    now2 = end_ms + 36_000  # Gamma indexes the fresh slug ~36s late (P2 polltime)
+    assert await mgr.check_and_roll("BTC", subscribe, now_ms=now2) == "market_added"
+    assert state.current is not None and state.current.condition_id == "fresh"
+    assert state.prewarm_gap_after_ms is None
+    kinds = [(t, d.get("via")) for t, d in events if t == "market_added"]
+    assert ("market_added", "prewarm_gap") in kinds
+    assert subscribed == ["fresh"]
+    out = capsys.readouterr().out
+    assert "[recovery] phase=window_discovered asset=BTC tf=5m" in out
+    assert "via=prewarm_gap" in out
+    # settle path routed: throttle dropped so the next-window lookahead starts
+    assert "settlement_discovery" in [t for t, _ in events]
+
+
+@pytest.mark.asyncio
+async def test_prewarm_gap_loses_race_to_adoption():
+    """Both the gap-tail pre-warm and the initial poll target the fresh slug:
+    whichever adopts first wins; the loser re-checks current and stands down
+    (no double subscribe, no orphaned market_added)."""
+    events = []
+    mgr = _mgr(events)
+    state = mgr.states[("BTC", "5m")]
+    cur = _market("cur", -1_000, window_index=7)
+    end_ms = cur.market_end_ts_ms
+    fresh = _market("fresh", 299_000, window_index=8)
+    winner = _market("pollwon", 299_000, window_index=8)
+    # post-gapped-promote state: current nulled, gap bookkeeping armed
+    state.current = None
+    state.prewarm_gap_after_ms = end_ms
+
+    async def stub_fetch(asset, after_ts_ms, strict_adjacent=False):
+        # the initial poll adopted while our GET was in flight
+        state.current = winner
+        return fresh
+
+    mgr.discoveries["5m"].fetch_next_market = stub_fetch  # type: ignore
+
+    subscribed = []
+
+    async def subscribe(market):
+        subscribed.append(market.condition_id)
+
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 5_000) is None
+    assert subscribed == []  # never re-subscribed the already-adopted window
+    assert state.current.condition_id == "pollwon"
+    assert state.prewarm_gap_after_ms is None  # bookkeeping retired either way
+    assert ("market_added", "prewarm_gap") not in [
+        (t, d.get("via")) for t, d in events if t == "market_added"]
+
+
+@pytest.mark.asyncio
+async def test_prewarm_gap_stops_after_end_plus_60s():
+    """Bounded stop for the gap tail: past T+60s the pre-warm gives up and
+    retires the bookkeeping (initial discovery keeps its own 2s cadence)."""
+    events = []
+    mgr = _mgr(events)
+    state = mgr.states[("BTC", "5m")]
+    cur = _market("cur", -1_000, window_index=7)
+    end_ms = cur.market_end_ts_ms
+    # post-gapped-promote state: current nulled, gap bookkeeping armed
+    state.current = None
+    state.prewarm_gap_after_ms = end_ms
+
+    calls = []
+
+    async def stub_fetch(asset, after_ts_ms, strict_adjacent=False):
+        calls.append(asset)
+        return None
+
+    mgr.discoveries["5m"].fetch_next_market = stub_fetch  # type: ignore
+
+    async def subscribe(market):
+        raise AssertionError("must not subscribe past the stop bound")
+
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 61_000) is None
+    assert calls == []
+    assert state.prewarm_gap_after_ms is None  # stop marker persists
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 90_000) is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_initial_poll_adoption_emits_gap_marker_and_clears(capsys):
+    """When the main poll wins the fresh-window race (pre-warm inside its 10s
+    retry window), the adoption still emits window_discovered with the gap
+    provenance (via=poll_gap) and clears the gap bookkeeping."""
+    events = []
+    mgr = _mgr(events)
+    state = mgr.states[("BTC", "5m")]
+    cur = _market("cur", -1_000, window_index=7)
+    state.current = cur
+    end_ms = cur.market_end_ts_ms
+    fresh = _market("fresh", 299_000, window_index=8)
+
+    async def stub_fetch(asset, after_ts_ms, strict_adjacent=False):
+        return fresh
+
+    mgr.discoveries["5m"].fetch_next_market = stub_fetch  # type: ignore
+
+    async def subscribe(market):
+        pass
+
+    assert await mgr.check_and_roll("BTC", subscribe, now_ms=end_ms + 1_000) == "coverage_gap"
+    # pre-warm inside its own 10s retry window defers → main poll adopts
+    state.prewarm_last_attempt_ms = end_ms + 1_000
+    state.last_discovery_attempt_ms = None
+    now2 = end_ms + 4_000
+    assert await mgr.check_and_roll("BTC", subscribe, now_ms=now2) == "market_added"
+    assert state.current is not None and state.current.condition_id == "fresh"
+    assert state.prewarm_gap_after_ms is None
+    out = capsys.readouterr().out
+    assert "via=poll_gap" in out
+    assert "[recovery] phase=window_discovered asset=BTC tf=5m" in out

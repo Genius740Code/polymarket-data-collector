@@ -95,3 +95,23 @@ def test_notify_settlement_unknown_asset_is_total():
     events = []
     mgr = _mgr(events)
     assert mgr.notify_settlement("NOPE") == 0
+
+
+def test_notify_settlement_emits_recovery_marker(capsys):
+    """P2 recovery marker (2026-10-11): the timing runs grep marker names from
+    collector stdout — notify_settlement must actually appear there. The P2
+    run saw zero notify_settlement markers while the path fired under the
+    event name settlement_discovery (grep-miss); the stdout line closes that
+    observability gap without touching the event contract."""
+    events = []
+    mgr = _mgr(events)
+    assert mgr.notify_settlement("BTC") >= 1
+    out = capsys.readouterr().out
+    assert "[recovery] phase=notify_settlement asset=BTC lanes=" in out
+
+
+def test_notify_settlement_no_reset_no_marker(capsys):
+    events = []
+    mgr = _mgr(events)
+    assert mgr.notify_settlement("NOPE") == 0
+    assert "phase=notify_settlement" not in capsys.readouterr().out

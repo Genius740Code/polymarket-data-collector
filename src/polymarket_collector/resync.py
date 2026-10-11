@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from .book import OrderBookState
+from .book import OrderBookState, recovery_marker
 from .enums import BookState, CollectorEventType
 
 
@@ -67,6 +67,19 @@ def _now_iso() -> str:
 # book and the provisional origin is recorded on the resync_completed event
 # for downstream to distinguish. No frames observed → no promotion
 # (fail-closed: no book is ever marked live without observed levels).
+#
+# P2 fetch_none-cluster unblock (2026-10-11): the identical-frame rule was
+# measured dead in liquid windows — the top-of-book moves every frame, the
+# streak restarts at 1 forever and the provisional path NEVER fired (zero
+# provisional markers across every P2 window while plain 5-minute windows
+# sat 130-297s stale with REST genuinely empty). note_ws_frame now also
+# banks `run` (consecutive ELIGIBLE frames, identity ignored) and
+# should_promote_provisional accepts run >= MIN only while a genuine
+# fetch_none cluster is open for the condition (REST-blind NOW — WS is the
+# only evidence source; a moving two-sided top is real streaming, not a
+# hazard). Outside a cluster the identical-frame rule is unchanged, and
+# every other gate (REST-verified veto, bounds revalidation, real book,
+# fail-closed) is untouched.
 WS_PROVISIONAL_MIN_FRAMES = 3
 
 
@@ -311,6 +324,17 @@ class ResyncManager:
                         self.on_event(CollectorEventType.resync_failed, {"condition_id": k, "fail_branch": "fetch_none_terminal", "attempts": n, "quiet_s": 3600, "reason": "REST exposes no full L2 for this token — honest stale, backing off"})
                     except Exception:
                         pass
+            # P2 recovery marker (2026-10-11): the strike timeline (first,
+            # mid, terminal) so the next timing run sees WHEN the fresh
+            # window went REST-blind — the 30s-paced climb to the 1h
+            # terminal quiet is the phase that parks plain-batch revival on
+            # WS-only evidence (see the cluster unblock above).
+            if n in (1, 3, 5):
+                try:
+                    recovery_marker("fetch_none_strike", cid=k, n=n,
+                                    quiet_s=3600 if n >= 5 else None)
+                except Exception:
+                    pass
             return n
         except Exception:
             return 0
@@ -355,6 +379,13 @@ class ResyncManager:
         An eligible frame identical to the previous one extends the streak; a
         changed top-of-book restarts it at 1; an ineligible frame clears it to
         0 (same-tick consistency). Never raises.
+
+        P2 (2026-10-11): every eligible frame also extends `run` — consecutive
+        two-sided sane frames with identity ignored — because in a liquid
+        window the top moves every frame and the identical-frame streak can
+        never reach MIN. should_promote_provisional gates `run` behind a
+        fetch_none cluster; the returned value (identical streak) and every
+        other caller contract are unchanged.
         """
         try:
             cid = str(condition_id)
@@ -374,19 +405,27 @@ class ResyncManager:
             return 0
         try:
             prev = self._ws_provisional.get(cid)
-            if isinstance(prev, dict) and prev.get("bid") == b and prev.get("ask") == a:
+            if isinstance(prev, dict):
                 try:
-                    streak = int(prev.get("streak", 0) or 0) + 1
+                    run = int(prev.get("run", 0) or 0) + 1
                 except Exception:
+                    run = 1
+                if prev.get("bid") == b and prev.get("ask") == a:
+                    try:
+                        streak = int(prev.get("streak", 0) or 0) + 1
+                    except Exception:
+                        streak = 1
+                else:
                     streak = 1
             else:
                 streak = 1
+                run = 1
             if cid not in self._ws_provisional and len(self._ws_provisional) >= 2000:
                 try:
                     self._ws_provisional.pop(next(iter(self._ws_provisional)), None)
                 except Exception:
                     pass
-            self._ws_provisional[cid] = {"bid": b, "ask": a, "streak": streak}
+            self._ws_provisional[cid] = {"bid": b, "ask": a, "streak": streak, "run": run}
             return streak
         except Exception:
             return 0
@@ -398,6 +437,16 @@ class ResyncManager:
         genuine fetch_none since the last REST success lifts the entry, see
         note_fetch_none) and anything below WS_PROVISIONAL_MIN_FRAMES —
         revalidating the banked frame so a corrupted entry can never promote.
+
+        P2 fetch_none-cluster unblock (2026-10-11): a genuine fetch_none
+        cluster is open for the condition (streak >= 1: REST returned a real
+        200-empty/404 for it) when `run` — consecutive two-sided sane frames
+        with identity ignored — also qualifies. In a liquid window the
+        identical-frame streak resets on every moving top and the provisional
+        path never fired; inside a cluster the moving top is exactly the
+        evidence that the venue streams the book REST cannot serve. Every
+        frame still passed ws_provisional_eligible individually and the
+        banked top is revalidated below.
         """
         try:
             cid = str(condition_id)
@@ -414,7 +463,17 @@ class ResyncManager:
             except Exception:
                 return False
             if streak < WS_PROVISIONAL_MIN_FRAMES:
-                return False
+                try:
+                    run = int(cur.get("run", 0) or 0)
+                except Exception:
+                    run = 0
+                if run < WS_PROVISIONAL_MIN_FRAMES:
+                    return False
+                try:
+                    if int(self._fetch_none_streak.get(cid, 0) or 0) < 1:
+                        return False  # moving-frame evidence only inside a fetch_none cluster
+                except Exception:
+                    return False
             return ws_provisional_eligible(cur.get("bid"), cur.get("ask"))
         except Exception:
             return False
@@ -509,6 +568,16 @@ class ResyncManager:
                 })
             except Exception:
                 pass
+        # P2 recovery marker (2026-10-11): the provisional path is the fast
+        # lane for REST-blind fresh windows — emit its firing (with the
+        # cluster evidence) so the next timing run can see it instead of
+        # inferring. P2 evidence: zero provisional markers in every window.
+        try:
+            recovery_marker("provisional_promote", asset=getattr(book, "asset", None),
+                            cid=cid, frames=WS_PROVISIONAL_MIN_FRAMES,
+                            fetch_none_cluster=bool(int(self._fetch_none_streak.get(cid, 0) or 0) >= 1))
+        except Exception:
+            pass
         return True
 
     def market_ended(self, condition_id: str):
