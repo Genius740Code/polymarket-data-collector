@@ -405,6 +405,22 @@ class OrderBookState:
         self.is_rollover_window: bool = False
         self.sequence_numbers: Dict[str, int] = {}  # token_id -> last seq
         self._stale_since_ms: Optional[int] = None
+        # P3 liveness fix (2026-10-11): why the CURRENT stale mark was
+        # minted. None = episode-style staleness (disconnect/book_stalled/
+        # crossed/H2 — RAM holds real applied frames, freshness may verify
+        # the row live). "sanity_bounds_failed"/"sequence_gap" =
+        # known-divergent RAM: the offending frame was rejected / deltas
+        # were missed, so a fresh age does not certify content — the row
+        # keeps the honest stale label until REST or a hash-gated
+        # full-book frame re-verifies. Cleared by mark_live; newest mark
+        # wins.
+        self._stale_reason: Optional[str] = None
+        # P3 stale_dominance marker counters: RAM-stale snapshot ticks of
+        # the current spell, and how many held a fresh verified book.
+        # Emitted at _STALE_DOMINANCE_CHECKPOINTS; reset on mark_live.
+        self._stale_spell_rows: int = 0
+        self._stale_spell_fresh: int = 0
+        self._stale_spell_reported: set = set()
         # §4 book_events: old/new BBO captured per applied WS message, drained by the collector
         self.pending_events: List[dict] = []
         # A1: last exchange frame timestamp seen on THIS connection (ms epoch).
@@ -581,10 +597,56 @@ class OrderBookState:
             self.book_hash[outcome] = str(h).strip()
 
     # -- state transitions (§1A) -------------------------------------------
-    def mark_stale(self, resync_id: str | None = None) -> None:
+    # P3 liveness fix (2026-10-11) — liveness follows book freshness.
+    #
+    # P3 retime evidence (PID 1211119, /tmp/opencode/p3_retime.txt): the
+    # roll chain is FIXED (prewarm discovers every window at T-119s,
+    # book_live within 0-17s, first live row +1.5s, 0 spawn/worker
+    # failures) but resync episodes dominated the first ~2 min post-roll —
+    # snapshots written under an open episode kept the stale/resyncing RAM
+    # label while real WS frames refreshed the book (stale rows: bk_age
+    # med 0ms, max 4.5s; (stale,resync_id)=334 vs live-no-resync=272 per
+    # lane in the first 2-3 min). +2min live% read 7.5-39% of preroll
+    # while the feed was actually alive; +5min recovered to 68-98%.
+    #
+    # Fix (row-level only): a snapshot whose book content is FRESH (both
+    # outcomes' last exchange update within FRESH_BOOK_AGE_MS of the
+    # bucket) and VERIFIED (both outcomes two-sided, price-bounded,
+    # uncrossed — the same sanity discipline as ws_provisional_eligible)
+    # reads book_state 'live' EVEN while an episode is open. RAM
+    # book_state, resync_id, episode bookkeeping and every evidence row
+    # (resync_episodes/collector_events) are untouched: gaps stay
+    # labeled, rows are never filled, nothing is invented — liveness is
+    # re-read from the content the venue actually streamed. A book that
+    # stops receiving frames ages past the bound within FRESH_BOOK_AGE_MS
+    # and the label honestly returns to stale.
+    #
+    # Boundary (freshness NOT trusted): a stale mark minted by
+    # "sanity_bounds_failed" or "sequence_gap" means RAM is KNOWN-divergent
+    # from the venue — the offending frame was rejected, so the update it
+    # carried was missed; a fresh age certifies only the last applied
+    # frame, not agreement with the venue. Those books keep the stale
+    # label until a REST replace (resync) or a hash-gated full-book frame
+    # re-verifies them. H2 empty-side staleness needs no extra rule: the
+    # two-sided gate refuses the row until real frames refill the side.
+    FRESH_BOOK_AGE_MS = 5000
+    _STALE_REASON_DIVERGENT = ("sanity_bounds_failed", "sequence_gap")
+    # stale_dominance marker checkpoints: emit the RAM-stale vs
+    # fresh-book split after ~15s (30 ticks) and ~3 min (360 ticks) of a
+    # stale spell on the 2Hz snapshot grid, so the next timing run
+    # measures the post-roll tax directly from stdout instead of parquet
+    # probes. Bounded: at most one line per checkpoint per spell;
+    # counters reset on revival (mark_live).
+    _STALE_DOMINANCE_CHECKPOINTS = (30, 360)
+
+    def mark_stale(self, resync_id: str | None = None, reason: str | None = None) -> None:
         self.book_state = BookState.stale
         self.resync_id = resync_id or str(uuid.uuid4())
         self._stale_since_ms = int(time.time() * 1000)
+        # P3: the reason tag decides whether freshness may later verify a
+        # row live (see _STALE_REASON_DIVERGENT). The newest mark wins;
+        # episode-style mints (reason None) keep freshness verification.
+        self._stale_reason = reason
 
     def mark_resyncing(self, resync_id: str | None = None) -> None:
         self.book_state = BookState.resyncing
@@ -601,6 +663,12 @@ class OrderBookState:
         # then clear on next snapshot call. For simplicity clear now.
         self.resync_id = None
         self._stale_since_ms = None
+        self._stale_reason = None
+        # P3: the stale spell ended — spell counters reset so the next
+        # episode's stale_dominance marker reports only its own window.
+        self._stale_spell_rows = 0
+        self._stale_spell_fresh = 0
+        self._stale_spell_reported = set()
         # P2 recovery marker (2026-10-11): one line per stale->live revival
         # with the outage duration — the live-tick outage the timing runs
         # measure end-to-end, attributed per book. Fires on every revival
@@ -625,7 +693,9 @@ class OrderBookState:
         errors = validate_ws_message(msg)
         if errors:
             # per §3A: log book_anomaly and mark stale; trigger resync externally
-            self.mark_stale()
+            # P3: reason tags the RAM as known-divergent — freshness may
+            # not verify the row live until REST/full-book re-verification.
+            self.mark_stale(reason="sanity_bounds_failed")
             return False, f"sanity_bounds_failed: {errors[0].reason} field={errors[0].field} value={errors[0].value}"
 
         # A1: record the frame's exchange timestamp (carry-forward source)
@@ -660,7 +730,9 @@ class OrderBookState:
                     if seq_int < last:
                         return False, "out_of_order_duplicate"
                     if seq_int != last + 1:
-                        self.mark_stale()
+                        # P3: reason tags the RAM as known-divergent (deltas
+                        # were missed) — freshness may not verify the row.
+                        self.mark_stale(reason="sequence_gap")
                         return False, f"sequence_gap expected {last+1} got {seq_int}"
                 self.sequence_numbers[str(token_id)] = seq_int
 
@@ -1223,6 +1295,31 @@ class OrderBookState:
             crossed = True
         return ((up_bid, up_bid_size), (up_ask, up_ask_size), (down_bid, down_bid_size), (down_ask, down_ask_size), crossed)
 
+    def fresh_verified(self, up_bid, up_ask, down_bid, down_ask, up_age_ms, down_age_ms) -> bool:
+        """True when the RAM book content is fresh AND verified (never raises).
+
+        P3 liveness fix gate. Fresh: both outcomes exchanged an update within
+        FRESH_BOOK_AGE_MS of the snapshot bucket (None age = never updated →
+        not fresh). Verified: both outcomes two-sided, price-bounded and
+        uncrossed (0 <= bid < ask <= 1) — the same sanity discipline as
+        ws_provisional_eligible, read from the row's own top-of-book. Total
+        by construction: NaN fails every comparison, None fails the gate,
+        any unexpected shape returns False.
+        """
+        try:
+            if up_age_ms is None or down_age_ms is None:
+                return False
+            if max(int(up_age_ms), int(down_age_ms)) > self.FRESH_BOOK_AGE_MS:
+                return False
+            for b, a in ((up_bid, up_ask), (down_bid, down_ask)):
+                if b is None or a is None:
+                    return False
+                if not (0.0 <= float(b) < float(a) <= 1.0):
+                    return False
+            return True
+        except Exception:
+            return False
+
     # -- snapshot generation (§3) ------------------------------------------
     def snapshot(self, ts_ms: int | None = None, ts_ns: int | None = None) -> BookSnapshot:
         """Generate a 500ms snapshot row. Call from shared scheduler tick."""
@@ -1321,6 +1418,36 @@ class OrderBookState:
         elif down_bid_raw is not None and down_ask_raw is not None and (down_bid_raw - down_ask_raw) > 1e-9:
             crossed = True
 
+        # P3 liveness fix: liveness follows book freshness — the ROW label
+        # is re-read from the content the venue actually streamed. RAM
+        # book_state, resync_id and every episode/evidence transition stay
+        # untouched; only this row's book_state may read live while an
+        # episode is still open. Known-divergent staleness (sanity/sequence
+        # — see _STALE_REASON_DIVERGENT) keeps the honest stale label.
+        row_state = self.book_state.value
+        if row_state != "live":
+            try:
+                if (self._stale_reason not in self._STALE_REASON_DIVERGENT
+                        and self.fresh_verified(up_bid, up_ask, down_bid, down_ask,
+                                                self._up_book_age_ms, self._down_book_age_ms)):
+                    row_state = "live"
+                # P3 stale_dominance marker: count the would-be-stale split —
+                # RAM-state staleness (the episode label) vs fresh verified
+                # content — so the next timing run measures the post-roll tax
+                # directly. Checkpoint-bounded (see _STALE_DOMINANCE_CHECKPOINTS).
+                self._stale_spell_rows += 1
+                if row_state == "live":
+                    self._stale_spell_fresh += 1
+                if (self._stale_spell_rows in self._STALE_DOMINANCE_CHECKPOINTS
+                        and self._stale_spell_rows not in self._stale_spell_reported):
+                    self._stale_spell_reported.add(self._stale_spell_rows)
+                    recovery_marker("stale_dominance", asset=self.asset, cid=self.condition_id,
+                                    window_index=self.window_index,
+                                    stale_total=self._stale_spell_rows,
+                                    stale_fresh_book=self._stale_spell_fresh)
+            except Exception:
+                pass
+
         return BookSnapshot(
             snapshot_id=str(uuid.uuid4()),
             schema_version=self.schema_version,
@@ -1347,7 +1474,7 @@ class OrderBookState:
             up_book_age_ms=self._up_book_age_ms,
             down_book_age_ms=self._down_book_age_ms,
             is_rollover_window=self.is_rollover_window,
-            book_state=self.book_state.value,
+            book_state=row_state,
             resync_id=self.resync_id,
             book_crossed=crossed,
             up_book_hash=self.book_hash.get("up"),

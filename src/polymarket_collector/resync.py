@@ -1150,7 +1150,21 @@ class ResyncManager:
         # mark resyncing
         # PERF: single targets list (was 4 full books.values() scans + BxM nest).
         # Same set/order (dict order), same mark_live/on_book_state_change sequence.
-        targets = [b for b in books.values() if b.condition_id == condition_id]
+        # P3 liveness fix (2026-10-11): an open episode must not force a
+        # healed book back to resyncing. The drive previously re-marked ALL
+        # books of the condition with no liveness check, so a book promoted
+        # live by real WS frames mid-episode (bk_age ~0) was downgraded on
+        # every walk/drive and held non-live through the fetch_none retry
+        # loop — the dominant stale-with-fresh-book tax of the first ~2 min
+        # post-roll (P3: (stale,resync_id)=334 vs live=272 per lane). Live
+        # books are skipped: their content is fresher than the REST
+        # snapshot that would replace it, and the REST cursor would regress
+        # sequence_numbers so the next live frame would read as a gap
+        # (mirrors try_ws_provisional_promote's live refusal). Stale/
+        # resyncing books are driven exactly as before.
+        targets = [b for b in books.values()
+                   if b.condition_id == condition_id
+                   and getattr(getattr(b, "book_state", None), "value", "") != "live"]
         for book in targets:
             book.mark_resyncing(resync_id=resync_id)
 
