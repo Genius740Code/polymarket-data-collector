@@ -3,6 +3,11 @@
 Spec: scripts/gate_probe.py follows pyarrow.parquet footer reads (never full-table
 materialisation), matching the pattern in src/polymarket_collector/completeness.py.
 
+Sampling: the newest --max-files-per-lane parquet files by mtime (name order is
+arbitrary). Density%: honest tick census — distinct on-grid timestamps over the
+sampled span. Gate verdict: keyed on CompNorm% (spread-normalized live share);
+the raw Comp>0.1% column is continuity-only and does not gate.
+
 EXIT 0 always on success (measurement REPORTS, never fails the gate). Exit 2 only
 on bad args / missing date partition.
 """
@@ -23,6 +28,11 @@ import pyarrow.parquet as pq
 DEFAULT_MAX_FILES_PER_LANE = 48
 MAX_FILES_PER_LANE_CAP = 200
 DEFAULT_TIMEOUT_S = 90
+
+# Rows allowed per sampled file before truncation. Observed 500ms part files
+# hold 240 rows; the margin keeps every row of a normal lane so the census
+# span matches the sampled span, while bounding pathological files.
+SAMPLE_ROWS_PER_FILE = 300
 
 EXPECTED_SLOTS_PER_DAY = 2 * 86400  # 500ms -> 2 per second = 172800
 
@@ -45,6 +55,12 @@ SPREAD_FRAC = 0.25
 # drift.
 DEV_FLOOR = 0.001
 
+# Complementarity gate threshold on CompNorm% — the share of live rows flagged
+# by the spread-normalized rule (deviation > max(DEV_FLOOR, SPREAD_FRAC *
+# combined_spread)). The gate requires complementarity <= 0.1%; the raw
+# Comp>0.1% column is continuity-only and never gates the verdict.
+COMP_NORM_GATE_PCT = 0.1
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -54,19 +70,19 @@ DEV_FLOOR = 0.001
 class LaneResult:
     lane: str  # asset name
     files_sampled: int
-    density_pct: float  # actual slots / expected slots * 100
+    density_pct: float  # tick census: distinct on-grid ts / (span//500ms + 1) * 100
     complement_gt_01_pct: float  # share with complementarity deviation > 0.1pp (all rows, continuity)
     comp_live_gt_01_pct: float  # share with deviation > 0.1pp, live rows only
     comp_stale_gt_01_pct: float  # share with deviation > 0.1pp, stale/resyncing rows
     null_mid_count: int  # rows where any price is null (guarded, never imputed)
-    comp_spread_norm_pct: float  # live rows flagged by CompSpreadNorm (> quarter spread + 0.001 floor)
+    comp_spread_norm_pct: float  # live rows flagged by CompSpreadNorm (> quarter spread + 0.001 floor); gates the verdict
     live_null_no_book_count: int  # live rows where all 4 prices are null (pre-discovery, stale-like)
     live_null_partial_count: int  # live rows where some but not all prices are null (real anomaly)
     live_null_partial_examples: List[int]  # up to 3 example ts_ns of LiveNullPartial rows
     dup_snapshot_id_count: int  # duplicate snapshot_id count
     offgrid_count: int  # off-grid ts count
     part_flag: bool  # PARTIAL -> lane hit timeout
-    span_ns: int  # union span of sampled files (ns)
+    span_ns: int  # sampled span: max ts - min ts (ns)
 
 
 @dataclass
@@ -92,17 +108,49 @@ class GateOutput:
 
 
 def compute_expected_slots(span_ns: int) -> int:
-    """Expected 500ms slots over a span (inclusive of both ends)."""
-    if span_ns <= 0:
+    """Grid slots covered by a span: floor(span_ns / 500ms) + 1 (ends inclusive).
+
+    A zero-width span still covers exactly one grid slot.
+    """
+    if span_ns < 0:
         return 0
-    # number of 500ms intervals = floor(span_ns / 500_000_000) + 1
     return span_ns // GRID_NS + 1
 
 
-def compute_actual_slots(span_ns: int, offgrid_count: int) -> int:
-    """Actual in-grid slots = expected - off-grid (off-grid are not 500ms slots)."""
-    expected = compute_expected_slots(span_ns)
-    return max(0, expected - offgrid_count)
+def density_census_pct(timestamps: List[int]) -> float:
+    """Honest tick census: distinct on-grid ts / (span // 500ms + 1) * 100.
+
+    span = max(ts) - min(ts) over the sampled rows. Duplicates and off-grid
+    ticks never inflate the numerator, so missing 500ms ticks surface as
+    Density% below 100. (The previous expected-minus-offgrid formula was
+    degenerate: it reported 100.0 whenever offgrid == 0, gaps included.)
+    """
+    if not timestamps:
+        return 0.0
+    denom = compute_expected_slots(max(timestamps) - min(timestamps))
+    if denom <= 0:
+        return 0.0
+    distinct_ongrid = len({ts for ts in timestamps if ts % GRID_NS == 0})
+    return distinct_ongrid / denom * 100
+
+
+def _mtime(p: Path) -> float:
+    """mtime for sampling order; 0.0 if the file vanished mid-scan (sorts last)."""
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def newest_parquet_files(snap_dir: Path, max_files: int) -> List[Path]:
+    """Newest-first parquet candidates by mtime, .tmp files excluded.
+
+    Filename order is arbitrary (names embed snapshot ids, not write order),
+    so sampling must sort by mtime and keep the newest max_files.
+    """
+    parts = [p for p in snap_dir.glob("*.parquet") if not p.name.endswith(".tmp")]
+    parts.sort(key=_mtime, reverse=True)
+    return parts[: max(0, max_files)]
 
 
 # ---------------------------------------------------------------------------
@@ -115,29 +163,31 @@ def analyze_lane(
     asset: str,
     max_files: int,
 ) -> LaneResult:
-    """Analyse one asset lane using pyarrow parquet footer only.
+    """Analyse one asset lane: newest-file sample + projected-column reads.
 
-    Reads only file metadata (num_rows) and column min/max from the footer.
-    Never materialises full table rows.
+    Samples the newest `max_files` parquet files by mtime, reads only the
+    projected columns, and scores complementarity split by book_state.
     """
-    parts: List[Path] = sorted(snap_dir.glob("*.parquet"))
-    # Filter out .tmp files if any
-    parts = [p for p in parts if not p.name.endswith(".tmp")]
-    if not parts:
+    sampled = newest_parquet_files(snap_dir, max_files)
+    if not sampled:
         # No data for this asset on this date
         return LaneResult(
             lane=asset,
             files_sampled=0,
             density_pct=0.0,
             complement_gt_01_pct=0.0,
+            comp_live_gt_01_pct=0.0,
+            comp_stale_gt_01_pct=0.0,
+            null_mid_count=0,
+            comp_spread_norm_pct=0.0,
+            live_null_no_book_count=0,
+            live_null_partial_count=0,
+            live_null_partial_examples=[],
             dup_snapshot_id_count=0,
             offgrid_count=0,
             part_flag=False,
             span_ns=0,
         )
-
-    # Cap files sampled
-    sampled = parts[:max_files]
 
     # For complementarity: we need to sample rows from each file,
     # but only the columns we need. Use pyarrow projection to minimise data.
@@ -153,86 +203,78 @@ def analyze_lane(
         "up_ask",
         "down_bid",
         "down_ask",
+        "book_state",
     ]
 
     # Track per-file row data in-memory (small sample, not full table)
     all_rows: List[dict] = []
-    file_row_counts: List[int] = []
-
-    # Initialize span trackers
-    min_ns: Optional[int] = None
-    max_ns: Optional[int] = None
 
     for fp in sampled:
         try:
-            meta = pq.read_metadata(str(fp))
-            n = meta.num_rows
-            file_row_counts.append(n)
-
-            # Read only needed columns from footer/projection
+            # Read only needed columns (footer-driven projection)
             try:
                 tbl = pq.read_table(str(fp), columns=needed_cols)
-                rows = tbl.to_pydict()
             except Exception:
                 # Fallback: read whole table (should be rare)
                 tbl = pq.read_table(str(fp))
-                rows = tbl.to_pydict()
+            rows = tbl.to_pydict()
+            book_states = rows.get("book_state")
 
-            # Accumulate rows — we keep it bounded by max_files * typical rows
-            for i in range(n):
-                row = {
-                    "ts_snapshot_ns": rows["ts_snapshot_ns"][i],
-                    "snapshot_id": rows["snapshot_id"][i],
-                    "up_bid": rows["up_bid"][i],
-                    "up_ask": rows["up_ask"][i],
-                    "down_bid": rows["down_bid"][i],
-                    "down_ask": rows["down_ask"][i],
-                }
-                all_rows.append(row)
-
-                # Update span trackers
-                if min_ns is None or row["ts_snapshot_ns"] < min_ns:
-                    min_ns = row["ts_snapshot_ns"]
-                if max_ns is None or row["ts_snapshot_ns"] > max_ns:
-                    max_ns = row["ts_snapshot_ns"]
-
-                if len(all_rows) % 1000 == 0:
-                    pass  # bound checked after loop
+            # Accumulate rows — bounded per file after the loop
+            for i in range(tbl.num_rows):
+                all_rows.append(
+                    {
+                        "ts_snapshot_ns": rows["ts_snapshot_ns"][i],
+                        "snapshot_id": rows["snapshot_id"][i],
+                        "up_bid": rows["up_bid"][i],
+                        "up_ask": rows["up_ask"][i],
+                        "down_bid": rows["down_bid"][i],
+                        "down_ask": rows["down_ask"][i],
+                        # None when the file predates the column — never
+                        # counted as live (see book_state split below)
+                        "book_state": book_states[i] if book_states is not None else None,
+                    }
+                )
         except Exception:
             # Skip unreadable files
             continue
 
-    # Bound total rows sampled
-    if len(all_rows) > max_files * 200:
-        all_rows = all_rows[: max_files * 200]
+    # Bound rows per sampled file (newest-first, so truncation only ever
+    # drops the oldest tail). Normal lanes keep every sampled row, keeping
+    # the census span equal to the sampled span.
+    row_cap = max_files * SAMPLE_ROWS_PER_FILE
+    if len(all_rows) > row_cap:
+        all_rows = all_rows[:row_cap]
 
     files_sampled = len(sampled)
 
-    if min_ns is None or max_ns is None:
+    if not all_rows:
         # No readable data
         return LaneResult(
             lane=asset,
             files_sampled=files_sampled,
             density_pct=0.0,
             complement_gt_01_pct=0.0,
+            comp_live_gt_01_pct=0.0,
+            comp_stale_gt_01_pct=0.0,
+            null_mid_count=0,
+            comp_spread_norm_pct=0.0,
+            live_null_no_book_count=0,
+            live_null_partial_count=0,
+            live_null_partial_examples=[],
             dup_snapshot_id_count=0,
             offgrid_count=0,
             part_flag=False,
             span_ns=0,
         )
 
-    span_ns = max_ns - min_ns + GRID_NS  # inclusive span
-    expected = compute_expected_slots(span_ns)
+    # --- Sampled span + honest tick census (distinct on-grid timestamps) ---
+    timestamps = [r["ts_snapshot_ns"] for r in all_rows]
+    span_ns = max(timestamps) - min(timestamps)
+    density_pct = density_census_pct(timestamps)
 
     # --- Off-grid count: ts_snapshot_ns % 500_000_000 != 0 ---
-    offgrid_count = sum(
-        1 for r in all_rows if r["ts_snapshot_ns"] % GRID_NS != 0
-    )
-
-    # --- Actual 500ms slots (expected minus off-grid) ---
-    actual_ingrid = compute_actual_slots(span_ns, offgrid_count)
-
-    density_pct = (actual_ingrid / expected * 100) if expected > 0 else 0.0
+    offgrid_count = sum(1 for ts in timestamps if ts % GRID_NS != 0)
 
     # Complementarity: split into live and stale rows
     # Guard nulls: count null-mid rows separately, never impute.
@@ -260,7 +302,7 @@ def analyze_lane(
 
         # Check if any of the four prices is null (None or NaN)
         has_null = ob is None or ua is None or db is None or da is None
-        book_state = r.get("book_state", "live")
+        book_state = r["book_state"]
         is_live = book_state == "live"
 
         if has_null:
@@ -302,7 +344,7 @@ def analyze_lane(
             if deviation > 0.001:
                 complement_count_live += 1
         else:
-            # stale or resyncing
+            # stale / resyncing (or unknown book_state)
             complement_checkable_stale += 1
             if deviation > 0.001:
                 complement_count_stale += 1
@@ -350,6 +392,26 @@ def analyze_lane(
         part_flag=part_flag,
         span_ns=span_ns,
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate verdict — spread-normalized live share (CompNorm%)
+# ---------------------------------------------------------------------------
+
+
+def breaching_lanes(lane_results: List[LaneResult]) -> List[str]:
+    """Lanes whose CompNorm% exceeds the complementarity gate threshold.
+
+    The verdict is keyed on CompNorm% — the share of live rows flagged by
+    deviation > max(DEV_FLOOR, SPREAD_FRAC * combined_spread) — because the
+    raw Comp>0.1% column punishes wide spreads (illiquidity) that ordinary
+    book width explains. Comp>0.1% is kept for continuity and never gates.
+    """
+    return [
+        f"{lr.lane} {lr.comp_spread_norm_pct:g}"
+        for lr in lane_results
+        if lr.comp_spread_norm_pct > COMP_NORM_GATE_PCT
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +582,13 @@ def main() -> None:
     print(f"Assets: {', '.join(a.upper() for a in assets)}")
     print()
 
+    # Column roles: which column gates what
+    print("Column roles: Density% gates coverage (distinct on-grid ticks over sampled span);")
+    print("CompNorm% gates the complementarity verdict (spread-normalized live share);")
+    print("Comp>0.1% is continuity-only (raw deviation, illiquidity-sensitive, does NOT gate);")
+    print("CompLive/CompStale split Comp>0.1% by book_state (diagnostics).")
+    print()
+
     # Table header
     print(f"{'Lane':<6} {'Density%':>7} {'Comp>0.1%':>10} {'CompLive>0.1%':>12} {'CompStale>0.1%':>13} {'NullMid':>6} {'CompNorm%':>8} {'LiveNoBook':>9} {'LivePartial':>10} {'Dups':>5} {'Offgrid':>6} {'Files':>5} {'Part'}")
     print("-" * 70)
@@ -528,6 +597,18 @@ def main() -> None:
         part_str = "YES" if lr.part_flag else ""
         examples_str = ", ".join(str(ts) for ts in lr.live_null_partial_examples[:3]) if lr.live_null_partial_examples else ""
         print(f"{lr.lane:<6} {lr.density_pct:>7.1f} {lr.complement_gt_01_pct:>10.1f} {lr.comp_live_gt_01_pct:>12.1f} {lr.comp_stale_gt_01_pct:>13.1f} {lr.null_mid_count:>6} {lr.comp_spread_norm_pct:>8.1f} {lr.live_null_no_book_count:>9} {lr.live_null_partial_count:>10} {lr.dup_snapshot_id_count:>5} {lr.offgrid_count:>6} {lr.files_sampled:>5} {part_str:<4} {examples_str}")
+
+    print()
+    breaches = breaching_lanes(lane_results)
+    if breaches:
+        print(
+            f"Gate verdict (CompNorm% > {COMP_NORM_GATE_PCT}): BREACH — " + ", ".join(breaches)
+        )
+    else:
+        print(
+            f"Gate verdict (CompNorm% > {COMP_NORM_GATE_PCT}): PASS — no lane"
+            " breaches the spread-normalized complementarity gate"
+        )
 
     print()
     print(f"Uploads: {uploads.successful} successful, {uploads.failed} failed (last 60 min)")

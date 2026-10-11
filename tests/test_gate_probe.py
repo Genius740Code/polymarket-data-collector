@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from gate_probe import (
     compute_expected_slots,
-    compute_actual_slots,
     GRID_NS,
     DEV_FLOOR,
     SPREAD_FRAC,
@@ -34,23 +33,17 @@ from gate_probe import (
 
 
 def test_compute_expected_slots():
-    """Expected 500ms slots over a span: floor(span_ns / 500_000_000) + 1."""
-    # Zero span -> 0 (handled by caller)
-    assert compute_expected_slots(0) == 0
+    """Grid slots over a span: floor(span_ns / 500_000_000) + 1, ends inclusive."""
+    # Zero-width span still covers exactly one grid slot (census denominator).
+    assert compute_expected_slots(0) == 1
     # span = 500ms -> intervals: [0, 500ms) -> 1 interval + 1 = 2 slots
     assert compute_expected_slots(500_000_000) == 2
     # span = 1000ms -> intervals: [0, 1000ms) -> 2 intervals + 1 = 3 slots
     assert compute_expected_slots(1_000_000_000) == 3
     # span = 1500ms -> 3 intervals + 1 = 4 slots
     assert compute_expected_slots(1_500_000_000) == 4
-
-
-def test_compute_actual_slots():
-    """Actual in-grid slots = expected - off-grid."""
-    # No off-grid -> actual == expected
-    assert compute_actual_slots(1_000_000_000, 0) == 3
-    # 1 off-grid slot removed from 4 expected -> 3
-    assert compute_actual_slots(1_500_000_000, 1) == 3
+    # Negative spans cannot occur (max - min >= 0); guarded to 0.
+    assert compute_expected_slots(-1) == 0
 
 
 def test_grid_ns_constant():
@@ -416,6 +409,213 @@ def test_parse_uploads_missing_log():
     """UNKNOWN when log file is missing."""
     verdict = parse_uploads(Path("/nonexistent/log.log"))
     assert verdict.status == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Sampling order — newest files by mtime (name order is arbitrary)
+# ---------------------------------------------------------------------------
+
+
+def _snap(ts_ns, sid, ob, ua, db, da, state="live"):
+    """Inline-literal snapshot row for fixture files."""
+    return {
+        "ts_snapshot_ns": ts_ns,
+        "snapshot_id": sid,
+        "up_bid": ob,
+        "up_ask": ua,
+        "down_bid": db,
+        "down_ask": da,
+        "book_state": state,
+    }
+
+
+def _write_snapshot_file(path, rows):
+    """Write a small parquet fixture holding exactly the projected columns."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tbl = pa.table(
+        {
+            "ts_snapshot_ns": pa.array([r["ts_snapshot_ns"] for r in rows], type=pa.int64()),
+            "snapshot_id": pa.array([r["snapshot_id"] for r in rows], type=pa.int64()),
+            "up_bid": pa.array([r["up_bid"] for r in rows], type=pa.float64()),
+            "up_ask": pa.array([r["up_ask"] for r in rows], type=pa.float64()),
+            "down_bid": pa.array([r["down_bid"] for r in rows], type=pa.float64()),
+            "down_ask": pa.array([r["down_ask"] for r in rows], type=pa.float64()),
+            "book_state": pa.array([r["book_state"] for r in rows], type=pa.string()),
+        }
+    )
+    pq.write_table(tbl, path)
+
+
+def test_newest_parquet_files_mtime_order(tmp_path):
+    """Sampling keeps the newest files by mtime, not the first by name.
+
+    New helpers are imported lazily so the pre-fix baseline fails this test
+    (and only this test) instead of erroring the whole module at collection.
+    """
+    from gate_probe import newest_parquet_files
+
+    names_and_mtimes = [
+        ("a.parquet", 1000.0),
+        ("d.parquet", 100.0),
+        ("e.parquet", 1500.0),
+        ("b.parquet", 2000.0),
+        ("c.parquet", 3000.0),
+        ("z.tmp", 9999.0),  # excluded despite the newest mtime
+    ]
+    for name, mtime in names_and_mtimes:
+        p = tmp_path / name
+        p.write_text("")
+        os.utime(p, (mtime, mtime))
+
+    got = newest_parquet_files(tmp_path, 3)
+    assert [p.name for p in got] == ["c.parquet", "b.parquet", "e.parquet"]
+
+    # max_files beyond the candidate set keeps all of them, newest first
+    got_all = newest_parquet_files(tmp_path, 10)
+    assert [p.name for p in got_all] == [
+        "c.parquet", "b.parquet", "e.parquet", "a.parquet", "d.parquet",
+    ]
+
+
+def test_analyze_lane_samples_newest_by_mtime(tmp_path):
+    """analyze_lane must sample the newest-by-mtime file, not the first by name."""
+    older = tmp_path / "a.parquet"  # name-sorts first, older mtime
+    newer = tmp_path / "b.parquet"  # name-sorts second, newer mtime
+    _write_snapshot_file(
+        older,
+        [
+            _snap(1000 * GRID_NS, 1, 0.5, 0.5, 0.5, 0.5),
+            _snap(1001 * GRID_NS, 2, 0.5, 0.5, 0.5, 0.5),
+        ],
+    )
+    _write_snapshot_file(
+        newer,
+        [
+            _snap(5000 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5),
+            _snap(5003 * GRID_NS, 4, 0.5, 0.5, 0.5, 0.5),
+        ],
+    )
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+
+    result = analyze_lane(tmp_path, "BTC", max_files=1)
+    assert result.files_sampled == 1
+    # Only achievable if the newer file (span 3 grid ticks) was sampled;
+    # name-order sampling of the older file would give span 1 grid tick.
+    assert result.span_ns == 3 * GRID_NS, "expected the newest-by-mtime file to be sampled"
+
+
+# ---------------------------------------------------------------------------
+# Density% — honest tick census (old expected-minus-offgrid formula was
+# degenerate: it reported 100.0 whenever offgrid == 0, gaps included)
+# ---------------------------------------------------------------------------
+
+
+def test_density_census_counts_gaps():
+    """A missing 500ms tick must show up as Density% below 100."""
+    from gate_probe import density_census_pct
+
+    # Ticks at 0, 500ms, 1000ms, 2000ms — the 1500ms tick is missing.
+    # The old formula reported (expected 5 - offgrid 0) / 5 = 100.0 despite the gap.
+    ts = [0, GRID_NS, 2 * GRID_NS, 4 * GRID_NS]
+    assert density_census_pct(ts) == 80.0  # 4 distinct on-grid / 5 slots
+
+
+def test_density_census_duplicates_do_not_inflate():
+    from gate_probe import density_census_pct
+
+    # Three distinct ticks, each duplicated: still 3/3, never 6/3.
+    assert density_census_pct([0, 0, GRID_NS, GRID_NS, 2 * GRID_NS, 2 * GRID_NS]) == 100.0
+
+
+def test_density_census_offgrid_excluded():
+    from gate_probe import density_census_pct
+
+    # 1ns is off-grid: distinct on-grid = {2000ms} = 1, span//500ms + 1 = 2 -> 50.0
+    assert density_census_pct([1, 2 * GRID_NS]) == 50.0
+
+
+def test_density_census_single_tick():
+    from gate_probe import density_census_pct
+
+    assert density_census_pct([GRID_NS]) == 100.0  # lone on-grid tick: 1/1
+    assert density_census_pct([1]) == 0.0  # lone off-grid tick counts as no tick
+    assert density_census_pct([]) == 0.0
+
+
+def test_analyze_lane_density_reports_gap(tmp_path):
+    """End-to-end: a lane with a missing 500ms tick reports Density% < 100."""
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5),
+        _snap(GRID_NS, 2, 0.5, 0.5, 0.5, 0.5),
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5),
+        _snap(4 * GRID_NS, 4, 0.5, 0.5, 0.5, 0.5),  # 1500ms tick missing
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+    # Old formula reported 100.0 here (offgrid == 0); census reports 4/5 = 80.0
+    assert result.density_pct == 80.0
+
+
+# ---------------------------------------------------------------------------
+# book_state projection — stale rows must score CompStale, not CompLive
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_lane_stale_rows_score_comp_stale(tmp_path):
+    """book_state must be projected: stale rows score CompStale, not CompLive."""
+    rows = [
+        _snap(0, 1, 0.5, 0.5, 0.5, 0.5, "live"),  # deviation 0
+        _snap(GRID_NS, 2, 0.3, 0.3, 0.3, 0.3, "stale"),  # deviation 0.4 > 0.001
+        _snap(2 * GRID_NS, 3, 0.5, 0.5, 0.5, 0.5, "resyncing"),  # deviation 0
+    ]
+    _write_snapshot_file(tmp_path / "lane.parquet", rows)
+    result = analyze_lane(tmp_path, "BTC", max_files=48)
+
+    # Stale bucket: 1 of 2 checkable rows deviates -> 50.0 (was 0.0 when
+    # book_state was missing from the projection and every row counted as live).
+    assert result.comp_stale_gt_01_pct == 50.0
+    # Live bucket: 1 checkable row with deviation 0 -> 0.0
+    assert result.comp_live_gt_01_pct == 0.0
+    # Continuity column over all rows: 1 of 3 -> 33.33
+    assert result.complement_gt_01_pct == pytest.approx(33.33)
+    # CompNorm% counts live rows only — the breaching row is stale -> 0.0
+    assert result.comp_spread_norm_pct == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gate verdict — keyed on CompNorm% (spread-normalized live share)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_verdict_breaches_use_comp_norm():
+    """The verdict keys off CompNorm%, not the raw Comp>0.1% column."""
+    from gate_probe import breaching_lanes, LaneResult
+
+    def lane(name, comp_norm_pct):
+        return LaneResult(
+            lane=name,
+            files_sampled=1,
+            density_pct=100.0,
+            complement_gt_01_pct=90.0,  # raw column high — must NOT gate
+            comp_live_gt_01_pct=90.0,
+            comp_stale_gt_01_pct=0.0,
+            null_mid_count=0,
+            comp_spread_norm_pct=comp_norm_pct,
+            live_null_no_book_count=0,
+            live_null_partial_count=0,
+            live_null_partial_examples=[],
+            dup_snapshot_id_count=0,
+            offgrid_count=0,
+            part_flag=False,
+            span_ns=0,
+        )
+
+    # Raw Comp>0.1% is 90.0 on every lane; only CompNorm% decides the verdict.
+    assert breaching_lanes([lane("BTC", 0.0), lane("ETH", 0.05)]) == []
+    assert breaching_lanes([lane("BTC", 0.0), lane("ETH", 2.4)]) == ["ETH 2.4"]
 
 
 # ---------------------------------------------------------------------------
