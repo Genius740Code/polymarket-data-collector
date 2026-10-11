@@ -3312,6 +3312,7 @@ def _stream_export_asset_dataset(
     cutoff_ts: Optional[float] = None,
     coalesce_rows: int = 20000,
     compact_dedup: bool = True,
+    max_files: Optional[int] = None,
 ) -> int:
     """Stream one (asset, whale-dataset) staging build. Returns rows written.
 
@@ -3343,6 +3344,15 @@ def _stream_export_asset_dataset(
     full key tuples — same rows, ~5x less RAM, peak <600MB at 2x XRP
     rows. False restores streaming.DedupState (tuple keys) for parity
     checks; the trades path always uses streaming.DedupState.
+
+    max_files (2026-10-11, default None = scan everything): bounded-scan
+    knob for the spawn-failure in-process fallback ONLY — keeps the
+    NEWEST max_files source files (freshness first), then restores
+    oldest-first processing order inside the kept slice so dedup
+    first-wins and cross-file order semantics are unchanged. The staged
+    file is PARTIAL by construction; io_stats["files_capped"] carries the
+    skipped count so the caller can log an honest PARTIAL line. Workers
+    never pass it (full coverage is their contract).
     """
     from .streaming import DedupState as _TupleDedupState
     from .streaming import iter_source_files, malloc_trim, write_batches
@@ -3445,6 +3455,27 @@ def _stream_export_asset_dataset(
             io_stats["rows_read"] = 0
         _extra = ["series_id", "asset", "book_state", "condition_id", "market_id"]
         _extra.extend(k for k in sort_keys if k not in _extra)
+        _scan_total = len(_files)
+        if max_files is not None and _scan_total > int(max_files):
+            # Bounded scan (spawn-failure in-process fallback): keep the
+            # NEWEST max_files files — freshness first — then restore
+            # oldest-first processing order inside the kept slice so dedup
+            # first-wins and cross-file order semantics stay intact. Count
+            # the skipped files for the caller's honest PARTIAL log line.
+            # MUST run before _group_paths_by_date so the groups (and the
+            # scan loop below) only ever hold the capped slice.
+
+            def _mtime_key(_p):
+                try:
+                    return _p.stat().st_mtime
+                except OSError:
+                    return 0.0
+
+            _files = sorted(
+                sorted(_files, key=_mtime_key, reverse=True)[: int(max_files)],
+                key=_mtime_key)
+            if io_stats is not None:
+                io_stats["files_capped"] = _scan_total - len(_files)
         _groups = _group_paths_by_date(_files)
         _total = len(_files)
         # 2026-10-10 phase timing (log line only): listing+grouping is the
@@ -3453,8 +3484,10 @@ def _stream_export_asset_dataset(
         # from the aggregate clock below by construction (elapsed here is
         # small; the per-file open/footer cost stays in aggregate where it
         # is paid).
-        print(f"[export:worker] phase {asset_upper}/{ds} scan: {_total} files "
-              f"elapsed={int(_time_g.time() - _scan_t0)}s", flush=True)
+        print(f"[export:worker] phase {asset_upper}/{ds} scan: {_total} files"
+              + (f" (capped from {_scan_total} at {int(max_files)}, newest-first)"
+                 if max_files is not None and _scan_total > int(max_files) else "")
+              + f" elapsed={int(_time_g.time() - _scan_t0)}s", flush=True)
         _done = 0
         _rows_out = 0
         _t0 = _time_g.time()
@@ -3718,6 +3751,25 @@ def _commit_staging_file(
 # process until the kernel kills the box mid-upload.
 SUBPROCESS_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events", "trades", "chainlink_events"}
 
+# 2026-10-11 spawn-failure bounded fallback (audit box-killer). When the
+# worker cannot spawn at all (fork ENOMEM / EMFILE / timeout — root cause
+# needs the full-exception log line above), the staging would otherwise
+# freeze on prior files until spawns heal. For the three LOCAL-ONLY whale
+# lanes (pure disk/CPU stream builds — trades/chainlink never fall back
+# in-process: Data-API enrichment must not run under the collector's
+# kaggle lock, and the chainlink concat path is unbounded) a file-capped
+# in-process build stages a PARTIAL file instead:
+#   - newest EXPORT_FALLBACK_FILE_CAP source files only (freshness first);
+#   - gated on EXPORT_FALLBACK_MIN_AVAIL_MB MemAvailable — full-build
+#     worker peaks measure ~500MB, cap-40 slices stay far under, and the
+#     gate keeps headroom on top so a loaded collector is never pushed over;
+#   - committed through the same monotonic/rolling guards (_commit_staging_file);
+#   - honestly logged as PARTIAL with scanned/total counts and NEVER
+#     checkpoint-marked — the next cycle retries the full worker build.
+_FALLBACK_INPROCESS_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", "book_events"}
+EXPORT_FALLBACK_FILE_CAP = 40
+EXPORT_FALLBACK_MIN_AVAIL_MB = 1400
+
 
 def _build_worker_main(payload_path: str, result_path: str) -> None:
     """Subprocess entry: build tmp staging files for a few datasets.
@@ -3961,15 +4013,39 @@ def _build_in_subprocess(
             return None
         return res
     except Exception as e:
+        # 2026-10-11 audit (box-killer): this line used to print only `{e}`
+        # (plus a 1500-char tail on timeouts), so once pm2 rotated the logs
+        # the spawn killer was unnameable. Log the FULL traceback unbounded
+        # plus parent context — fork ENOMEM (overcommit vs VmRSS), EMFILE
+        # (fd exhaustion) and worker timeouts are distinguishable from this
+        # one block. Return value and caller behavior are unchanged: None →
+        # the caller keeps prior staging (fail closed). The old "caller
+        # falls back in-process" text described a design that no longer
+        # exists — the caller has failed closed since 2026-09-12.
+        import traceback as _tb
+        _ctx = ""
+        try:
+            _rss_mb = -1
+            with open("/proc/self/status") as _st_f:
+                for _ln in _st_f:
+                    if _ln.startswith("VmRSS:"):
+                        _rss_mb = int(_ln.split()[1]) // 1024
+                        break
+            _ctx = (f" [ctx: parent pid={os.getpid()} ppid={os.getppid()} "
+                    f"rss={_rss_mb}MB avail={_avail_mb()}MB "
+                    f"open_fds={len(os.listdir('/proc/self/fd'))}]")
+        except Exception:
+            pass
         _tail = ""
         try:
             if isinstance(e, _sp.TimeoutExpired):
                 _so = str(getattr(e, "stdout", None) or "")
                 _se = str(getattr(e, "stderr", None) or "")
-                _tail = f" stdout tail:\n{_so[-1500:]}\nstderr tail:\n{_se[-1500:]}"
+                _tail = f" stdout tail:\n{_so[-8000:]}\nstderr tail:\n{_se[-8000:]}"
         except Exception:
             pass
-        print(f"[export:worker] spawn failed, caller falls back in-process: {e}{_tail}")
+        print(f"[export:worker] spawn failed, caller keeps prior staging (fail closed): "
+              f"{type(e).__name__}: {e}{_ctx}{_tail}\n{_tb.format_exc()}", flush=True)
         return None
     finally:
         for _p in (locals().get("_ppath"), locals().get("_rpath")):
@@ -4146,6 +4222,87 @@ def export_per_asset_single_file(
                             _why = f" reason={str(_built_one.get('error'))[:200]}"
                     except Exception:
                         pass
+                    # 2026-10-11 spawn-failure bounded fallback (audit
+                    # box-killer). `_built_one is None` means the worker
+                    # never produced a result (spawn/OS failure — the full
+                    # traceback is logged in _build_in_subprocess); a dict
+                    # with "error" means the worker RAN and aborted itself
+                    # (rss-cap etc.) — only the former may fall back, and
+                    # only for the local-only whale lanes, and only with
+                    # real memory headroom. The fallback streams the NEWEST
+                    # EXPORT_FALLBACK_FILE_CAP source files in-process and
+                    # stages a PARTIAL file through the same commit guards;
+                    # trades/chainlink keep prior staging (fail closed) —
+                    # their builds do Data-API network work / unbounded
+                    # concat that must never run inside the collector under
+                    # the kaggle lock. NOT checkpoint-marked either way:
+                    # the next cycle retries the full worker build.
+                    if (_built_one is None and ds in _FALLBACK_INPROCESS_DATASETS
+                            and _avail_mb() >= EXPORT_FALLBACK_MIN_AVAIL_MB):
+                        try:
+                            _mid_map_fb: Dict[str, str] = _load_market_id_map(base)
+                        except Exception:
+                            _mid_map_fb = {}
+                        _excl_fb: set = set()
+                        if ds == "book_snapshots_clean":
+                            try:
+                                from .markets_log import MarketsLog as _ML_fb
+
+                                for _mr_fb in _ML_fb(base).load_latest():
+                                    if _mr_fb.get("resolution_outcome") == "disputed" and _mr_fb.get("condition_id"):
+                                        _excl_fb.add(str(_mr_fb["condition_id"]))
+                            except Exception:
+                                pass
+                        _tmp_fb = _out_path.with_suffix(".parquet.tmp")
+                        _io_fb: dict = {}
+                        _rows_fb = None
+                        try:
+                            _rows_fb = _stream_export_asset_dataset(
+                                base, ds, _au_one, _tmp_fb, timeframe_label, l2_levels,
+                                _mid_map_fb, live_only=(ds == "book_snapshots_clean"),
+                                excluded_cids=_excl_fb, io_stats=_io_fb,
+                                source_dataset=("book_snapshots_500ms" if ds == "book_snapshots_clean" else None),
+                                cutoff_ts=cutoff_ts, max_files=EXPORT_FALLBACK_FILE_CAP)
+                        except Exception as _fb_e:
+                            try:
+                                if _tmp_fb.exists():
+                                    _tmp_fb.unlink()
+                            except Exception:
+                                pass
+                            print(f"[export] WARN {ds}/{_au_one} in-process fallback build failed "
+                                  f"({_fb_e}) — keeping prior staging (fail closed)", flush=True)
+                        else:
+                            if (_io_fb.get("files_failed") or _io_fb.get("failed_bytes")
+                                    or _io_fb.get("write_dropped_rows")):
+                                # Same fail-closed rule as the worker coverage
+                                # gate: ANY unreadable input or dropped batch
+                                # keeps the prior staging file.
+                                try:
+                                    if _tmp_fb.exists():
+                                        _tmp_fb.unlink()
+                                except Exception:
+                                    pass
+                                print(f"[export] WARN {ds}/{_au_one} in-process fallback saw "
+                                      f"unreadable inputs (failed={_io_fb.get('files_failed', 0)} "
+                                      f"bytes={_io_fb.get('failed_bytes', 0)} "
+                                      f"dropped_rows={_io_fb.get('write_dropped_rows', 0)}) "
+                                      f"— keeping prior staging (fail closed)", flush=True)
+                            else:
+                                _n_pre_fb = int((_pre_mani or {}).get("n") or 0)
+                                _scanned_fb = int(_io_fb.get("files_ok") or 0)
+                                _committed_fb = _commit_staging_file(
+                                    _out_path, _tmp_fb, int(_rows_fb or 0), ds=ds,
+                                    rolling_window=rolling_window, l2_levels=l2_levels,
+                                    base=base, out=out)
+                                _partial_fb = _scanned_fb < _n_pre_fb or int(_io_fb.get("files_capped") or 0) > 0
+                                print(f"[export] {ds}/{_au_one} spawn failed → bounded in-process "
+                                      f"fallback: {'PARTIAL ' if _partial_fb else ''}{_committed_fb} rows "
+                                      f"(built {int(_rows_fb or 0)}) from {_scanned_fb}/{_n_pre_fb} source "
+                                      f"files (cap {EXPORT_FALLBACK_FILE_CAP}, "
+                                      f"{_avail_mb()}MB avail){' — monotonic guard kept prior staging' if _committed_fb != int(_rows_fb or 0) else ''} "
+                                      f"— full worker rebuild deferred to next cycle", flush=True)
+                                stats[_rel] = _committed_fb
+                                continue
                     print(f"[export] WARN {ds}/{_au_one} worker failed{_why} — keeping prior staging (fail closed)")
                     try:
                         _pr = pq.read_metadata(str(_out_path)).num_rows if _out_path.exists() else None
