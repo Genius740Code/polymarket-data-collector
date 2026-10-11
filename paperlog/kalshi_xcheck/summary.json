@@ -1,0 +1,595 @@
+{
+  "script": "scripts/kalshi_xcheck.py",
+  "generated_at_utc": "2026-10-11T09:56:16Z",
+  "purpose": "external ground truth for our BTC-15m settlement labels; report-only, labels never adjusted",
+  "kalshi": {
+    "base_url": "https://api.elections.kalshi.com/trade-api/v2",
+    "series_ticker": "KXBTC15M",
+    "status_filter": "settled",
+    "requests_made": 22,
+    "request_budget": 60
+  },
+  "our_side": {
+    "source": "data/markets_log (event-sourced parquet; read-only scan)",
+    "series_id": "BTC-15m",
+    "files_scanned": 25477,
+    "read_errors": 7,
+    "condition_ids": 30,
+    "distinct_windows": 30,
+    "merge_rule": "latest event per condition_id by updated_at; window bounds from first event carrying them",
+    "coverage_note": "our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+  },
+  "alignment_rule": "exact UTC window boundary equality: kalshi open_time == our market_start AND kalshi close_time == our market_end (epoch seconds); both venues align 15m windows to quarter-hour UTC; zero tolerance, no gap filling, no substituted values",
+  "agreement_rule": "(kalshi result == 'yes') == (our resolution_outcome == 'up')",
+  "primary": {
+    "description": "the 20 most recent settled Kalshi KXBTC15M markets vs our markets_log",
+    "kalshi_markets": 20,
+    "window_range_utc": [
+      "2026-10-11T04:45:00Z",
+      "2026-10-11T09:45:00Z"
+    ],
+    "agreement": 0,
+    "disagreement": 0,
+    "unmatchable": 20,
+    "pairs": [],
+    "unmatchable_details": [
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110545-45",
+        "window_start_utc": "2026-10-11T09:30:00Z",
+        "window_end_utc": "2026-10-11T09:45:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110530-30",
+        "window_start_utc": "2026-10-11T09:15:00Z",
+        "window_end_utc": "2026-10-11T09:30:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110515-15",
+        "window_start_utc": "2026-10-11T09:00:00Z",
+        "window_end_utc": "2026-10-11T09:15:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110500-00",
+        "window_start_utc": "2026-10-11T08:45:00Z",
+        "window_end_utc": "2026-10-11T09:00:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110445-45",
+        "window_start_utc": "2026-10-11T08:30:00Z",
+        "window_end_utc": "2026-10-11T08:45:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110430-30",
+        "window_start_utc": "2026-10-11T08:15:00Z",
+        "window_end_utc": "2026-10-11T08:30:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110415-15",
+        "window_start_utc": "2026-10-11T08:00:00Z",
+        "window_end_utc": "2026-10-11T08:15:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110400-00",
+        "window_start_utc": "2026-10-11T07:45:00Z",
+        "window_end_utc": "2026-10-11T08:00:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110345-45",
+        "window_start_utc": "2026-10-11T07:30:00Z",
+        "window_end_utc": "2026-10-11T07:45:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110330-30",
+        "window_start_utc": "2026-10-11T07:15:00Z",
+        "window_end_utc": "2026-10-11T07:30:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110315-15",
+        "window_start_utc": "2026-10-11T07:00:00Z",
+        "window_end_utc": "2026-10-11T07:15:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110300-00",
+        "window_start_utc": "2026-10-11T06:45:00Z",
+        "window_end_utc": "2026-10-11T07:00:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110245-45",
+        "window_start_utc": "2026-10-11T06:30:00Z",
+        "window_end_utc": "2026-10-11T06:45:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110230-30",
+        "window_start_utc": "2026-10-11T06:15:00Z",
+        "window_end_utc": "2026-10-11T06:30:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110215-15",
+        "window_start_utc": "2026-10-11T06:00:00Z",
+        "window_end_utc": "2026-10-11T06:15:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110200-00",
+        "window_start_utc": "2026-10-11T05:45:00Z",
+        "window_end_utc": "2026-10-11T06:00:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110145-45",
+        "window_start_utc": "2026-10-11T05:30:00Z",
+        "window_end_utc": "2026-10-11T05:45:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110130-30",
+        "window_start_utc": "2026-10-11T05:15:00Z",
+        "window_end_utc": "2026-10-11T05:30:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110115-15",
+        "window_start_utc": "2026-10-11T05:00:00Z",
+        "window_end_utc": "2026-10-11T05:15:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      },
+      {
+        "kalshi_ticker": "KXBTC15M-26OCT110100-00",
+        "window_start_utc": "2026-10-11T04:45:00Z",
+        "window_end_utc": "2026-10-11T05:00:00Z",
+        "reason": "no BTC-15m window with identical start/end in our markets_log; our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows)"
+      }
+    ]
+  },
+  "supplementary": {
+    "description": "our resolved BTC-15m windows vs Kalshi settled history for the same window range",
+    "our_windows": 30,
+    "kalshi_windows_fetched_in_range": 108,
+    "agreement": 30,
+    "disagreement": 0,
+    "unmatchable": 0,
+    "pairs": [
+      {
+        "window_start_utc": "2026-10-01T17:00:00Z",
+        "window_end_utc": "2026-10-01T17:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011315-15",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84142.82,
+        "kalshi_expiration_value": "84406.27",
+        "kalshi_settlement_ts": "2026-10-01T17:15:03.998192Z",
+        "our_condition_id": "0x5ab15d5579072d5f20967be96776e86cef0b39c02ff813e97a849013c2316d8a",
+        "our_slug": "btc-updown-15m-1790874000",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T17:15:00Z",
+        "window_end_utc": "2026-10-01T17:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011330-30",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84406.27,
+        "kalshi_expiration_value": "84868.05",
+        "kalshi_settlement_ts": "2026-10-01T17:30:03.996106Z",
+        "our_condition_id": "0xe32fe4c4139598be3206f366aaa163fdb0f67d7273e22aed98f5c79aa99479dd",
+        "our_slug": "btc-updown-15m-1790874900",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T17:30:00Z",
+        "window_end_utc": "2026-10-01T17:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011345-45",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84868.05,
+        "kalshi_expiration_value": "85003.43",
+        "kalshi_settlement_ts": "2026-10-01T17:45:04.002997Z",
+        "our_condition_id": "0x6b0d8d78cb383002a22ff8a58c1f97168b125d5cf7d1570ab26a4eef261f9e62",
+        "our_slug": "btc-updown-15m-1790875800",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T17:45:00Z",
+        "window_end_utc": "2026-10-01T18:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011400-00",
+        "kalshi_result": "no",
+        "kalshi_strike": 85003.43,
+        "kalshi_expiration_value": "84838.39",
+        "kalshi_settlement_ts": "2026-10-01T18:00:04.008925Z",
+        "our_condition_id": "0x5df0c2a858d67a44ca938df78545ef898b9182fa0e7f20ef68c4513426e1f0ef",
+        "our_slug": "btc-updown-15m-1790876700",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T18:00:00Z",
+        "window_end_utc": "2026-10-01T18:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011415-15",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84838.39,
+        "kalshi_expiration_value": "84881.89",
+        "kalshi_settlement_ts": "2026-10-01T18:15:04.009216Z",
+        "our_condition_id": "0xe5f3475984df01296f2e0f922749d30b301a9bcdf03efd1605b44891725af798",
+        "our_slug": "btc-updown-15m-1790877600",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T18:15:00Z",
+        "window_end_utc": "2026-10-01T18:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011430-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 84881.89,
+        "kalshi_expiration_value": "84777.35",
+        "kalshi_settlement_ts": "2026-10-01T18:30:04.012662Z",
+        "our_condition_id": "0x42e99cac50e1bc72f5226d4b38ceacdda6883d28d66ce711979b1586303cd6b5",
+        "our_slug": "btc-updown-15m-1790878500",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T18:30:00Z",
+        "window_end_utc": "2026-10-01T18:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011445-45",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84777.35,
+        "kalshi_expiration_value": "84913.74",
+        "kalshi_settlement_ts": "2026-10-01T18:45:04.004134Z",
+        "our_condition_id": "0x1a2675bf2b8bda261c1b2930ea4fe62d3ce1f9f31d2d4acea61bb34e5fce01d0",
+        "our_slug": "btc-updown-15m-1790879400",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T18:45:00Z",
+        "window_end_utc": "2026-10-01T19:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011500-00",
+        "kalshi_result": "no",
+        "kalshi_strike": 84913.74,
+        "kalshi_expiration_value": "84778.66",
+        "kalshi_settlement_ts": "2026-10-01T19:00:04.003584Z",
+        "our_condition_id": "0x3cf5296551c8028ca9e397e491032ec0af5154a1c67983a4a1c69e5ede6f9fd9",
+        "our_slug": "btc-updown-15m-1790880300",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T19:00:00Z",
+        "window_end_utc": "2026-10-01T19:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011515-15",
+        "kalshi_result": "no",
+        "kalshi_strike": 84778.66,
+        "kalshi_expiration_value": "84776.11",
+        "kalshi_settlement_ts": "2026-10-01T19:15:04.011286Z",
+        "our_condition_id": "0x65c58b60656e17133fac27ebf69c9e180b101fa79c5b32a37c679bc724ef5051",
+        "our_slug": "btc-updown-15m-1790881200",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T19:15:00Z",
+        "window_end_utc": "2026-10-01T19:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011530-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 84776.11,
+        "kalshi_expiration_value": "84589.89",
+        "kalshi_settlement_ts": "2026-10-01T19:30:04.000248Z",
+        "our_condition_id": "0xda4919134466521bb506b346dcd7263a8837b8f601c231e099339cca26dd639b",
+        "our_slug": "btc-updown-15m-1790882100",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T19:30:00Z",
+        "window_end_utc": "2026-10-01T19:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011545-45",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84589.89,
+        "kalshi_expiration_value": "84618.66",
+        "kalshi_settlement_ts": "2026-10-01T19:45:04.009058Z",
+        "our_condition_id": "0x99f201b30e41138ed28a42e6caba6124f7593a7f70e6ee23adcfb241543d5fea",
+        "our_slug": "btc-updown-15m-1790883000",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T19:45:00Z",
+        "window_end_utc": "2026-10-01T20:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011600-00",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84618.66,
+        "kalshi_expiration_value": "84636.71",
+        "kalshi_settlement_ts": "2026-10-01T20:00:04.012064Z",
+        "our_condition_id": "0xf519129a97df45878d43459098ebaa3a04aa48951782e1cb538eaaca0c8a85b9",
+        "our_slug": "btc-updown-15m-1790883900",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T20:00:00Z",
+        "window_end_utc": "2026-10-01T20:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011615-15",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84636.71,
+        "kalshi_expiration_value": "84762.29",
+        "kalshi_settlement_ts": "2026-10-01T20:15:04.001488Z",
+        "our_condition_id": "0x041594631419fd5e57fa68d48365d0d9acacfd9668b594aef939f1fc72314d94",
+        "our_slug": "btc-updown-15m-1790884800",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-01T20:15:00Z",
+        "window_end_utc": "2026-10-01T20:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT011630-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 84762.29,
+        "kalshi_expiration_value": "84751.56",
+        "kalshi_settlement_ts": "2026-10-01T20:30:04.010444Z",
+        "our_condition_id": "0xb945cb34b3f34c940a9ca559b9b74fa36a8a5d6762253f4a4d780b2574931f28",
+        "our_slug": "btc-updown-15m-1790885700",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T16:00:00Z",
+        "window_end_utc": "2026-10-02T16:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021215-15",
+        "kalshi_result": "no",
+        "kalshi_strike": 85274.11,
+        "kalshi_expiration_value": "85192.21",
+        "kalshi_settlement_ts": "2026-10-02T16:15:04.013736Z",
+        "our_condition_id": "0x9062613f98cc676ccc9111170b0ae603982e8ce6aa1344ec8a4fe0a411aa754d",
+        "our_slug": "btc-updown-15m-1790956800",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T16:15:00Z",
+        "window_end_utc": "2026-10-02T16:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021230-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 85192.21,
+        "kalshi_expiration_value": "85181.71",
+        "kalshi_settlement_ts": "2026-10-02T16:30:04.01861Z",
+        "our_condition_id": "0x50b09f86e33a7c1fa8da1604298976b3be87845700586d6f34a47146139e40e7",
+        "our_slug": "btc-updown-15m-1790957700",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T16:30:00Z",
+        "window_end_utc": "2026-10-02T16:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021245-45",
+        "kalshi_result": "no",
+        "kalshi_strike": 85181.71,
+        "kalshi_expiration_value": "85156.37",
+        "kalshi_settlement_ts": "2026-10-02T16:45:04.003383Z",
+        "our_condition_id": "0x97a18f186b897f8809e991ebed008a9f5cf8ab2a9202fed404cfc94c957b9bdd",
+        "our_slug": "btc-updown-15m-1790958600",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T16:45:00Z",
+        "window_end_utc": "2026-10-02T17:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021300-00",
+        "kalshi_result": "no",
+        "kalshi_strike": 85156.37,
+        "kalshi_expiration_value": "85128.18",
+        "kalshi_settlement_ts": "2026-10-02T17:00:04.013634Z",
+        "our_condition_id": "0x5730e769673dc67b175fe467ae3ea25d49a709f7663f93d7e45a9c4d655f78ef",
+        "our_slug": "btc-updown-15m-1790959500",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T17:00:00Z",
+        "window_end_utc": "2026-10-02T17:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021315-15",
+        "kalshi_result": "no",
+        "kalshi_strike": 85128.18,
+        "kalshi_expiration_value": "84953.30",
+        "kalshi_settlement_ts": "2026-10-02T17:15:04.010864Z",
+        "our_condition_id": "0x5cafb4988d4fda3712aad2b30d39d516f5d2928f66b0e11f59e6a49f62d27c4e",
+        "our_slug": "btc-updown-15m-1790960400",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T17:15:00Z",
+        "window_end_utc": "2026-10-02T17:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021330-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 84953.3,
+        "kalshi_expiration_value": "84634.79",
+        "kalshi_settlement_ts": "2026-10-02T17:30:04.007699Z",
+        "our_condition_id": "0x0c6d64e0b7a5ba8154239fe8520255ac50835f44959f13a50dcdbd72490ca8d2",
+        "our_slug": "btc-updown-15m-1790961300",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T17:30:00Z",
+        "window_end_utc": "2026-10-02T17:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021345-45",
+        "kalshi_result": "no",
+        "kalshi_strike": 84634.79,
+        "kalshi_expiration_value": "84596.14",
+        "kalshi_settlement_ts": "2026-10-02T17:45:04.020187Z",
+        "our_condition_id": "0xb54f3f0cc0b361e4e881fbd79117cf9b439ba2dddb1c7f2a7557814e1a431637",
+        "our_slug": "btc-updown-15m-1790962200",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T17:45:00Z",
+        "window_end_utc": "2026-10-02T18:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021400-00",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84596.14,
+        "kalshi_expiration_value": "84787.33",
+        "kalshi_settlement_ts": "2026-10-02T18:00:04.017534Z",
+        "our_condition_id": "0x89d3c99058e8d8211f5afac48478d508a4f8aaa6e34433791fe6d86afde28045",
+        "our_slug": "btc-updown-15m-1790963100",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T18:00:00Z",
+        "window_end_utc": "2026-10-02T18:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021415-15",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84787.33,
+        "kalshi_expiration_value": "84862.65",
+        "kalshi_settlement_ts": "2026-10-02T18:15:04.010246Z",
+        "our_condition_id": "0xe61f1981b96005eaf8d383bca0403f9f490a5a9735335f6686bd3f051ad1321c",
+        "our_slug": "btc-updown-15m-1790964000",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T18:15:00Z",
+        "window_end_utc": "2026-10-02T18:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021430-30",
+        "kalshi_result": "no",
+        "kalshi_strike": 84862.65,
+        "kalshi_expiration_value": "84596.57",
+        "kalshi_settlement_ts": "2026-10-02T18:30:04.006263Z",
+        "our_condition_id": "0x217824c0ff071f2aeee50bee4df36c143624cb54253408c14f5e8bec6372c0bf",
+        "our_slug": "btc-updown-15m-1790964900",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T18:30:00Z",
+        "window_end_utc": "2026-10-02T18:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021445-45",
+        "kalshi_result": "no",
+        "kalshi_strike": 84596.57,
+        "kalshi_expiration_value": "83957.42",
+        "kalshi_settlement_ts": "2026-10-02T18:45:04.008929Z",
+        "our_condition_id": "0xbbecc785dee7c78227e112e247b994928924e1b29e06a2ff0dc1a89141c05233",
+        "our_slug": "btc-updown-15m-1790965800",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T18:45:00Z",
+        "window_end_utc": "2026-10-02T19:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021500-00",
+        "kalshi_result": "yes",
+        "kalshi_strike": 83957.42,
+        "kalshi_expiration_value": "84250.56",
+        "kalshi_settlement_ts": "2026-10-02T19:00:04.009583Z",
+        "our_condition_id": "0x9d6f97271cd414655bd1f7b9670adb0fc91e152cbd2b758130c3454722c73580",
+        "our_slug": "btc-updown-15m-1790966700",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T19:00:00Z",
+        "window_end_utc": "2026-10-02T19:15:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021515-15",
+        "kalshi_result": "no",
+        "kalshi_strike": 84250.56,
+        "kalshi_expiration_value": "84118.74",
+        "kalshi_settlement_ts": "2026-10-02T19:15:04.007231Z",
+        "our_condition_id": "0xbb99ac907d3e0f9f910aa0f61ff725a90480b38f611c43c1d0fa456fc86382d3",
+        "our_slug": "btc-updown-15m-1790967600",
+        "our_outcome": "down",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T19:15:00Z",
+        "window_end_utc": "2026-10-02T19:30:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021530-30",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84118.74,
+        "kalshi_expiration_value": "84124.90",
+        "kalshi_settlement_ts": "2026-10-02T19:30:04.017721Z",
+        "our_condition_id": "0x583c19f499d248423409460e818b3d284fde7c209a7e181f6394f426f3c5fcf2",
+        "our_slug": "btc-updown-15m-1790968500",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T19:30:00Z",
+        "window_end_utc": "2026-10-02T19:45:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021545-45",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84124.9,
+        "kalshi_expiration_value": "84153.27",
+        "kalshi_settlement_ts": "2026-10-02T19:45:04.009103Z",
+        "our_condition_id": "0x260f309aa5201a85dc491761620a14e2484371e5b26967b2a1d8683fb0716524",
+        "our_slug": "btc-updown-15m-1790969400",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      },
+      {
+        "window_start_utc": "2026-10-02T19:45:00Z",
+        "window_end_utc": "2026-10-02T20:00:00Z",
+        "kalshi_ticker": "KXBTC15M-26OCT021600-00",
+        "kalshi_result": "yes",
+        "kalshi_strike": 84153.27,
+        "kalshi_expiration_value": "84282.63",
+        "kalshi_settlement_ts": "2026-10-02T20:00:04.009325Z",
+        "our_condition_id": "0x10eed3596e0393ff4c3c6bf0e36ef1d823e51a8d230a6f80ea2a4779c22789ff",
+        "our_slug": "btc-updown-15m-1790970300",
+        "our_outcome": "up",
+        "our_status": "resolved",
+        "verdict": "agreement"
+      }
+    ],
+    "unmatchable_details": []
+  },
+  "notes": [
+    "unmatchable pairs are reported with reasons; our labels are never modified",
+    "primary pass counts from the Kalshi side; supplementary counts per our-window",
+    "our BTC-15m coverage: 2026-10-01T17:00:00Z..2026-10-02T20:00:00Z UTC (30 windows); the 15m lane was not writing on the dates of the 20 most recent Kalshi markets",
+    "windows that fall inside the primary range are excluded from the supplementary pass"
+  ]
+}
