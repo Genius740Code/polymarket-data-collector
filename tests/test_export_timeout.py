@@ -63,6 +63,31 @@ def test_worker_spawn_budget_kept_but_raised() -> None:
     assert "timeout=timeout_s" in src  # budget still enforced, never removed
 
 
+def test_timeout_expired_fails_closed_keeps_prior(tmp_path, capsys, monkeypatch) -> None:
+    """P4 pin (2026-10-12): a TimeoutExpired spawn returns None and the caller
+    keeps prior staging — the scope-skip fix must not touch this contract.
+    The worker's captured stdout tail (progress lines proving steady work,
+    not a hang) rides along for the log."""
+    import subprocess as _sp
+
+    def _timeout(*a, **k):
+        raise _sp.TimeoutExpired(
+            cmd="worker", timeout=1800,
+            output="[export:worker] progress BTC/book_snapshots_500ms: 1461/1754 files "
+                   "date=2026-10-11 rows=932000 elapsed=1761s")
+
+    monkeypatch.setattr(_sp, "run", _timeout)
+    base = Path(tmp_path) / "data"
+    res = _build_in_subprocess(base, tmp_path, ["book_snapshots_500ms"], ["BTC"],
+                               "5m", 10, False, True)
+    assert res is None  # fail closed: None -> caller keeps prior staging
+    logged = capsys.readouterr().out
+    assert "[export:worker] spawn failed" in logged
+    assert "TimeoutExpired" in logged
+    assert "keeps prior staging (fail closed)" in logged
+    assert "1461/1754" in logged  # the worker stdout tail is not swallowed
+
+
 def _real_hive():
     return Path(__file__).resolve().parents[1] / "data" / "book_snapshots_500ms"
 

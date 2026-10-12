@@ -3194,6 +3194,102 @@ def _projected_read_columns(file_col_names, schema, extra) -> "list | None":
     return wanted or None
 
 
+def _epoch_day_of_date_label(label: str) -> "int | None":
+    """Epoch-day index of a `date=` partition label ("YYYY-MM-DD"); "unknown" -> -1.
+
+    Pure helper for the scope-skip carry filter: carried prior-staging rows
+    survive exactly when the date= partition they were flushed into still
+    holds files. "unknown" maps to -1 (the sentinel _carry_date_filter uses
+    for rows whose ts cannot be resolved — the writer's honest-gap partition).
+    """
+    if label == "unknown":
+        return -1
+    try:
+        import datetime as _dt_d
+
+        return _dt_d.date.fromisoformat(str(label)).toordinal() - 719163
+    except Exception:
+        return None
+
+
+def _carry_date_filter(t: "pa.Table", kept_days: set) -> "pa.Table":
+    """Filter carried prior-staging rows to date partitions still in the hive.
+
+    Scope-skip correctness: the prune deletes individual files (market-end
+    aware), so a carried row must leave the staging when its whole date=
+    partition is gone — otherwise the rolling-window mirror would never
+    shrink. Row->date resolution mirrors parquet_writer.append exactly
+    (ns bucket first: ts_snapshot_ns then ts_received_ns; then ms ts_source;
+    else the unknown partition), so a row is kept iff the partition the
+    writer actually flushed it into still exists. Rows with no resolvable
+    date survive only when a date=unknown partition is present (kept_days
+    contains -1). Never raises: on kernel trouble the batch passes through
+    unfiltered (a superset of the full rebuild is the safe direction — the
+    rows are real, previously-verified data; the next full rebuild heals
+    the window exactly).
+    """
+    try:
+        if t is None or t.num_rows == 0 or not kept_days:
+            return t
+        import pyarrow.compute as _pc_c
+
+        _days: list = []
+        for _c in ("ts_snapshot_ns", "ts_received_ns"):
+            if _c in t.schema.names:
+                try:
+                    _ns = _pc_c.cast(t.column(_c), pa.int64(), safe=False)
+                    _ok = _pc_c.is_valid(_ns)
+                    _mn = _pc_c.min(_ns).as_py()
+                    if _mn is not None and _mn < 0:
+                        # pre-1970 rows exist: pyarrow's int divide truncates
+                        # toward zero while the writer floors (Python //) —
+                        # compute those days exactly (never in real hives;
+                        # corrupt-ts honesty costs one narrow pylist).
+                        _dl = _ns.to_pylist()
+                        _d = pa.array(
+                            [None if v is None else v // 86_400_000_000_000 for v in _dl],
+                            pa.int64())
+                        del _dl
+                    else:
+                        # every representable int64 ns (year ~1677..2262)
+                        # parses in datetime, so validity marks the bucket
+                        # usable; for ns >= 0 trunc == floor exactly.
+                        _d = _pc_c.divide(
+                            _ns, pa.scalar(86_400_000_000_000, pa.int64()))
+                    _days.append((_pc_c.if_else(_ok, _d, pa.nulls(t.num_rows, pa.int64())), _ok))
+                except Exception:
+                    pass
+        if "ts_source" in t.schema.names:
+            try:
+                _ms = _pc_c.cast(t.column("ts_source"), pa.float64(), safe=False)
+                _ms = _pc_c.if_else(_pc_c.greater(_ms, pa.scalar(1e11)),
+                                    _ms, _pc_c.multiply(_ms, pa.scalar(1000.0)))
+                _ok2 = _pc_c.and_(
+                    _pc_c.is_valid(_ms),
+                    _pc_c.and_(_pc_c.greater(_ms, pa.scalar(-62_135_596_80_000.0)),
+                               _pc_c.less(_ms, pa.scalar(253_402_300_799_000.0))))
+                _d2 = _pc_c.cast(
+                    _pc_c.floor(_pc_c.divide(_ms, pa.scalar(86_400_000.0))),
+                    pa.int64(), safe=False)
+                _days.append((_pc_c.if_else(_ok2, _d2, pa.nulls(t.num_rows, pa.int64())), _ok2))
+            except Exception:
+                pass
+        _day = pa.nulls(t.num_rows, pa.int64())
+        # reversed build => earlier-listed (higher-priority) sources overwrite
+        # the sentinel only where THEY are valid: ts_snapshot_ns wins over
+        # ts_received_ns wins over ts_source, exactly like parquet_writer.append.
+        for _dcol, _dok in reversed(_days):
+            _day = _pc_c.if_else(_dok, _dcol, _day)
+        _day = _pc_c.fill_null(_day, pa.scalar(-1, pa.int64()))
+        _mask = _pc_c.fill_null(
+            _pc_c.is_in(_day, value_set=pa.array(sorted(kept_days), type=pa.int64())), False)
+        if int(_pc_c.sum(_pc_c.cast(_mask, pa.int64())).as_py() or 0) == t.num_rows:
+            return t
+        return t.filter(_mask)
+    except Exception:
+        return t
+
+
 def _compact_key_digest(vals: tuple) -> bytes:
     """16-byte canonical digest of one dedup key tuple (2026-10-10).
 
@@ -3313,6 +3409,7 @@ def _stream_export_asset_dataset(
     coalesce_rows: int = 20000,
     compact_dedup: bool = True,
     max_files: Optional[int] = None,
+    skip_watermark: Optional[dict] = None,
 ) -> int:
     """Stream one (asset, whale-dataset) staging build. Returns rows written.
 
@@ -3353,6 +3450,35 @@ def _stream_export_asset_dataset(
     file is PARTIAL by construction; io_stats["files_capped"] carries the
     skipped count so the caller can log an honest PARTIAL line. Workers
     never pass it (full coverage is their contract).
+
+    skip_watermark (2026-10-12 P4 fix, default None = full scan): the
+    P4 box-killer was a THROUGHPUT/BUDGET mismatch, not a hang — the BTC
+    snapshots worker scanned 1461/1754 files (~932k rows) at ~530 rows/s
+    under collector contention and was killed at the 1800s timeout with
+    steady ~60s/50-file progress all along; the full scan needs ~2100s.
+    Mechanism (b), chosen by measurement over (a) 3600s timeout (holds
+    _kaggle_lock ~35min every cycle: flushes skipped, live% ~0 for 40min,
+    backlog draining past 03:36), (c) per-date spawn splits (same total
+    CPU, same lock-hold, resets only the clock) and (d) nice/ionice
+    (worker just lasts longer): bound the scan scope to the DELTA. Files
+    with mtime <= skip_watermark["cutoff"] were already staged+verified
+    (their rows are in the prior staging file, proven by rows+bytes
+    recorded at commit and re-verified here against the file on disk);
+    they are never rescanned — the prior staging file is streamed through
+    THE SAME _transform pipeline first (idempotent lane/asset/live
+    filters, E1 heal with the CURRENT market_id map, dedup seeding so
+    re-delivered rows stay first-wins, per-batch sort), filtered to date
+    partitions still present in the hive (_carry_date_filter — the prune
+    deletes per file, so whole vanished dates must leave the staging).
+    Only files newer than the cutoff are then scanned. Coverage gate
+    unchanged: both pre-spawn and worker manifests stay metadata-only
+    over ALL files <= cutoff, skipped or not. Fail closed: ANY
+    verification doubt (missing file, rows/bytes mismatch, mixed
+    layout, no overlap) disables the skip and full-scans. The mid-build
+    race (files written between the prior cutoff and commit) is closed
+    by keying the skip on the recorded CUTOFF, never the staging mtime.
+    Never combined with max_files (fallback builds are PARTIAL by
+    construction and must not carry).
     """
     from .streaming import DedupState as _TupleDedupState
     from .streaming import iter_source_files, malloc_trim, write_batches
@@ -3476,8 +3602,71 @@ def _stream_export_asset_dataset(
                 key=_mtime_key)
             if io_stats is not None:
                 io_stats["files_capped"] = _scan_total - len(_files)
-        _groups = _group_paths_by_date(_files)
-        _total = len(_files)
+        # ---- scope-skip decision (P4 2026-10-12): files already staged+verified
+        # are never rescanned. Authorization chain, ALL of it fail-closed:
+        # skip_watermark carries the CUTOFF of the build that committed the
+        # prior staging plus its rows+bytes; the prior staging file on disk is
+        # re-verified (footer rows + size) — any doubt disables the skip and
+        # the legacy full scan runs. Never active together with max_files
+        # (fallback builds are PARTIAL by construction and must not carry).
+        _skip_wm = None
+        _prior_path = None
+        _skip_reason = ""
+
+        def _stat_le(_p, _cut) -> bool:
+            try:
+                return _p.stat().st_mtime <= _cut
+            except OSError:
+                return False  # unstatable file is never skipped (fail closed)
+
+        if skip_watermark is not None and max_files is None:
+            try:
+                _wm_cut = float(skip_watermark.get("cutoff") or 0)
+                _wm_rows = int(skip_watermark.get("rows") or 0)
+                _wm_bytes = int(skip_watermark.get("bytes") or 0)
+            except Exception:
+                _wm_cut = _wm_rows = _wm_bytes = 0
+            _prior_path = (Path(str(tmp_path)[:-4])
+                           if str(tmp_path).endswith(".tmp") else None)
+            if _wm_cut <= 0 or _wm_rows <= 0 or _wm_bytes <= 0 or _prior_path is None:
+                _skip_reason = "watermark incomplete"
+            elif not _prior_path.exists():
+                _skip_reason = "prior staging missing"
+            else:
+                try:
+                    if pq.read_metadata(str(_prior_path)).num_rows != _wm_rows:
+                        _skip_reason = "prior staging rows != watermark"
+                    elif _prior_path.stat().st_size != _wm_bytes:
+                        _skip_reason = "prior staging bytes != watermark"
+                except Exception as _ve:
+                    _skip_reason = f"prior staging unreadable ({_ve})"
+            if not _skip_reason:
+                _kept_dates = {_date_partition_of(p) for p in _files}
+                if "" in _kept_dates:
+                    # mixed/unpartitioned layout: rows cannot be mapped to
+                    # partitions soundly -> full scan (fail closed).
+                    _skip_reason = "unpartitioned file in scan set"
+                elif not any(_stat_le(_p, _wm_cut) for _p in _files):
+                    # window slid completely past the watermark: the carried
+                    # file would only hold rows of pruned dates -> full scan.
+                    _skip_reason = "no file predates the watermark cutoff"
+                else:
+                    _skip_wm = {"cutoff": _wm_cut, "rows": _wm_rows,
+                                "bytes": _wm_bytes, "dates": _kept_dates}
+        _loop_files = _files
+        _skip_files_n = 0
+        if _skip_wm is not None:
+            _loop_files = []
+            for _p in _files:
+                if _stat_le(_p, _skip_wm["cutoff"]):
+                    _skip_files_n += 1
+                else:
+                    _loop_files.append(_p)
+            if io_stats is not None:
+                io_stats["files_skipped"] = _skip_files_n
+                io_stats["carried_rows"] = 0
+        _groups = _group_paths_by_date(_loop_files)
+        _total = len(_loop_files)
         # 2026-10-10 phase timing (log line only): listing+grouping is the
         # scan phase — metadata-only, measured in single-digit seconds even
         # at ~2000 files, so it is reported on its own line and excluded
@@ -3487,9 +3676,54 @@ def _stream_export_asset_dataset(
         print(f"[export:worker] phase {asset_upper}/{ds} scan: {_total} files"
               + (f" (capped from {_scan_total} at {int(max_files)}, newest-first)"
                  if max_files is not None and _scan_total > int(max_files) else "")
+              + (f" (scope-skip: {_skip_files_n}/{_scan_total} already staged+verified)"
+                 if _skip_wm is not None else
+                 (f" (scope-skip disabled: {_skip_reason})" if skip_watermark is not None else ""))
               + f" elapsed={int(_time_g.time() - _scan_t0)}s", flush=True)
-        _done = 0
+        # ---- carry phase: prior staging streamed through the SAME transform
+        # pipeline first (idempotent filters, CURRENT market_id heal, dedup
+        # seeding, per-batch sort), date-filtered to partitions still in the
+        # hive. Fail closed: a read/transform failure here raises (the worker
+        # reports error, the parent keeps prior staging) — carried rows are
+        # part of the shipped file and must never ship short.
         _rows_out = 0
+        if _skip_wm is not None:
+            _kept_days: set = set()
+            for _dl in _skip_wm["dates"]:
+                _di = _epoch_day_of_date_label(_dl)
+                if _di is not None:
+                    _kept_days.add(_di)
+            _carried = 0
+            _carry_dropped = 0
+            _pf_prior = pq.ParquetFile(str(_prior_path))
+            _prior_cols = _projected_read_columns(
+                _pf_prior.schema_arrow.names, schema, _extra)
+            for _chunk in _pf_prior.iter_batches(batch_size=20000, columns=_prior_cols):
+                _t = pa.Table.from_batches([_chunk])
+                del _chunk
+                if _t.num_rows == 0:
+                    del _t
+                    continue
+                _tf = _carry_date_filter(_t, _kept_days)
+                if _tf.num_rows < _t.num_rows:
+                    _carry_dropped += _t.num_rows - _tf.num_rows
+                del _t
+                _t2 = _transform(_tf)
+                del _tf
+                if _t2 is not None and _t2.num_rows > 0:
+                    _carried += _t2.num_rows
+                    _rows_out += _t2.num_rows
+                    if io_stats is not None:
+                        io_stats["carried_rows"] = _carried
+                    yield _t2
+                del _t2
+            del _pf_prior
+            print(f"[export:worker] scope-skip {asset_upper}/{ds}: carried {_carried} rows "
+                  f"from verified prior staging ({_skip_wm['rows']} rows @ cutoff "
+                  f"{int(_skip_wm['cutoff'])})"
+                  + (f", date-filter dropped {_carry_dropped} carried rows "
+                     f"(partition left the hive)" if _carry_dropped else ""), flush=True)
+        _done = 0
         _t0 = _time_g.time()
         _last_log = _t0
         # 2026-10-10 zero-accumulation streaming (peak fix): each decoded
@@ -3896,7 +4130,8 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
                             int(_p.get("l2_levels") or 10), _mid_map,
                             live_only=(_ds == "book_snapshots_clean"),
                             excluded_cids=_excluded_cids,
-                            source_dataset=_src, io_stats=_io, cutoff_ts=_cutoff)
+                            source_dataset=_src, io_stats=_io, cutoff_ts=_cutoff,
+                            skip_watermark=(_p.get("skip_watermark") or None))
                     elif _ds == "chainlink_events":
                         # 2026-09-11 OOM: full-hive concat isolated here too.
                         _t = _read_dataset_per_asset(
@@ -3927,6 +4162,13 @@ def _build_worker_main(payload_path: str, result_path: str) -> None:
                         _res[_rel] = {"tmp": None, "rows": None, "skip": True}
                         continue
                     _res[_rel] = {"tmp": str(_tmp) if _tmp.exists() else None, "rows": _n}
+                    # honest scope-skip accounting for the parent log (the
+                    # worker's own stdout is only surfaced on failure). Key is
+                    # "skip_stats" — "skip" is the caller's not-built sentinel.
+                    if _io.get("files_skipped") or _io.get("carried_rows"):
+                        _res[_rel]["skip_stats"] = {
+                            "skipped_files": int(_io.get("files_skipped") or 0),
+                            "carried_rows": int(_io.get("carried_rows") or 0)}
                     # Report ANY read failure, including 0-byte stubs
                     # (failed=1, failed_bytes=0) which the old
                     # `files_failed`-only gate let through to Kaggle.
@@ -3969,6 +4211,7 @@ def _build_in_subprocess(
     rolling_window: bool,
     timeout_s: int = 1800,
     cutoff_ts: Optional[float] = None,
+    skip_watermark: Optional[dict] = None,
 ) -> Optional[Dict[str, dict]]:
     """Run the per-(dataset,asset) tmp builds in a worker process.
 
@@ -3977,6 +4220,18 @@ def _build_in_subprocess(
     2026-10-07: projected/partitioned snapshot scans complete far inside
     this on a loaded box; the cap stays as a runaway backstop (never
     removed) and progress lines in the worker log tail diagnose stalls.
+
+    skip_watermark (2026-10-12 P4 fix, optional): authorizes the worker's
+    scope-skip — hive files at/below watermark["cutoff"] were already
+    staged+verified (prior staging rows+bytes recorded at commit) and are
+    never rescanned; the prior staging file is carried through the same
+    transform pipeline instead. The worker re-verifies the prior staging
+    against rows+bytes before using it (any doubt -> full scan). The
+    spawn budget itself is unchanged: the SKIP brings per-cycle work from
+    O(window) to O(delta) — the P4 full scan needed ~2100s at ~530 rows/s
+    under collector contention (killed at 1800s, lock held 02:44->03:14,
+    flushes starved); raising the budget would only lengthen the lock-hold
+    without touching throughput.
     """
     import json as _js
     import subprocess as _sp
@@ -3987,6 +4242,7 @@ def _build_in_subprocess(
         "timeframe_label": timeframe_label, "l2_levels": l2_levels,
         "include_binance": include_binance, "rolling_window": rolling_window,
         "cutoff_ts": cutoff_ts,
+        "skip_watermark": skip_watermark,
         "_ppid": os.getpid(),
     }
     try:
@@ -4124,9 +4380,28 @@ def export_per_asset_single_file(
     except Exception:
         _progress = {}
 
-    def _mark_done(_lane: str, _ds: str) -> None:
+    def _mark_done(_lane: str, _ds: str, *, _cutoff: Optional[float] = None,
+                   _rows: Optional[int] = None, _bytes: Optional[int] = None) -> None:
         try:
-            _progress[f"{_lane}/{_ds}"] = int(__import__("time").time())
+            _now = int(__import__("time").time())
+            _key = f"{_lane}/{_ds}"
+            if _cutoff is not None and _rows is not None and _bytes is not None:
+                # 2026-10-12 scope-skip watermark: the CUTOFF this successful
+                # build covered + the exact artifact it committed (rows from
+                # the footer, bytes from stat). Next cycle authorizes the
+                # worker to skip hive files at/below the cutoff ONLY when the
+                # staging file on disk still matches rows+bytes (fail closed:
+                # a PARTIAL fallback, a monotonic-guard keep or any later
+                # change makes the watermark stale -> full scan).
+                _progress[_key] = {"ts": _now, "cutoff": float(_cutoff),
+                                   "rows": int(_rows), "bytes": int(_bytes)}
+            elif isinstance(_progress.get(_key), dict):
+                # not published this cycle (guard kept prior / empty build):
+                # the kept artifact's coverage watermark stays sound — only
+                # the freshness ts moves, never the recorded coverage.
+                _progress[_key]["ts"] = _now
+            else:
+                _progress[_key] = _now
             _prog_path.parent.mkdir(parents=True, exist_ok=True)
             import json as _js_p2
 
@@ -4136,10 +4411,57 @@ def export_per_asset_single_file(
 
     def _is_fresh(_lane: str, _ds: str, _max_age_s: int = 2700) -> bool:
         try:
-            _ts = int(_progress.get(f"{_lane}/{_ds}") or 0)
+            _v = _progress.get(f"{_lane}/{_ds}")
+            if isinstance(_v, dict):
+                _ts = int(_v.get("ts") or 0)
+            else:
+                _ts = int(_v or 0)
             return (int(__import__("time").time()) - _ts) < _max_age_s
         except Exception:
             return False
+
+    def _skip_watermark_for(_ds_key: str, _out_path: Path) -> Optional[dict]:
+        """Scope-skip authorization (P4 2026-10-12): the prior staging file
+        must be the EXACT artifact the recorded watermark committed — footer
+        rows + on-disk size match — and, when a staging-manifest.json exists
+        beside it (written after verified uploads), its rows must agree too.
+        Any doubt returns None -> the worker full-scans (fail closed)."""
+        try:
+            _v = _progress.get(_ds_key)
+            if not isinstance(_v, dict):
+                return None
+            _cutoff = float(_v.get("cutoff") or 0)
+            _rows = int(_v.get("rows") or 0)
+            _bytes = int(_v.get("bytes") or 0)
+            if _cutoff <= 0 or _rows <= 0 or _bytes <= 0:
+                return None
+            if not _out_path.exists():
+                return None
+            try:
+                if pq.read_metadata(str(_out_path)).num_rows != _rows:
+                    return None
+            except Exception:
+                return None
+            try:
+                if _out_path.stat().st_size != _bytes:
+                    return None
+            except OSError:
+                return None
+            try:
+                _mf = _out_path.parent / "staging-manifest.json"
+                if _mf.exists():
+                    import json as _js_m
+
+                    _ents = (_js_m.loads(_mf.read_text()) or {}).get("files") or []
+                    _ent = next((f for f in _ents if isinstance(f, dict)
+                                 and f.get("name") == _out_path.name), None)
+                    if _ent is not None and int(_ent.get("rows") or -1) != _rows:
+                        return None
+            except Exception:
+                pass
+            return {"cutoff": _cutoff, "rows": _rows, "bytes": _bytes}
+        except Exception:
+            return None
 
     for ds in datasets:
         # 2026-09-10 OOM: heavy datasets build in short-lived workers, ONE
@@ -4209,9 +4531,23 @@ def export_per_asset_single_file(
                         cutoff_ts if cutoff_ts is not None else float("inf"))
                 except Exception:
                     _pre_mani = None
+                # 2026-10-12 P4 scope-skip: authorize the worker to carry the
+                # verified prior staging (rows+bytes watermark from the last
+                # successful commit at a recorded cutoff) and skip rescanning
+                # hive files at/below that cutoff. Fail closed by construction:
+                # no watermark / stale artifact / missing cutoff -> full scan.
+                _skip_wm = None
+                if ds in STREAM_WHALE_DATASETS and cutoff_ts is not None:
+                    _skip_wm = _skip_watermark_for(f"{_lane_key}/{ds}/{_au_one}", _out_path)
+                    if _skip_wm is not None:
+                        print(f"[export] scope-skip {ds}/{_au_one}: authorized — prior staging "
+                              f"verified (rows+bytes match watermark, cutoff "
+                              f"{int(_skip_wm['cutoff'])}); worker skips already-staged files",
+                              flush=True)
                 _built_one = _build_in_subprocess(
                     base, out, [ds], [_asset], timeframe_label, l2_levels,
-                    include_binance, rolling_window, cutoff_ts=cutoff_ts)
+                    include_binance, rolling_window, cutoff_ts=cutoff_ts,
+                    skip_watermark=_skip_wm)
                 _out_path = out / f"{_au_one}_{ds}.parquet"
                 _rel = str(_out_path.relative_to(base) if _out_path.is_relative_to(base) else _out_path)
                 _failed = _built_one is None or (isinstance(_built_one, dict) and _built_one.get("error"))
@@ -4361,12 +4697,31 @@ def export_per_asset_single_file(
                         _pr = None
                     stats[_rel] = _pr if _pr is not None else 0
                     continue
-                stats[_rel] = _commit_staging_file(
+                _committed = _commit_staging_file(
                     _out_path, _tmp, int(_rows), ds=ds,
                     rolling_window=rolling_window, l2_levels=l2_levels,
                     base=base, out=out)
+                stats[_rel] = _committed
+                # honest accounting of what the worker actually did
+                _skip_info = (_info.get("skip_stats") or {}) if isinstance(_info, dict) else {}
+                if _skip_info:
+                    print(f"[export] scope-skip {ds}/{_au_one}: build carried "
+                          f"{int(_skip_info.get('carried_rows') or 0)} rows and skipped "
+                          f"{int(_skip_info.get('skipped_files') or 0)} already-staged "
+                          f"source files — committed {_committed} rows", flush=True)
                 try:
-                    _mark_done(_lane_key, f"{ds}/{_au_one}")
+                    _published = (int(_committed) == int(_rows) and int(_rows) > 0)
+                    if (_published and ds in STREAM_WHALE_DATASETS
+                            and cutoff_ts is not None):
+                        # scope-skip watermark: only a PUBLISHED build may record
+                        # coverage (a monotonic-guard keep or empty build leaves
+                        # the old watermark — next cycle full-scans, fail closed)
+                        _mark_done(_lane_key, f"{ds}/{_au_one}",
+                                   _cutoff=float(cutoff_ts),
+                                   _rows=int(_committed),
+                                   _bytes=int(_out_path.stat().st_size))
+                    else:
+                        _mark_done(_lane_key, f"{ds}/{_au_one}")
                 except Exception:
                     pass
             import gc as _gc_ds
