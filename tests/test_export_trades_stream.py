@@ -292,12 +292,11 @@ def test_chunk_stream_rows_match_expected_transform(monkeypatch, tmp_path) -> No
     # E1 heal: hex market_id -> numeric 42 (cid in markets_latest)
     assert rows[("tokA", "tA")]["market_id"] == "42"
     assert rows[("tokD", "tD")]["market_id"] == "42"
-    # mechanical notional fill — NOTE: the kernel branch is a PRE-EXISTING
-    # dead path (pc.case_when takes a struct in this pyarrow, the 3-arg form
-    # raises and the bare except swallows it; HEAD behaves identically — both
-    # paths ship notional NULL here). Kept verbatim for exact HEAD parity;
-    # the dead kernel is reported for a deliberate follow-up fix.
-    assert rows[("tokD", "tD")]["notional"] is None
+    # mechanical notional fill — kernel FIXED 2026-10-12: the 3-arg
+    # pc.case_when raised (wants STRUCT) and the bare except swallowed it,
+    # so fills silently no-opped since introduction; pc.if_else computes.
+    # tokD: price=0.5, size=2.0 -> notional=1.0 (legacy fallback semantics).
+    assert rows[("tokD", "tD")]["notional"] == pytest.approx(1.0)
     # N7: NULL series backfilled for the known cid, kept NULL for the unknown one
     assert rows[("tokB", "tB")]["series_id"] == "BTC-5m"
     assert rows[("tokE", "tE")]["series_id"] is None
@@ -326,6 +325,54 @@ def test_writeback_accumulator_off_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("ALLOW_HIVE_WRITEBACK", "1")
     ex._stream_export_trades_dataset(base, "BTC", tmp, "5m", deadline_s=60)
     assert len(calls) == 1  # enabled -> accumulation resumes, write-back runs
+
+
+# ---------------------------------------------------------------- mechanical fills kernel
+
+def test_mechanical_fills_kernel_computes() -> None:
+    """The notional/aggressor fill kernels must COMPUTE (2026-10-12 fix):
+    the 3-arg pc.case_when raised (pyarrow wants a STRUCT) and the bare
+    except swallowed it — fills silently no-opped since introduction.
+    Semantics are the pre-kernel legacy fallback's, verbatim:
+    notional=price*size only when price AND size exist; aggressor=lower(side)
+    only when side is non-empty; present values NEVER overwritten."""
+    rows = [
+        # notional NULL + price/size -> filled
+        _trd(1, 1790000001000, CID, "tok1", "t1", side="BUY", price=0.25, size=8.0, notional=None),
+        # notional present -> untouched (even if != price*size)
+        _trd(2, 1790000002000, CID, "tok2", "t2", side="SELL", price=0.3, size=2.0, notional=7.0),
+        # notional NULL + price NULL -> honest NULL (no invention)
+        _trd(3, 1790000003000, CID, "tok3", "t3", side="buy", price=None, size=2.0, notional=None),
+        # aggressor NULL + side set -> lowercased side
+        _trd(4, 1790000004000, CID, "tok4", "t4", side="Buy", price=0.5, size=2.0, notional=1.0),
+        # aggressor NULL + side empty -> honest NULL
+        _trd(5, 1790000005000, CID, "tok5", "t5", side="", price=0.5, size=2.0, notional=1.0),
+    ]
+    t = pa.Table.from_pylist(rows, schema=_TS)
+    # rows 1/3/4/5 carry NULL inputs (row 4: aggressor via crafted patch below)
+    t = t.set_column(t.schema.get_field_index("aggressor_side"), "aggressor_side",
+                     pa.array(["buy", "sell", None, None, None], type=pa.string()))
+    t = t.set_column(t.schema.get_field_index("side"), "side",
+                     pa.array(["buy", "sell", "buy", "Buy", ""], type=pa.string()))
+    out = ex._trades_mechanical_fills(t).to_pylist()
+    assert out[0]["notional"] == pytest.approx(2.0)      # 0.25 * 8.0 — filled
+    assert out[1]["notional"] == pytest.approx(7.0)      # present — untouched
+    assert out[2]["notional"] is None                    # price NULL — honest gap
+    assert out[0]["aggressor_side"] == "buy"             # present — untouched
+    assert out[3]["aggressor_side"] == "buy"             # side "Buy" -> "buy"
+    assert out[4]["aggressor_side"] is None              # empty side — honest gap
+    # no other column may move
+    assert [r["trade_id"] for r in out] == ["t1", "t2", "t3", "t4", "t5"]
+    assert [r["price"] for r in out] == [0.25, 0.3, None, 0.5, 0.5]
+
+
+def test_mechanical_fills_kernel_guards() -> None:
+    """Fail-soft contract unchanged: empty table / missing columns never raise."""
+    assert ex._trades_mechanical_fills(None) is None
+    assert ex._trades_mechanical_fills(pa.table({})).num_rows == 0
+    t = pa.table({"a": [1, 2]})  # no notional/aggressor columns
+    out = ex._trades_mechanical_fills(t)
+    assert out.num_rows == 2 and out.column("a").to_pylist() == [1, 2]
 
 
 # ---------------------------------------------------------------- pool cache bound

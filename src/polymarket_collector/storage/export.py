@@ -2697,7 +2697,13 @@ def build_markets_summary(
                                 try:
                                     _ms2 = pc.strptime(_s, format="%Y-%m-%dT%H:%M:%S.%f", unit="ms",
                                                        error_is_null=True)
-                                    _ms = pc.case_when(pc.is_null(_ms), _ms2, _ms)
+                                    # 3-arg pc.case_when raised (wants STRUCT) — was a
+                                    # silent no-op since introduction; fixed 2026-10-12
+                                    # to pc.if_else. NOTE: pyarrow strptime has no %f
+                                    # support, so this fallback stays inert for
+                                    # fractional-second strings (0 such rows in the
+                                    # hive; all ts_source are int64) — separate issue.
+                                    _ms = pc.if_else(pc.is_null(_ms), _ms2, _ms)
                                     del _ms2
                                 except Exception:
                                     pass
@@ -2978,7 +2984,9 @@ def _trades_mechanical_fills(combined: pa.Table) -> pa.Table:
                         pc.cast(combined.column("price"), pa.float64()),
                         pc.cast(combined.column("size"), pa.float64()),
                     )
-                    _filled = pc.case_when(_need, _calc, _not)
+                    # 3-arg pc.case_when raises (wants STRUCT) — was a silent
+                    # no-op since introduction; fixed 2026-10-12
+                    _filled = pc.if_else(_need, _calc, _not)
                     _pos = combined.schema.get_field_index("notional")
                     combined = combined.set_column(_pos, "notional", _filled.cast(pa.float64()))
             except Exception:
@@ -2993,7 +3001,9 @@ def _trades_mechanical_fills(combined: pa.Table) -> pa.Table:
                 )
                 if _any_true(_need_ag):
                     _low = pc.utf8_lower(_sd)
-                    _filled_ag = pc.case_when(_need_ag, _low, _ag)
+                    # 3-arg pc.case_when raises (wants STRUCT) — was a silent
+                    # no-op since introduction; fixed 2026-10-12
+                    _filled_ag = pc.if_else(_need_ag, _low, _ag)
                     _posa = combined.schema.get_field_index("aggressor_side")
                     combined = combined.set_column(_posa, "aggressor_side", _filled_ag.cast(_ag.type))
             except Exception:
