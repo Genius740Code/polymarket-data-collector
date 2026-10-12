@@ -247,7 +247,10 @@ def _backfill_trade_wallets_chunked(
     try:
         import gc as _gc_c
         import time as _time_c
-        _deadline = (_time_c.time() + deadline_s) if deadline_s else None
+        # raw budget (may be <= 0 = expired; `if deadline_s` used to turn a
+        # 0.0 remaining into None = unbounded): consumers treat <= 0 as
+        # already-past and ship honest NULLs.
+        _deadline = (_time_c.time() + deadline_s) if deadline_s is not None else None
         vc = table.column("condition_id").value_counts()
         vals = vc.field("values").to_pylist()
         counts = vc.field("counts").to_pylist()
@@ -586,7 +589,9 @@ def _backfill_trade_wallets(combined: pa.Table, data_dir: Path, asset: Optional[
     if not need_by_cid:
         return combined
     import time as _time_dl
-    _deadline_dl = (_time_dl.time() + deadline_s) if deadline_s else None
+    # raw budget (may be <= 0 = expired; `if deadline_s` used to turn a 0.0
+    # remaining into None = unbounded data-api time).
+    _deadline_dl = (_time_dl.time() + deadline_s) if deadline_s is not None else None
     filled_wallet = 0
     filled_outcome = 0
     legs_by_cid: dict = {}
@@ -787,17 +792,25 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
     (same keys, same fee derivation, same maker attribution from the cached
     both-legs pools), but driven by a COMPLETE have-set built in a narrow
     pre-pass instead of a full-width concat — so the streaming export never
-    materializes the whole trades hive. Yields one insert Table per market
-    with rows (caller appends them to the staging writer). Markets whose
-    taker fetch is deadline-skipped contribute nothing (honest gap, healed
-    next pass). trade_id suffixes use a shared counter (unique by
-    construction; exact suffixes may differ from the legacy path).
+    materializes the whole trades hive. The have-set is a _DigestCounter of
+    16-byte fill-key digests (2026-10-12): take() is exactly the legacy
+    "if have.get(key, 0) > 0: have[key] -= 1; continue" consume, with key
+    equality pinned by _trades_fill_key_digest on both sites. Yields one
+    insert Table per market with rows (caller appends them to the staging
+    writer). Markets whose taker fetch is deadline-skipped contribute
+    nothing (honest gap, healed next pass). trade_id suffixes use a shared
+    counter (unique by construction; exact suffixes may differ from the
+    legacy path).
     """
     import collections as _coll
     import datetime as _dt2
     import time as _time_r
 
-    _deadline = (_time_r.time() + deadline_s) if deadline_s else None
+    # raw remaining budget (may be <= 0 = expired): `if deadline_s` ate a
+    # 0.0 remaining and turned it into None = UNBOUNDED data-api time after
+    # the 420s budget spent (the 12-15min worker grind behind the 2026-10-12
+    # cap-aborts). None stays None (no budget = legacy unlimited).
+    _deadline = (_time_r.time() + deadline_s) if deadline_s is not None else None
     _inserted = [0]
     _fee_derived = [0]
 
@@ -845,8 +858,11 @@ def _reconcile_trades_global(markets_order, ctx_by_cid, have, pool_cache, taker_
                 k = (txh, round(float(t.get("price")), 6), round(float(t.get("size")), 6))
             except Exception:
                 continue
-            if _have.get(k, 0) > 0:
-                _have[k] -= 1
+            # compact have-set consume: take() is the legacy
+            # "if have.get(k, 0) > 0: have[k] -= 1; continue" — key equality
+            # via the same 16-byte digest the pre-pass bumped
+            # (_trades_fill_key_digest parity, pinned by tests).
+            if _have.take(_compact_key_digest(k)):
                 continue
             w = t.get("proxyWallet") or t.get("wallet")
             ts_ms = _api_ts_ms(t)
@@ -958,7 +974,9 @@ def _reconcile_zero_trade_markets(base: Path, asset: Optional[str], known_cids: 
 
     if span_lo_ms is None or span_hi_ms is None:
         return
-    _deadline = (_time_z.time() + (deadline_s if deadline_s else 120.0))
+    # raw budget (may be <= 0 = expired; falsy deadline_s used to fall back
+    # to the 120s default instead of expiring — None still means default).
+    _deadline = (_time_z.time() + (deadline_s if deadline_s is not None else 120.0))
     try:
         _ml = _load_markets_latest_rows(base)
     except Exception as e:
@@ -1216,13 +1234,37 @@ def _lane_series_mask(series_col, want: str):
     return mask
 
 
-def _backfill_null_series_ids(table, data_dir, dataset: str = ""):
+def _load_series_id_map(data_dir) -> dict:
+    """condition_id -> series_id from markets_latest (tiny map, loaded ONCE
+    per staging build). The N7 NULL-series backfill re-read the file on
+    every call; the streaming trades path calls it per 20k-row chunk, so the
+    read is hoisted here (same first-cid-wins rule as _backfill_null_series_ids).
+    Never raises; {} when unreadable (residual NULLs stay honest NULLs)."""
+    _map: dict = {}
+    try:
+        _latest = Path(data_dir) / "markets_latest" / "markets_latest.parquet"
+        if not _latest.exists():
+            return _map
+        _lt = pq.read_table(str(_latest), columns=["condition_id", "series_id"])
+        for _c, _s in zip(_lt.column("condition_id").to_pylist(),
+                          _lt.column("series_id").to_pylist()):
+            if _c and _s and str(_c) not in _map:
+                _map[str(_c)] = str(_s)
+    except Exception:
+        return {}
+    return _map
+
+
+def _backfill_null_series_ids(table, data_dir, dataset: str = "", series_map=None):
     """N7: fill NULL series_id from markets_latest condition_id map.
 
     Token-to-market is static, so a trade snapshotted before its market row
     was discovered can be resolved at export time. Returns (table, filled_n).
     Only fills NULL/empty series_id where condition_id has a known series;
     truly unresolvable rows keep NULL (honest gap, counted by callers).
+    series_map (2026-10-12): optional preloaded condition_id -> series_id
+    dict (see _load_series_id_map) so per-chunk callers skip the file read;
+    None keeps the legacy read-when-needed behavior.
     """
     try:
         import pyarrow.compute as _pc_bf
@@ -1234,47 +1276,48 @@ def _backfill_null_series_ids(table, data_dir, dataset: str = ""):
                 return table, 0
         except Exception:
             pass
+        _map: dict = series_map if series_map is not None else {}
+        if series_map is None:
+            try:
+                _base = Path(data_dir)
+                _latest = _base / "markets_latest" / "markets_latest.parquet"
+                if not _latest.exists():
+                    return table, 0
+                import pyarrow.parquet as _pq_bf
+                try:
+                    _lt = _pq_bf.read_table(str(_latest), columns=["condition_id", "series_id"])
+                except Exception:
+                    return table, 0
+                try:
+                    _cids = _lt.column("condition_id").to_pylist()
+                    _sids = _lt.column("series_id").to_pylist()
+                    for _c, _s in zip(_cids, _sids):
+                        if _c and _s and str(_c) not in _map:
+                            _map[str(_c)] = str(_s)
+                except Exception:
+                    return table, 0
+            except Exception:
+                return table, 0
+        if not _map:
+            return table, 0
         try:
-            _base = Path(data_dir)
-            _latest = _base / "markets_latest" / "markets_latest.parquet"
-            if not _latest.exists():
-                return table, 0
-            import pyarrow.parquet as _pq_bf
-            try:
-                _lt = _pq_bf.read_table(str(_latest), columns=["condition_id", "series_id"])
-            except Exception:
-                return table, 0
-            _map: dict = {}
-            try:
-                _cids = _lt.column("condition_id").to_pylist()
-                _sids = _lt.column("series_id").to_pylist()
-                for _c, _s in zip(_cids, _sids):
-                    if _c and _s and str(_c) not in _map:
-                        _map[str(_c)] = str(_s)
-            except Exception:
-                return table, 0
-            if not _map:
-                return table, 0
-            try:
-                _series = table.column("series_id").to_pylist()
-                _cids_t = table.column("condition_id").to_pylist()
-            except Exception:
-                return table, 0
-            _filled = 0
-            _new_series = []
-            for _s, _c in zip(_series, _cids_t):
-                if (_s is None or _s == "") and _c and str(_c) in _map:
-                    _new_series.append(_map[str(_c)])
-                    _filled += 1
-                else:
-                    _new_series.append(_s)
-            if not _filled:
-                return table, 0
-            _pos = table.schema.get_field_index("series_id")
-            table = table.set_column(_pos, "series_id", pa.array(_new_series, type=pa.string()))
-            return table, _filled
+            _series = table.column("series_id").to_pylist()
+            _cids_t = table.column("condition_id").to_pylist()
         except Exception:
             return table, 0
+        _filled = 0
+        _new_series = []
+        for _s, _c in zip(_series, _cids_t):
+            if (_s is None or _s == "") and _c and str(_c) in _map:
+                _new_series.append(_map[str(_c)])
+                _filled += 1
+            else:
+                _new_series.append(_s)
+        if not _filled:
+            return table, 0
+        _pos = table.schema.get_field_index("series_id")
+        table = table.set_column(_pos, "series_id", pa.array(_new_series, type=pa.string()))
+        return table, _filled
     except Exception:
         return table, 0
 
@@ -1343,7 +1386,8 @@ def _phase_timed_iter(src, label: str):
 
 
 def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, *,
-                                  deadline_s=None, cutoff_ts=None, io_stats=None) -> int:
+                                  deadline_s=None, cutoff_ts=None, io_stats=None,
+                                  coalesce_rows: int = 20000) -> int:
     """Bounded-RAM streaming trades staging build (2026-09-11).
 
     The legacy path concats the whole per-asset trades hive (~1GB Arrow for
@@ -1365,6 +1409,33 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
       (readers sort per E13; the parity test sorts before comparing).
     Returns rows written. NEVER raises for data reasons (fails closed per
     file via io_stats like the other stream paths).
+
+    2026-10-12 parity fix (measured cap-abort at 1001MB on real BTC:
+    137 files / 1.72M rows; pre-pass alone 732MB) — the snapshot-path peak
+    patterns (718729d coalesce ceiling, 5dcb1e2 compact keys, 9450d7e
+    zero-accumulation) are mirrored here:
+    - the 4MB GROUP pass through _read_dataset_per_asset (full-width read +
+      concat + whole-group to_pylist inside _backfill_trade_wallets, ~10x
+      RAM) is replaced by a per-file, per-chunk pass: each source file is
+      decoded in coalesce_rows-row chunks via ParquetFile.iter_batches and
+      each chunk is transformed (same lane/asset/N7 filter, cached-pool
+      enrichment, mechanical fills, E1 heal, dedup, per-chunk sort) and
+      yielded immediately — no decoded batch is ever held across files.
+      coalesce_rows is the ROW-GROUP CEILING handed to the writer, never
+      an accumulation target. Row content and first-wins dedup semantics
+      are unchanged; per-chunk sort replaces per-group sort (readers sort
+      per E13).
+    - the two global per-row key stores are 16-byte digests in
+      _DigestCounter/_DigestSet (~16B/key) instead of Python
+      tuple containers (~121-300B/key; the tuple have-set alone measured
+      ~320MB at BTC scale).
+    - the narrow write-back accumulator (7 fill columns for ALL rows) is
+      only built when ALLOW_HIVE_WRITEBACK=1 (its consumer refuses to run
+      otherwise — the accumulation was pure RAM waste by default).
+    - the Data-API budget is honored after expiry: the old zero-clamp on the
+      remaining budget made an expired value falsy -> None -> UNBOUNDED
+      post-expiry fetching (the 12-15min worker grind). Expired now means
+      honest NULLs immediately.
     """
     import collections as _coll2
     import gc as _gc_s
@@ -1428,7 +1499,12 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
             return None
 
     # ---- pre-pass (narrow): global have-set + per-market fee/series/first ctx
-    have = _coll2.Counter()
+    # 2026-10-12 compact keys: the have-set is a _DigestCounter of 16-byte
+    # fill-key digests (same key equality as the legacy tuple Counter — see
+    # _trades_fill_key_digest; parity pinned by tests). have-set/ctx stay
+    # COMPLETE (every file still visited); union semantics unchanged
+    # (columns accumulate, first non-null wins).
+    have = _DigestCounter()
     fee_rates = {}
     series_counts = {}
     first_ctx = {}
@@ -1487,10 +1563,96 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
             if _sch is not None:
                 for _fld in _sch:
                     _union_field_add(_union_fields, _union_order, _fld.name, _fld.type)
+            _rows_f = 0
+
+            def _pre_rows(d, *, _have=have, _first_ctx=first_ctx, _fee_rates=fee_rates,
+                          _series_counts=series_counts, _oldest_needed=oldest_needed,
+                          _markets_order=markets_order) -> None:
+                # row-local pre-pass fold over one decoded chunk (2026-10-12:
+                # the whole-file to_pylist peaked 672MB on the first ~500k-row
+                # compacted file — the chunked read bounds it; same per-row
+                # work as the legacy whole-file loop). The state objects bind
+                # as defaults (same objects — pure mutation, and the enclosing
+                # names are del'd after the pre-pass).
+                nonlocal _span_lo, _span_hi
+                for r in d:
+                    cid = r.get("condition_id")
+                    if not cid:
+                        continue
+                    if cid not in _first_ctx:
+                        _first_ctx[cid] = {"market_id": r.get("market_id"), "asset": r.get("asset"),
+                                           "window_index": r.get("window_index")}
+                        _markets_order.append(cid)
+                        _fee_rates[cid] = set()
+                        _series_counts[cid] = _coll2.Counter()
+                    try:
+                        _series_counts[cid][r.get("series_id")] += 1
+                    except Exception:
+                        pass
+                    if (r.get("transaction_hash") and r.get("price") is not None
+                            and r.get("size") is not None):
+                        try:
+                            _have.bump(_trades_fill_key_digest(
+                                r.get("transaction_hash"), r.get("price"), r.get("size")))
+                        except Exception:
+                            pass
+                    try:
+                        _vote = _fee_rate_vote(r.get("fee"), r.get("fee_is_estimated"), r.get("notional"))
+                        if _vote is not None:
+                            _fee_rates[cid].add(_vote)
+                    except Exception:
+                        pass
+                    if _need_row(r):
+                        _tsm = _ts_ms_of(r.get("ts_source"))
+                        _prev = _oldest_needed.get(cid)
+                        if _tsm is not None and (_prev is None or _tsm < _prev):
+                            _oldest_needed[cid] = _tsm
+                    # H5-ZERO: local ts span for the 0-trade reconcile (every row,
+                    # not just enrichment-needing ones — the span bounds which
+                    # windows are holes in the shipped data).
+                    _tsm_any = _ts_ms_of(r.get("ts_source"))
+                    if _tsm_any is not None:
+                        if _span_lo is None or _tsm_any < _span_lo:
+                            _span_lo = _tsm_any
+                        if _span_hi is None or _tsm_any > _span_hi:
+                            _span_hi = _tsm_any
+
+            _cols_p = [c for c in _PRE_COLS if _sch is None or c in _sch.names]
+            _pf_pp = None
             try:
-                t = pq.read_table(str(p), columns=[c for c in _PRE_COLS
-                                                   if _sch is None or c in _sch.names])
+                _pf_pp = pq.ParquetFile(str(p))
+                _it = _pf_pp.iter_batches(batch_size=coalesce_rows,
+                                          columns=(_cols_p or None),
+                                          use_threads=False)
             except Exception:
+                _pf_pp = None
+            if _pf_pp is not None:
+                # chunked narrow read (snapshot-path pattern): one decoded
+                # batch alive at a time, lane-filtered and folded per chunk —
+                # the whole-file read_table + to_pylist was the residual peak
+                # driver on compacted ~300k-row files (measured 672MB).
+                for _pb in _it:
+                    t = pa.Table.from_batches([_pb])
+                    del _pb
+                    if t.num_rows == 0:
+                        del t
+                        continue
+                    _rows_f += t.num_rows  # pre-filter count (legacy semantics)
+                    if want is not None and "series_id" in t.schema.names:
+                        try:
+                            t = t.filter(_lane_series_mask(t.column("series_id"), want))
+                        except Exception:
+                            pass
+                    d = t.to_pylist()
+                    del t
+                    _pre_rows(d)
+                    del d
+                del _pf_pp
+                if io_stats is not None:
+                    io_stats["files_ok"] += 1
+                    io_stats["rows_read"] += _rows_f
+            else:
+                # legacy fallback for files the streaming reader cannot open
                 t = read_table(p)
                 if t is None:
                     raise IOError(f"unreadable {p.name}")
@@ -1498,64 +1660,19 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                 t = t.select(keep) if keep else None
                 if t is None or t.num_rows == 0:
                     continue
-            if t.num_rows == 0:
-                continue
-            if io_stats is not None:
-                io_stats["files_ok"] += 1
-                io_stats["rows_read"] += t.num_rows
-            # lane filter mirrors _read_dataset_per_asset (missing col = keep)
-            if want is not None and "series_id" in t.schema.names:
-                try:
-                    t = t.filter(_lane_series_mask(t.column("series_id"), want))
-                except Exception:
-                    pass
-                if t.num_rows == 0:
-                    continue
-            d = t.to_pylist()
-            del t
-            for r in d:
-                cid = r.get("condition_id")
-                if not cid:
-                    continue
-                if cid not in first_ctx:
-                    first_ctx[cid] = {"market_id": r.get("market_id"), "asset": r.get("asset"),
-                                      "window_index": r.get("window_index")}
-                    markets_order.append(cid)
-                    fee_rates[cid] = set()
-                    series_counts[cid] = _coll2.Counter()
-                try:
-                    series_counts[cid][r.get("series_id")] += 1
-                except Exception:
-                    pass
-                if (r.get("transaction_hash") and r.get("price") is not None
-                        and r.get("size") is not None):
+                if io_stats is not None:
+                    io_stats["files_ok"] += 1
+                    io_stats["rows_read"] += t.num_rows
+                # lane filter mirrors _read_dataset_per_asset (missing col = keep)
+                if want is not None and "series_id" in t.schema.names:
                     try:
-                        have[((r.get("transaction_hash") or "").lower(),
-                              round(float(r.get("price")), 6),
-                              round(float(r.get("size")), 6))] += 1
+                        t = t.filter(_lane_series_mask(t.column("series_id"), want))
                     except Exception:
                         pass
-                try:
-                    _vote = _fee_rate_vote(r.get("fee"), r.get("fee_is_estimated"), r.get("notional"))
-                    if _vote is not None:
-                        fee_rates[cid].add(_vote)
-                except Exception:
-                    pass
-                if _need_row(r):
-                    _tsm = _ts_ms_of(r.get("ts_source"))
-                    _prev = oldest_needed.get(cid)
-                    if _tsm is not None and (_prev is None or _tsm < _prev):
-                        oldest_needed[cid] = _tsm
-                # H5-ZERO: local ts span for the 0-trade reconcile (every row,
-                # not just enrichment-needing ones — the span bounds which
-                # windows are holes in the shipped data).
-                _tsm_any = _ts_ms_of(r.get("ts_source"))
-                if _tsm_any is not None:
-                    if _span_lo is None or _tsm_any < _span_lo:
-                        _span_lo = _tsm_any
-                    if _span_hi is None or _tsm_any > _span_hi:
-                        _span_hi = _tsm_any
-            del d
+                d = t.to_pylist()
+                del t
+                _pre_rows(d)
+                del d
         except Exception:
             _pre_failed += 1
             try:
@@ -1592,95 +1709,296 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
     except Exception:
         _union_schema = None
 
-    # ---- byte-bounded groups over the same file order
-    groups = []
-    _cur: list = []
-    _cur_b = 0
-    for p in files:
-        try:
-            _sz = p.stat().st_size
-        except OSError:
-            continue
-        if _cur and _cur_b + _sz > 4_000_000:
-            groups.append(_cur)
-            _cur = []
-            _cur_b = 0
-        _cur.append(p)
-        _cur_b += _sz
-    if _cur:
-        groups.append(_cur)
+    # ---- 2026-10-12 zero-accumulation chunk pass (mirrors the snapshot
+    # path, 9450d7e): the legacy byte-bounded GROUP pass fed each 4MB group
+    # through _read_dataset_per_asset — full-width read + concat + a
+    # whole-group to_pylist inside _backfill_trade_wallets (~10x RAM) — and
+    # the worker blew the untouched 1000MB cap on real BTC (137 files,
+    # 1.72M rows). Now each source file is decoded in coalesce_rows-row
+    # chunks and each chunk is transformed (same semantics per row: asset /
+    # lane+N7 filter, cached-pool enrichment, mechanical fills, E1 heal,
+    # global dedup, per-chunk sort) and yielded immediately. No decoded
+    # batch is ever held across files; coalesce_rows is only the ROW-GROUP
+    # CEILING handed to the writer, never an accumulation target.
+    _groups = _group_paths_by_date(files)
     del files
     _gc_s.collect()
 
-    pool_cache: dict = {}
+    # memory-bounded leg-pool cache (see _BoundedPoolCache): the deadline
+    # bounds the Data-API phase in TIME, this bounds it in RAM — same honest
+    # NULLs + next-pass healing when either budget is spent.
+    pool_cache: dict = _BoundedPoolCache()
     taker_cache: dict = {}
-    seen_dd: set = set()
+    # compact keys: 16-byte digests of (token_id, trade_id) — same first-wins
+    # semantics as the legacy tuple set, ~16B/key instead of ~200B/key.
+    seen_dd = _DigestSet()
     wb_parts: list = []
     wb_rows = [0]
+    # the write-back accumulator is only useful when the write-back itself
+    # can run (ALLOW_HIVE_WRITEBACK=1, H4 default OFF) — accumulating 7
+    # narrow columns for every row of the window was pure RAM waste by
+    # default (~100MB+ at BTC scale).
+    _wb_enabled = False
+    try:
+        import os as _os_wb
+        _wb_enabled = _os_wb.environ.get("ALLOW_HIVE_WRITEBACK") == "1"
+    except Exception:
+        _wb_enabled = False
+    # maps loaded ONCE (snapshot-path pattern): the per-chunk transform calls
+    # the N7 NULL-series backfill and the E1 market_id heal per chunk, and
+    # re-reading markets_latest at 20k-row granularity would be thousands of
+    # tiny reads per build.
+    _series_map: dict = {}
+    try:
+        _series_map = _load_series_id_map(base)
+    except Exception:
+        _series_map = {}
+    _mid_map_t: Dict[str, str] = {}
+    try:
+        _mid_map_t = _load_market_id_map(base)
+    except Exception:
+        _mid_map_t = {}
+    try:
+        import re as _re_t
+        _hex_re = _re_t.compile(r"0[xX][0-9a-fA-F]{64}\Z")
+    except Exception:
+        _hex_re = None
+    try:
+        _trades_sort_keys = _sort_keys_for_schema(_get_schema("trades"))
+    except Exception:
+        _trades_sort_keys = []
 
     def _left_all():
-        return (max(0.0, _deadline - _time_s.time()) if _deadline else None)
+        # raw remaining Data-API budget (may be <= 0 = expired): the old
+        # zero-clamp made an EXPIRED budget falsy -> None -> unbounded
+        # post-expiry fetching (the 12-15min worker grind behind the
+        # 2026-10-12 cap-aborts). Consumers treat <= 0 as already-past and
+        # ship honest NULLs; None stays None (no budget given).
+        return ((_deadline - _time_s.time()) if _deadline is not None else None)
+
+    def _transform(t: pa.Table, p) -> pa.Table:
+        # one decoded chunk -> same row semantics as the legacy group path
+        # (_read_dataset_per_asset trades branch), chunk-local: every step
+        # is row-local or per-market via the shared pool_cache.
+        t = _normalize_ts_source_int(t)
+        # asset filter: only when the file's path does not guarantee the
+        # partition (mixed-layout fallback keeps NULL/UNKNOWN rows — N7).
+        if "asset" in t.schema.names and f"asset={asset_upper}" not in str(p):
+            try:
+                _eq = pc.equal(t.column("asset"), pa.scalar(asset_upper))
+                _eq = pc.fill_null(_eq, False)
+                try:
+                    _unk = pc.or_(pc.is_null(t.column("asset")),
+                                  pc.equal(t.column("asset"), pa.scalar("UNKNOWN")))
+                    _unk = pc.fill_null(_unk, False)
+                    _mask_a = pc.or_(_eq, _unk)
+                except Exception:
+                    _mask_a = _eq
+                t = t.filter(_mask_a)
+            except Exception:
+                pass
+        # lane filter + N7 NULL-series backfill (SAME helper as the concat
+        # path; series_map preloaded once above)
+        t = _apply_lane_series_filter(t, asset_upper, timeframe_label, base, "trades",
+                                      series_map=_series_map)
+        # enrichment (data-api both-legs pools, cached across chunks) —
+        # same call and same failure behavior as the group path
+        try:
+            t = _backfill_trade_wallets_chunked(t, base, asset=asset_upper, reconcile=False,
+                                                deadline_s=_left_all(), pool_cache=pool_cache,
+                                                timeframe_label=timeframe_label)
+        except Exception as e:
+            print(f"[export] WARN wallet backfill failed: {e}")
+        # mechanical fills + legacy fallbacks (SAME helper as the concat path)
+        t = _trades_mechanical_fills(t)
+        # E1 heal: hex/NULL market_id -> numeric id or NULL (never the hex
+        # value; same rule as the group path's _heal_hex_market_ids, with
+        # the markets_latest map preloaded once — narrow columns only).
+        if _hex_re is not None:
+            try:
+                if "market_id" in t.schema.names and "condition_id" in t.schema.names:
+                    _mids = t.column("market_id").to_pylist()
+                    _bad = [i for i, m in enumerate(_mids)
+                            if m is None or (isinstance(m, str) and bool(_hex_re.match(m.strip())))]
+                    if _bad:
+                        _cidsm = t.column("condition_id").to_pylist()
+                        _newm = list(_mids)
+                        for i in _bad:
+                            _newm[i] = _mid_map_t.get(str(_cidsm[i] or ""))
+                        _posm = t.schema.get_field_index("market_id")
+                        t = t.set_column(_posm, "market_id", pa.array(_newm, type=pa.string()))
+                    del _mids
+            except Exception as e:
+                print(f"[export] WARN market_id heal failed for trades: {e}")
+        # M4: NULL/0 window_index rows stay (honest gap, counted loudly)
+        _count_window_index_gaps(t)
+        # E5: staging never ships mixed-case sides (SAME helper as concat path)
+        t = _lowercase_trade_sides(t)
+        # global (token_id, trade_id) dedup — same first-wins semantics as
+        # the legacy whole-table guard, via compact 16-byte digests.
+        try:
+            _names = t.schema.names
+            if "token_id" in _names and "trade_id" in _names:
+                _tids = t.column("trade_id").to_pylist()
+                _toks = t.column("token_id").to_pylist()
+                _keep2 = []
+                for i in range(t.num_rows):
+                    _k = _compact_key_digest((str(_toks[i]), str(_tids[i])))
+                    if _k not in seen_dd:
+                        seen_dd.add(_k)
+                        _keep2.append(i)
+                del _tids, _toks
+                if len(_keep2) < t.num_rows:
+                    _keep_set = set(_keep2)
+                    t = t.filter(pa.array([i in _keep_set for i in range(t.num_rows)],
+                                          type=pa.bool_()))
+                    del _keep_set
+                del _keep2
+        except Exception as e:
+            print(f"[export] WARN trades group dedup failed: {e}")
+        # per-chunk sort (same keys as the group path; readers sort anyway
+        # per E13, and the staging file is per-chunk time-ordered either way)
+        if t.num_rows > 1 and _trades_sort_keys:
+            try:
+                keys = [(k, "ascending") for k in _trades_sort_keys if k in t.schema.names]
+                if keys:
+                    t = pc.take(t, pc.sort_indices(t, sort_keys=keys))
+            except Exception:
+                pass
+        return t
 
     def _gen():
-        for _gi, _group in enumerate(groups):
-            _left = (max(0.0, _deadline - _time_s.time()) if _deadline else None)
-            try:
-                t = _read_dataset_per_asset(base, "trades", asset_upper,
-                                            include_binance=False,
-                                            timeframe_label=timeframe_label,
-                                            stats=io_stats, deadline_s=_left,
-                                            files=_group, reconcile=False,
-                                            pool_cache=pool_cache, writeback=False)
-            except Exception as e:
-                print(f"[export] WARN trades group {_gi} failed: {e} — skipped (fail closed)")
-                continue
-            if t is None or t.num_rows == 0:
-                continue
-            # global (token_id, trade_id) dedup — same first-wins semantics
-            # as the legacy whole-table guard, via a narrow in-RAM key set.
-            try:
-                _names = t.schema.names
-                if "token_id" in _names and "trade_id" in _names:
-                    _tids = t.column("trade_id").to_pylist()
-                    _toks = t.column("token_id").to_pylist()
-                    _keep2 = []
-                    for i in range(t.num_rows):
-                        _k = (str(_toks[i]), str(_tids[i]))
-                        if _k not in seen_dd:
-                            seen_dd.add(_k)
-                            _keep2.append(i)
-                    del _tids, _toks
-                    if len(_keep2) < t.num_rows:
-                        _keep_set = set(_keep2)
-                        t = t.filter(pa.array([i in _keep_set for i in range(t.num_rows)],
-                                              type=pa.bool_()))
-                        del _keep_set
-                    del _keep2
-                    _gc_s.collect()
-            except Exception as e:
-                print(f"[export] WARN trades group dedup failed: {e}")
-            # narrow write-back accumulator (trade_id + fill cols only)
-            try:
-                _ncols = {}
-                for _c in _WB_COLS:
-                    _ncols[_c] = t.column(_c) if _c in t.schema.names else pa.array(
-                        [None] * t.num_rows, type=pa.string() if _c != "fee" else pa.float64())
-                # fee_is_estimated is bool — fix the fallback type
-                if "fee_is_estimated" not in t.schema.names:
-                    _ncols["fee_is_estimated"] = pa.array([None] * t.num_rows, type=pa.bool_())
-                wb_parts.append(pa.table(_ncols))
-                wb_rows[0] += t.num_rows
-            except Exception as e:
-                print(f"[export] WARN trades write-back accumulator failed: {e}")
-            yield t
-            del t
+        _rows_out = 0
+        _done = 0
+        _total = sum(len(_ps) for _, _ps in _groups)
+        _t0 = _time_s.time()
+        _last_log = _t0
+        for _date, _paths in _groups:
+            for _p in _paths:
+                _done += 1
+                _sz_p = 0
+                try:
+                    _sz_p = _p.stat().st_size
+                except OSError:
+                    pass
+                try:
+                    _pf = pq.ParquetFile(str(_p))
+                except Exception:
+                    # fail closed: unreadable file is counted, its rows drop,
+                    # the coverage gate keeps prior staging.
+                    if io_stats is not None:
+                        io_stats["files_failed"] += 1
+                        io_stats["failed_bytes"] += _sz_p
+                    continue
+                _file_ok = True
+                try:
+                    _fcols = _pf.schema_arrow.names
+                except Exception:
+                    _fcols = None
+                _cols = _projected_read_columns(_fcols, _union_schema, _WB_COLS)
+                try:
+                    for _chunk in _pf.iter_batches(batch_size=coalesce_rows,
+                                                   columns=_cols,
+                                                   use_threads=False):
+                        _t = pa.Table.from_batches([_chunk])
+                        del _chunk
+                        if _t.num_rows == 0:
+                            del _t
+                            continue
+                        try:
+                            _t2 = _transform(_t, _p)
+                        except Exception as _te:
+                            # fail closed: this file's rows drop (a chunk of
+                            # the same file that already shipped stays
+                            # shipped); the coverage gate fails on ANY
+                            # failed file either way.
+                            print(f"[export] WARN trades chunk transform failed ({_te}) — "
+                                  f"1 batches dropped (fail closed)")
+                            if io_stats is not None:
+                                io_stats["files_failed"] += 1
+                                io_stats["failed_bytes"] += _sz_p
+                            del _t
+                            _file_ok = False
+                            break
+                        del _t
+                        # per-chunk trim: enrichment pylists + rebuilds churn
+                        # freed-but-untrimmed pages that stack while the
+                        # Data-API phase interleaves fetches with decode
+                        # (measured +270MB on the first big file; the trim
+                        # keeps the transient flat). gc stays per-partition.
+                        try:
+                            _malloc_trim()
+                        except Exception:
+                            pass
+                        if _t2 is not None and _t2.num_rows > 0:
+                            # narrow write-back accumulator (trade_id + fill
+                            # cols only) — only when the write-back runs
+                            if _wb_enabled:
+                                try:
+                                    _ncols = {}
+                                    for _c in _WB_COLS:
+                                        _ncols[_c] = _t2.column(_c) if _c in _t2.schema.names else pa.array(
+                                            [None] * _t2.num_rows, type=pa.string() if _c != "fee" else pa.float64())
+                                    # fee_is_estimated is bool — fix the fallback type
+                                    if "fee_is_estimated" not in _t2.schema.names:
+                                        _ncols["fee_is_estimated"] = pa.array([None] * _t2.num_rows, type=pa.bool_())
+                                    wb_parts.append(pa.table(_ncols))
+                                    wb_rows[0] += _t2.num_rows
+                                except Exception as e:
+                                    print(f"[export] WARN trades write-back accumulator failed: {e}")
+                            _rows_out += _t2.num_rows
+                            yield _t2
+                        del _t2
+                    del _pf
+                except Exception:
+                    # decode error mid-file: earlier chunks already shipped
+                    # (same as the old already-flushed case); the file is
+                    # failed and the coverage gate keeps prior staging.
+                    if io_stats is not None:
+                        io_stats["files_failed"] += 1
+                        io_stats["failed_bytes"] += _sz_p
+                    _pf = None  # release promptly; rebound next file
+                    continue
+                if not _file_ok:
+                    continue
+                # per-file release: the writer's row group + the chunk
+                # transients leave freed-but-untrimmed arena pages that stack
+                # across the whole window (C7 measured ~2MB/file) — trim per
+                # file, gc per date partition below (snapshot-path pattern).
+                try:
+                    _malloc_trim()
+                except Exception:
+                    pass
+                _now = _time_s.time()
+                if _now - _last_log >= 60:
+                    _last_log = _now
+                    _rss = None
+                    try:
+                        with open("/proc/self/status") as _sf:
+                            for _sl in _sf:
+                                if _sl.startswith("VmRSS:"):
+                                    _rss = int(_sl.split()[1]) // 1024
+                                    break
+                    except Exception:
+                        _rss = None
+                    print(f"[export:worker] progress {asset_upper}/trades tf={timeframe_label}: "
+                          f"{_done}/{_total} files date={_date or '?'} rows={_rows_out} "
+                          f"elapsed={int(_now - _t0)}s"
+                          + (f" rss={_rss}MB" if _rss is not None else ""), flush=True)
+            # per-date-partition release (snapshot-path pattern)
             _gc_s.collect()
+            try:
+                _malloc_trim()
+            except Exception:
+                pass
         # phase 2: global reconcile inserts (complete have-set ⇒ never duplicated)
         try:
             for _ins in _reconcile_trades_global(markets_order, ctx_by_cid, have,
                                                  pool_cache, taker_cache,
                                                  asset_upper, deadline_s=_left_all()):
-                yield _ins
+                if _ins is not None and _ins.num_rows > 0:
+                    _rows_out += _ins.num_rows
+                    yield _ins
         except Exception as e:
             print(f"[export] WARN trades global reconcile failed: {e}")
         # phase 2b: H5-ZERO — markets with ZERO local rows but real Data-API
@@ -1696,12 +2014,15 @@ def _stream_export_trades_dataset(base, asset_upper, tmp_path, timeframe_label, 
                                                       deadline_s=_left_all(),
                                                       pool_cache=pool_cache,
                                                       taker_cache=taker_cache):
-                yield _ins
+                if _ins is not None and _ins.num_rows > 0:
+                    _rows_out += _ins.num_rows
+                    yield _ins
         except Exception as e:
             print(f"[export] WARN zero-trade reconcile failed: {e}")
 
     n = write_batches(_phase_timed_iter(_gen(), f"{asset_upper}/trades"),
-                      tmp_path, schema=_union_schema, stats=io_stats)
+                      tmp_path, schema=_union_schema, stats=io_stats,
+                      row_group_rows=coalesce_rows)
     del pool_cache, taker_cache, seen_dd, have, ctx_by_cid, markets_order
     _gc_s.collect()
     # single narrow write-back at the end (NULLs filled only, atomic per file)
@@ -2576,6 +2897,224 @@ def _heal_hex_market_ids(table: pa.Table, data_dir: Path) -> pa.Table:
         return table
 
 
+def _apply_lane_series_filter(combined: pa.Table, asset: Optional[str],
+                              timeframe_label: Optional[str], data_dir: Path,
+                              dataset: str, series_map: "dict | None" = None) -> pa.Table:
+    """Multi-timeframe lane filter — extracted verbatim from the concat path
+    (2026-10-12) so the streaming trades chunk transform applies EXACTLY the
+    same semantics per chunk: N7 NULL-series backfill (preloaded series_map
+    skips the markets_latest re-read; None keeps legacy read-per-call),
+    _lane_series_mask (weather lanes pass), residual NULL-series rows kept
+    and counted (unroutable, honest gap — real trades never vanish from
+    every lane file). Never raises past the input table."""
+    if timeframe_label is None or not asset or "series_id" not in combined.schema.names:
+        return combined
+    try:
+        want = f"{asset.upper()}-{timeframe_label}"
+        try:
+            # N7: resolve NULL series via markets_latest before filtering
+            # so honest-NULL trades are not silently dropped from lanes.
+            try:
+                combined, _nbf = _backfill_null_series_ids(combined, data_dir, dataset,
+                                                           series_map=series_map)
+                if _nbf:
+                    print(f"[export] backfilled {_nbf} NULL series_id via markets_latest for {dataset} asset={asset}")
+            except Exception:
+                pass
+            mask = _lane_series_mask(combined.column("series_id"), want)
+            # N7: keep residual NULL-series rows (fail open, counted) —
+            # they are real trades that would otherwise vanish from every
+            # lane file. Downstream dedups by trade_id across lanes.
+            try:
+                _nulls = pc.is_null(combined.column("series_id"))
+                _null_n = int(pc.sum(_nulls).as_py() or 0)
+            except Exception:
+                _null_n = 0
+                _nulls = None
+            if _null_n and _nulls is not None:
+                try:
+                    mask = pc.or_(pc.fill_null(mask, False), _nulls)
+                    print(f"[export] kept {_null_n} NULL-series rows in lane {want} for {dataset} (unroutable, honest gap)")
+                except Exception:
+                    pass
+            else:
+                try:
+                    mask = pc.fill_null(mask, False)
+                except Exception:
+                    pass
+            combined = combined.filter(mask)
+        except Exception as e:
+            print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
+    except Exception as e:
+        print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
+    return combined
+
+
+def _trades_mechanical_fills(combined: pa.Table) -> pa.Table:
+    """Mechanical trades fills — extracted verbatim from the concat path
+    (2026-10-12) so the streaming chunk transform is byte-identical to the
+    legacy per-group semantics: Arrow kernels for notional/aggressor_side,
+    then the row-local legacy fallbacks (transaction_hash-from-trade_id,
+    wallet-from-proxy/maker/taker) on 8000-row slices. Never raises past
+    the input table; only touches trades columns.
+    """
+    if combined is None or combined.num_rows == 0:
+        return combined
+
+    def _any_true(mask) -> bool:
+        try:
+            return int(pc.sum(mask).as_py() or 0) > 0
+        except Exception:
+            return True  # fail open: run the fill path
+
+    try:
+        names = combined.schema.names
+        if "notional" in names and "price" in names and "size" in names:
+            try:
+                _not = combined.column("notional")
+                _need = pc.invert(pc.is_valid(_not))
+                if _any_true(_need):
+                    _calc = pc.multiply(
+                        pc.cast(combined.column("price"), pa.float64()),
+                        pc.cast(combined.column("size"), pa.float64()),
+                    )
+                    _filled = pc.case_when(_need, _calc, _not)
+                    _pos = combined.schema.get_field_index("notional")
+                    combined = combined.set_column(_pos, "notional", _filled.cast(pa.float64()))
+            except Exception:
+                pass
+        if "aggressor_side" in names and "side" in names:
+            try:
+                _ag = combined.column("aggressor_side")
+                _sd = pc.cast(combined.column("side"), pa.string())
+                _need_ag = pc.and_(
+                    pc.is_null(_ag),
+                    pc.and_(pc.is_valid(_sd), pc.greater(pc.utf8_length(_sd), 0)),
+                )
+                if _any_true(_need_ag):
+                    _low = pc.utf8_lower(_sd)
+                    _filled_ag = pc.case_when(_need_ag, _low, _ag)
+                    _posa = combined.schema.get_field_index("aggressor_side")
+                    combined = combined.set_column(_posa, "aggressor_side", _filled_ag.cast(_ag.type))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[export] WARN backfill (kernels) failed for trades: {e}")
+    # legacy fallbacks (transaction_hash-from-trade_id, old dict wallet
+    # keys): only for rows that can benefit — skip the pylist scan
+    # entirely when no NULL wallet/tx_hash exists alongside inputs.
+    try:
+        names = combined.schema.names
+        _may_help = False
+        if "transaction_hash" in names and "trade_id" in names:
+            try:
+                _th = combined.column("transaction_hash")
+                if _th.null_count > 0:
+                    _may_help = True
+            except Exception:
+                _may_help = True
+        if not _may_help and "wallet" in names:
+            try:
+                if combined.column("wallet").null_count > 0 and any(
+                    c in names for c in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner", "maker_wallet", "taker_wallet")
+                ):
+                    _may_help = True
+            except Exception:
+                _may_help = True
+        if _may_help:
+            # 2026-09-11 OOM: row-sliced pylist (the logic is row-local —
+            # no cross-row deps — so slices are exactly equivalent). The
+            # old whole-table to_pylist() ~10x'd a 100k-row BTC concat
+            # and tripped the worker RSS cap by itself.
+            _slice_n = 8000
+            _fixed_parts = []
+            _changed_any = False
+            for _off in range(0, combined.num_rows, _slice_n):
+                pylist = combined.slice(_off, _slice_n).to_pylist()
+                changed = False
+                for r in pylist:
+                    if r.get("transaction_hash") is None and r.get("trade_id"):
+                        # fallback: trade_id may be hash if hash was used as trade_id
+                        # check if trade_id looks like hash (hex length 32+)
+                        tid = str(r.get("trade_id"))
+                        if len(tid) >= 32 and all(c in "0123456789abcdef" for c in tid.lower()[:8]):
+                            r["transaction_hash"] = tid
+                            changed = True
+                    # wallet backfill — no RPC, just normalize existing CLOB fields
+                    # old data may have proxyWallet/wallet under different keys already flattened
+                    if r.get("wallet") is None:
+                        for cand in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner"):
+                            if r.get(cand):
+                                r["wallet"] = str(r[cand])
+                                changed = True
+                                break
+                    if r.get("maker_wallet") is None and r.get("proxyWallet"):
+                        r["maker_wallet"] = str(r["proxyWallet"])
+                        changed = True
+                    if r.get("wallet") is None and r.get("maker_wallet"):
+                        r["wallet"] = r["maker_wallet"]
+                        changed = True
+                    if r.get("wallet") is None and r.get("taker_wallet"):
+                        r["wallet"] = r["taker_wallet"]
+                        changed = True
+                if changed:
+                    _changed_any = True
+                _fixed_parts.append(pa.Table.from_pylist(pylist, schema=combined.schema))
+                del pylist
+            if _changed_any:
+                # rebuild table with same schema as combined (preserve types where possible)
+                combined = pa.concat_tables(_fixed_parts, promote_options="default")
+            del _fixed_parts
+            import gc as _gc_tb
+            _gc_tb.collect()
+    except Exception as e:
+        print(f"[export] WARN backfill failed for trades: {e}")
+        pass
+    return combined
+
+
+def _count_window_index_gaps(combined: pa.Table) -> None:
+    """M4 (audit 2026-09-18), extracted verbatim: NULL/0 window_index trades
+    are honest-gap rows and are KEPT in staging — counted loudly so the gap
+    stays visible instead of hiding it from consumers. Log-only."""
+    try:
+        if combined is None or combined.num_rows == 0 or "window_index" not in combined.schema.names:
+            return
+        col = combined.column("window_index")
+        not_null = pc.invert(pc.is_null(col))
+        not_zero = pc.not_equal(col, pa.scalar(0))
+        mask = pc.and_(not_null, not_zero)
+        if mask.null_count > 0:
+            mask = pc.fill_null(mask, False)
+        kept_gap = int(pc.sum(pc.invert(mask)).as_py() or 0)
+        if kept_gap:
+            print(f"[export] trades window_index: keeping {kept_gap} NULL/0 honest-gap rows in staging (M4)")
+    except Exception as e:
+        print(f"[export] WARN window_index gap count failed: {e}")
+
+
+def _lowercase_trade_sides(combined: pa.Table) -> pa.Table:
+    """E5, extracted verbatim: lowercase legacy uppercase sides at staging-read
+    (the hive is migrated by the write-back; staging must never ship mixed
+    case). 2026-09-10 OOM: Arrow kernels on narrow columns (never to_pylist
+    of the whole table)."""
+    try:
+        if combined is None or combined.num_rows == 0:
+            return combined
+        for sc in ("side", "aggressor_side"):
+            if sc not in combined.schema.names:
+                continue
+            col = combined.column(sc)
+            vals = col.to_pylist()
+            if any(isinstance(v, str) and v != v.lower() for v in vals):
+                lowered = [v.lower() if isinstance(v, str) else v for v in vals]
+                pos = combined.schema.get_field_index(sc)
+                combined = combined.set_column(pos, sc, pa.array(lowered, type=col.type))
+    except Exception as e:
+        print(f"[export] WARN side normalization failed: {e}")
+    return combined
+
+
 def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], include_binance: bool = False, timeframe_label: Optional[str] = None, stats: Optional[dict] = None, deadline_s: Optional[float] = None, files: Optional[list] = None, reconcile: bool = True, pool_cache: Optional[dict] = None, writeback: bool = False, cutoff_ts: Optional[float] = None) -> Optional[pa.Table]:
     """Read all parquet files for dataset (+ optional asset filter).
 
@@ -2721,49 +3260,10 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
             print(f"[export] ERROR all {len(patterns)} files failed for {dataset} asset={asset} — aborting read")
         return None
     combined = pa.concat_tables(tables, **({"promote_options": "default"} if tuple(int(x) for x in pa.__version__.split(".")[:2]) >= (16, 0) else {"promote": True})) if len(tables) > 1 else tables[0]
-    # multi-timeframe lane filter — applied once on the combined table.
-    # _lane_series_mask covers weather lanes too: city assets (HONG-KONG,
-    # ...) carry series WEATHER-HIGH-1D/WEATHER-LOW-1D which `{asset}-{tf}`
-    # never matches (the old `asset == "WEATHER"` branch was dead code).
-    if timeframe_label is not None and asset and "series_id" in combined.schema.names:
-        try:
-            want = f"{asset.upper()}-{timeframe_label}"
-            try:
-                # N7: resolve NULL series via markets_latest before filtering
-                # so honest-NULL trades are not silently dropped from lanes.
-                try:
-                    combined, _nbf = _backfill_null_series_ids(combined, data_dir, dataset)
-                    if _nbf:
-                        print(f"[export] backfilled {_nbf} NULL series_id via markets_latest for {dataset} asset={asset}")
-                except Exception:
-                    pass
-                mask = _lane_series_mask(combined.column("series_id"), want)
-                # N7: keep residual NULL-series rows (fail open, counted) —
-                # they are real trades that would otherwise vanish from every
-                # lane file. Downstream dedups by trade_id across lanes.
-                try:
-                    _nulls = pc.is_null(combined.column("series_id"))
-                    _null_n = int(pc.sum(_nulls).as_py() or 0)
-                except Exception:
-                    _null_n = 0
-                    _nulls = None
-                if _null_n and _nulls is not None:
-                    try:
-                        mask = pc.or_(pc.fill_null(mask, False), _nulls)
-                        print(f"[export] kept {_null_n} NULL-series rows in lane {want} for {dataset} (unroutable, honest gap)")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        mask = pc.fill_null(mask, False)
-                    except Exception:
-                        pass
-                combined = combined.filter(mask)
-            except Exception as e:
-                print(f"[export] WARN timeframe filter failed for {dataset} "
-                      f"asset={asset} tf={timeframe_label}: {e}")
-        except Exception as e:
-            print(f"[export] WARN timeframe filter failed for {dataset} asset={asset} tf={timeframe_label}: {e}")
+    # multi-timeframe lane filter — applied once on the combined table
+    # (extracted 2026-10-12 into _apply_lane_series_filter; the streaming
+    # trades chunk transform calls the SAME helper per chunk).
+    combined = _apply_lane_series_filter(combined, asset, timeframe_label, data_dir, dataset)
     # filter binance again if combined still has mixed sources (promote case) — keep nulls
     if dataset == "chainlink_events" and not include_binance and "source" in combined.schema.names:
         try:
@@ -2797,116 +3297,10 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     # backfill trades: compute notional, fee, aggressor_side, transaction_hash where null for old 3.1.0 data
     # 2026-09-10 OOM: Arrow kernels for the mechanical fills; the legacy
     # dict-key fallback scan (to_pylist) runs only when its inputs exist.
+    # 2026-10-12: extracted verbatim into _trades_mechanical_fills (the
+    # streaming trades chunk transform calls the SAME helper per chunk).
     if dataset == "trades" and combined.num_rows > 0:
-        def _any_true(mask) -> bool:
-            try:
-                return int(pc.sum(mask).as_py() or 0) > 0
-            except Exception:
-                return True  # fail open: run the fill path
-
-        try:
-            names = combined.schema.names
-            if "notional" in names and "price" in names and "size" in names:
-                try:
-                    _not = combined.column("notional")
-                    _need = pc.invert(pc.is_valid(_not))
-                    if _any_true(_need):
-                        _calc = pc.multiply(
-                            pc.cast(combined.column("price"), pa.float64()),
-                            pc.cast(combined.column("size"), pa.float64()),
-                        )
-                        _filled = pc.case_when(_need, _calc, _not)
-                        _pos = combined.schema.get_field_index("notional")
-                        combined = combined.set_column(_pos, "notional", _filled.cast(pa.float64()))
-                except Exception:
-                    pass
-            if "aggressor_side" in names and "side" in names:
-                try:
-                    _ag = combined.column("aggressor_side")
-                    _sd = pc.cast(combined.column("side"), pa.string())
-                    _need_ag = pc.and_(
-                        pc.is_null(_ag),
-                        pc.and_(pc.is_valid(_sd), pc.greater(pc.utf8_length(_sd), 0)),
-                    )
-                    if _any_true(_need_ag):
-                        _low = pc.utf8_lower(_sd)
-                        _filled_ag = pc.case_when(_need_ag, _low, _ag)
-                        _posa = combined.schema.get_field_index("aggressor_side")
-                        combined = combined.set_column(_posa, "aggressor_side", _filled_ag.cast(_ag.type))
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[export] WARN backfill (kernels) failed for {dataset}: {e}")
-        # legacy fallbacks (transaction_hash-from-trade_id, old dict wallet
-        # keys): only for rows that can benefit — skip the pylist scan
-        # entirely when no NULL wallet/tx_hash exists alongside inputs.
-        try:
-            names = combined.schema.names
-            _may_help = False
-            if "transaction_hash" in names and "trade_id" in names:
-                try:
-                    _th = combined.column("transaction_hash")
-                    if _th.null_count > 0:
-                        _may_help = True
-                except Exception:
-                    _may_help = True
-            if not _may_help and "wallet" in names:
-                try:
-                    if combined.column("wallet").null_count > 0 and any(
-                        c in names for c in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner", "maker_wallet", "taker_wallet")
-                    ):
-                        _may_help = True
-                except Exception:
-                    _may_help = True
-            if _may_help:
-                # 2026-09-11 OOM: row-sliced pylist (the logic is row-local —
-                # no cross-row deps — so slices are exactly equivalent). The
-                # old whole-table to_pylist() ~10x'd a 100k-row BTC concat
-                # and tripped the worker RSS cap by itself.
-                _slice_n = 8000
-                _fixed_parts = []
-                _changed_any = False
-                for _off in range(0, combined.num_rows, _slice_n):
-                    pylist = combined.slice(_off, _slice_n).to_pylist()
-                    changed = False
-                    for r in pylist:
-                        if r.get("transaction_hash") is None and r.get("trade_id"):
-                            # fallback: trade_id may be hash if hash was used as trade_id
-                            # check if trade_id looks like hash (hex length 32+)
-                            tid = str(r.get("trade_id"))
-                            if len(tid) >= 32 and all(c in "0123456789abcdef" for c in tid.lower()[:8]):
-                                r["transaction_hash"] = tid
-                                changed = True
-                        # wallet backfill — no RPC, just normalize existing CLOB fields
-                        # old data may have proxyWallet/wallet under different keys already flattened
-                        if r.get("wallet") is None:
-                            for cand in ("proxyWallet", "proxy_wallet", "maker", "taker", "owner"):
-                                if r.get(cand):
-                                    r["wallet"] = str(r[cand])
-                                    changed = True
-                                    break
-                        if r.get("maker_wallet") is None and r.get("proxyWallet"):
-                            r["maker_wallet"] = str(r["proxyWallet"])
-                            changed = True
-                        if r.get("wallet") is None and r.get("maker_wallet"):
-                            r["wallet"] = r["maker_wallet"]
-                            changed = True
-                        if r.get("wallet") is None and r.get("taker_wallet"):
-                            r["wallet"] = r["taker_wallet"]
-                            changed = True
-                    if changed:
-                        _changed_any = True
-                    _fixed_parts.append(pa.Table.from_pylist(pylist, schema=combined.schema))
-                    del pylist
-                if _changed_any:
-                    # rebuild table with same schema as combined (preserve types where possible)
-                    combined = pa.concat_tables(_fixed_parts, promote_options="default")
-                del _fixed_parts
-                import gc as _gc_tb
-                _gc_tb.collect()
-        except Exception as e:
-            print(f"[export] WARN backfill failed for {dataset}: {e}")
-            pass
+        combined = _trades_mechanical_fills(combined)
     # E1 (2026-09-09): heal hex market_id (== condition_id) from markets_latest.
     # Old hive rows carry the corruption; staging must ship numeric ids for joins.
     # Unmapped rows keep NULL (honest gap) — never the hex value.
@@ -2921,35 +3315,17 @@ def _read_dataset_per_asset(data_dir: Path, dataset: str, asset: Optional[str], 
     # (unresolvable market at ingest) and are KEPT in staging — the hive's
     # truth. The old E2 filter dropped them from the published dataset, hiding
     # gaps from consumers. Count loudly instead so the gap stays visible.
-    if dataset == "trades" and combined.num_rows > 0 and "window_index" in combined.schema.names:
-        try:
-            col = combined.column("window_index")
-            not_null = pc.invert(pc.is_null(col))
-            not_zero = pc.not_equal(col, pa.scalar(0))
-            mask = pc.and_(not_null, not_zero)
-            if mask.null_count > 0:
-                mask = pc.fill_null(mask, False)
-            kept_gap = int(pc.sum(pc.invert(mask)).as_py() or 0)
-            if kept_gap:
-                print(f"[export] trades window_index: keeping {kept_gap} NULL/0 honest-gap rows in staging (M4)")
-        except Exception as e:
-            print(f"[export] WARN window_index gap count failed: {e}")
+    # 2026-10-12: extracted verbatim into _count_window_index_gaps (the
+    # streaming trades chunk transform calls the SAME helper per chunk).
+    if dataset == "trades" and combined.num_rows > 0:
+        _count_window_index_gaps(combined)
     # E5: lowercase legacy uppercase aggressor sides at staging-read (hive is
     # migrated by the write-back below; staging must never ship mixed case).
     # 2026-09-10 OOM: Arrow kernels on narrow columns (never to_pylist).
+    # 2026-10-12: extracted verbatim into _lowercase_trade_sides (the
+    # streaming trades chunk transform calls the SAME helper per chunk).
     if dataset == "trades" and combined.num_rows > 0:
-        try:
-            for sc in ("side", "aggressor_side"):
-                if sc not in combined.schema.names:
-                    continue
-                col = combined.column(sc)
-                vals = col.to_pylist()
-                if any(isinstance(v, str) and v != v.lower() for v in vals):
-                    lowered = [v.lower() if isinstance(v, str) else v for v in vals]
-                    pos = combined.schema.get_field_index(sc)
-                    combined = combined.set_column(pos, sc, pa.array(lowered, type=col.type))
-        except Exception as e:
-            print(f"[export] WARN side normalization failed: {e}")
+        combined = _lowercase_trade_sides(combined)
     # dedup before sort: remove exact duplicate rows that writer missed (WAL replay, buffer races)
     # For resync_episodes keep latest per resync_id, for snapshots keep first per (asset,condition_id,ts_snapshot_ns)
     # 2026-09-10 OOM: value_counts guard — the pylist path below explodes wide
@@ -3341,8 +3717,11 @@ class _CompactDedupState:
     at production scale, measured 307B -> 97B/key at 700K keys) cuts the
     set ~3x with identical first-wins behavior; projected peak at
     2x rows stays <600MB against the untouched 1000MB cap. Coalescing is
-    kept (67ms/file win, absolved by the size-independence measurement);
-    the trades path keeps streaming.DedupState untouched.
+    kept (67ms/file win, absolved by the size-independence measurement).
+    The trades path (2026-10-12) uses the same 16-byte digests via the
+    _DigestSet/_DigestCounter containers (two global per-row key stores
+    made the plain-set cost 2x there); streaming.DedupState itself stays
+    byte-identical for its own callers.
     """
 
     def __init__(self, key_cols):
@@ -3393,6 +3772,227 @@ class _CompactDedupState:
         return table.filter(mask)
 
 
+class _DigestSet:
+    """Open-addressing set of 16-byte key digests (2026-10-12 trades fix).
+
+    Same membership semantics as a Python set of _compact_key_digest bytes
+    (slot equality compares the full 16-byte digest, so a false positive is
+    the same accepted 128-bit collision bound), but ~16B/key instead of
+    ~121B/key at 1M+ keys. The trades staging path holds TWO global
+    per-row key stores for the whole window — the api- reconcile have-set
+    (tx, price, size) and the (token_id, trade_id) dedup set — and at BTC
+    scale (1.7M rows) the plain digest sets measured 490MB, keeping the
+    worker over the untouched 1000MB cap; this container takes ~55MB each.
+    Fail-closed by construction: a probing bug raises loudly (never a
+    silent membership guess), and the parity tests pin exact set-equality
+    against the plain-digest path on real hive keys.
+    """
+
+    __slots__ = ("_cap", "_slots", "_occ", "_n")
+
+    def __init__(self, capacity: int = 1 << 16):
+        c = 1
+        while c < int(capacity):
+            c <<= 1
+        self._cap = c
+        self._slots = bytearray(c * 16)
+        self._occ = bytearray((c + 7) // 8)
+        self._n = 0
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _find(self, dg: bytes) -> int:
+        """Slot index holding dg, else ~i of the first free slot (negative)."""
+        cap = self._cap
+        occ = self._occ
+        slots = self._slots
+        i = int.from_bytes(dg[:8], "big") & (cap - 1)
+        while True:
+            if not (occ[i >> 3] >> (i & 7)) & 1:
+                return ~i
+            o = i * 16
+            if slots[o:o + 16] == dg:
+                return i
+            i = (i + 1) & (cap - 1)
+
+    def _insert_new(self, dg: bytes) -> None:
+        i = ~self._find(dg)
+        self._slots[i * 16:i * 16 + 16] = dg
+        self._occ[i >> 3] |= 1 << (i & 7)
+        self._n += 1
+
+    def add(self, dg: bytes) -> bool:
+        """Insert dg; True when it was new (set.add + newness in one)."""
+        if (self._n + 1) * 10 > self._cap * 7:
+            self._grow()
+        i = self._find(dg)
+        if i >= 0:
+            return False
+        self._insert_new(dg)
+        return True
+
+    def __contains__(self, dg: bytes) -> bool:
+        return self._find(dg) >= 0
+
+    def _grow(self, counts: "bytearray | None" = None) -> "bytearray | None":
+        """Double the table, rehashing every occupied slot.
+
+        counts (optional, _DigestCounter): 1 byte per OLD slot index —
+        remapped to each key's NEW slot index, so count slots stay aligned
+        with digest slots across growth (a prefix copy would corrupt them).
+        Returns the remapped counts array (None when counts is None).
+        """
+        old_slots, old_occ, old_cap = self._slots, self._occ, self._cap
+        cap = old_cap << 1
+        self._cap = cap
+        self._slots = bytearray(cap * 16)
+        self._occ = bytearray((cap + 7) // 8)
+        self._n = 0
+        new_counts = bytearray(cap) if counts is not None else None
+        for i in range(old_cap):
+            if (old_occ[i >> 3] >> (i & 7)) & 1:
+                o = i * 16
+                dg = bytes(old_slots[o:o + 16])
+                j = ~self._find(dg)
+                self._slots[j * 16:j * 16 + 16] = dg
+                self._occ[j >> 3] |= 1 << (j & 7)
+                self._n += 1
+                if new_counts is not None:
+                    new_counts[j] = counts[i]
+        return new_counts
+
+
+class _DigestCounter:
+    """Counting variant of _DigestSet for the trades api- reconcile have-set.
+
+    Mirrors collections.Counter semantics for the two operations the
+    reconcile needs: bump(key) += 1 while building, and take(key) —
+    "if count > 0: count -= 1 and return True" (fill already local, do not
+    insert), False when absent/exhausted (insert the api- row). A count
+    that reaches 0 stays occupied but reads absent, exactly like a Counter
+    holding 0. Counts are 1 byte/key, remapped on growth by
+    _DigestSet._grow(counts); the (pathological) >255 case spills to a
+    small exact dict so counts never wrap silently.
+    """
+
+    __slots__ = ("_set", "_counts", "_over")
+
+    def __init__(self, capacity: int = 1 << 16):
+        self._set = _DigestSet(capacity)
+        self._counts = bytearray(self._set._cap)
+        self._over: dict = {}
+
+    def __len__(self) -> int:
+        return len(self._set)
+
+    def _slot_for_bump(self, dg: bytes) -> int:
+        s = self._set
+        if (s._n + 1) * 10 > s._cap * 7:
+            self._counts = s._grow(self._counts)
+        i = s._find(dg)
+        if i < 0:
+            s._insert_new(dg)
+            i = s._find(dg)
+        return i
+
+    def bump(self, dg: bytes) -> None:
+        if dg in self._over:
+            self._over[dg] += 1
+            return
+        i = self._slot_for_bump(dg)
+        c = self._counts[i]
+        if c < 255:
+            self._counts[i] = c + 1
+        else:
+            self._over[dg] = 256
+
+    def take(self, dg: bytes) -> bool:
+        s = self._set
+        if dg not in s:
+            return False
+        if dg in self._over:
+            n = self._over[dg] - 1
+            if n > 255:
+                self._over[dg] = n
+            else:
+                del self._over[dg]
+                self._counts[s._find(dg)] = n
+            return True
+        i = s._find(dg)
+        c = self._counts[i]
+        if c == 0:
+            return False
+        self._counts[i] = c - 1
+        return True
+
+
+def _trades_fill_key_digest(txh, price, size) -> bytes:
+    """16-byte digest of the trades fill key (tx, price, size).
+
+    The pre-pass have-set and the api- reconcile site must agree on key
+    equality; both build the exact legacy Counter tuple and digest it, so
+    digest equality == legacy key equality. Raises on malformed price/size
+    exactly like the legacy round(float(...)) did (callers skip the row).
+    """
+    return _compact_key_digest((
+        (txh or "").lower(),
+        round(float(price), 6),
+        round(float(size), 6),
+    ))
+
+
+# 2026-10-12 prod-mode peak fix: the streaming trades worker's Data-API phase
+# (deadline 420s) cached both-legs pools for every market it touched and the
+# live cache grew ~250MB on real BTC before the budget spent — the measured
+# residual that kept the worker at 700MB peak (>600MB bar) even after the
+# digest/zero-accumulation fixes brought the local pipeline to ~450MB. The
+# deadline ALREADY degrades enrichment to honest NULLs once the TIME budget
+# is spent ("healed by the next pass"); this cap is the symmetric MEMORY
+# budget: past max legs, newly fetched pools store EMPTY and their markets
+# keep honest NULLs this pass (same healing path: the next staging rebuild
+# re-fetches them, and the 15-min second pass + on-chain pass heal the hive).
+# ~400B per leg entry measured (tuple key + wallet strings + dict slots).
+_TRADES_POOL_CACHE_MAX_LEGS = 240_000
+
+
+class _BoundedPoolCache(dict):
+    """pool_cache dict with a memory budget for the streaming trades export.
+
+    Drop-in dict: legacy callers keep plain dicts (unbounded, unchanged).
+    Past max_legs, __setitem__ stores EMPTY pools for the market — later
+    chunks treat it as cached-empty (no re-fetch, no attribution) exactly
+    like a deadline-skipped market: honest NULLs, healed next pass. Never
+    evicts (a cached market's attribution never changes mid-build). Logs
+    once when the budget first binds.
+    """
+
+    def __init__(self, max_legs: int = _TRADES_POOL_CACHE_MAX_LEGS):
+        super().__init__()
+        self.max_legs = int(max_legs)
+        self.legs = 0
+        self.refused = 0
+        self._logged = False
+
+    def __setitem__(self, cid, pools) -> None:
+        buy, sell, out = pools
+        try:
+            n = sum(len(v) for v in buy.values()) + sum(len(v) for v in sell.values())
+        except Exception:
+            n = 0
+        if self.legs + n > self.max_legs:
+            self.refused += 1
+            if not self._logged:
+                self._logged = True
+                print(f"[export] trades pool cache memory budget reached "
+                      f"({self.max_legs} legs, {self.refused} market keeps honest "
+                      f"NULL wallets this pass — healed next pass)", flush=True)
+            super().__setitem__(cid, ({}, {}, {}))
+            return
+        self.legs += n
+        super().__setitem__(cid, pools)
+
+
 def _stream_export_asset_dataset(
     base: Path,
     ds: str,
@@ -3440,7 +4040,8 @@ def _stream_export_asset_dataset(
     seen-set stores 16-byte key digests (_CompactDedupState) instead of
     full key tuples — same rows, ~5x less RAM, peak <600MB at 2x XRP
     rows. False restores streaming.DedupState (tuple keys) for parity
-    checks; the trades path always uses streaming.DedupState.
+    checks; the trades path (2026-10-12) uses its own digest containers
+    (_DigestSet/_DigestCounter) for its two global per-row key stores.
 
     max_files (2026-10-11, default None = scan everything): bounded-scan
     knob for the spawn-failure in-process fallback ONLY — keeps the
@@ -4640,6 +5241,17 @@ def export_per_asset_single_file(
                                 stats[_rel] = _committed_fb
                                 continue
                     print(f"[export] WARN {ds}/{_au_one} worker failed{_why} — keeping prior staging (fail closed)")
+                    # 2026-10-12 per-lane upload independence: record the abort
+                    # in the coverage manifests so Step 1b SEES it — the silent
+                    # absent key hid worker aborts from the upload gate (zero
+                    # Upload lines since 2026-10-11 15:57 were undiagnosable
+                    # from the manifests alone). The marker is fail closed PER
+                    # LANE (prior staging kept) and never blocks the upload of
+                    # the lanes that built fine.
+                    if manifests is not None and _pre_mani is not None:
+                        manifests[f"{ds}/{_au_one}"] = {
+                            "pre": _pre_mani, "worker": None, "ok": False,
+                            "read_errors": {}, "worker_failed": True}
                     try:
                         _pr = pq.read_metadata(str(_out_path)).num_rows if _out_path.exists() else None
                     except Exception:
@@ -6792,7 +7404,18 @@ def _export_and_upload_all_kaggle_impl(
     # to the NEXT export on both sides.
     import pyarrow.parquet as _pq
     lost = []
+    _lane_aborts = []
     for _mk, _mi in _manifests.items():
+        if _mi.get("worker_failed"):
+            # 2026-10-12 per-lane upload independence: this lane's worker
+            # aborted (rss cap / spawn failure) and the lane already kept
+            # its prior verified staging — fail closed PER LANE. The abort
+            # must never block the upload of the lanes that built fine
+            # (the trades cap-aborts stretched the pre-upload phase past
+            # collector incarnation lifetimes; uploads stopped entirely
+            # while no gate line ever said why). Loud, counted, non-blocking.
+            _lane_aborts.append(_mk)
+            continue
         if not _mi.get("ok"):
             lost.append(f"{_mk}: worker inputs != hive at build start")
         _re = _mi.get("read_errors") or {}
@@ -6806,6 +7429,10 @@ def _export_and_upload_all_kaggle_impl(
         if int(_re.get("write_dropped_rows") or 0) > 0:
             lost.append(f"{_mk}: staging write dropped {_re.get('write_dropped_rows')} rows "
                         f"({_re.get('write_dropped_batches', 0)} batches)")
+    if _lane_aborts:
+        print(f"[export] {len(_lane_aborts)} staging lanes kept prior staging after worker abort "
+              f"(fail closed per lane; other lanes' fresh staging still uploads): "
+              f"{_lane_aborts[:8]}", flush=True)
     for a in assets:
         f = staging / f"{a}_book_snapshots_500ms.parquet"
         staging_rows = None
