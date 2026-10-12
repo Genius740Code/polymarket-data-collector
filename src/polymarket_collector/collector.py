@@ -5135,6 +5135,91 @@ class Collector:
                 except Exception:
                     pass
 
+    # B-4 adaptive drain (2026-10-12). The fixed 6-bucket catch-up slice
+    # drained 6 buckets/tick while a saturated event loop stretched ticks to
+    # ~3s — drain == accrual, so one 60s stall (export storms, heal bursts)
+    # parked the scheduler at a ~60-76s steady-state deficit it could never
+    # close (measured 2026-10-12, PID 1218164: 20,926 scheduler_lag events
+    # over 14h with cur_bucket-last_bucket pinned at 71-79s; every processed
+    # bucket is a DEFERRED bucket, so the M5 downgrade below reverted
+    # ~97% of rows to stale despite fresh four-price books — 0% live in the
+    # newest files while book_live markers fired constantly). A cheap tick
+    # (76-213ms per 6-bucket body, measured) may now drain up to the CAP
+    # within the per-tick time BUDGET; the FLOOR keeps the old 6/tick
+    # minimum on slow ticks, so the body never exceeds budget + one
+    # bucket's duration — the 1013 slow-consumer protection B-4 exists
+    # for (a 120-bucket burst blocked for seconds and 1013-closed the
+    # fattest lane, 2026-09-17). Yield-free: the break never awaits.
+    _CATCHUP_SLICE_FLOOR = 6
+    _CATCHUP_SLICE_CAP = 60
+    _CATCHUP_SLICE_BUDGET_S = 0.400
+
+    @staticmethod
+    def _catchup_over_budget(idx: int, elapsed_s: float) -> bool:
+        """True when the catch-up drain must stop adding buckets this tick.
+
+        Past the floor once the budget is spent — see _CATCHUP_SLICE_*
+        above. Pure function of (index, elapsed); never raises.
+        """
+        try:
+            return idx >= Collector._CATCHUP_SLICE_FLOOR and elapsed_s >= Collector._CATCHUP_SLICE_BUDGET_S
+        except Exception:
+            return False
+
+    def _commit_snapshot_progress(self, last_processed: Optional[int], cur_bucket: int) -> None:
+        """Advance the 500ms scheduler cursor to the last PROCESSED bucket.
+
+        B-4 (2026-09-17) advanced to buckets[-1]; the adaptive drain can
+        stop mid-batch once the budget is spent, so the cursor must follow
+        the last bucket actually processed — otherwise the unprocessed tail
+        would be silently skipped (rows lost without even the coverage_gap
+        trail). Falls back to cur_bucket when nothing was processed.
+        """
+        try:
+            self._last_snapshot_bucket_ms = int(last_processed) if last_processed is not None else int(cur_bucket)
+        except Exception:
+            try:
+                self._last_snapshot_bucket_ms = int(cur_bucket)
+            except Exception:
+                pass
+
+    def _deferred_content_diverges(self, book: Any, bucket_ms: int) -> bool:
+        """M5 catch-up honesty, routed through the P3 freshness gate (2026-10-12).
+
+        A deferred bucket (bucket < cur_bucket) is stamped with CURRENT RAM
+        levels — forward-fill — so M5 (2026-09-17) downgraded every live row
+        from a deferred bucket to stale. e974883 made the row label follow
+        content freshness, but its age calc clamps post-bucket updates to
+        0ms, so a book updated long AFTER the bucket still reads "fresh",
+        the gate flips such rows live — and the M5 blanket revert then ate
+        the gate decision for ~97% of rows while the scheduler lived in
+        permanent catch-up (0% live measured 2026-10-12 16:22-16:31 UTC
+        with p50=p90=p99=max age=0ms and four-price uncrossed books).
+
+        Reconciliation, using the SAME FRESH_BOOK_AGE_MS window the gate
+        already trusts: the live label survives only while the book's last
+        exchange update stayed within FRESH_BOOK_AGE_MS of the bucket
+        (content certifiable at bucket time, the exact tolerance on-time
+        rows already get); a deferral that outlasts the window is genuine
+        forward-fill and keeps the honest stale label. Fail-closed: a
+        never-updated clock or any error downgrades exactly like the old
+        blanket rule. Pure reads; never raises.
+        """
+        try:
+            bucket_ns = int(bucket_ms) * 1_000_000
+            try:
+                fresh_ns = int(book.FRESH_BOOK_AGE_MS) * 1_000_000
+            except Exception:
+                fresh_ns = 5_000_000_000
+            up_ns = getattr(book, "_up_last_update_ns", None)
+            down_ns = getattr(book, "_down_last_update_ns", None)
+            if up_ns is None or down_ns is None:
+                return True  # one side never updated — cannot certify
+            return (int(up_ns) > bucket_ns + fresh_ns
+                    or int(down_ns) > bucket_ns + fresh_ns)
+        except Exception:
+            return True
+
     async def _snapshot_loop(self) -> None:
         """Single scheduler 500ms aligned to UTC epoch grid (§3) with catch-up for missed buckets (§3 completeness).
 
@@ -5243,18 +5328,32 @@ class Collector:
                 # burst blocks the loop for seconds (p99 tick 6s, max 40s) and
                 # starves WS reads until the server 1013-closes the fattest
                 # lane ("slow consumer: send buffer full" on BTC). Process at
-                # most 6 buckets/tick (~3s of grid — drains faster than the
-                # 2-buckets/sec accrual); the remainder is picked up on
-                # following ticks. Same rows, same grid, scheduler_lag above
-                # already carries the audit signal. The batch stays
-                # yield-free (frozen-RAM bit-identity per the PERF note below).
+                # least the FLOOR buckets/tick (~3s of grid — drains faster
+                # than the 2-buckets/sec accrual); the remainder is picked up
+                # on following ticks. The batch stays yield-free (frozen-RAM
+                # bit-identity per the PERF note below).
+                # Adaptive drain (2026-10-12): the CAP bounds the slice and
+                # the in-loop time budget below stops it early on slow ticks
+                # — a cheap tick now drains the whole backlog within the
+                # budget instead of re-pegging drain == accrual forever (see
+                # _CATCHUP_SLICE_* above for the measured permanent-catch-up
+                # failure this fixes).
                 try:
                     _buckets_all = list(buckets)
                 except Exception:
                     _buckets_all = [cur_bucket]
-                buckets = _buckets_all[:6] if len(_buckets_all) > 6 else _buckets_all
+                buckets = _buckets_all[:self._CATCHUP_SLICE_CAP] if len(_buckets_all) > self._CATCHUP_SLICE_CAP else _buckets_all
                 _first_bucket = buckets[0] if buckets else cur_bucket
-                for bucket in buckets:
+                _catchup_t0 = time.perf_counter()
+                _last_processed_bucket: Optional[int] = None
+                for _b_i, bucket in enumerate(buckets):
+                    if (len(buckets) > self._CATCHUP_SLICE_FLOOR
+                            and self._catchup_over_budget(_b_i, time.perf_counter() - _catchup_t0)):
+                        # Budget spent — hand the remainder to the next tick.
+                        # The cursor below follows the last PROCESSED bucket,
+                        # so nothing is skipped and the grid stays intact.
+                        break
+                    _last_processed_bucket = bucket
                     _tick += 1
                     # Emit snapshot per active market — only if bucket within [market_start, market_end)
                     # This prevents double-writing for next market before its start (was causing 2x duplication)
@@ -5547,7 +5646,15 @@ class Collector:
                             # ms later so `bucket < now_ms` downgraded EVERY live row
                             # (~98% stale). Only genuinely deferred buckets go stale.
                             try:
-                                if bucket < cur_bucket and row.get("book_state") == "live":
+                                # M5 (2026-09-17) + P3 (e974883) reconciliation:
+                                # the downgrade now defers to the same
+                                # FRESH_BOOK_AGE_MS window the row gate trusts
+                                # — only genuinely forward-filled content
+                                # (last exchange update past the bucket by
+                                # more than the window) loses the live label.
+                                # See _deferred_content_diverges.
+                                if (bucket < cur_bucket and row.get("book_state") == "live"
+                                        and self._deferred_content_diverges(book, bucket)):
                                     row["book_state"] = "stale"
                                     if not row.get("resync_id"):
                                         _brid2 = getattr(book, "resync_id", None)
@@ -5642,9 +5749,11 @@ class Collector:
                 self._last_snapshot_tick_ms = (time.perf_counter() - _tick_t0) * 1000
                 # B-4: advance to the last PROCESSED bucket (not wall-clock) so
                 # a sliced catch-up resumes where it stopped instead of
-                # dropping the deferred buckets.
+                # dropping the deferred buckets. The adaptive drain may stop
+                # mid-batch on budget — the cursor must follow the last bucket
+                # actually processed, never the unprocessed buckets[-1] tail.
                 try:
-                    self._last_snapshot_bucket_ms = buckets[-1] if buckets else cur_bucket
+                    self._commit_snapshot_progress(_last_processed_bucket, cur_bucket)
                 except Exception:
                     self._last_snapshot_bucket_ms = cur_bucket
             except Exception as e:
