@@ -13,7 +13,7 @@ import random
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from .book import OrderBookState, recovery_marker
@@ -197,6 +197,13 @@ class ResyncManager:
         # REST-dead book may re-enter the provisional path until REST
         # re-confirms (note_fetch_ok re-arms). Bounded + total.
         self._rest_verified: Dict[str, float] = {}
+        # 2026-10-11: track first WS frame per condition_id after a disconnect
+        # so the timing run can emit post_roll_first_tick markers (T0 → first-tick).
+        self._post_roll_first_tick_emitted: Dict[str, bool] = {}
+        # Map condition_id -> asset for recovery marker emission.
+        self._condition_asset: Dict[str, str] = {}
+        # Map condition_id -> T0 disconnect timestamp for marker emission.
+        self._condition_t0_ts: Dict[str, str] = {}
         # 2026-09-25 stale-epidemic fix: per-asset newest LIVE buffer id.
         # newest_open_buffer_id() runs on EVERY WS message; the old
         # reversed(list(_episodes.keys())) scan allocated an O(N) list per
@@ -426,6 +433,19 @@ class ResyncManager:
                 except Exception:
                     pass
             self._ws_provisional[cid] = {"bid": b, "ask": a, "streak": streak, "run": run}
+            # Emit post-roll first-tick marker on the very first WS frame after
+            # a disconnect (T0), so timing runs can measure the dip from T0 → first-tick.
+            first_tick_key = f"first_tick_{cid}"
+            if not self._post_roll_first_tick_emitted.get(first_tick_key, False):
+                try:
+                    recovery_marker("post_roll_first_tick",
+                                   asset=self._condition_asset.get(cid, "UNKNOWN"),
+                                   T0=self._condition_t0_ts.get(cid, ""),
+                                   first_tick=_now_iso(),
+                                   condition_id=cid)
+                except Exception:
+                    pass
+                self._post_roll_first_tick_emitted[first_tick_key] = True
             return streak
         except Exception:
             return 0
@@ -991,6 +1011,17 @@ class ResyncManager:
             resync_attempt_count=0,
             detected_ts_utc=now_iso,
         )
+        # Map condition_id -> asset for recovery marker emission.
+        self._condition_asset[condition_id] = asset.upper()
+        # Map condition_id -> T0 disconnect timestamp for marker emission.
+        self._condition_t0_ts[condition_id] = _disc_iso
+        # Emit post-roll dip start marker with T0 timestamp
+        try:
+            recovery_marker("post_roll_dip_start", asset=asset.upper(),
+                           T0=_disc_iso,
+                           condition_id=condition_id)
+        except Exception:
+            pass
         self._episodes[resync_id] = ep
         self._buffers[resync_id] = deque()
         self._buffer_deadline[resync_id] = time.monotonic() + self._buffer_age_limit_s()

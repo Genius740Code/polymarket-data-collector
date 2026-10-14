@@ -47,7 +47,7 @@ _heal_429_streak: int = 0
 # for _HEAL_429_CLEAN_S — a handful of lifetime 429s must never park heals
 # behind U(30,60)s forever.
 _heal_429_last_event: float = 0.0
-_HEAL_429_CLEAN_S: float = 60.0
+_HEAL_429_CLEAN_S: float = 30.0
 
 # Heal pacing (pmdata-parity audit): per-book minimum interval between
 # first-bucket trigger starts, and a tighter per-book REST-attempt cap so a

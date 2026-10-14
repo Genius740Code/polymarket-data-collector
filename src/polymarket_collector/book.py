@@ -55,7 +55,6 @@ def bucket_ts_utc(bucket_ms: int) -> str:
     cached = _BUCKET_TS_CACHE.get(bucket_ms)
     if cached is not None:
         return cached
-    import datetime
     dt = datetime.datetime.fromtimestamp(bucket_ms / 1000, tz=datetime.timezone.utc)
     ts_utc = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     # Bounded: buckets advance monotonically; keep only the latest few so a
@@ -77,7 +76,6 @@ def depth_within(levels: List[Tuple[Optional[float], Optional[float]]], best: Op
         return None
     window = window_cents * 0.01
     total = 0.0
-    found_any = False
     for price, size in levels:
         if price is None or size is None:
             continue
@@ -93,7 +91,6 @@ def depth_within(levels: List[Tuple[Optional[float], Optional[float]]], best: Op
             # abs suffices since sorted best-first implies distance non-decreasing
             break
         total += float(size)
-        found_any = True
     # If book had a best but no levels within window (e.g. only stale None levels), total 0
     # That is a valid 0 (there are levels but none in window), vs None for empty side.
     # Distinguish: if best is not None we return total (could be 0).
@@ -682,6 +679,39 @@ class OrderBookState:
             except Exception:
                 pass
 
+    def _fresh_book_promotion(self, msg: dict) -> bool:
+        """Freshness-based promotion: promote if both outcomes' last exchange
+        update is within FRESH_BOOK_AGE_MS of the bucket and the content is
+        verified (two-sided, price-bounded, uncrossed). Enables earlier
+        recovery post-roll when WS frames refresh book content without a
+        well-formed hash."""
+        try:
+            now_ns = int(time.time() * 1e9)
+            _fba = 5000  # FRESH_BOOK_AGE_MS
+            up_fresh = (self._up_last_update_ns is not None
+                        and (now_ns - self._up_last_update_ns) < _fba * 1000)
+            down_fresh = (self._down_last_update_ns is not None
+                          and (now_ns - self._down_last_update_ns) < _fba * 1000)
+            if not (up_fresh and down_fresh):
+                return False
+            # Verify: both outcomes two-sided, price-bounded, uncrossed
+            has_bid = self.up.bids.best_top()[0] is not None
+            has_ask = self.up.asks.best_top()[0] is not None
+            if not (has_bid and has_ask):
+                return False
+            try:
+                b = float(self.up.bids.best_price())
+                a = float(self.up.asks.best_price())
+            except Exception:
+                return False
+            if not (0.0 <= b < a <= 1.0):
+                return False
+            if self.up.bids.crossed_with(self.down.asks):
+                return False
+            return True
+        except Exception:
+            return False
+
     # -- apply message (with validation) -----------------------------------
     def apply_ws_message(self, msg: dict) -> Tuple[bool, Optional[str]]:
         """Apply a WS delta/message to the book.
@@ -846,7 +876,6 @@ class OrderBookState:
                 self._apply_levels(book.bids, msg["bids"], is_bid=True)
             if "asks" in msg:
                 self._apply_levels(book.asks, msg["asks"], is_bid=False)
-            now_ms = int(time.time() * 1000)
             self._last_update_ns = time.time_ns()
             if outcome == "up":
                 self._up_book_age_ms = 0
@@ -902,6 +931,11 @@ class OrderBookState:
                             self.resync_id = _rid
                         promo_note = (f"book_hash_missing_promoted_anyway outcome={outcome} "
                                       f"hash={msg.get('hash')!r} — one-sided weather promotion, levels real")
+                    elif self._fresh_book_promotion(msg):
+                        _rid = self.resync_id
+                        self.mark_live()
+                        promo_note = ("freshness_promotion both_outcomes_two_sided_price_bounded_uncrossed "
+                                      "within FRESH_BOOK_AGE_MS — earlier recovery post-roll")
                     else:
                         promo_note = (f"book_hash_missing_on_promotion outcome={outcome} "
                                       f"hash={msg.get('hash')!r} — levels applied, promotion refused; REST heal covers")
