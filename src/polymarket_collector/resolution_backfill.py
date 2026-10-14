@@ -35,6 +35,29 @@ def _now_iso() -> str:
     return datetime.datetime.now(tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _iso_settlement_ts(v):
+    """Coerce settlement_ts_utc to the canonical ISO string. Never raises.
+
+    2026-10-14 crash-loop (pm2 id 8, ~4x/hr): markets_latest carries
+    settlement_ts_utc as int64 epoch-ms (the old ts_source int-ms leak —
+    normalized to ISO everywhere else, see chainlink), so every row this
+    backfill re-appended round-tripped through append+flush as an
+    int64-typed fragment while collector-written fragments carry strings;
+    MarketsLog.compact() then died on "Could not convert '1791590700000'
+    with type str: tried to convert to int64" and killed each 15-min run.
+    int-ms (and digit-strings) become ISO; already-ISO or unparseable
+    values pass through untouched (fail-closed, no data loss).
+    """
+    try:
+        if v is None:
+            return None
+        ms = int(v)
+        return datetime.datetime.fromtimestamp(
+            ms / 1000, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return v
+
+
 def fetch_official_outcome(condition_id: str) -> Optional[Dict]:
     """Official outcome from the CLOB: the token flagged ``winner`` post-settlement.
 
@@ -157,6 +180,10 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
             new_row["tick_size"] = official["minimum_tick_size"]
         if official.get("minimum_order_size") is not None:
             new_row["minimum_order_size"] = official["minimum_order_size"]
+        # 2026-10-14: latest's int64 epoch-ms settlement_ts_utc must not
+        # round-trip into the log — collector fragments carry the canonical
+        # ISO string and compact() cannot merge an int column with a str one.
+        new_row["settlement_ts_utc"] = _iso_settlement_ts(new_row.get("settlement_ts_utc"))
         log.append(new_row)
         if was_inferred:
             stats["upgraded"] += 1
@@ -166,8 +193,16 @@ def backfill_resolutions(data_dir: str | Path, dry_run: bool = False, max_fetch:
             print(f"[resolution-backfill] {r.get('asset')} w{r.get('window_index')} resolved {official['outcome']} (official)")
         time.sleep(0.2)  # gentle on the CLOB
     if not dry_run and (stats["resolved"] or stats["upgraded"]):
-        log.flush_staging()
-        log.compact()
+        try:
+            log.flush_staging()
+            log.compact()
+        except Exception as e:
+            # Fail-closed (same WARN idiom as the passes below): flushed
+            # fragments are atomic tmp+rename, a failed compact leaves
+            # markets_latest exactly as-is, and the next cron run retries.
+            # Letting the ArrowInvalid escape here crash-looped pm2 id 8
+            # ~4x/hr on the mixed int/str settlement_ts_utc winners.
+            print(f"[resolution-backfill] WARN markets_latest compact failed (latest unchanged, retried next run): {e}")
     print(f"[resolution-backfill] done: {stats}")
     return stats
 
