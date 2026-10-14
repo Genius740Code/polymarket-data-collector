@@ -430,3 +430,119 @@ def test_monotonic_keep_does_not_advance_watermark(tmp_path) -> None:
     # guard-kept artifact never advances the recorded coverage cutoff
     assert {k: wm2[k] for k in ("cutoff", "rows", "bytes")} == \
         {k: wm1[k] for k in ("cutoff", "rows", "bytes")}
+
+
+# --------------------------------------- 2026-10-14 carry-peak fix regressions
+#
+# The scope-skip carry read of a REAL prior staging decoded 20000-row x 842
+# column chunks (137MB decoded, +137MB per identity filter copy — the 500ms
+# worker crossed its 1000MB rss cap 340k rows into the BTC carry; HYPE
+# peaked 1076MB on the bench, clean lanes passed only because their staging
+# is ~4x smaller). The fix slices the carry/delta reads at
+# _CARRY_READ_BATCH_ROWS, keeps one row-group-scoped reader iterator per
+# carry row group (a single long-lived iter_batches retains ~33MB of reader
+# state per ~200k rows), skips identity filters, trims the allocator
+# between slices and stores dedup keys in the open-addressed _DigestSet
+# (~29B/key vs ~90-100B/key as a Python set of bytes). Measured on the real
+# HYPE 5m pair: carry peak 1076 -> 522MB; fixed full scan 531MB; output
+# rows x 842 columns content-identical to both the HEAD carry and a full
+# rebuild on the same frozen inputs.
+
+def test_mask_keeps_all_null_safe() -> None:
+    """_mask_keeps_all: True only for an all-True mask; NULLs DROP rows in
+    Table.filter so they must read as False (an all-NULL mask is NOT 'all
+    true'); kernel trouble returns False so the caller runs the filter."""
+    assert E._mask_keeps_all(pa.array([True, True, True])) is True
+    assert E._mask_keeps_all(pa.array([True, False, True])) is False
+    assert E._mask_keeps_all(pa.array([True, None, True])) is False
+    assert E._mask_keeps_all(pa.array([None, None], type=pa.bool_())) is False
+    assert E._mask_keeps_all("not-a-mask") is False
+
+
+def test_snapshot_dedup_store_open_addressed_set_parity() -> None:
+    """The snapshot dedup seen-store is the trades path's open-addressed
+    _DigestSet (~29B/key) with full set-parity semantics — the plain Python
+    set of 16-byte digests measured 103MB at the real carry's 1.15M keys."""
+    st = E._CompactDedupState(["asset", "condition_id", "ts_snapshot_ns"])
+    assert isinstance(st.seen, E._DigestSet)
+    d1 = E._compact_key_digest(("BTC", "0x" + "a" * 64, 123))
+    d2 = E._compact_key_digest(("BTC", "0x" + "b" * 64, 123))
+    assert d1 not in st.seen and len(st.seen) == 0
+    assert st.seen.add(d1) is True     # new
+    assert st.seen.add(d1) is False    # duplicate
+    assert d1 in st.seen and d2 not in st.seen and len(st.seen) == 1
+    st.seen.update([d2])
+    assert len(st.seen) == 2
+    assert sorted(st.seen) == sorted([d1, d2])  # iteration parity
+    assert st.seen == {d1, d2}                   # set-equality parity
+    # filter keeps first-wins rows exactly like the tuple path (fresh store)
+    st2 = E._CompactDedupState(["asset", "condition_id", "ts_snapshot_ns"])
+    t = pa.table({"asset": ["BTC", "BTC"],
+                  "condition_id": ["0x" + "a" * 64, "0x" + "a" * 64],
+                  "ts_snapshot_ns": pa.array([123, 123], pa.int64())})
+    out = st2.filter(t)
+    assert out.num_rows == 1 and st2.dupes == 1
+
+
+def test_carry_reads_prior_staging_in_bounded_slices(tmp_path, capsys) -> None:
+    """A FAT prior staging (one row group deeper than the decode slice) is
+    carried through the row-group-scoped sliced read: every decoded batch
+    <= _CARRY_READ_BATCH_ROWS rows, single-threaded, and the incremental
+    output still matches a full rescan row-for-row."""
+    base = _dated_hive(tmp_path, {"2026-10-10": (3, 1700)}, mtime=time.time() - 7200)
+    out1 = tmp_path / "BTC_book_snapshots_500ms.parquet"
+    tmp1 = tmp_path / "BTC_book_snapshots_500ms.parquet.tmp"
+    n1 = _build(base, tmp1)
+    os.replace(str(tmp1), str(out1))
+    assert n1 == 5100
+    capsys.readouterr()
+
+    part = base / _DS / "date=2026-10-11" / "asset=BTC"
+    _now = time.time()
+    _write_file(part, "f00.parquet", "2026-10-11", 5000, 300, _now)
+    wm = {"cutoff": _now - 3600, "rows": pq.read_metadata(str(out1)).num_rows,
+          "bytes": out1.stat().st_size}
+
+    # spy on every ParquetFile the build opens: record iter_batches kwargs
+    import polymarket_collector.storage.export as _E
+    _real_pf = _E.pq.ParquetFile
+    batches_seen: list = []
+
+    class _SpyPF(_real_pf):  # type: ignore[misc,valid-type]
+        def iter_batches(self, **kw):
+            for b in super().iter_batches(**kw):
+                batches_seen.append((kw.get("batch_size"), kw.get("use_threads"),
+                                     kw.get("row_groups"), b.num_rows))
+                yield b
+
+    _E.pq.ParquetFile = _SpyPF
+    try:
+        tmp2 = tmp_path / "BTC_book_snapshots_500ms.parquet.tmp"
+        io2: dict = {}
+        n2 = _build(base, tmp2, skip_watermark=wm, io=io2, cutoff=_now + 60)
+    finally:
+        _E.pq.ParquetFile = _real_pf
+
+    assert n2 == 5400 and io2["carried_rows"] == 5100
+    assert io2["files_skipped"] == 3 and io2.get("files_failed", 0) == 0
+    # the prior-staging read: every decoded slice <= the decode batch bound,
+    # single-threaded, one row-group-scoped iterator per row group
+    prior_slices = [b for b in batches_seen if b[3] > 0 and b[0] == E._CARRY_READ_BATCH_ROWS]
+    assert prior_slices, "carry read must be sliced, not whole-row-group"
+    assert all(b[3] <= E._CARRY_READ_BATCH_ROWS for b in prior_slices)
+    assert all(b[1] is False for b in prior_slices)
+    assert sum(b[3] for b in prior_slices) >= 5100
+    # slices stay far under the writer ceiling (the old 20000x842 fat chunk
+    # was the rss-cap peak driver)
+    assert E._CARRY_READ_BATCH_ROWS < 20000
+    # incremental build == full rescan of the same hive
+    tmp_full = tmp_path / "full.parquet.tmp"
+    n_full = _build(base, tmp_full, cutoff=_now + 60)
+    assert n_full == 5400
+    assert _keys_of(tmp2) == _keys_of(tmp_full)
+
+
+def test_release_arrow_pool_best_effort() -> None:
+    """The mimalloc-arena purge helper is safe anywhere and returns None
+    (best-effort; the pool API is exercised, failures swallowed)."""
+    assert E._release_arrow_pool() is None

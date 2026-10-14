@@ -3676,6 +3676,64 @@ def _carry_date_filter(t: "pa.Table", kept_days: set) -> "pa.Table":
         return t
 
 
+def _mask_keeps_all(mask) -> bool:
+    """True only when Table.filter(mask) would keep every row (null-safe).
+
+    Pure helper for the streaming transform fast path: pyarrow's filter
+    kernel materializes a full copy of the batch even for an all-true mask,
+    and snapshot batches are whale-wide — one 20000x842 decoded carry chunk
+    measured 137MB logical, +137MB Arrow pool per identity filter, the
+    dominant term of the 500ms carry worker's rss-cap-abort peak. Skipping
+    the identity filter is row-identical (filter with an all-true mask
+    returns the same rows). NULL mask entries DROP their row, so nulls must
+    read as False — pc.all(skip_nulls=True) would call an all-NULL mask
+    "all true" and the skip would leak rows the filter drops. Never raises:
+    on kernel trouble returns False so the caller runs the real filter
+    (fail closed — the filter, never the skip).
+    """
+    try:
+        return bool(pc.all(pc.fill_null(mask, False)).as_py())
+    except Exception:
+        return False
+
+
+def _release_arrow_pool() -> None:
+    """Best-effort purge of pyarrow's memory-pool arenas (2026-10-14).
+
+    The wheel's default pool is mimalloc, whose arenas RETAIN freed slice
+    buffers as dirty pages — malloc_trim cannot touch them (the streaming
+    trims kept firing while VmRSS stayed ~200MB over the live pool). The
+    pool's own release_unused() returns them: measured on the real HYPE
+    staging churn loop (2000x842 decode + sort-take slices), RSS held
+    232-255MB with malloc_trim alone vs 209-221MB with the purge. Safe
+    anywhere: best-effort, never raises here.
+    """
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+
+
+# 2026-10-14 carry-peak fix: decode batch for the whale snapshot lanes. The
+# scope-skip carry reads the prior STAGING — the one input whose row groups
+# are as deep as the writer ceiling (20000) over the full output width (842
+# cols at l2=100), so a batch_size=20000 read materializes ~137MB decoded
+# chunks (measured: base 148MB + decode 224MB + two identity-filter copies
+# 180+124MB = 689MB in ONE chunk cycle; the BTC carry crossed the 1000MB
+# worker rss cap 340k rows in, HYPE peaked 1076MB — clean lanes passed only
+# because their staging is ~4x smaller). Hive flush files decode tiny, so
+# 20000 was safe before compaction merged history into ~300k-row files with
+# the same fat row groups — the delta scan needs the same bound. Both reads
+# slice at this size; the writer coalesces the per-chunk yields into row
+# groups bounded by the writer's own ceiling, so per-chunk batch semantics
+# and order are unchanged. A smaller writer ceiling was measured and
+# rejected: the row-group transient win is paid back by the footer —
+# pq.read_metadata of a 240-row-group staging parses 191MB vs 56MB at 62
+# groups, and the next cycle's carry re-opens its own output, so the cost
+# recurs every cycle.
+_CARRY_READ_BATCH_ROWS = 2000
+
+
 def _compact_key_digest(vals: tuple) -> bytes:
     """16-byte canonical digest of one dedup key tuple (2026-10-10).
 
@@ -3723,20 +3781,27 @@ class _CompactDedupState:
     linearly (~300B/key: 66-char condition_id hex strings held per row in
     Python tuples). The seen set is the only unbounded term and the peak
     driver: no-lane-filter builds hold 1.45M+ keys (~435MB) and abort-time
-    hives held ~1.4x the files. Storing 16-byte digests (~100B/key all-in
-    at production scale, measured 307B -> 97B/key at 700K keys) cuts the
-    set ~3x with identical first-wins behavior; projected peak at
-    2x rows stays <600MB against the untouched 1000MB cap. Coalescing is
-    kept (67ms/file win, absolved by the size-independence measurement).
-    The trades path (2026-10-12) uses the same 16-byte digests via the
-    _DigestSet/_DigestCounter containers (two global per-row key stores
-    made the plain-set cost 2x there); streaming.DedupState itself stays
-    byte-identical for its own callers.
+    hives held ~1.4x the files. Storing 16-byte digests cuts the set ~3x
+    with identical first-wins behavior; projected peak at 2x rows stays
+    <600MB against the untouched 1000MB cap. Coalescing is kept (67ms/file
+    win, absolved by the size-independence measurement). 2026-10-14: the
+    digest store itself moved from a Python set of bytes objects (still
+    ~90-103B/key all-in at the 500ms carry's 1.15M keys) to the trades
+    path's open-addressed _DigestSet (~29B/key) — the carry-peak fix's last
+    big line-item; streaming.DedupState itself stays byte-identical for its
+    own callers.
     """
 
     def __init__(self, key_cols):
         self.key_cols = list(key_cols)
-        self.seen: set = set()
+        # 2026-10-14: open-addressed _DigestSet (~29B/key at 1M+ keys)
+        # instead of a Python set of 16-byte bytes objects (~90-100B/key —
+        # measured 103MB at the real HYPE carry's 1.15M keys, the largest
+        # single line-item after the row-group transients). Same membership
+        # semantics (full 16-byte digest compare); add() reports newness so
+        # the slow path is one probe per row. The pinned worker-peak tests
+        # keep working: __len__/__iter__ yield the same 16-byte digests.
+        self.seen = _DigestSet()
         self.dupes = 0
         self.kept = 0
 
@@ -3770,8 +3835,7 @@ class _CompactDedupState:
         keep = []
         for i in range(table.num_rows):
             dg = _compact_key_digest(tuple(cols[j][i] for j in range(len(self.key_cols))))
-            if dg not in self.seen:
-                self.seen.add(dg)
+            if self.seen.add(dg):
                 keep.append(i)
         self.dupes += table.num_rows - len(keep)
         self.kept += len(keep)
@@ -3844,6 +3908,28 @@ class _DigestSet:
 
     def __contains__(self, dg: bytes) -> bool:
         return self._find(dg) >= 0
+
+    def update(self, dgs) -> None:
+        """set.update parity (2026-10-14): the snapshot dedup fast path hands
+        a generator of digests; membership semantics identical to a set."""
+        for dg in dgs:
+            self.add(dg)
+
+    def __iter__(self):
+        """set iteration parity: yields every stored 16-byte digest (the
+        worker-peak bytes-per-key audit sums getsizeof over these)."""
+        occ, slots = self._occ, self._slots
+        for i in range(self._cap):
+            if (occ[i >> 3] >> (i & 7)) & 1:
+                o = i * 16
+                yield bytes(slots[o:o + 16])
+
+    def __eq__(self, other):
+        """set equality parity (2026-10-14): the worker-peak first-wins
+        parity test compares seen against a plain digest set."""
+        if isinstance(other, (set, frozenset)):
+            return len(self) == len(other) and all(dg in other for dg in self)
+        return NotImplemented
 
     def _grow(self, counts: "bytearray | None" = None) -> "bytearray | None":
         """Double the table, rehashing every occupied slot.
@@ -4035,16 +4121,23 @@ def _stream_export_asset_dataset(
     clean hive — the clean hive (2.85M rows after 40h without prune) can no
     longer be concat-loaded, and its catch-up rebuild belongs off-peak.
 
-    coalesce_rows (default 20000; kept as the ROW-GROUP CEILING, not an
-    accumulation target): decoded chunks are transformed+yielded one by one
-    as decoded (zero accumulation — the 2026-10-10 _pending list that held
-    ~coalesce_rows decoded rows alongside the writer's own row-group buffer
-    is gone after the XRP worker still blew the untouched 1000MB cap at
-    1500+ files). The writer coalesces the small yields into sane row groups
-    bounded by this ceiling. Row content, oldest-first order and dedup
+    coalesce_rows (ROW-GROUP CEILING handed to the writer; the snapshot
+    lanes keep the 20000 default): source files decode in
+    _CARRY_READ_BATCH_ROWS-row slices and each transformed slice is yielded
+    immediately (2026-10-14 carry-peak fix — a 20000-row slice of the
+    carried staging measured 137MB decoded plus 137MB per identity filter
+    copy, and the 500ms carry worker crossed the 1000MB rss cap 340k rows
+    in; slices cut every per-chunk transient ~10x while the writer's
+    coalescing terms — pending rows plus the concat_tables transient at
+    flush — stay at the HEAD row-group layout and footer size; a smaller
+    ceiling measured lower build peaks but inflated the footer 4x, and the
+    next cycle's carry re-opens its own output, so the cost recurs).
+    The 2026-10-10 _pending list that held ~coalesce_rows decoded rows
+    ALONGSIDE the writer's own row-group buffer stays gone: nothing is
+    held on the generator side. Row content, oldest-first order and dedup
     first-wins semantics are unchanged; per-file decode errors still mark
-    only that file; a chunk transform error marks its own file (fail closed —
-    the coverage gate keeps prior staging either way).
+    only that file; a chunk transform error marks its own file (fail
+    closed — the coverage gate keeps prior staging either way).
 
     compact_dedup (2026-10-10 peak fix, default True): the global dedup
     seen-set stores 16-byte key digests (_CompactDedupState) instead of
@@ -4117,7 +4210,12 @@ def _stream_export_asset_dataset(
                 # _lane_series_mask also passes WEATHER-HIGH/LOW-1D rows, whose
                 # city assets never match `{asset}-{tf}` (old WEATHER branch
                 # was dead code — asset is e.g. HONG-KONG, never "WEATHER").
-                t = t.filter(_lane_series_mask(t.column("series_id"), want))
+                _lane_mask = _lane_series_mask(t.column("series_id"), want)
+                if not _mask_keeps_all(_lane_mask):
+                    # all-true masks skip the filter: Table.filter copies the
+                    # whole batch even when no row drops (2026-10-14 carry-peak
+                    # fix — the carry/compacted-file batches are whale-wide).
+                    t = t.filter(_lane_mask)
             except Exception as e:
                 # M4: fail CLOSED — a filter failure must not leak other-lane rows
                 raise RuntimeError(f"lane filter failed: {e}")
@@ -4130,7 +4228,10 @@ def _stream_export_asset_dataset(
             # 34 LOW cities shipped byte-identical full-hive dumps labeled as
             # one city). Zero-row results stage as schema-empty files.
             try:
-                t = t.filter(pc.equal(t.column("asset"), pa.scalar(asset_upper)))
+                _asset_mask = pc.equal(t.column("asset"), pa.scalar(asset_upper))
+                if not _mask_keeps_all(_asset_mask):
+                    # same identity-filter skip as the lane mask above
+                    t = t.filter(_asset_mask)
             except Exception:
                 pass
         if live_only and "book_state" in t.schema.names:
@@ -4298,6 +4399,24 @@ def _stream_export_asset_dataset(
         # reports error, the parent keeps prior staging) — carried rows are
         # part of the shipped file and must never ship short.
         _rows_out = 0
+
+        def _rg_chunks(pf_x, cols_x):
+            # 2026-10-14 carry-peak fix, CARRY read only: slice one row group
+            # per iterator. A single long-lived iter_batches RETAINS reader
+            # state as it crosses row groups — measured on the real HYPE
+            # staging, decode-only: pool grew 56->161MB (+33MB steps every
+            # ~200k rows) and RSS 232->344MB across one 1.06M-row file; a
+            # fresh iterator per row group holds the pool flat at ~0-1MB
+            # and RSS ~210-235MB end-to-end (same rows, same order). The
+            # delta scan keeps ONE iterator per FILE instead: a file that
+            # fails at decode must contribute nothing (per-file fail
+            # closed, pinned by test_decode_error_keeps_pending_threshold_sane),
+            # and each file's retention is bounded anyway (~50MB on the
+            # biggest compacted file, released at file end).
+            for _rgi in range(pf_x.num_row_groups):
+                yield from pf_x.iter_batches(batch_size=_CARRY_READ_BATCH_ROWS,
+                                              columns=cols_x, use_threads=False,
+                                              row_groups=[_rgi])
         if _skip_wm is not None:
             _kept_days: set = set()
             for _dl in _skip_wm["dates"]:
@@ -4309,7 +4428,14 @@ def _stream_export_asset_dataset(
             _pf_prior = pq.ParquetFile(str(_prior_path))
             _prior_cols = _projected_read_columns(
                 _pf_prior.schema_arrow.names, schema, _extra)
-            for _chunk in _pf_prior.iter_batches(batch_size=20000, columns=_prior_cols):
+            # carry read: sliced at _CARRY_READ_BATCH_ROWS (fat staging row
+            # groups are the peak driver — see the constant), one row group
+            # per iterator (see _rg_chunks) and single-threaded like the
+            # trades chunked reads; each transformed slice is yielded
+            # directly and the writer coalesces up to the (reduced) row
+            # group ceiling.
+            _carry_n = 0
+            for _chunk in _rg_chunks(_pf_prior, _prior_cols):
                 _t = pa.Table.from_batches([_chunk])
                 del _chunk
                 if _t.num_rows == 0:
@@ -4328,7 +4454,26 @@ def _stream_export_asset_dataset(
                         io_stats["carried_rows"] = _carried
                     yield _t2
                 del _t2
+                _carry_n += 1
+                if _carry_n % 10 == 0:
+                    # per-slice gc/trim (same freed-but-untrimmed heap the
+                    # per-date loop below trims for): without it the freed
+                    # slice buffers ratchet VmRSS far over the live pool —
+                    # malloc_trim for the glibc heap, release_unused() for
+                    # the mimalloc arenas pyarrow allocates from.
+                    try:
+                        _gc_g.collect()
+                        malloc_trim()
+                    except Exception:
+                        pass
+                    _release_arrow_pool()
             del _pf_prior
+            try:
+                _gc_g.collect()
+                malloc_trim()
+            except Exception:
+                pass
+            _release_arrow_pool()
             print(f"[export:worker] scope-skip {asset_upper}/{ds}: carried {_carried} rows "
                   f"from verified prior staging ({_skip_wm['rows']} rows @ cutoff "
                   f"{int(_skip_wm['cutoff'])})"
@@ -4338,13 +4483,17 @@ def _stream_export_asset_dataset(
         _t0 = _time_g.time()
         _last_log = _t0
         # 2026-10-10 zero-accumulation streaming (peak fix): each decoded
-        # chunk is transformed and yielded immediately — no decoded batch is
-        # EVER held across files. coalesce_rows is now only the row-group
-        # CEILING handed to the writer (see the write_batches call), not an
+        # chunk is transformed and handed off immediately — no decoded batch
+        # is EVER held across files. coalesce_rows is the row-group CEILING
+        # handed to the writer (see the write_batches call), not an
         # accumulation target. The old _pending list held ~coalesce_rows
         # decoded rows while the writer held another row group plus a concat
-        # transient on each side; now at most one decoded chunk (~one source
-        # file) plus the writer's single bounded row group are alive at once.
+        # transient on each side. 2026-10-14 carry-peak fix: decoding now
+        # runs in _CARRY_READ_BATCH_ROWS-row slices, one row group per
+        # reader iterator (a single long-lived iter_batches retains ~33MB of
+        # reader state per ~200k rows — measured), so the slice transients
+        # stay ~10x smaller on the fat staging/compacted row groups that
+        # made the 500ms worker's carry the rss-cap peak driver.
         # Unchanged: row content, oldest-first order, dedup first-wins
         # (sequential filter over the same row order keeps the same set),
         # per-batch sort (readers sort anyway per E13), fail-closed per-file
@@ -4381,8 +4530,10 @@ def _stream_export_asset_dataset(
                 except OSError:
                     pass
                 _file_ok = True
+                _delta_n = 0
                 try:
-                    for _chunk in _pf.iter_batches(batch_size=20000, columns=_cols):
+                    for _chunk in _pf.iter_batches(batch_size=_CARRY_READ_BATCH_ROWS,
+                                                   columns=_cols, use_threads=False):
                         _t = pa.Table.from_batches([_chunk])
                         del _chunk
                         if _t.num_rows == 0:
@@ -4390,6 +4541,18 @@ def _stream_export_asset_dataset(
                             continue
                         if io_stats is not None:
                             io_stats["rows_read"] += _t.num_rows
+                        _delta_n += 1
+                        if _delta_n % 10 == 0:
+                            # same per-slice trim cadence as the carry loop:
+                            # a compacted ~300k-row file is ONE date group,
+                            # so the per-date trim below never fires inside
+                            # it and the slice churn ratchets VmRSS.
+                            try:
+                                _gc_g.collect()
+                                malloc_trim()
+                            except Exception:
+                                pass
+                            _release_arrow_pool()
                         try:
                             _t2 = _transform(_t)
                         except Exception as _te:
@@ -4440,8 +4603,10 @@ def _stream_export_asset_dataset(
                 malloc_trim()
             except Exception:
                 pass
+            _release_arrow_pool()
         # no tail flush: zero accumulation means every decoded chunk has
-        # already been transformed and yielded above.
+        # already been transformed and yielded above (the writer coalesces
+        # the per-chunk yields up to the row-group ceiling).
 
     healed_note = ""
     rows = write_batches(_phase_timed_iter(_gen(), f"{asset_upper}/{ds}"),
