@@ -6525,6 +6525,109 @@ def _write_kaggle_state(staging: Path, dataset: str, notes: str, build_start_ms:
         pass
 
 
+# 2026-10-13 post-publish teardown bound (prod Oct-13 evidence: RSS
+# 1.1GB -> 2.34GB ~2.5min after publish at 22:22 -> pm2 max-memory-restart,
+# 442 ticks/lane lost). The prune used to read_table() each candidate
+# hive file's decision column WHOLE (multi-100MB compacted book_events
+# files hold 24M+ rows) and to_pylist() it — GBs of Arrow+Python transient
+# per file inside the collector's export thread, right after publish.
+# The scanners below stream row-group batches instead: peak = one batch
+# (rows x one column) + the running DISTINCT set (bounded by the number
+# of markets in the file). Decision math is IDENTICAL — same distinct
+# cids, same market-end max, same conservative keep on any error.
+_PRUNE_SCAN_BATCH_ROWS = 131_072
+
+
+def _scan_file_cids_bounded(p: Path) -> tuple:
+    """Footer row count + distinct non-empty condition_ids, batched (never raises).
+
+    Returns (num_rows, cids). Unreadable file / no condition_id column /
+    zero rows -> (None, None): the caller keeps the file (fail closed) —
+    exactly the old read_table-exception and schema-check semantics.
+    """
+    try:
+        _pf = pq.ParquetFile(str(p))
+    except Exception:
+        return (None, None)
+    try:
+        try:
+            _n = int(_pf.metadata.num_rows)
+            if _n == 0 or "condition_id" not in _pf.schema.names:
+                return (None, None)
+        except Exception:
+            return (None, None)
+        cids: set = set()
+        for _b in _pf.iter_batches(batch_size=_PRUNE_SCAN_BATCH_ROWS,
+                                   columns=["condition_id"]):
+            try:
+                # Arrow-native dedup — Python objects only for the distinct
+                # values (the full column is never materialized).
+                _u = pc.unique(_b.column(0))
+                cids.update(str(_v) for _v in _u.to_pylist() if _v)
+            finally:
+                del _b
+        return (_n, cids)
+    except Exception:
+        return (None, None)
+    finally:
+        try:
+            _pf.close()
+        except Exception:
+            pass
+
+
+def _scan_file_max_ts_ns_bounded(p: Path) -> Optional[int]:
+    """Newest non-null ts (ns) of the first present/valued ts column, batched.
+
+    Mirrors the old full-column to_pylist+max exactly: column order
+    (ts_received_ns, ts_utc), first column with any non-null value wins,
+    ISO strings parsed to ms then scaled to ns. Returns None when no
+    column yields a value (caller keeps the file — fail closed).
+    """
+    for _col in ("ts_received_ns", "ts_utc"):
+        _col_max = None
+        _saw = False
+        try:
+            _pf = pq.ParquetFile(str(p))
+        except Exception:
+            continue
+        try:
+            try:
+                if (_col not in _pf.schema.names
+                        or int(_pf.metadata.num_rows) == 0):
+                    continue
+            except Exception:
+                continue
+            try:
+                for _b in _pf.iter_batches(batch_size=_PRUNE_SCAN_BATCH_ROWS,
+                                           columns=[_col]):
+                    try:
+                        for _v in _b.column(0).to_pylist():
+                            if _v is None:
+                                continue
+                            _saw = True
+                            if isinstance(_v, str):
+                                _cand = (int(_dt.datetime.fromisoformat(
+                                             str(_v).replace("Z", "+00:00")
+                                         ).timestamp() * 1000)) * 1_000_000
+                            else:
+                                _cand = int(_v)
+                            if _col_max is None or _cand > _col_max:
+                                _col_max = _cand
+                    finally:
+                        del _b
+            except Exception:
+                continue
+        finally:
+            try:
+                _pf.close()
+            except Exception:
+                pass
+        if _saw:
+            return _col_max
+    return None
+
+
 def cleanup_local_data(
     data_dir: str | Path,
     assets: List[str] | None = None,
@@ -6840,8 +6943,12 @@ def cleanup_local_data(
     latest = base / "markets_latest" / "markets_latest.parquet"
     try:
         if latest.exists():
-            tbl = read_table(latest)
-            if "condition_id" in tbl.schema.names and "market_end_ts_ms" in tbl.schema.names:
+            # 2026-10-13: column-subset read — the map only needs these two
+            # fields; a missing column fails the read and lands in the
+            # except below (pruning skipped, fail closed — same as the old
+            # schema-name check).
+            tbl = read_table(latest, columns=["condition_id", "market_end_ts_ms"])
+            if tbl is not None and "condition_id" in tbl.schema.names and "market_end_ts_ms" in tbl.schema.names:
                 for cid, me in zip(tbl.column("condition_id").to_pylist(),
                                    tbl.column("market_end_ts_ms").to_pylist()):
                     if cid and me is not None:
@@ -6849,6 +6956,7 @@ def cleanup_local_data(
                             end_by_cid[str(cid)] = int(me)
                         except Exception:
                             pass
+                del tbl
     except Exception as e:
         print(f"[prune] WARN could not read markets_latest — pruning skipped this cycle: {e}")
         return {}
@@ -6930,18 +7038,16 @@ def cleanup_local_data(
                     except OSError:
                         pass
                 if dataset in CID_DATASETS:
-                    try:
-                        t = pq.read_table(str(p), columns=["condition_id"])
-                    except Exception:
-                        continue  # unreadable or no condition_id — conservative keep
-                    if t is None or t.num_rows == 0 or "condition_id" not in t.schema.names:
-                        del t
-                        continue
-                    cids = {str(c) for c in t.column("condition_id").to_pylist() if c}
-                    _n = t.num_rows
-                    del t
-                    if not cids:
-                        continue
+                    # 2026-10-13: bounded batched scan (see
+                    # _scan_file_cids_bounded) — the old read_table of the
+                    # WHOLE condition_id column + to_pylist() materialized
+                    # 24M+ Python strings per big compacted file (the 22:22
+                    # post-publish RSS spike 1.1->2.34GB -> pm2 restart).
+                    # Same distinct-cid set, same conservative keep on any
+                    # unreadable input, same decision math.
+                    _n, cids = _scan_file_cids_bounded(p)
+                    if _n is None or not cids:
+                        continue  # unreadable / empty / no column — conservative keep
                     ends = [end_by_cid.get(c) for c in cids]
                     if any(e is None for e in ends):
                         continue  # unknown condition — conservative keep
@@ -6949,29 +7055,12 @@ def cleanup_local_data(
                         continue  # some market inside the retention leeway — keep
                     _delete_file(p, _n, f"all markets ended < cutoff {cutoff_ms}")
                 elif dataset in TS_DATASETS:
-                    # timestamp-only datasets: age the FILE by its newest row
-                    max_ts_ns = None
-                    for col in ("ts_received_ns", "ts_utc"):
-                        try:
-                            t = pq.read_table(str(p), columns=[col])
-                        except Exception:
-                            t = None
-                        if t is None or t.num_rows == 0 or col not in t.schema.names:
-                            try:
-                                del t
-                            except Exception:
-                                pass
-                            continue
-                        vals = t.column(col).to_pylist()
-                        del t
-                        vals = [v for v in vals if v is not None]
-                        if vals:
-                            if isinstance(vals[0], str):
-                                ms_vals = [int(_dt2.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp() * 1000) for v in vals]
-                                max_ts_ns = max(max_ts_ns or 0, max(ms_vals) * 1_000_000)
-                            else:
-                                max_ts_ns = max(max_ts_ns or 0, int(max(vals)))
-                            break
+                    # timestamp-only datasets: age the FILE by its newest row.
+                    # 2026-10-13: bounded batched scan (see
+                    # _scan_file_max_ts_ns_bounded) — the old full-column
+                    # read+to_pylist had the same whole-file materialization
+                    # blast radius as the CID branch above.
+                    max_ts_ns = _scan_file_max_ts_ns_bounded(p)
                     if max_ts_ns is None:
                         continue
                     if max_ts_ns // 1_000_000 < cutoff_ms:
@@ -6982,6 +7071,15 @@ def cleanup_local_data(
                         _delete_file(p, _n_ts, "newest row older than cutoff")
             except Exception as e:
                 print(f"[prune] WARN skipping unreadable {p}: {e}")
+        # 2026-10-13 post-publish teardown bound: release this dataset's
+        # scan state (batch refs, Arrow arenas, end-map lookups) before the
+        # next dataset starts — same per-dataset gc the staging-build loop
+        # uses — so peaks never stack across datasets after publish.
+        try:
+            import gc as _gc_prune
+            _gc_prune.collect()
+        except Exception:
+            pass
 
     # remove empty leaf dirs left behind (hive hygiene, safe: only empties)
     if not dry_run:
@@ -7468,6 +7566,14 @@ def _export_and_upload_all_kaggle_impl(
             "files": prep["files"],
         }
         return result
+    # 2026-10-13 post-publish teardown bound: the build's materialized
+    # coverage evidence (per-(dataset,asset) manifests) and the prep dict
+    # are dead after this gate — release them BEFORE the upload+prune so
+    # the post-publish phase (the 22:22 RSS-spike window) never carries
+    # whole-build state. The Step-2 result only needs the file count,
+    # already extracted into result["staging"] (and _files_n below).
+    _files_n = prep["files"]
+    del _manifests, prep
 
     # Step 2: Upload to Kaggle (single dataset)
     print(f"=== Step 2: Uploading {tf_label} staging to Kaggle {dataset_prefix} ===")
@@ -7480,7 +7586,7 @@ def _export_and_upload_all_kaggle_impl(
     result["kaggle_uploads"][dataset_prefix] = {
         "status": "success" if ok else "failed",
         "staging": str(staging),
-        "files": prep["files"],
+        "files": _files_n,
     }
     if ok:
         print(f"✓ Upload success {dataset_prefix}, pruning hive after verified ready...")

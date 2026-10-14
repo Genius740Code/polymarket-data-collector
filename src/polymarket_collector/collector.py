@@ -7302,122 +7302,131 @@ class Collector:
         kaggle_uploads: list[dict] = []
 
         async def _do_test_kaggle_upload(tag: str):
-            # Flush + compact + staging upload, record result — held under kaggle_lock so snapshot appends buffer safely during staging.
-            async with self._kaggle_lock:
+            # Flush + compact + staging upload, record result — kaggle-lock-FREE
+            # (2026-10-13 22:30 flush-gap fix, same shrink as the prod
+            # _kaggle_lane_tick): the old `async with self._kaggle_lock` held
+            # the lock across the whole export worker, so the flush loop's 5s
+            # lock wait skipped every parquet flush and the writer buffer
+            # ballooned until the snapshot loop's inline flushes stalled the
+            # 500ms scheduler (prod coverage_gap 198.5s every cycle). Safety:
+            # the flush below COMPLETES before the worker spawns (its isolation
+            # cutoff then sees the flushed rows — same inclusion guarantee),
+            # staging commits are per-cycle tmp+rename, and writer.flush() is
+            # same-thread vs snapshot appends (no race).
+            try:
+                n = self.writer.flush()
+                if n:
+                    print(f"[test-kaggle:{tag}] flushed {n} rows before staging (no kaggle lock held — snapshot + flush loops keep ticking)")
+            except Exception as e:
+                print(f"[test-kaggle:{tag}] flush err {e}")
+            try:
+                self.markets_log.flush_staging()
+            except Exception:
+                pass
+            try:
+                p = self.markets_log.compact()
+                print(f"[test-kaggle:{tag}] compacted {p}")
+            except Exception as e:
+                print(f"[test-kaggle:{tag}] compact err {e}")
+            # Build clean view so snapshot_clean available for analysis
+            try:
+                from .storage.clean_view import build_clean_view
+                built = build_clean_view(self.config.storage.data_dir)
+                print(f"[test-kaggle:{tag}] clean_view rows {built}")
+            except Exception as e:
+                print(f"[test-kaggle:{tag}] clean_view err {e}")
+            # Prepare staging + upload (dry_run if no creds to avoid crash)
+            # Staging is one-file-per-asset: 7 assets ×5 (snapshots, clean view, trades, book_events, chainlink) +3 globals + summary =39 files
+            # Single dataset gghgg1/polymarket-5m-crypto — all assets share same slug, cumulative rows.
+            _has_creds = _validate_kaggle_config()
+            try:
+                from .storage.export import cleanup_local_data as _cleanup
+                # B-fix: run the export in a worker thread — it makes
+                # synchronous HTTP calls (data-api enrichment, Kaggle client)
+                # that otherwise FREEZE the whole event loop for minutes,
+                # stalling the 500ms snapshot scheduler (measured: the chunk
+                # upload at 20:20 blocked the loop past the run's timeout).
+                res = await asyncio.to_thread(
+                    export_and_upload_all_kaggle,
+                    data_dir=self.config.storage.data_dir,
+                    assets=self.config.assets,
+                    timeframe_labels=[test_tf],
+                    l2_levels=self._export_l2_levels(),
+                    dataset_prefix=self.config.kaggle_dataset_for(test_tf),
+                    dry_run=not _has_creds,
+                )
+                # Quick-test prune: after verified Kaggle ready, delete only closed markets.
+                # Prod keeps 2h buffer; test uses 120s so first 2 markets (10min old) are removable by second chunk.
+                # For dry_run (no creds) we do NOT delete — just log what would be pruned, to avoid losing data without Kaggle.
+                def _is_dry(r):
+                    try:
+                        for v in r.get("kaggle_uploads", {}).values():
+                            if v.get("status") == "dry_run":
+                                return True
+                    except Exception:
+                        pass
+                    return False
+                is_dry = _is_dry(res)
+                if not is_dry and _has_creds:
+                    built_pruned = sum(res.get("cleanup", {}).values()) if isinstance(res.get("cleanup"), dict) else 0
+                    if built_pruned == 0:
+                        # 2026-09-09 15m run: the 0h/120s test-buffer prune
+                        # deleted CLOSED-window snapshot files mid-run (window-1
+                        # lost ~1200 ticks before the final staging build →
+                        # 30% completeness artifact + thin finalize re-upload).
+                        # Test hives are <100MB — disk hygiene never justifies
+                        # eating the measured windows. Prune DISABLED in test
+                        # mode (production 2h path above still runs). The gate
+                        # staging + analysis now always see the full run.
+                        print(f"[test-kaggle:{tag}] test-buffer prune SKIPPED (harness fix 2026-09-09: 0h cutoff ate closed windows on 15m lanes)")
+                elif is_dry:
+                    # dry_run: simulate prune, don't delete — show what would be deleted after real Kaggle
+                    try:
+                        # preview: count files that would be deleted with 120s buffer, without actually deleting if no checkpoint
+                        # We peek by calling cleanup with a preview flag? For now just log, no delete.
+                        print(f"[test-kaggle:{tag}] dry_run — skipping delete (no Kaggle creds). Would prune closed markets with 120s buffer after real upload.")
+                    except Exception:
+                        pass
+
+                # I-11: only a verified-successful upload counts as a completed
+                # chunk — a failed attempt previously satisfied the chunk gate and
+                # permanently blocked the final retry within the run.
+                _up_status = None
                 try:
-                    n = self.writer.flush()
-                    if n:
-                        print(f"[test-kaggle:{tag}] flushed {n} rows before staging (lock held, snapshots go to fresh buffer)")
-                except Exception as e:
-                    print(f"[test-kaggle:{tag}] flush err {e}")
-                try:
-                    self.markets_log.flush_staging()
+                    for _v in (res.get("kaggle_uploads") or {}).values():
+                        _up_status = _v.get("status")
+                        if _up_status == "success":
+                            break
                 except Exception:
                     pass
+                if _up_status == "success":
+                    kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
+                else:
+                    print(f"[test-kaggle:{tag}] upload NOT counted as completed chunk (status={_up_status or res.get('error')}) — data retained, retry scheduled")
+                # one-file-per-asset audit: staging should be 39 files for 7 assets
                 try:
-                    p = self.markets_log.compact()
-                    print(f"[test-kaggle:{tag}] compacted {p}")
-                except Exception as e:
-                    print(f"[test-kaggle:{tag}] compact err {e}")
-                # Build clean view so snapshot_clean available for analysis
-                try:
-                    from .storage.clean_view import build_clean_view
-                    built = build_clean_view(self.config.storage.data_dir)
-                    print(f"[test-kaggle:{tag}] clean_view rows {built}")
-                except Exception as e:
-                    print(f"[test-kaggle:{tag}] clean_view err {e}")
-                # Prepare staging + upload (dry_run if no creds to avoid crash)
-                # Staging is one-file-per-asset: 7 assets ×5 (snapshots, clean view, trades, book_events, chainlink) +3 globals + summary =39 files
-                # Single dataset gghgg1/polymarket-5m-crypto — all assets share same slug, cumulative rows.
-                _has_creds = _validate_kaggle_config()
-                try:
-                    from .storage.export import cleanup_local_data as _cleanup
-                    # B-fix: run the export in a worker thread — it makes
-                    # synchronous HTTP calls (data-api enrichment, Kaggle client)
-                    # that otherwise FREEZE the whole event loop for minutes,
-                    # stalling the 500ms snapshot scheduler (measured: the chunk
-                    # upload at 20:20 blocked the loop past the run's timeout).
-                    res = await asyncio.to_thread(
-                        export_and_upload_all_kaggle,
-                        data_dir=self.config.storage.data_dir,
-                        assets=self.config.assets,
-                        timeframe_labels=[test_tf],
-                        l2_levels=self._export_l2_levels(),
-                        dataset_prefix=self.config.kaggle_dataset_for(test_tf),
-                        dry_run=not _has_creds,
-                    )
-                    # Quick-test prune: after verified Kaggle ready, delete only closed markets.
-                    # Prod keeps 2h buffer; test uses 120s so first 2 markets (10min old) are removable by second chunk.
-                    # For dry_run (no creds) we do NOT delete — just log what would be pruned, to avoid losing data without Kaggle.
-                    def _is_dry(r):
-                        try:
-                            for v in r.get("kaggle_uploads", {}).values():
-                                if v.get("status") == "dry_run":
-                                    return True
-                        except Exception:
-                            pass
-                        return False
-                    is_dry = _is_dry(res)
-                    if not is_dry and _has_creds:
-                        built_pruned = sum(res.get("cleanup", {}).values()) if isinstance(res.get("cleanup"), dict) else 0
-                        if built_pruned == 0:
-                            # 2026-09-09 15m run: the 0h/120s test-buffer prune
-                            # deleted CLOSED-window snapshot files mid-run (window-1
-                            # lost ~1200 ticks before the final staging build →
-                            # 30% completeness artifact + thin finalize re-upload).
-                            # Test hives are <100MB — disk hygiene never justifies
-                            # eating the measured windows. Prune DISABLED in test
-                            # mode (production 2h path above still runs). The gate
-                            # staging + analysis now always see the full run.
-                            print(f"[test-kaggle:{tag}] test-buffer prune SKIPPED (harness fix 2026-09-09: 0h cutoff ate closed windows on 15m lanes)")
-                    elif is_dry:
-                        # dry_run: simulate prune, don't delete — show what would be deleted after real Kaggle
-                        try:
-                            # preview: count files that would be deleted with 120s buffer, without actually deleting if no checkpoint
-                            # We peek by calling cleanup with a preview flag? For now just log, no delete.
-                            print(f"[test-kaggle:{tag}] dry_run — skipping delete (no Kaggle creds). Would prune closed markets with 120s buffer after real upload.")
-                        except Exception:
-                            pass
-
-                    # I-11: only a verified-successful upload counts as a completed
-                    # chunk — a failed attempt previously satisfied the chunk gate and
-                    # permanently blocked the final retry within the run.
-                    _up_status = None
-                    try:
-                        for _v in (res.get("kaggle_uploads") or {}).values():
-                            _up_status = _v.get("status")
-                            if _up_status == "success":
-                                break
-                    except Exception:
-                        pass
-                    if _up_status == "success":
-                        kaggle_uploads.append({"at_s": int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp()) - start_ts, "tag": tag, "result": res})
+                    st = res.get("staging", {})
+                    files = st.get("files", 0)
+                    expected = len(self.config.assets) * 5 + 4
+                    if files != expected:
+                        print(f"[test-kaggle:{tag}] WARN staging files {files} != expected {expected} (one-file-per-asset)")
                     else:
-                        print(f"[test-kaggle:{tag}] upload NOT counted as completed chunk (status={_up_status or res.get('error')}) — data retained, retry scheduled")
-                    # one-file-per-asset audit: staging should be 39 files for 7 assets
-                    try:
-                        st = res.get("staging", {})
-                        files = st.get("files", 0)
-                        expected = len(self.config.assets) * 5 + 4
-                        if files != expected:
-                            print(f"[test-kaggle:{tag}] WARN staging files {files} != expected {expected} (one-file-per-asset)")
-                        else:
-                            print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: snapshots, clean view, trades, book_events, chainlink +3 globals + summary)")
-                    except Exception:
-                        pass
-                    # also intermediate lightweight analysis
-                    try:
-                        inter = await self._analyse_test_data(start_ms, num_markets, window_size=ws, write_interim=f"test_analysis_{tag}.json")
-                        print(f"[test-kaggle:{tag}] interim completeness {inter.get('checks',{}).get('snapshot_completeness_pct')}% clean {inter.get('checks',{}).get('clean_completeness_pct')}%")
-                    except Exception as e:
-                        print(f"[test-kaggle:{tag}] interim analyse err {e}")
-                    # keep list on collector for final report
-                    self._kaggle_uploads = kaggle_uploads
-                    return res
+                        print(f"[test-kaggle:{tag}] staging OK {files} files (one per asset: snapshots, clean view, trades, book_events, chainlink +3 globals + summary)")
+                except Exception:
+                    pass
+                # also intermediate lightweight analysis
+                try:
+                    inter = await self._analyse_test_data(start_ms, num_markets, window_size=ws, write_interim=f"test_analysis_{tag}.json")
+                    print(f"[test-kaggle:{tag}] interim completeness {inter.get('checks',{}).get('snapshot_completeness_pct')}% clean {inter.get('checks',{}).get('clean_completeness_pct')}%")
                 except Exception as e:
-                    print(f"[test-kaggle:{tag}] kaggle err {e}")
-                    import traceback; traceback.print_exc()
-                    return {"error": str(e)}
+                    print(f"[test-kaggle:{tag}] interim analyse err {e}")
+                # keep list on collector for final report
+                self._kaggle_uploads = kaggle_uploads
+                return res
+            except Exception as e:
+                print(f"[test-kaggle:{tag}] kaggle err {e}")
+                import traceback; traceback.print_exc()
+                return {"error": str(e)}
 
         try:
             while self._running:
@@ -7862,6 +7871,82 @@ class Collector:
             print(f"[analyse] write err {e}")
         return report
 
+    async def _kaggle_lane_tick(self, tf: str, *, dry_run: bool, interval: int) -> dict:
+        """One lane's flush -> staging/upload tick — kaggle-lock-FREE (2026-10-13).
+
+        22:30 flush-gap fix (prod Oct-13 evidence): this body used to run
+        inside `async with self._kaggle_lock`, holding the lock across the
+        flush AND the entire export worker (staging build + upload + prune —
+        3min steady-state, 27min on the 1d lane). The flush loop's 5s lock
+        wait then skipped EVERY parquet flush for the whole export, the
+        writer buffer ballooned (32,478 rows at the next cycle's flush = the
+        measured backlog) and every snapshot-loop append hit the inline
+        threshold/backpressure flush() — a synchronous parquet+WAL+fsync
+        write ON the 500ms scheduler thread, contending with the export
+        worker's staging I/O -> coverage_gap 198.5s (278 ticks/lane) every
+        cycle (96% of all missing density ticks, with the 22:22 restart).
+
+        Lock-scope shrink — the narrowest variant, safety argued per step:
+        (1) flush BEFORE the worker, NO lock: writer.flush() runs on the
+            event-loop thread — the same thread as snapshot appends, so
+            they can never interleave mid-flush (single-threaded §10A
+            ordering); the flush COMPLETES before the worker spawns, so
+            the worker's isolation cutoff (export_isolation.begin_snapshot
+            inside the impl) still observes every flushed row — identical
+            "staging includes in-memory rows" inclusion guarantee.
+        (2) worker runs WITHOUT the lock: staging dirs are per-lane and
+            per-cycle, every staging commit is atomic tmp+rename, and the
+            cross-process export lock (export_and_upload_all_kaggle
+            entry point) serializes builds against backfill crons.
+            Mid-export flushes (the flush loop is no longer locked out)
+            only create hive files with mtime > the frozen build cutoff —
+            excluded from THIS staging by design, uploaded next cycle,
+            and never pruned (mtime guards in cleanup_local_data keep
+            everything newer than the checkpoint). Nothing the kaggle
+            lock protected remains.
+        (3) NO re-acquire after the worker: the collector has no
+            post-worker commit/swap — the staging publish happens inside
+            the worker under the cross-process export lock; this method
+            only records the result.
+        """
+        try:
+            n = self.writer.flush()
+            if n:
+                print(f"[kaggle loop] flushed {n} rows before staging (no kaggle lock held — snapshot + flush loops keep ticking)")
+        except Exception as e:
+            print(f"[kaggle loop] flush err {e}")
+        try:
+            self.markets_log.flush_staging()
+        except Exception:
+            pass
+        try:
+            self.markets_log.compact()
+        except Exception:
+            pass
+        res = await asyncio.to_thread(
+            export_and_upload_all_kaggle,
+            data_dir=self.config.storage.data_dir,
+            assets=self.config.assets,
+            timeframe_labels=[tf],
+            l2_levels=self._export_l2_levels(),
+            dataset_prefix=self.config.kaggle_dataset_for(tf),
+            dry_run=dry_run,
+        )
+        export_n = len(res.get("export", {}))
+        kag = res.get("kaggle_uploads", {})
+        succ = sum(1 for v in kag.values() if v.get("status") == "success")
+        dry = sum(1 for v in kag.values() if v.get("status") == "dry_run")
+        print(f"[kaggle:{tf}] staging {export_n} files -> {kag} succ {succ} dry {dry} prune {res.get('cleanup',{})}")
+        if not hasattr(self, "_kaggle_uploads"):
+            # start() owns this list; lazy-init keeps the method callable on
+            # a not-yet-started collector (tests, embedders).
+            self._kaggle_uploads = []
+        self._kaggle_uploads.append({"ts": int(time.time()), "interval": interval, "tf": tf, "result": res})
+        # Bounded: result dicts are nontrivial; keep only recent history
+        if len(self._kaggle_uploads) > 200:
+            del self._kaggle_uploads[:len(self._kaggle_uploads) - 200]
+        return res
+
     async def _kaggle_upload_loop(self) -> None:
         """Multi-timeframe Kaggle loop: one lane per tick, round-robin.
 
@@ -7939,53 +8024,12 @@ class Collector:
                 if not has_data:
                     print("[kaggle] no hive data yet, skipping")
                 else:
-                    async def _upload_one(tf: str) -> None:
-                        # Flush buffer under kaggle lock so staging includes in-memory rows (fixes 2b unflushed buffer)
-                        # Uses same lock as test mode and flush loop to avoid races with snapshot append
-                        if hasattr(self, "_kaggle_lock"):
-                            async with self._kaggle_lock:
-                                try:
-                                    n = self.writer.flush()
-                                    if n:
-                                        print(f"[kaggle loop] flushed {n} rows before staging (lock held)")
-                                except Exception as e:
-                                    print(f"[kaggle loop] flush err {e}")
-                                try:
-                                    self.markets_log.flush_staging()
-                                except Exception:
-                                    pass
-                                try:
-                                    self.markets_log.compact()
-                                except Exception:
-                                    pass
-                                res = await asyncio.to_thread(
-                                    export_and_upload_all_kaggle,
-                                    data_dir=self.config.storage.data_dir,
-                                    assets=self.config.assets,
-                                    timeframe_labels=[tf],
-                                    l2_levels=self._export_l2_levels(),
-                                    dataset_prefix=self.config.kaggle_dataset_for(tf),
-                                    dry_run=not _has_creds,
-                                )
-                        else:
-                            res = await asyncio.to_thread(
-                                export_and_upload_all_kaggle,
-                                data_dir=self.config.storage.data_dir,
-                                assets=self.config.assets,
-                                timeframe_labels=[tf],
-                                l2_levels=self._export_l2_levels(),
-                                dataset_prefix=self.config.kaggle_dataset_for(tf),
-                                dry_run=not _has_creds,
-                            )
-                        export_n = len(res.get("export", {}))
-                        kag = res.get("kaggle_uploads", {})
-                        succ = sum(1 for v in kag.values() if v.get("status")=="success")
-                        dry = sum(1 for v in kag.values() if v.get("status")=="dry_run")
-                        print(f"[kaggle:{tf}] staging {export_n} files -> {kag} succ {succ} dry {dry} prune {res.get('cleanup',{})}")
-                        self._kaggle_uploads.append({"ts": int(time.time()), "interval": interval, "tf": tf, "result": res})
-                        # Bounded: result dicts are nontrivial; keep only recent history
-                        if len(self._kaggle_uploads) > 200:
-                            del self._kaggle_uploads[:len(self._kaggle_uploads) - 200]
+                    # Lock-free per-lane tick (see _kaggle_lane_tick for the
+                    # 22:30 flush-gap evidence + safety argument). The flush
+                    # inside it completes BEFORE the export worker spawns, so
+                    # staging still includes the in-memory rows; the worker
+                    # runs to completion while the snapshot + flush loops
+                    # keep ticking (the lock is never held across the await).
                     _lanes = self.rollover.enabled_lane_labels()
                     _tf = _next_kaggle_lane(self.config.storage.data_dir, _lanes)
                     _tick_start = time.time()
@@ -7993,7 +8037,7 @@ class Collector:
                         print("[kaggle] no enabled lanes, skipping")
                     else:
                         print(f"[kaggle] tick lane={_tf} (lanes={_lanes})")
-                        await _upload_one(_tf)
+                        await self._kaggle_lane_tick(_tf, dry_run=not _has_creds, interval=interval)
                         # drop per-lane staging tables between ticks so the
                         # export peak stays flat, not stacked.
                         try:
