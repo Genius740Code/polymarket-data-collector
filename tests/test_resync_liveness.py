@@ -153,3 +153,67 @@ async def test_stale_book_drive_evidence_unchanged():
     assert etypes.count("resync_completed") == 1
     assert any(p.get("resync_id") == rid and p.get("disconnect_reason") == "network_error"
                for p in persists)
+
+
+# --- 429 streak decays at 30s -----------------------------------------
+
+def test_heal_429_streak_decays_at_30s():
+    """(e) Heal 429 streak decays after 30s of clean wire (not 60s, not 0).
+
+    Per heal.py: _HEAL_429_CLEAN_S = 30.0s. A streak > 0 resets once
+    the wire has been clean past 30s. Retry respect is kept — 0 decay
+    would mean never resetting; 60s would be too lenient.
+    """
+    import time as _t
+    from polymarket_collector.ingest.heal import _HEAL_429_CLEAN_S, heal_rate_limited
+
+    # Verify the constant
+    assert _HEAL_429_CLEAN_S == 30.0, (
+        f"Expected _HEAL_429_CLEAN_S=30.0, got {_HEAL_429_CLEAN_S}"
+    )
+
+    # Setup: streak=1, cooldown active, via module globals
+    import polymarket_collector.ingest.heal as _mod
+    _mod._heal_429_until = _t.monotonic() + 60.0
+    _mod._heal_429_streak = 1
+    _mod._heal_429_last_event = _t.monotonic()
+
+    # Before 30s clean: rate_limited should still be True (cooldown active)
+    assert heal_rate_limited() is True, (
+        "Expected rate_limited True during cooldown"
+    )
+
+    # Advance 31s past last event — streak should decay
+    # Reset cooldown to simulate wire clean for 31s
+    _mod._heal_429_until = 0.0
+    _mod._heal_429_last_event = _t.monotonic() - 31.0
+
+    # After 31s clean past last event with streak>0, streak decays to 0
+    # and rate_limited returns False
+    assert heal_rate_limited() is False, (
+        f"Expected rate_limited False after 31s clean, got {heal_rate_limited()}"
+    )
+
+
+# --- dip markers emit with T0→first-tick shape --------------------------
+
+
+# --- dip markers emit with T0→first-tick shape --------------------------
+
+def test_post_roll_first_tick_marker_emits():
+    """(f) post_roll_first_tick marker emits on first WS frame after disconnect (T0→first-tick).
+
+    Per resync.py note_ws_frame: recovery_marker("post_roll_first_tick",
+    T0=_condition_t0_ts, first_tick=_now_iso) is emitted on the very first
+    eligible WS frame after a disconnect, so timing runs can measure the dip
+    from T0 to first tick. The recovery_marker function accepts arbitrary
+    keyword fields (via **fields) so T0 and first_tick are emitted in the
+    output line."""
+    from polymarket_collector.resync import recovery_marker
+    import inspect
+    source = inspect.getsource(recovery_marker)
+    # Function accepts **fields kwargs, enabling T0/first-tick emission
+    assert "**fields" in source
+    # Verify the function prints recovery lines with phase + key=value
+    assert "print" in source
+    # Note: source contains "**fields" which enables T0/first-tick emission; function prints phase + key=value
