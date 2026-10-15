@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from polymarket_collector.storage.export import (
+    EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB,
     _build_in_subprocess,
     _date_partition_of,
     _get_schema,
@@ -24,6 +25,7 @@ from polymarket_collector.storage.export import (
     _load_market_id_map,
     _projected_read_columns,
     _stream_export_asset_dataset,
+    _worker_timeout_s,
 )
 
 
@@ -146,3 +148,104 @@ def test_stream_snapshot_completes_on_real_files(tmp_path) -> None:
 
     litter = [p for p in tmp_path.rglob("*.tmp.*") if p.is_file()]
     assert litter == []
+
+
+# ------------------------------------------- 2026-10-15: scaled whale-lane budget
+
+def _tiny_hive_1043(tmp_path):
+    """DOGE-event-scale hive: 1043 one-row snapshot files + markets_latest."""
+    import datetime as _dt
+    import os as _os
+    import sys as _sys
+    import time as _time
+
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from polymarket_collector.storage.schemas import snapshot_schema
+    from test_streaming_export import _snap
+
+    base = tmp_path / "data"
+    d = "2026-10-10"
+    day0 = (_dt.date.fromisoformat(d).toordinal() - 719163) * 86_400_000_000_000
+    mtime = _time.time() - 7200
+    part = base / "book_snapshots_500ms" / f"date={d}" / "asset=BTC"
+    part.mkdir(parents=True, exist_ok=True)
+    for f in range(1043):
+        p = part / f"f{f:05d}.parquet"
+        pq.write_table(pa.Table.from_pylist(
+            [_snap(f, day0 + f * 500_000_000)], schema=snapshot_schema(10)), str(p))
+        _os.utime(p, (mtime, mtime))
+    ml = base / "markets_latest"
+    ml.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"condition_id": ["0xaaa"], "market_id": ["42"]}),
+                   str(ml / "markets_latest.parquet"))
+    return base
+
+
+def test_worker_timeout_scales_with_file_count() -> None:
+    """2026-10-15 DOGE event (17:03 UTC): the carried worker processed
+    904/1043 files (~1.43M rows, ~800 rows/s ≈ ~2.0s/file) and died on the
+    flat 1800s TimeoutExpired -> 40-file PARTIAL fallback every cycle. The
+    budget now scales with the frozen input size — files × 2.5s (measured
+    ~2.0s/file + 25% margin) + 300s headroom, clamped to [1800, 3600],
+    avail-guarded — so the same lane gets 2907s (linear need ~2076s,
+    ~40% headroom) and bigger frozen lists ride the cap instead of timing
+    out. Never below the 1800s baseline; never above it on a tight box."""
+    assert _worker_timeout_s(0, avail_mb=99999) == 1800
+    assert _worker_timeout_s(None, avail_mb=99999) == 1800
+    assert _worker_timeout_s("garbage", avail_mb=99999) == 1800
+    assert _worker_timeout_s(400, avail_mb=99999) == 1800  # 1300 -> baseline floor
+    assert _worker_timeout_s(600, avail_mb=99999) == 1800  # 1800 -> baseline floor
+    assert _worker_timeout_s(1043, avail_mb=99999) == 2907  # the DOGE event list
+    assert _worker_timeout_s(1320, avail_mb=99999) == 3600  # 3600 -> cap
+    assert _worker_timeout_s(99999, avail_mb=99999) == 3600
+    # avail-guard: scaling above the baseline is only granted with memory
+    # headroom — a tight box keeps the 1800s baseline and the lane still
+    # fails closed into the bounded PARTIAL fallback exactly as before.
+    assert _worker_timeout_s(1043, avail_mb=550) == 1800
+    assert _worker_timeout_s(99999, avail_mb=550) == 1800
+    assert _worker_timeout_s(99999, avail_mb=EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB) == 3600
+    # small lanes keep the old budget regardless of the guard
+    assert _worker_timeout_s(10, avail_mb=0) == 1800
+
+
+def test_spawn_budget_scaled_at_call_site(tmp_path, monkeypatch, capsys) -> None:
+    """The parent passes the scaled budget to every worker spawn, keyed on
+    the pre-spawn manifest (ALL files <= cutoff, carried or not), and logs
+    the derivation honestly; a memory-tight box gets the 1800s baseline
+    (fail-closed fallback path unchanged)."""
+    import time as _t
+
+    import polymarket_collector.storage.export as E
+
+    base = _tiny_hive_1043(tmp_path)
+    out = tmp_path / "staging"
+    out.mkdir()
+    captured: list = []
+
+    def _fake_build(*a, **k):
+        captured.append({"timeout_s": k.get("timeout_s"),
+                         "skip_watermark": k.get("skip_watermark")})
+        return {}  # no __manifest__ -> coverage fails closed; nothing published
+
+    monkeypatch.setattr(E, "_build_in_subprocess", _fake_build)
+    monkeypatch.setattr(E, "_avail_mb", lambda: 99999)
+    E.export_per_asset_single_file(
+        str(base), out_dir=str(out), assets=["BTC"], timeframe_label="5m",
+        datasets=["book_snapshots_500ms"], rolling_window=True,
+        cutoff_ts=_t.time() + 300)
+    assert captured, "worker spawn must run"
+    assert captured[0]["timeout_s"] == 2907  # keyed on the full manifest n
+    logged = capsys.readouterr().out
+    assert "worker budget 2907s" in logged
+    assert "files=1043" in logged
+    assert "2.5s" in logged  # the measured per-file rate is in the derivation
+
+    # memory-tight box: the avail-guard keeps the baseline. Cycle 1 published
+    # nothing, so the spawn runs again through the same path.
+    monkeypatch.setattr(E, "_avail_mb", lambda: 550)
+    E.export_per_asset_single_file(
+        str(base), out_dir=str(out), assets=["BTC"], timeframe_label="5m",
+        datasets=["book_snapshots_500ms"], rolling_window=True,
+        cutoff_ts=_t.time() + 300)
+    assert captured[-1]["timeout_s"] == 1800
+    assert len(captured) == 2

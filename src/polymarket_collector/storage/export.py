@@ -4160,11 +4160,16 @@ def _stream_export_asset_dataset(
     snapshots worker scanned 1461/1754 files (~932k rows) at ~530 rows/s
     under collector contention and was killed at the 1800s timeout with
     steady ~60s/50-file progress all along; the full scan needs ~2100s.
-    Mechanism (b), chosen by measurement over (a) 3600s timeout (holds
-    _kaggle_lock ~35min every cycle: flushes skipped, live% ~0 for 40min,
-    backlog draining past 03:36), (c) per-date spawn splits (same total
-    CPU, same lock-hold, resets only the clock) and (d) nice/ionice
-    (worker just lasts longer): bound the scan scope to the DELTA. Files
+    Mechanism (b), chosen by measurement over (a) a then-fixed 3600s
+    timeout — at the time the tick held _kaggle_lock across the whole
+    export, so a longer worker starved flushes for ~35min every cycle.
+    That objection is STALE since b7b86fd (2026-10-13) made the kaggle
+    tick lock-free; (a) and (b) are now COMBINED: the carry keeps
+    per-cycle work at O(delta), and the caller scales the spawn budget to
+    the frozen input size (_worker_timeout_s, avail-guarded) so a real
+    whale delta + carry fits the budget instead of timing out into the
+    PARTIAL fallback (DOGE 2026-10-15: 904/1043 files in 1800s). The
+    mechanism itself is unchanged — bound the scan scope to the DELTA. Files
     with mtime <= skip_watermark["cutoff"] were already staged+verified
     (their rows are in the prior staging file, proven by rows+bytes
     recorded at commit and re-verified here against the file on disk);
@@ -4780,6 +4785,62 @@ _FALLBACK_INPROCESS_DATASETS = {"book_snapshots_500ms", "book_snapshots_clean", 
 EXPORT_FALLBACK_FILE_CAP = 40
 EXPORT_FALLBACK_MIN_AVAIL_MB = 1400
 
+# 2026-10-15 whale-lane budget (DOGE 17:03 UTC event): the flat 1800s cap
+# under-budgeted a real carried whale build — the worker WITH carry
+# (1,202,530 rows carried, 8 files skipped) processed 904/1043 files
+# (~1.43M rows, ~800 rows/s ≈ ~2.0s/file under live collector contention)
+# and died on TimeoutExpired, so the cycle ended in the 40-file PARTIAL
+# fallback. The old rejection of a bigger budget ("holds _kaggle_lock
+# ~35min/cycle, starves flushes") is STALE: since b7b86fd (2026-10-13) the
+# kaggle tick is lock-free — collector._kaggle_lane_tick flushes BEFORE
+# the spawn and runs the worker via to_thread with NOTHING holding
+# _kaggle_lock across it, so a longer worker no longer starves parquet
+# flushes/snapshots. The budget now scales with the frozen input size:
+#   timeout = clamp(files * 2.5s + 300s, 1800, 3600)
+# 2.5s/file = measured ~2.0s/file + 25% margin (DOGE run above, same
+# carried path this budget pays for); 300s covers the scan phase, carry
+# replay and the staging write. The 3600s cap is itself avail-guarded
+# (EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB): on a memory-tight box the budget
+# stays at the 1800s baseline and a too-big lane still fails closed into
+# the bounded PARTIAL fallback exactly as before. PARTIAL honesty, the
+# monotonic guard, the coverage gate and retention are untouched — only
+# the runaway backstop moves. The file count is the pre-spawn manifest n
+# (ALL files <= cutoff, carried or not), so the budget always covers
+# carry + delta, never just the delta.
+EXPORT_WORKER_TIMEOUT_BASE_S = 1800
+EXPORT_WORKER_TIMEOUT_MAX_S = 3600
+EXPORT_WORKER_TIMEOUT_S_PER_FILE = 2.5
+EXPORT_WORKER_TIMEOUT_HEADROOM_S = 300
+EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB = 1000
+
+
+def _worker_timeout_s(n_files, avail_mb: Optional[int] = None) -> int:
+    """Per-worker spawn budget scaled to the frozen input size (2026-10-15).
+
+    files * measured-rate + headroom, clamped to [base, cap]. Never below
+    the 1800s baseline (small lanes keep the old budget); above it only
+    with memory headroom — the avail-guard clamps a tight box back to the
+    baseline so the run fails closed into the bounded fallback as before.
+    """
+    try:
+        n = int(n_files or 0)
+    except Exception:
+        n = 0
+    budget = EXPORT_WORKER_TIMEOUT_BASE_S
+    if n > 0:
+        budget = int(n * EXPORT_WORKER_TIMEOUT_S_PER_FILE + EXPORT_WORKER_TIMEOUT_HEADROOM_S)
+        if budget < EXPORT_WORKER_TIMEOUT_BASE_S:
+            budget = EXPORT_WORKER_TIMEOUT_BASE_S
+        # avail-guard on the cap: scaling above the baseline is only granted
+        # with memory headroom — a tight box keeps the 1800s baseline and
+        # the lane fails closed into the bounded fallback exactly as before.
+        _avail = _avail_mb() if avail_mb is None else int(avail_mb)
+        if _avail < EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB:
+            budget = EXPORT_WORKER_TIMEOUT_BASE_S
+        elif budget > EXPORT_WORKER_TIMEOUT_MAX_S:
+            budget = EXPORT_WORKER_TIMEOUT_MAX_S
+    return budget
+
 
 def _build_worker_main(payload_path: str, result_path: str) -> None:
     """Subprocess entry: build tmp staging files for a few datasets.
@@ -4996,6 +5057,16 @@ def _build_in_subprocess(
     2026-10-07: projected/partitioned snapshot scans complete far inside
     this on a loaded box; the cap stays as a runaway backstop (never
     removed) and progress lines in the worker log tail diagnose stalls.
+    2026-10-15: the caller now passes a per-lane budget scaled to the
+    frozen input size (_worker_timeout_s — files * measured ~2.0s/file
+    + headroom, clamped to [1800, 3600], avail-guarded). The old
+    objection to a bigger budget — "raising it only lengthens the
+    _kaggle_lock hold, starving flushes" — is STALE since b7b86fd
+    (2026-10-13): collector._kaggle_lane_tick is kaggle-lock-FREE (flush
+    completes before the spawn; the worker runs via to_thread with
+    nothing holding _kaggle_lock), so a longer worker no longer starves
+    parquet flushes/snapshots. Fail-closed semantics are unchanged: any
+    timeout still returns None -> prior staging kept.
 
     skip_watermark (2026-10-12 P4 fix, optional): authorizes the worker's
     scope-skip — hive files at/below watermark["cutoff"] were already
@@ -5003,11 +5074,8 @@ def _build_in_subprocess(
     never rescanned; the prior staging file is carried through the same
     transform pipeline instead. The worker re-verifies the prior staging
     against rows+bytes before using it (any doubt -> full scan). The
-    spawn budget itself is unchanged: the SKIP brings per-cycle work from
-    O(window) to O(delta) — the P4 full scan needed ~2100s at ~530 rows/s
-    under collector contention (killed at 1800s, lock held 02:44->03:14,
-    flushes starved); raising the budget would only lengthen the lock-hold
-    without touching throughput.
+    spawn budget scales with the FULL frozen manifest (carried + delta
+    files), so the timeout always covers carry replay + delta scan.
     """
     import json as _js
     import subprocess as _sp
@@ -5320,10 +5388,23 @@ def export_per_asset_single_file(
                               f"verified (rows+bytes match watermark, cutoff "
                               f"{int(_skip_wm['cutoff'])}); worker skips already-staged files",
                               flush=True)
+                # 2026-10-15 scaled whale-lane budget: the frozen input size
+                # (manifest n = ALL files <= cutoff, carried or not) sets the
+                # spawn budget — files * measured rate + headroom, capped,
+                # avail-guarded. Never below the 1800s baseline; the timeout
+                # itself stays a hard fail-closed backstop.
+                _wt = _worker_timeout_s((_pre_mani or {}).get("n"))
+                if _wt != EXPORT_WORKER_TIMEOUT_BASE_S:
+                    print(f"[export] {ds}/{_au_one}: worker budget {_wt}s "
+                          f"(files={int((_pre_mani or {}).get('n') or 0)} × "
+                          f"{EXPORT_WORKER_TIMEOUT_S_PER_FILE}s + "
+                          f"{EXPORT_WORKER_TIMEOUT_HEADROOM_S}s headroom, cap "
+                          f"{EXPORT_WORKER_TIMEOUT_MAX_S}s, avail-guard "
+                          f"{EXPORT_WORKER_TIMEOUT_MIN_AVAIL_MB}MB)", flush=True)
                 _built_one = _build_in_subprocess(
                     base, out, [ds], [_asset], timeframe_label, l2_levels,
                     include_binance, rolling_window, cutoff_ts=cutoff_ts,
-                    skip_watermark=_skip_wm)
+                    skip_watermark=_skip_wm, timeout_s=_wt)
                 _out_path = out / f"{_au_one}_{ds}.parquet"
                 _rel = str(_out_path.relative_to(base) if _out_path.is_relative_to(base) else _out_path)
                 _failed = _built_one is None or (isinstance(_built_one, dict) and _built_one.get("error"))
@@ -6018,7 +6099,7 @@ def _write_staging_manifest(staging: Path, dataset_slug: str, timeframe_label: s
         "dataset": dataset_slug,
         "timeframe": timeframe_label,
         "built_at_utc": _dt_m.datetime.now(_dt_m.timezone.utc).isoformat(),
-        "builder": "bounded-worker (08ea3d4: column-projected, date-partitioned, 60s progress, 1800s timeout/420s api budget, fail-closed, tmp+rename)",
+        "builder": "bounded-worker (08ea3d4: column-projected, date-partitioned, 60s progress, scaled 1800-3600s timeout (2026-10-15: files×rate+headroom, avail-guarded)/420s api budget, fail-closed, tmp+rename)",
         "total_rows": _total,
         "files": files,
     }
@@ -6050,9 +6131,10 @@ def prepare_kaggle_staging_15m(
 
     Thin wrapper over prepare_kaggle_staging_5m (same bounded-worker path:
     column-projected reads, date-partitioned streaming, 60s progress logs,
-    1800s worker timeout / 420s Data-API budget, RSS cap, fail-closed
-    coverage manifests, atomic tmp+rename; ts_source coerced to int64
-    epoch-ms by _normalize_ts_source_int in the streaming transform).
+    scaled 1800-3600s worker timeout (2026-10-15) / 420s Data-API budget,
+    RSS cap, fail-closed coverage manifests, atomic tmp+rename;
+    ts_source coerced to int64 epoch-ms by _normalize_ts_source_int in the
+    streaming transform).
     No 4h/1d builder is added here — out of scope.
 
     Enablement is a double gate, never automatic: the caller must pass

@@ -546,3 +546,58 @@ def test_release_arrow_pool_best_effort() -> None:
     """The mimalloc-arena purge helper is safe anywhere and returns None
     (best-effort; the pool API is exercised, failures swallowed)."""
     assert E._release_arrow_pool() is None
+
+
+def test_scaled_spawn_budget_covers_carry_plus_delta(monkeypatch, tmp_path) -> None:
+    """2026-10-15 whale-lane budget: the spawn budget is keyed on the
+    pre-spawn manifest — ALL frozen files (carried + delta), never the
+    delta-only count — because the carried worker pays for BOTH the carry
+    replay and the delta scan (DOGE 17:03 UTC event: 1,202,530 carried rows
+    + 904/1043 delta files processed inside 1800s, ~2.0s/file, then
+    TimeoutExpired -> PARTIAL). 1043 frozen files authorize 2907s
+    (files x 2.5s + 300s headroom, avail-guarded): ~40% headroom over the
+    measured ~2076s linear need. A delta-only key (1040 -> 1407s -> 1800
+    baseline) would re-create the exact under-budget that killed DOGE."""
+    base = _dated_hive(tmp_path, {"2026-10-10": (3, 1)}, mtime=time.time() - 7200)
+    out = tmp_path / "staging"
+    out.mkdir()
+    c1 = time.time()
+    E.export_per_asset_single_file(
+        str(base), out_dir=str(out), assets=["BTC"], timeframe_label="5m",
+        datasets=[_DS], rolling_window=True, cutoff_ts=c1)
+    staged = out / "BTC_book_snapshots_500ms.parquet"
+    assert pq.read_metadata(str(staged)).num_rows == 3
+    prog = json.loads((base / "kaggle_staging" / "_progress.json").read_text())
+    assert prog[f"5m/{_DS}/BTC"]["rows"] == 3  # cycle-1 watermark recorded
+
+    # 1040 fresh delta files: 3 carry + 1040 delta = the DOGE event's 1043
+    _now = time.time()
+    part = base / _DS / "date=2026-10-11" / "asset=BTC"
+    for f in range(1040):
+        _write_file(part, f"d{f:05d}.parquet", "2026-10-11", f, 1, _now + f)
+    _age_out_progress(base)
+
+    captured: list = []
+
+    def _fake_build(*a, **k):
+        captured.append({"timeout_s": k.get("timeout_s"),
+                         "skip_watermark": k.get("skip_watermark")})
+        return {}  # no __manifest__ -> coverage fails closed; prior kept
+
+    monkeypatch.setattr(E, "_build_in_subprocess", _fake_build)
+    monkeypatch.setattr(E, "_avail_mb", lambda: 99999)
+    E.export_per_asset_single_file(
+        str(base), out_dir=str(out), assets=["BTC"], timeframe_label="5m",
+        datasets=[_DS], rolling_window=True, cutoff_ts=_now + 2000)
+    assert captured, "worker spawn must run"
+    assert captured[0]["skip_watermark"] is not None  # carry authorized
+    # budget keyed on the FULL manifest (carry + delta), not the delta slice
+    assert captured[0]["timeout_s"] == E._worker_timeout_s(1043) == 2907
+    # and the coverage/watermark guards are untouched: the fake build proved
+    # nothing, so the prior staging is kept and only the freshness ts moves —
+    # the recorded coverage (cutoff/rows/bytes) must NOT advance (a failed
+    # build never widens what the next cycle may skip).
+    assert pq.read_metadata(str(staged)).num_rows == 3
+    prog2 = json.loads((base / "kaggle_staging" / "_progress.json").read_text())
+    _w1, _w2 = prog[f"5m/{_DS}/BTC"], prog2[f"5m/{_DS}/BTC"]
+    assert (_w2["cutoff"], _w2["rows"], _w2["bytes"]) == (_w1["cutoff"], _w1["rows"], _w1["bytes"])
