@@ -2506,8 +2506,22 @@ def build_markets_summary(
                 dist = valid_w.group_by("condition_id").aggregate([("wallet", "count_distinct")])
                 for r in dist.to_pylist():
                     traders_by_cid[r["condition_id"]] = int(r["wallet_count_distinct"] or 0)
+                del dist
+            del agg, valid_w
         except Exception as e:
             print(f"[export] WARN markets_summary trades aggregation failed: {e}")
+        # 2026-10-16 finalize-RSS fix (b7b86fd per-dataset del/gc pattern): the
+        # trades narrow concat + group_by transients measured +350MB peak on
+        # the 2M-row 5m staging and used to stay REFERENCED for the whole
+        # rest of the build (OHLC fold + chainlink + final table), stacking
+        # that peak on the fold's. Free them at the phase boundary. The concat
+        # + single group_by stays EXACTLY as-is: per-file aggregation then
+        # merging measured last-ULP notional differences on 1972/20434 real
+        # cids (float sum is order-sensitive) — parity over byte-cost.
+        del t, cols, trades
+        import gc as _gc_trades
+
+        _gc_trades.collect()
 
     # --- snapshots (clean): outcome-token mid OHLC + average spread per condition_id ---
     # 2026-09-10 OOM: prefer the just-built staging clean files (lane-pure,
@@ -2515,9 +2529,15 @@ def build_markets_summary(
     # as fallback. Per-cid state stays KBs either way; open/close = row at
     # min/max ts among non-null mids (matches sorted first/last).
     ohlc_by_cid: Dict[str, dict] = {}
+    # 2026-10-16 finalize-RSS fix: project the 6 fold columns AT READ TIME.
+    # The clean staging/hive files carry the full 842-column L2 schema;
+    # iter_batches without columns= decompressed EVERY column of every row
+    # group through the fold — measured +748MB peak in the collector parent
+    # (5m lane, 3.45M clean rows), the dominant term of the 2.68GB pm2 kill
+    # (2.2GB cap, 23:21 Oct-15). Same rows, same per-cid math — the fold is
+    # order-independent by construction (min/max ts, low/high, running sums).
+    _FOLD_NEED = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
     try:
-        from .streaming import stream_batches as _stream_batches
-
         _acc: Dict[str, dict] = {}
         _staging_clean: list = []
         try:
@@ -2531,10 +2551,9 @@ def build_markets_summary(
             _staging_clean = []
 
         def _fold_batch(_b: pa.Table) -> None:
-            _need = ["condition_id", "ts_snapshot_ns", "up_bid", "up_ask", "down_bid", "down_ask"]
-            if not all(c in _b.schema.names for c in _need):
+            if not all(c in _b.schema.names for c in _FOLD_NEED):
                 return
-            _cols = {c: _b.column(c).to_pylist() for c in _need}
+            _cols = {c: _b.column(c).to_pylist() for c in _FOLD_NEED}
             for _i in range(_b.num_rows):
                 _cid = _cols["condition_id"][_i]
                 _ts = _cols["ts_snapshot_ns"][_i]
@@ -2602,7 +2621,11 @@ def build_markets_summary(
                 except Exception:
                     continue
                 try:
-                    for _chunk in _pf.iter_batches(batch_size=20000):
+                    # projection (columns=_FOLD_NEED): a file missing a needed
+                    # column raises here, is caught below and skipped — exactly
+                    # the old outcome where every batch failed the fold's
+                    # all-columns-present guard and contributed nothing.
+                    for _chunk in _pf.iter_batches(batch_size=20000, columns=_FOLD_NEED):
                         _bt = pa.Table.from_batches([_chunk])
                         if _bt.num_rows == 0:
                             continue
@@ -2611,9 +2634,25 @@ def build_markets_summary(
                 except Exception:
                     continue
         else:
-            for _bt in _stream_batches(base, "book_snapshots_clean", None, ts_col="ts_snapshot_ns"):
-                _fold_batch(_bt)
-                del _bt
+            # Hive fallback: same projection — stream_batches reads whole rows
+            # and the clean hive shares the 842-column schema, so the old
+            # fallback had the same whole-file blow-up as the staging loop.
+            from .streaming import iter_source_files as _iter_clean_files
+
+            for _fp in _iter_clean_files(base, "book_snapshots_clean", None, ts_col="ts_snapshot_ns"):
+                try:
+                    _pf = pq.ParquetFile(str(_fp))
+                except Exception:
+                    continue
+                try:
+                    for _chunk in _pf.iter_batches(batch_size=20000, columns=_FOLD_NEED):
+                        _bt = pa.Table.from_batches([_chunk])
+                        if _bt.num_rows == 0:
+                            continue
+                        _fold_batch(_bt)
+                        del _bt
+                except Exception:
+                    continue
         for _cid, _a in _acc.items():
             ohlc_by_cid[_cid] = {
                 "up_open": _a["up_open"], "up_close": _a["up_close"],
