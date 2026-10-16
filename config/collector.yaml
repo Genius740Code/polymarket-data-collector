@@ -54,7 +54,12 @@ kaggle:
   # quarantine + 1G guard ~= 3.8G. Tradeoff: ~14 versions/day/lane on Kaggle.
   # 2026-10-03: 4->6h headroom for the 1h upload cycle (data disk 6%,
   # retention is cheap; stalls are not).
-  local_retention_hours: 6
+  # 2026-10-16: 6->2h — data disk 98%, prune/verify race net-zero, hive 18G
+  # (snapshots 6.7G + book_events 11G; gap evidence NEVER pruned per AGENTS.md).
+  # 2-lane cadence 1h (2x1800s) needs >=2h headroom per guard rule above:
+  # 2h keeps exactly 2x. Deletes ONLY already-uploaded rows via guard;
+  # Kaggle rolling versions keep full history. Revert to 6h on a bigger disk.
+  local_retention_hours: 2
   # 2026-09-20 disk-full fix: the prune MOVES files to data/_quarantine/
   # (same filesystem) instead of unlinking — without a bound every "prune"
   # frees 0 bytes. reap_quarantine() deletes quarantined files past the
