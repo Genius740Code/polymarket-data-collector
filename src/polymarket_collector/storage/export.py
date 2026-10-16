@@ -6933,9 +6933,19 @@ def cleanup_local_data(
 
     Called ONLY after a verified Kaggle upload. Deletes local parquet files whose
     every row is (a) from a market that ENDED before the cutoff and (b) therefore
-    already included in at least one uploaded version. The cutoff is
-    ``min(now, upload_checkpoint) - retention_hours`` — the retention is the
-    "leeway" window kept locally just in case.
+    already included in at least one uploaded version. PER-LANE PRUNE
+    INDEPENDENCE (2026-10-16, mirrors f3f1b77's per-lane non-blocking upload):
+    each lane is its own Kaggle dataset (separate slug, separate versions) and
+    its staging is series-filtered to its OWN markets, so a file's cutoff is
+    ``min(now, own verified checkpoint) - retention_hours`` over the lanes that
+    OWN rows in the file (per-condition series_id/window_size from
+    markets_latest). A stale or never-uploaded lane blocks only files that
+    contain its own markets' rows. Two narrow cross-lane couplings stay,
+    documented in the code: (1) the shared hive interleaves lanes' rows in one
+    flush file, so every OWNING lane of a file must have shipped it, and rows
+    whose lane cannot be attributed keep the cross-lane (all-lanes) gate; (2)
+    timestamp-only chainlink_events carries no condition_id and every lane's
+    dataset ships its own copy, so it keeps the cross-lane gate.
 
     Semantics per file (never per row — files are the delete unit after compaction):
     - condition-bearing datasets (snapshots, clean view, book_events, trades):
@@ -6960,8 +6970,8 @@ def cleanup_local_data(
     Quarantine bound (2026-09-20 disk-full fix): the prune MOVES files to
     <data_dir>/_quarantine/ (same filesystem) instead of unlinking, so without
     a bound every "prune" frees 0 bytes. The quarantine reap runs ONLY after
-    a verified upload checkpoint is established (fail closed — no checkpoint,
-    no reap, no prune), bounded by quarantine_retention_hours /
+    a verified upload checkpoint is established (fail closed — no verified
+    upload on ANY lane, no reap, no prune), bounded by quarantine_retention_hours /
     quarantine_max_bytes, and each expiry batch emits a coverage_gap
     collector_events row. The reaper only ever removes already-uploaded or
     unreadable review-buffer data, never the live hive.
@@ -7037,16 +7047,20 @@ def cleanup_local_data(
         _lane_ds[tf_label] = "gghgg1/polymarket-5m-crypto"
     _per_lane: dict = {}
 
-    # Resolve checkpoint: MINIMUM last-upload across ALL enabled lanes.
-    # 2026-09-11 DATA-LOSS FIX: lanes share one hive (rows for every lane
-    # interleave in the same flush files), but uploads happen one lane per
-    # tick. The old max() checkpoint let a fresh 5m upload authorize deletion
-    # of 15m/1h/4h rows those lanes had never uploaded — 34h of 15m/1h/4h
-    # snapshots (Sep 9 20:07 → Sep 11 06:39) were deleted unrecoverably.
-    # A row is safe to delete only once ITS lane uploaded it, so the slowest
-    # lane gates the prune. As round-robin uploads catch lanes up, the min
-    # advances and the prune bites on its own. Never-uploaded lanes are
-    # excluded (their rows are recent by construction) but WARN loudly.
+    # Resolve PER-LANE verified checkpoints (2026-10-16 per-lane prune
+    # independence, mirroring f3f1b77's per-lane non-blocking UPLOAD).
+    # Lanes are INDEPENDENT Kaggle datasets (separate slugs, separate
+    # version histories) and each lane's staging is series-filtered to its
+    # OWN markets — only the OWNING lane's upload ever carries a row. The
+    # old gate took min(last_upload) across ALL lanes and returned {} when
+    # ANY lane had no verified upload, so one stale lane (1h, 27h stale on
+    # 2026-10-16: 3.5h+ whale builds, timeouts/kills) vetoed EVERY lane's
+    # prune while 5m verified hourly — staging grew to 18G and the disk hit
+    # 99.97%. Now each lane's checkpoint gates only rows that lane OWNS
+    # (attribution per file below); a stale or never-uploaded lane blocks
+    # only its own rows' files. 2026-09-11 data-loss class stays closed:
+    # a fresh lane still cannot authorize deleting rows another lane owns
+    # and has not shipped — the shared-hive coupling is scoped per file.
     if checkpoint_ms is None:
         _lanes: list = list(_lanes_cfg)
         for _lane in _lanes:
@@ -7075,44 +7089,44 @@ def cleanup_local_data(
             if _best is not None:
                 _per_lane[_lane] = _best
             else:
+                # 2026-10-16: no longer a global veto — this lane gates only
+                # files containing its OWN markets' rows (fail closed for
+                # those files, resolved per file below).
                 print(f"[prune] WARN lane {_lane} has no verified upload yet — "
-                      f"pruning skipped (fail closed; its history is at risk until it uploads)")
-        _missing_lanes = [l for l in _lanes if l not in _per_lane]
-        if _missing_lanes:
-            # Fail closed: a lane with no verified upload must gate the prune.
-            # The old code excluded such lanes so other lanes authorized
-            # deleting rows the stalled lane never shipped (2026-09-11 class).
-            # Tradeoff: a newly added lane blocks pruning until its first
-            # upload — budget disk for that.
-            print(f"[prune] lanes {_missing_lanes} have no verified upload — pruning skipped (fail closed)")
-            return {}
-        if _per_lane:
-            _slow = min(_per_lane, key=lambda k: _per_lane[k])
-            checkpoint_ms = min(_per_lane.values())
-            try:
-                import datetime as _dt_slow
-                _slow_iso = _dt_slow.datetime.fromtimestamp(
-                    checkpoint_ms / 1000, tz=_dt_slow.timezone.utc).isoformat()
-            except Exception:
-                _slow_iso = str(checkpoint_ms)
-            print(f"[prune] checkpoint gated by slowest lane {_slow} @ {_slow_iso} "
-                  f"(lanes={_per_lane})")
-        else:
+                      f"it gates only its own rows (fail closed for them)")
+        if not _per_lane:
             # No verified upload on ANY lane — fail closed, never prune blind.
             print("[prune] no verified Kaggle upload on any lane — pruning skipped (fail closed)")
             return {}
-    # 2026-09-12 coverage proof (per DATASET): a hive file of dataset D is
-    # deletable only if EVERY lane's uploaded staging for D included it.
+        try:
+            import datetime as _dt_ckpt
+            _iso_by_lane = {k: _dt_ckpt.datetime.fromtimestamp(
+                v / 1000, tz=_dt_ckpt.timezone.utc).isoformat() for k, v in _per_lane.items()}
+        except Exception:
+            _iso_by_lane = dict(_per_lane)
+        print(f"[prune] per-lane verified checkpoints (each lane gates only its own rows): {_iso_by_lane}")
+    else:
+        # explicit-checkpoint callers: every lane is known-verified at this ms
+        for _lane in _lanes_cfg:
+            _per_lane[_lane] = int(checkpoint_ms)
+    # 2026-09-12 coverage proof (per DATASET, 2026-10-16 scoped per OWNING
+    # lane): a hive file of dataset D is deletable only if the uploaded
+    # staging for D of every lane that OWNS rows in it included it.
     # Staging freshness per (lane, dataset) = oldest staging file mtime for
     # D in that lane's staging dir, minus a build-slack (a staging file
     # committed at T covers hive files existing at build start < T; lane
     # builds take <3h, so T-3h is a sound lower bound).
-    # Why per-dataset, not per-lane: lanes share one hive but upload
-    # different datasets at different freshness (gate-skipped trades keep
-    # days-old priors while snapshots rebuild hourly). Per-lane gating would
-    # either delete rows whose staging is stale (data loss, observed
-    # 2026-09-11) or block all pruning on one stale dataset (disk death
-    # spiral). Per-dataset freshness prunes exactly what is proven uploaded.
+    # Freshness stays per (lane, dataset) — the 2026-09-12 proof that a
+    # hive file is deletable only if the uploading lane's staging for D
+    # included it. Staging freshness per (lane, dataset) = oldest staging
+    # file mtime for D in that lane's staging dir, minus a build-slack (a
+    # staging file committed at T covers hive files existing at build
+    # start < T; lane builds take <3h, so T-3h is a sound lower bound).
+    # 2026-10-16: the cutoffs are kept PER (lane, dataset) here and applied
+    # per FILE to that file's OWNING lanes only — the old min() across all
+    # lanes re-coupled independent datasets (disk death spiral, see the
+    # checkpoint block above); gating by a NON-owning lane's staging would
+    # wrongly delete rows (data loss, observed 2026-09-11).
     # Staging files map: {ASSET}_{ds}.parquet -> ds; markets.parquet ->
     # markets_log; collector_events/resync_episodes.parquet -> themselves
     # (markets_summary is derived — gates nothing).
@@ -7139,7 +7153,7 @@ def cleanup_local_data(
                 break
         if _sdir is None:
             print(f"[prune] WARN lane {_lane} has no staging dir — "
-                  f"not gating coverage (its history is at risk until it uploads)")
+                  f"its own rows stay kept (no verified coverage proof for them)")
             continue
         _per_ds_min: dict = {}
         try:
@@ -7175,32 +7189,54 @@ def cleanup_local_data(
                       f"verified upload — unverified staging does not gate coverage")
                 continue
             _fresh_by_ds.setdefault(_ds, {})[_lane] = _mt
-    _fresh_cutoff_by_ds: dict = {}
-    for _ds, _per_lane in _fresh_by_ds.items():
-        _missing = [l for l in _lanes_b if l not in _per_lane]
-        if _missing:
-            print(f"[prune] WARN dataset {_ds} missing staging for lanes {_missing} — "
-                  f"its hive files are never pruned until every lane ships it")
-            continue
-        _fresh_cutoff_by_ds[_ds] = min(_per_lane.values()) - _BUILD_SLACK_MS
-    if _fresh_cutoff_by_ds:
+    # Per-(lane, dataset) coverage cutoffs (2026-10-16): the old code took
+    # min() across ALL lanes per dataset, so one stale lane's staging
+    # freshness gated every OTHER lane's rows too. Lane ownership is now
+    # resolved per FILE (owning-lane gate in the scan below); here we keep
+    # each (lane, dataset) pair's own verified-staging cutoff, plus the max
+    # per dataset for the stat-only early-keep ("newer than every lane's
+    # staging" — never reads the file). A lane with no verified staging for
+    # D simply keeps its own rows' files; it no longer blocks other lanes.
+    _fc_lane_ds: dict = {}
+    _fc_max_ds: dict = {}
+    for _ds, _per_ds_fresh in _fresh_by_ds.items():
+        for _lane, _mt in _per_ds_fresh.items():
+            _fc_lane_ds.setdefault(_ds, {})[_lane] = _mt - _BUILD_SLACK_MS
+        _fc_max_ds[_ds] = max(_per_ds_fresh.values()) - _BUILD_SLACK_MS
+    if _fc_max_ds:
         try:
             import datetime as _dt_fresh
             _show = {k: _dt_fresh.datetime.fromtimestamp(v / 1000, tz=_dt_fresh.timezone.utc).isoformat()
-                     for k, v in _fresh_cutoff_by_ds.items()}
+                     for k, v in sorted(_fc_max_ds.items())}
         except Exception:
-            _show = _fresh_cutoff_by_ds
-        print(f"[prune] coverage proof per dataset (hive files newer than these are kept): {_show}")
+            _show = dict(_fc_max_ds)
+        print(f"[prune] coverage proof per (lane, dataset) "
+              f"(a lane's rows newer than its own cutoff are kept): {_show}")
     else:
         print("[prune] no per-dataset staging freshness available — coverage proof blocks all deletes")
     now_ms = int(_dt2.datetime.now(tz=_dt2.timezone.utc).timestamp() * 1000)
-    cutoff_ms = min(now_ms, checkpoint_ms) - int(retention_hours) * 3600 * 1000
+    _retention_ms = int(retention_hours) * 3600 * 1000
+    # Market-end cutoff PER LANE (2026-10-16): a lane's rows are deletable
+    # once that lane's OWN verified upload is retention-hours behind. The
+    # old single global cutoff (min across all lanes — the "slowest-lane
+    # checkpoint") survives only as the min over a file's OWNING lanes,
+    # resolved per file in the scan below.
+    _cutoff_by_lane: dict = {}
+    for _lane, _ck in _per_lane.items():
+        _cutoff_by_lane[_lane] = min(now_ms, int(_ck)) - _retention_ms
+    _min_cutoff = min(_cutoff_by_lane.values()) if _cutoff_by_lane else None
+    # upper bound over all lanes — the stat-only writer-file fast path
+    # (a flush file newer than this can never pass any owning lane's cutoff)
+    _ub_cutoff = max(_cutoff_by_lane.values()) if _cutoff_by_lane else None
 
-    # Gated quarantine reap: runs ONLY after a verified upload checkpoint
-    # exists (we are past every fail-closed return above). Deletions are
-    # already-uploaded or unreadable rows only, and each deletion batch
-    # emits a coverage_gap collector_events row so the gap trail stays
-    # honest even as the review buffer expires.
+    # Gated quarantine reap: runs ONLY after at least one lane has a
+    # verified upload checkpoint (the no-lane fail-closed return above).
+    # Quarantined rows were already proven uploaded when they were moved
+    # (or are unreadable review stubs), and the reap keeps its own
+    # retention-hours / max-bytes bounds, so per-lane independence extends
+    # here too — one stale lane no longer pins the review buffer. Deletion
+    # batches emit a coverage_gap collector_events row so the gap trail
+    # stays honest even as the review buffer expires.
     if reap_quarantine:
         if quarantine_retention_hours is None or quarantine_max_bytes is None:
             try:
@@ -7224,24 +7260,79 @@ def cleanup_local_data(
         except Exception as _reap_e:
             print(f"[prune] WARN quarantine reap failed (prune continues): {_reap_e}")
 
-    # condition_id -> market_end map (never pruned source of truth)
+    # condition_id -> market_end map + condition_id -> owning-LANE map
+    # (never-pruned source of truth). The lane map feeds the per-file
+    # owning-lane gate below (2026-10-16): each lane's staging is
+    # series-filtered to its own markets, so only the OWNING lane's upload
+    # ever carries a row. When markets_latest predates the
+    # series_id/window_size_seconds columns the map is empty and every file
+    # falls back to the conservative cross-lane gate — never delete rows a
+    # lane may own but has not shipped (fail closed).
     end_by_cid: dict = {}
+    lane_by_cid: dict = {}
+    _lanes_cfg_set = set(_lanes_cfg)
+    _ws_to_lane: dict = {}
+    try:
+        from ..config import CollectorConfig as _CCws
+        for _l in _lanes_cfg:
+            try:
+                _ws_to_lane[int(_CCws.WINDOW_SIZES_SECONDS[str(_l).lower()])] = str(_l).lower()
+            except Exception:
+                continue
+    except Exception:
+        _ws_to_lane = {}
     latest = base / "markets_latest" / "markets_latest.parquet"
     try:
         if latest.exists():
-            # 2026-10-13: column-subset read — the map only needs these two
+            # 2026-10-13: column-subset read — the map only needs a few
             # fields; a missing column fails the read and lands in the
-            # except below (pruning skipped, fail closed — same as the old
-            # schema-name check).
-            tbl = read_table(latest, columns=["condition_id", "market_end_ts_ms"])
+            # fallback 2-column read or the except below (pruning skipped,
+            # fail closed — same as the old schema-name check). 2026-10-16:
+            # also projects series_id + window_size_seconds for lane
+            # attribution; older schemas without them retry the 2-column
+            # read and leave lane_by_cid empty (cross-lane gate).
+            tbl = None
+            try:
+                tbl = read_table(latest, columns=["condition_id", "market_end_ts_ms",
+                                                  "series_id", "window_size_seconds"])
+            except Exception:
+                tbl = None
+            if tbl is None or "series_id" not in tbl.schema.names \
+                    or "window_size_seconds" not in tbl.schema.names:
+                tbl = read_table(latest, columns=["condition_id", "market_end_ts_ms"])
             if tbl is not None and "condition_id" in tbl.schema.names and "market_end_ts_ms" in tbl.schema.names:
-                for cid, me in zip(tbl.column("condition_id").to_pylist(),
-                                   tbl.column("market_end_ts_ms").to_pylist()):
+                _cids_l = tbl.column("condition_id").to_pylist()
+                _ends_l = tbl.column("market_end_ts_ms").to_pylist()
+                _sers_l = (tbl.column("series_id").to_pylist()
+                           if "series_id" in tbl.schema.names else [None] * len(_cids_l))
+                _wss_l = (tbl.column("window_size_seconds").to_pylist()
+                          if "window_size_seconds" in tbl.schema.names else [None] * len(_cids_l))
+                for cid, me, se, ws in zip(_cids_l, _ends_l, _sers_l, _wss_l):
                     if cid and me is not None:
                         try:
                             end_by_cid[str(cid)] = int(me)
                         except Exception:
                             pass
+                    if not cid:
+                        continue
+                    _lane = None
+                    try:
+                        _se_s = str(se) if se else ""
+                        if _se_s.upper() in _WEATHER_SERIES_IDS:
+                            # every lane's staging ships the weather rows
+                            # (_lane_series_mask OR-mask) — nobody owns them
+                            # alone -> unattributable
+                            _lane = None
+                        elif "-" in _se_s:
+                            _sfx = _se_s.rsplit("-", 1)[-1].strip().lower()
+                            if _sfx in _lanes_cfg_set:
+                                _lane = _sfx
+                        if _lane is None and ws is not None:
+                            _lane = _ws_to_lane.get(int(ws))
+                    except Exception:
+                        _lane = None
+                    # None = unattributable -> cross-lane gate for that file
+                    lane_by_cid[str(cid)] = _lane
                 del tbl
     except Exception as e:
         print(f"[prune] WARN could not read markets_latest — pruning skipped this cycle: {e}")
@@ -7285,44 +7376,70 @@ def cleanup_local_data(
 
     import re as _re_prune
     _writer_pat = _re_prune.compile(r".+_\d+\.parquet$")
+
+    def _required_lanes(cids) -> set | None:
+        """Lanes whose rows this file provably contains (shared-hive gate).
+
+        2026-10-16: the shared hive interleaves lanes' rows in one flush
+        file and each lane's staging is series-filtered, so ONLY the owning
+        lane's upload ever carries a row — a file is deletable only after
+        EVERY owning lane shipped it. A stale lane therefore blocks only
+        files that contain its own markets' rows. Any condition whose lane
+        cannot be proven (missing/NULL series_id + window_size, weather
+        series, disabled lanes) returns None: the file falls back to the
+        conservative CROSS-LANE gate (all enabled lanes must have shipped
+        it) — the 2026-09-11 data-loss class stays closed.
+        """
+        req: set = set()
+        for c in cids:
+            lane = lane_by_cid.get(str(c))
+            if not lane or lane not in _lanes_cfg_set:
+                return None
+            req.add(lane)
+        return req
+
     for dataset in CID_DATASETS + TS_DATASETS:
         if dataset in skipped:
             continue
         ds_root = base / dataset
         if not ds_root.exists():
             continue
+        # No lane has verified staging for D — nothing of D can be proven
+        # uploaded: fail closed for the whole dataset (unchanged).
+        _fc_max = _fc_max_ds.get(dataset)
+        if _fc_max is None:
+            continue
         for p in sorted(ds_root.rglob("*.parquet")):
             if p.name.endswith(".tmp"):
                 continue
             try:
-                # 2026-09-12 coverage proof (see above): never delete a hive
-                # file of dataset D newer than every lane's staging for D —
-                # no uploaded staging could have included it. Pure stat.
-                _fc = _fresh_cutoff_by_ds.get(dataset)
-                if _fc is None:
-                    continue  # freshness unknown for D — fail closed
+                _mt = None
                 try:
-                    if int(p.stat().st_mtime * 1000) > _fc:
-                        continue
+                    _mt = int(p.stat().st_mtime * 1000)
                 except OSError:
                     pass
+                # 2026-09-12 coverage proof (see above): never delete a hive
+                # file of dataset D newer than EVERY lane's staging for D —
+                # no uploaded staging could have included it. Pure stat;
+                # files under this bound take the per-owning-lane check below.
+                if _mt is not None and _mt > _fc_max:
+                    continue
                 # 2026-09-11 OOM: the old code read_table()'d EVERY hive file
                 # fully (70k+ files, GBs transient in the LONG-LIVED parent)
                 # and the kernel OOM-killed the collector mid-prune. Two guards:
                 # (a) writer-named flush files ({ds}_{ts}.parquet) carry only
                 # rows collected around their mtime — mtime > cutoff proves a
                 # live market inside, so they are kept WITHOUT any read.
+                # _ub_cutoff is the max over all lanes' cutoffs, so this stat
+                # only ever keeps files no owning-lane cutoff could pass.
                 # Compacted files (mtime = compact time, not content time)
                 # always take the content check below. Both rules are
                 # conservative: they only ever keep more, never delete wrongly.
                 # (b) the content check projects the single decision column
                 # instead of materializing 120-col wide rows.
-                if _writer_pat.match(p.name):
-                    try:
-                        if int(p.stat().st_mtime * 1000) > cutoff_ms:
-                            continue
-                    except OSError:
-                        pass
+                if _mt is not None and _ub_cutoff is not None \
+                        and _writer_pat.match(p.name) and _mt > _ub_cutoff:
+                    continue
                 if dataset in CID_DATASETS:
                     # 2026-10-13: bounded batched scan (see
                     # _scan_file_cids_bounded) — the old read_table of the
@@ -7337,19 +7454,57 @@ def cleanup_local_data(
                     ends = [end_by_cid.get(c) for c in cids]
                     if any(e is None for e in ends):
                         continue  # unknown condition — conservative keep
-                    if max(ends) >= cutoff_ms:
+                    # 2026-10-16 per-lane prune independence: resolve which
+                    # lanes OWN this file's rows; each owning lane gates the
+                    # file on its OWN verified checkpoint + coverage proof.
+                    # Unattributable rows keep the cross-lane gate.
+                    _req = _required_lanes(cids)
+                    if _req is None:
+                        _req = set(_lanes_cfg)
+                    _miss = [l for l in _req if l not in _cutoff_by_lane]
+                    if _miss:
+                        continue  # an owning lane never verified — blocks only its own rows' files
+                    _cutoff = min(_cutoff_by_lane[l] for l in _req)
+                    _covered = True
+                    for _l in _req:
+                        _fc_l = _fc_lane_ds.get(dataset, {}).get(_l)
+                        if _fc_l is None or (_mt is not None and _mt > _fc_l):
+                            _covered = False
+                            break
+                    if not _covered:
+                        continue  # an owning lane's verified staging does not cover this file
+                    if _mt is not None and _writer_pat.match(p.name) and _mt > _cutoff:
+                        continue
+                    if max(ends) >= _cutoff:
                         continue  # some market inside the retention leeway — keep
-                    _delete_file(p, _n, f"all markets ended < cutoff {cutoff_ms}")
+                    _delete_file(p, _n, f"all markets ended < cutoff {_cutoff} "
+                                        f"(owning lanes {sorted(_req)})")
                 elif dataset in TS_DATASETS:
                     # timestamp-only datasets: age the FILE by its newest row.
                     # 2026-10-13: bounded batched scan (see
                     # _scan_file_max_ts_ns_bounded) — the old full-column
                     # read+to_pylist had the same whole-file materialization
                     # blast radius as the CID branch above.
+                    # 2026-10-16: these rows carry no condition_id, so lane
+                    # ownership is unprovable — and every lane's dataset
+                    # ships its own copy of the asset-level feed. The
+                    # cross-lane gate STAYS for them (narrow coupling: all
+                    # enabled lanes must have shipped the file).
+                    if any(l not in _cutoff_by_lane for l in _lanes_cfg):
+                        continue  # a lane never verified — fail closed for this dataset
+                    _covered = True
+                    for _l in _lanes_cfg:
+                        _fc_l = _fc_lane_ds.get(dataset, {}).get(_l)
+                        if _fc_l is None or (_mt is not None and _mt > _fc_l):
+                            _covered = False
+                            break
+                    if not _covered:
+                        continue
+                    _cutoff_ts = min(_cutoff_by_lane[l] for l in _lanes_cfg)
                     max_ts_ns = _scan_file_max_ts_ns_bounded(p)
                     if max_ts_ns is None:
                         continue
-                    if max_ts_ns // 1_000_000 < cutoff_ms:
+                    if max_ts_ns // 1_000_000 < _cutoff_ts:
                         try:
                             _n_ts = pq.read_metadata(str(p)).num_rows
                         except Exception:
@@ -7391,7 +7546,7 @@ def cleanup_local_data(
                 print(f"[prune] WARN quarantine expiry failed: {_qe}")
 
     if stats or pruned_rows:
-        print(f"[prune:{tf_label}] deleted {len(stats)} files / {pruned_rows} rows older than {retention_hours}h leeway (cutoff {cutoff_ms})")
+        print(f"[prune:{tf_label}] deleted {len(stats)} files / {pruned_rows} rows older than {retention_hours}h leeway (strictest per-owning-lane cutoff {_min_cutoff})")
     return stats
 
 
@@ -7503,10 +7658,12 @@ def _expire_quarantine(base: Path, ttl_hours: float | None = None, max_bytes: in
 def emergency_reclaim_staging(data_dir: str | Path, dry_run: bool = False) -> dict:
     """Free disk by deleting REBUILDABLE Kaggle staging for stalled lanes.
 
-    2026-09-22 ENOSPC fix: ``cleanup_local_data`` fail-closes the HIVE when
-    any lane has no verified upload (2026-09-11 data-loss guard) — correct
-    for safety, but it means the disk-guard emergency path freed 0 bytes
-    while ``kaggle_staging/{lane}/`` kept 5 lanes of derived copies.
+    2026-09-22 ENOSPC fix: ``cleanup_local_data`` fail-closes the HIVE per
+    owning lane (2026-10-16: a lane with no verified upload keeps every file
+    containing its own rows — the 2026-09-11 data-loss guard) — correct for
+    safety, but it means the disk-guard emergency path freed 0 bytes from
+    the hive while ``kaggle_staging/{lane}/`` kept stalled lanes' derived
+    copies.
     Staging is a pure build cache: every lane's staging is rebuilt from the
     live hive on each upload tick, so deleting it loses nothing (next
     successful export regenerates it; coverage proof simply treats the

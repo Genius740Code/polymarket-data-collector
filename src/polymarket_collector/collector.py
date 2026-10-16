@@ -6034,9 +6034,11 @@ class Collector:
                 self.config.storage.data_dir,
                 self.config.assets,
                 [str(t).lower() for t in (self.rollover.enabled_lane_labels() or ["5m"])],
-                # zero leeway: cutoff = slowest verified upload. Every gate
-                # (all-ended, unknown-keep, per-dataset coverage) stays on —
-                # only already-uploaded rows can go.
+                # zero leeway: each file's cutoff is its OWNING lanes' slowest
+                # verified upload (per-lane prune independence, 2026-10-16).
+                # Every gate (all-ended, unknown-keep, per-(lane,dataset)
+                # coverage, owning-lane attribution) stays on — only
+                # already-uploaded rows can go.
                 retention_hours=0,
             )
             print(f"[disk-guard] emergency prune done: {len(res)} files "
@@ -6048,7 +6050,7 @@ class Collector:
                 # WAL-failed drops began. Throttled upstream (600s/1800s),
                 # so at most a few rows/hour. _writer_event swallows
                 # internally (pre-existing handler) — no new silent pass here.
-                self._writer_event(CollectorEventType.write_failed, {"dataset": "book_snapshots_500ms", "reason": "emergency_prune_zero_files", "note": "slowest-lane checkpoint stalled; hive prune fail-closed"})
+                self._writer_event(CollectorEventType.write_failed, {"dataset": "book_snapshots_500ms", "reason": "emergency_prune_zero_files", "note": "stale lane fail-closed its own rows; hive prune pruned 0 files"})
                 # Hive fail-closed (stalled lane) — staging reclaim already ran
                 # inline in _disk_guard_tick, but retry here post-scan: a lane
                 # may have finished uploading since the tick, changing which
