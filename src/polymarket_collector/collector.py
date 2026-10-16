@@ -50,6 +50,7 @@ from .storage.quarantine import reap_quarantine
 from .rollover import MarketInfo, RolloverManager
 from .resync import ResyncManager, exponential_backoff
 from .storage.cursor_store import CursorState, CursorStore
+from .storage.l2_retention import apply_l2_retention, reap_l2_quarantine
 from .storage.markets_log import MarketsLog
 from .storage.parquet_io import read_table
 from .storage.parquet_writer import ParquetWriter
@@ -5989,6 +5990,49 @@ class Collector:
                     print(f"[disk-guard] gap-log err {_gq_e}")
             except Exception as _re:
                 print(f"[disk-guard] reap err {_re}")
+            # (1b) 2026-10-16 OPERATOR-ENABLED l2_raw time-partitioned
+            # retention (disk 100%, 0 free; l2_raw ~4G/day, no Kaggle L2
+            # dataset; parsed ticks live permanently in snapshots +
+            # book_events). apply moves eligible date= partitions to
+            # _quarantine/l2_raw (atomic rename + manifest row; failed move
+            # keeps the source; gap evidence ineligible by construction);
+            # then the bounded reaper frees ONLY quarantined l2 partitions,
+            # oldest-first, max 1/cycle, ONLY under this same disk pressure.
+            # Both never raise; keys absent (merge default) -> block skipped,
+            # zero behavior change.
+            try:
+                _l2_days = getattr(self.config.storage,
+                                   "l2_retention_days", None)
+            except Exception:
+                _l2_days = None
+            if _l2_days:
+                try:
+                    _l2_res = apply_l2_retention(
+                        self.config.storage.data_dir,
+                        retention_days=_l2_days)
+                    if isinstance(_l2_res, dict) and _l2_res.get("moved"):
+                        print(f"[disk-guard] l2 retention moved "
+                              f"{len(_l2_res['moved'])} partition(s) to "
+                              f"_quarantine/l2_raw")
+                except Exception as _l2e:
+                    print(f"[disk-guard] l2 retention err {_l2e}")
+                try:
+                    _l2_rs = reap_l2_quarantine(
+                        self.config.storage.data_dir,
+                        enabled=bool(getattr(
+                            self.config.storage,
+                            "l2_quarantine_reap_enabled", False)),
+                        min_free_bytes=min_bytes,
+                        max_deletes_per_cycle=int(getattr(
+                            self.config.storage,
+                            "l2_quarantine_max_deletes_per_cycle", 1) or 1))
+                    if (isinstance(_l2_rs, dict)
+                            and int(_l2_rs.get("deleted", 0) or 0) > 0):
+                        print(f"[disk-guard] l2 quarantine reap freed "
+                              f"{int(_l2_rs.get('bytes_deleted', 0) or 0)}B "
+                              f"({_l2_rs.get('deleted')} partition(s))")
+                except Exception as _l2re:
+                    print(f"[disk-guard] l2 reap err {_l2re}")
             # (2) full verified prune is a slow hive scan — flag it for the
             # async loop, which runs it in a thread (overlap + hourly throttle).
             # 2026-09-22 ENOSPC fix: hive prune fail-closes (0 files) while a

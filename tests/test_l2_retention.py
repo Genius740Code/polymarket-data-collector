@@ -253,3 +253,114 @@ def test_reap_dry_run_deletes_nothing(tmp_path):
                                   max_deletes_per_cycle=10, dry_run=True)
     assert stats["would_delete"], "dry-run still reports"
     assert (tmp_path / "_quarantine" / "l2_raw" / "date=2026-09-01").exists()
+
+
+# 7. collector disk-guard wiring (2026-10-16 operator enablement) ---------------
+
+def _guard_collector(tmp_path, **storage_over):
+    """Bare Collector (no __init__/sockets), stubbed LOW-DISK writer.
+
+    _disk_guard_tick only touches config.storage.*, writer.check_disk_space
+    and (on tmp_path) the reap/staging helpers — safe without a live hive.
+    """
+    from types import SimpleNamespace
+
+    from polymarket_collector.collector import Collector
+
+    cfg = CollectorConfig()
+    cfg.storage.data_dir = str(tmp_path)
+    for k, v in storage_over.items():
+        setattr(cfg.storage, k, v)
+    c = Collector.__new__(Collector)
+    c.config = cfg
+    c.writer = SimpleNamespace(
+        check_disk_space=lambda min_bytes: {"free_bytes": 100,
+                                            "min_bytes": min_bytes,
+                                            "data_dir": str(tmp_path)})
+    c._last_disk_check_monotonic = 0.0
+    return c
+
+
+def test_disk_guard_wires_apply_then_reap(tmp_path, monkeypatch):
+    """Low disk + keys set -> apply runs, THEN the bounded reap, in order."""
+    import polymarket_collector.collector as coll
+
+    calls: list = []
+
+    def _fake_apply(d, **kw):
+        calls.append(("apply", kw))
+        return {"moved": [{"partition": "date=x"}], "kept": {}}
+
+    def _fake_reap(d, **kw):
+        calls.append(("reap", kw))
+        return {"deleted": 1, "bytes_deleted": 4096, "kept": 0}
+
+    monkeypatch.setattr(coll, "apply_l2_retention", _fake_apply)
+    monkeypatch.setattr(coll, "reap_l2_quarantine", _fake_reap)
+    c = _guard_collector(tmp_path, l2_retention_days=3,
+                         l2_quarantine_reap_enabled=True,
+                         l2_quarantine_max_deletes_per_cycle=1)
+    c._disk_guard_tick()
+    assert [name for name, _ in calls] == ["apply", "reap"], \
+        "apply must stage partitions before the reap frees them"
+    assert calls[0][1].get("retention_days") == 3
+    reap_kw = calls[1][1]
+    assert reap_kw.get("enabled") is True
+    assert reap_kw.get("max_deletes_per_cycle") == 1, "bounded: 1 delete/cycle"
+    assert reap_kw.get("min_free_bytes") == c.config.storage.disk_space_min_bytes
+
+
+def test_disk_guard_l2_skipped_when_keys_absent(tmp_path, monkeypatch):
+    """Merge default (keys absent) = zero behavior change: no l2 calls."""
+    import polymarket_collector.collector as coll
+
+    calls: list = []
+    monkeypatch.setattr(coll, "apply_l2_retention",
+                        lambda d, **kw: calls.append(("apply", kw)) or {"moved": []})
+    monkeypatch.setattr(coll, "reap_l2_quarantine",
+                        lambda d, **kw: calls.append(("reap", kw)) or {})
+    c = _guard_collector(tmp_path)  # defaults: days=None, reap_enabled=False
+    c._disk_guard_tick()
+    assert calls == [], "l2 retention must stay dormant when keys are absent"
+
+
+def test_disk_guard_l2_skipped_without_disk_pressure(tmp_path, monkeypatch):
+    """Healthy disk -> guard returns before the l2 block (pressure-gated)."""
+    import polymarket_collector.collector as coll
+
+    calls: list = []
+    monkeypatch.setattr(coll, "apply_l2_retention",
+                        lambda d, **kw: calls.append(("apply", kw)) or {"moved": []})
+    monkeypatch.setattr(coll, "reap_l2_quarantine",
+                        lambda d, **kw: calls.append(("reap", kw)) or {})
+    c = _guard_collector(tmp_path, l2_retention_days=3,
+                         l2_quarantine_reap_enabled=True)
+    c.writer.check_disk_space = lambda min_bytes: None  # no alert
+    c._disk_guard_tick()
+    assert calls == [], "no disk pressure -> no l2 retention calls"
+
+
+def test_disk_guard_l2_never_raises(tmp_path, monkeypatch):
+    """A raising l2 helper must not break the guard tick."""
+    import polymarket_collector.collector as coll
+
+    def _boom(d, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(coll, "apply_l2_retention", _boom)
+    monkeypatch.setattr(coll, "reap_l2_quarantine", _boom)
+    c = _guard_collector(tmp_path, l2_retention_days=3,
+                         l2_quarantine_reap_enabled=True)
+    c._disk_guard_tick()  # must not raise
+
+
+# 8. shipped collector.yaml carries the operator keys -----------------------------
+
+def test_shipped_yaml_operator_keys():
+    from pathlib import Path
+
+    yml = Path(__file__).resolve().parents[1] / "config" / "collector.yaml"
+    cfg = CollectorConfig.from_yaml(yml)
+    assert cfg.storage.l2_retention_days == 3
+    assert cfg.storage.l2_quarantine_reap_enabled is True
+    assert cfg.storage.l2_quarantine_max_deletes_per_cycle == 1

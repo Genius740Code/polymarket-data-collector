@@ -136,6 +136,19 @@ storage:
   # than ENOSPC death; reap is cheap (walks only _quarantine/) and the
   # zero-leeway emergency prune only deletes already-uploaded rows.
   disk_space_min_bytes: 1073741824
+  # 2026-10-16 OPERATOR-ENABLED (authorized): disk 100%, 0 avail. l2_raw is a
+  # verbatim WS firehose (~4G/day, 56G over 14 daily partitions) with NO
+  # Kaggle L2 dataset published; parsed ticks live permanently in snapshots +
+  # book_events (gap evidence is ineligible by construction — retention moves
+  # ONLY l2_raw/date=* partitions to _quarantine/l2_raw, atomic rename +
+  # manifest row, failed move keeps the source). 3 days keeps ~12G live for
+  # backtest replay/debug; ~40G+ moves to quarantine, then the bounded reaper
+  # deletes ONLY quarantined l2 partitions, oldest-first, under disk pressure.
+  # Both keys absent (merge default) = retention off, nothing moves.
+  l2_retention_days: 3
+  l2_quarantine_reap_enabled: true
+  # bounded reaper: at most ONE partition delete per disk-guard cycle (30s)
+  l2_quarantine_max_deletes_per_cycle: 1
   flush_interval_seconds: 120
   # 2026-10-03: threshold 1500->5000->40000 — the threshold is GLOBAL fleet
   # rows (not per-group): at ~300-500 rows/s, 5000 flushed every ~10s = 40+
