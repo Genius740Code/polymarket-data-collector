@@ -29,6 +29,19 @@ Safety contract (AGENT.md / AGENTS.md real-data-only):
   disk pressure demands it (free bytes below threshold), oldest-first,
   bounded to ``max_deletes_per_cycle`` per call. Default OFF.
 
+2026-10-16 hang fix (disk 100%, apply blocked >100s with zero output):
+the old eligibility path enumerated and parquet-read EVERY file of a
+partition (walk + stat + column read) before deciding anything — O(files)
+on a saturated disk never returns, so the wired disk-guard call blocked
+silently every tick. Now ``date=`` eligibility is decided from directory
+names via ONE single-level scandir (no per-file walk/stat in the decision
+path); per-file work happens only INSIDE an already-eligible partition,
+capped at ``SCAN_FILES_PER_PARTITION_TICK`` files per tick — the
+remainder spills to the next tick with progress logged and resumes from
+process-local state. Guards, manifest rows and the never-raise contract
+are unchanged; small partitions still complete in one tick, so their
+manifest rows are identical to the one-pass path.
+
 Patterns followed: ``storage/compaction.py`` merge-verify-then-delete
 (verify before any destructive step), ``storage/quarantine.py`` bounded
 reaper (only bounded deleter), ``export.py`` rolling-window prune
@@ -58,6 +71,19 @@ QUARANTINE_DIRNAME = "_quarantine"
 MANIFEST_NAME = "_retention_manifest.parquet"
 
 DAY_MS = 86_400_000
+
+# 2026-10-16 hang fix: per-file scan bound. One tick parquet-reads at most
+# this many files per ELIGIBLE partition; the remainder spills to the next
+# tick (progress logged, resumable via ``_SCAN_PROGRESS``). Small
+# partitions (a handful of files) still complete in a single tick, so the
+# manifest matches the one-pass path exactly.
+SCAN_FILES_PER_PARTITION_TICK = 128
+
+# In-process resumable scan progress: abs partition dir -> state record.
+# Survives across disk-guard ticks inside one collector process; lost on
+# restart (conservative rescan from zero). Never persisted to disk, never
+# written into the live hive, dropped once a partition moves.
+_SCAN_PROGRESS: dict[str, dict] = {}
 
 
 def _log(msg: str) -> None:
@@ -97,6 +123,29 @@ def _now_ms() -> int:
         return int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp() * 1000)
     except Exception:
         return 0
+
+
+def _partition_dir_names(l2_root: Path) -> list[str]:
+    """Single-level scandir of partition-directory names (sorted).
+
+    Decision-path enumeration ONLY: directory entry names and d_types
+    (Linux getdents — no per-file walk, no per-file stat). Whether a
+    ``date=`` partition is eligible is decided from these names alone;
+    files inside are touched only by the bounded scan that runs after
+    eligibility. Never raises.
+    """
+    names: list[str] = []
+    try:
+        with _os.scandir(l2_root) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        names.append(entry.name)
+                except OSError:
+                    continue
+    except Exception:
+        return []
+    return sorted(names)
 
 
 def _load_market_ends(base: Path) -> dict | None:
@@ -285,6 +334,104 @@ def _partition_rows_and_sha(part_dir: Path, base: Path) -> tuple[int, str]:
         return 0, "unknown"
 
 
+def _scan_partition_files_bounded(part_dir: Path, base: Path, *, file_cap: int) -> dict:
+    """Bounded per-file pass INSIDE an already-eligible partition. Never raises.
+
+    Old path: one unbroken rglob + parquet read of every file — O(files) on
+    a saturated disk, the hang. This reads at most ``file_cap`` files per
+    call, then spills: rows, sha parts and condition_ids accumulated so far
+    stay in process-local ``_SCAN_PROGRESS`` so the next tick resumes where
+    this one stopped instead of restarting. A completed scan is cached
+    until the partition moves (a failed move retries the move, not the
+    scan). Per-file semantics match the one-pass helpers exactly: .tmp
+    files skipped, sha over sorted ``relpath:size`` relative to ``base``,
+    rows from parquet metadata, unreadable file -> fail closed (partition
+    kept, progress reset).
+
+    Returns ``{"done", "files_done", "files_total", "rows", "sha",
+    "cids", "unreadable"}`` — ``done=False, unreadable=True`` means keep
+    (fail closed); ``done=False, unreadable=False`` means spilled to the
+    next tick; ``done=True`` carries rows/sha/cids for the manifest.
+    """
+    key = str(part_dir)
+    try:
+        import pyarrow.parquet as pq
+
+        try:
+            files = sorted(p for p in part_dir.rglob("*.parquet")
+                           if not p.name.endswith(".tmp"))
+        except Exception:
+            files = []
+        total = len(files)
+        st = _SCAN_PROGRESS.get(key)
+        if (isinstance(st, dict) and st.get("done")
+                and st.get("count") == total):
+            return {"done": True, "files_done": total, "files_total": total,
+                    "rows": int(st.get("rows", 0)), "sha": str(st.get("sha", "")),
+                    "cids": set(st.get("cids") or set()), "unreadable": False}
+        if (not isinstance(st, dict) or st.get("done")
+                or not isinstance(st.get("next"), int)
+                or not isinstance(st.get("parts"), list)
+                or not isinstance(st.get("cids"), set)
+                or st.get("count") != total
+                or st["next"] < 0 or st["next"] > total):
+            st = {"next": 0, "rows": 0, "parts": [], "cids": set(), "count": total}
+        start = int(st["next"])
+        try:
+            cap = max(1, int(file_cap))
+        except Exception:
+            cap = 1
+        stop = min(total, start + cap)
+        for f in files[start:stop]:
+            try:
+                t = pq.read_table(str(f), columns=["condition_id"])
+            except Exception:
+                _SCAN_PROGRESS.pop(key, None)
+                return {"done": False, "files_done": start, "files_total": total,
+                        "rows": 0, "sha": "", "cids": set(), "unreadable": True}
+            try:
+                if t is not None and t.num_rows:
+                    st["rows"] += int(t.num_rows)
+                    if "condition_id" in t.schema.names:
+                        for c in t.column("condition_id").to_pylist():
+                            if c:
+                                st["cids"].add(str(c))
+            except Exception:
+                _SCAN_PROGRESS.pop(key, None)
+                return {"done": False, "files_done": start, "files_total": total,
+                        "rows": 0, "sha": "", "cids": set(), "unreadable": True}
+            try:
+                rel = str(f.relative_to(base))
+            except Exception:
+                rel = f.name
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = -1
+            st["parts"].append(f"{rel}:{size}")
+            st["next"] += 1
+        if stop >= total:
+            rec = {"done": True, "next": total, "count": total,
+                   "rows": int(st["rows"]),
+                   "sha": _hashlib.sha1("\n".join(st["parts"]).encode()).hexdigest(),
+                   "cids": set(st["cids"])}
+            _SCAN_PROGRESS[key] = rec
+            return {"done": True, "files_done": total, "files_total": total,
+                    "rows": rec["rows"], "sha": rec["sha"],
+                    "cids": set(rec["cids"]), "unreadable": False}
+        _SCAN_PROGRESS[key] = st
+        return {"done": False, "files_done": stop, "files_total": total,
+                "rows": 0, "sha": "", "cids": set(), "unreadable": False}
+    except Exception as e:
+        _log(f"[l2-retention] WARN bounded scan failed for {part_dir} ({e}) — keeping partition")
+        try:
+            _SCAN_PROGRESS.pop(key, None)
+        except Exception:
+            pass
+        return {"done": False, "files_done": 0, "files_total": 0,
+                "rows": 0, "sha": "", "cids": set(), "unreadable": True}
+
+
 def _append_manifest(base: Path, row: dict) -> bool:
     """Append one row to the quarantine manifest (tmp+rename). Never raises."""
     try:
@@ -358,12 +505,17 @@ def quarantine_partition(
     partition: str,
     *,
     dry_run: bool = False,
+    rows_sha: tuple | None = None,
 ) -> dict:
     """Move one ``<dataset>/<partition>`` dir into ``_quarantine/``.
 
     Refuses anything but ``l2_raw`` (gap evidence can never pass through
     this path). Atomic dir rename; a failed move keeps the source.
-    Never raises.
+    ``rows_sha`` may carry the (rows, sha) a bounded scan already
+    computed for this partition (manifest stays identical to the one-pass
+    path without re-walking the files); without it the full per-file
+    pass runs here — fine for an explicit single-partition call, never
+    used by the tick path. Never raises.
     """
     try:
         base = Path(data_dir)
@@ -375,7 +527,13 @@ def quarantine_partition(
         dest = base / QUARANTINE_DIRNAME / str(dataset) / str(partition)
         if dest.exists():
             return {"moved": False, "reason": f"kept: quarantine target exists ({dest})"}
-        rows, sha = _partition_rows_and_sha(src, base)
+        if isinstance(rows_sha, (tuple, list)) and len(rows_sha) == 2:
+            try:
+                rows, sha = int(rows_sha[0]), str(rows_sha[1])
+            except Exception:
+                rows, sha = _partition_rows_and_sha(src, base)
+        else:
+            rows, sha = _partition_rows_and_sha(src, base)
         if dry_run:
             return {"moved": False, "dry_run": True, "rows": rows, "sha": sha,
                     "reason": f"dry-run would move {dataset}/{partition} ({rows} rows)"}
@@ -384,6 +542,10 @@ def quarantine_partition(
             _os.replace(str(src), str(dest))
         except Exception as mv:
             return {"moved": False, "reason": f"kept: move failed ({mv}); source left in place"}
+        try:
+            _SCAN_PROGRESS.pop(str(src), None)
+        except Exception:
+            pass
         moved_ts = _now_ms()
         ok = _append_manifest(base, {"partition": str(partition), "rows": rows,
                                      "sha": sha, "moved_ts": moved_ts})
@@ -403,12 +565,23 @@ def apply_l2_retention(
     checkpoint_ms: int | None = None,
     lanes: list[str] | None = None,
     dry_run: bool = False,
+    scan_file_cap: int | None = None,
 ) -> dict:
     """Time-partitioned retention for l2_raw. Never raises.
 
     Disabled (retain everything) when ``retention_days`` is None or <= 0.
     Otherwise every ``l2_raw/date=`` partition must pass ALL guards or it
     stays: age cutoff, market-end cutoff, slowest-lane checkpoint.
+
+    Enumeration is bounded (2026-10-16 hang fix): eligibility is decided
+    from directory names via one single-level scandir — no per-file
+    walk/stat in the decision path. Per-file work runs only inside an
+    already-eligible partition, at most ``scan_file_cap`` files per tick
+    (default ``SCAN_FILES_PER_PARTITION_TICK``); the remainder spills to
+    the next tick with progress logged and resumes from process-local
+    state. Guards, manifest rows and kept-reasons are unchanged from the
+    one-pass path.
+
     Returns ``{"moved": [...], "kept": {partition: reason}, "disabled": bool}``.
     """
     try:
@@ -431,51 +604,66 @@ def apply_l2_retention(
             return {"moved": [], "kept": {}, "disabled": False, "cutoff_ms": cutoff_ms}
         checkpoint = slowest_lane_checkpoint_ms(base, lanes=lanes, explicit_ms=checkpoint_ms)
         if checkpoint is None:
-            kept = {}
-            for part in sorted(p for p in l2_root.iterdir() if p.is_dir()):
-                kept[part.name] = "no verified slowest-lane checkpoint (fail closed)"
+            kept = {name: "no verified slowest-lane checkpoint (fail closed)"
+                    for name in _partition_dir_names(l2_root)}
             return {"moved": [], "kept": kept, "disabled": False,
                     "cutoff_ms": cutoff_ms, "checkpoint_ms": None}
         end_by_cid = _load_market_ends(base)
         if end_by_cid is None:
-            kept = {}
-            for part in sorted(p for p in l2_root.iterdir() if p.is_dir()):
-                kept[part.name] = "markets_latest unreadable (fail closed)"
+            kept = {name: "markets_latest unreadable (fail closed)"
+                    for name in _partition_dir_names(l2_root)}
             return {"moved": [], "kept": kept, "disabled": False,
                     "cutoff_ms": cutoff_ms, "checkpoint_ms": checkpoint}
         moved: list = []
         kept = {}
-        for part in sorted(p for p in l2_root.iterdir() if p.is_dir()):
-            day = _parse_date_partition(part.name)
+        try:
+            cap = (SCAN_FILES_PER_PARTITION_TICK if scan_file_cap is None
+                   else int(scan_file_cap))
+        except Exception:
+            cap = SCAN_FILES_PER_PARTITION_TICK
+        for name in _partition_dir_names(l2_root):
+            day = _parse_date_partition(name)
             if day is None:
-                kept[part.name] = "not a date= partition (left alone)"
+                kept[name] = "not a date= partition (left alone)"
                 continue
             pend = _partition_end_ms(day)
             if pend >= cutoff_ms:
-                kept[part.name] = f"younger than cutoff ({cutoff_ms})"
+                kept[name] = f"younger than cutoff ({cutoff_ms})"
                 continue
             if pend > checkpoint:
-                kept[part.name] = "slowest-lane checkpoint has not passed this partition"
+                kept[name] = "slowest-lane checkpoint has not passed this partition"
                 continue
-            cids = _partition_condition_ids(part)
-            if cids is None:
-                kept[part.name] = "condition_ids unreadable (fail closed)"
+            # Directory-level guards passed — per-file work starts here and
+            # is bounded per tick; the remainder spills to the next tick.
+            scan = _scan_partition_files_bounded(l2_root / name, base, file_cap=cap)
+            if scan.get("unreadable"):
+                kept[name] = "condition_ids unreadable (fail closed)"
                 continue
+            if not scan.get("done"):
+                kept[name] = (f"scan in progress: {scan['files_done']}/"
+                              f"{scan['files_total']} files this tick "
+                              f"(cap {cap}) — resumes next tick")
+                _log(f"[l2-retention] {name} scan {scan['files_done']}/"
+                     f"{scan['files_total']} files this tick (cap {cap}) — "
+                     f"remainder spills to next tick")
+                continue
+            cids = scan.get("cids") or set()
             if not cids:
-                kept[part.name] = "empty partition (nothing to move)"
+                kept[name] = "empty partition (nothing to move)"
                 continue
             ends = [end_by_cid.get(c) for c in cids]
             if any(e is None for e in ends):
-                kept[part.name] = "unknown condition_id (market-end cutoff, conservative keep)"
+                kept[name] = "unknown condition_id (market-end cutoff, conservative keep)"
                 continue
             if max(ends) >= cutoff_ms:
-                kept[part.name] = "some market inside the retention leeway (market-end cutoff)"
+                kept[name] = "some market inside the retention leeway (market-end cutoff)"
                 continue
-            res = quarantine_partition(base, ALLOWED_DATASET, part.name, dry_run=dry_run)
+            res = quarantine_partition(base, ALLOWED_DATASET, name, dry_run=dry_run,
+                                       rows_sha=(scan.get("rows", 0), scan.get("sha", "")))
             if res.get("moved"):
-                moved.append({"partition": part.name, **res})
+                moved.append({"partition": name, **res})
             else:
-                kept[part.name] = str(res.get("reason", "move declined"))
+                kept[name] = str(res.get("reason", "move declined"))
         return {"moved": moved, "kept": kept, "disabled": False,
                 "cutoff_ms": cutoff_ms, "checkpoint_ms": checkpoint}
     except Exception as e:

@@ -364,3 +364,92 @@ def test_shipped_yaml_operator_keys():
     assert cfg.storage.l2_retention_days == 3
     assert cfg.storage.l2_quarantine_reap_enabled is True
     assert cfg.storage.l2_quarantine_max_deletes_per_cycle == 1
+
+
+# 9. bounded per-tick enumeration (2026-10-16 100%-disk hang fix) ---------------
+# Old path rglob+parquet-read EVERY file before deciding eligibility —
+# O(files) on the saturated 56G hive never returned (apply blocked >100s,
+# timeout-killed). Eligibility now comes from directory names via one
+# single-level scandir; per-file work is capped per tick and spills over.
+
+def _hive_l2_n_files(base, day=OLD_DAY, cid=CID_OLD, n_files=8, rows=1):
+    """Many-file partition: n_files real parquet files under asset=BTC."""
+    t0 = int(_dt.datetime(2026, 9, 1, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    d = base / "l2_raw" / f"date={day}" / "asset=BTC"
+    for i in range(n_files):
+        _write(d / f"part-{i:05d}.parquet",
+               [_l2_row(cid, t0 + i * 500) for _ in range(rows)])
+    return base
+
+
+def test_2000_file_partition_decides_under_5s(tmp_path):
+    """A 2000-file partition must decide (and stay) in one bounded tick."""
+    import time as _time
+
+    _ended_markets(_hive_l2_n_files(tmp_path, n_files=2000))
+    cap = lr.SCAN_FILES_PER_PARTITION_TICK
+    t0 = _time.monotonic()
+    out = lr.apply_l2_retention(tmp_path, retention_days=RETENTION_DAYS,
+                                now_ms=NOW, checkpoint_ms=NOW)
+    wall = _time.monotonic() - t0
+    assert wall < 5.0, f"decision path walked files: {wall:.2f}s for 2000 files"
+    assert out["moved"] == [], "2000 files > per-tick cap — spilled, not moved"
+    reason = out["kept"][f"date={OLD_DAY}"]
+    assert f"{cap}/2000 files this tick" in reason, reason
+    assert (tmp_path / "l2_raw" / f"date={OLD_DAY}").exists()
+    out2 = lr.apply_l2_retention(tmp_path, retention_days=RETENTION_DAYS,
+                                 now_ms=NOW, checkpoint_ms=NOW)
+    assert f"{2 * cap}/2000 files this tick" in out2["kept"][f"date={OLD_DAY}"], \
+        "scan must resume forward across ticks, not restart from zero"
+
+
+def test_bounded_scan_matches_one_pass_rows_sha_cids(tmp_path):
+    """Bounded scan must reproduce the one-pass helpers exactly."""
+    base = _ended_markets(_hive_l2_old(tmp_path, n=4))
+    t0 = int(_dt.datetime(2026, 9, 1, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    _write(base / "l2_raw" / f"date={OLD_DAY}" / "asset=ETH" / "l2.parquet",
+           [_l2_row(CID_OLD, t0 + 999)])
+    src = base / "l2_raw" / f"date={OLD_DAY}"
+    exp_rows, exp_sha = lr._partition_rows_and_sha(src, base)  # one-pass reference
+    scan = lr._scan_partition_files_bounded(
+        src, base, file_cap=lr.SCAN_FILES_PER_PARTITION_TICK)
+    assert scan["done"] and not scan["unreadable"]
+    assert scan["cids"] == lr._partition_condition_ids(src)
+    assert (scan["rows"], scan["sha"]) == (exp_rows, exp_sha)
+    assert exp_rows == 5
+
+
+def test_manifest_identical_to_full_scan(tmp_path):
+    """Manifest row from the bounded path == the one-pass (rows, sha)."""
+    base = _ended_markets(_hive_l2_old(tmp_path, n=4))
+    t0 = int(_dt.datetime(2026, 9, 1, tzinfo=_dt.timezone.utc).timestamp() * 1000)
+    _write(base / "l2_raw" / f"date={OLD_DAY}" / "asset=ETH" / "l2.parquet",
+           [_l2_row(CID_OLD, t0 + 999)])
+    src = base / "l2_raw" / f"date={OLD_DAY}"
+    exp_rows, exp_sha = lr._partition_rows_and_sha(src, base)
+    out = lr.apply_l2_retention(base, retention_days=RETENTION_DAYS,
+                                now_ms=NOW, checkpoint_ms=NOW)
+    assert [m["partition"] for m in out["moved"]] == [f"date={OLD_DAY}"]
+    man = pq.read_table(str(base / "_quarantine" / "l2_raw" / lr.MANIFEST_NAME)).to_pylist()
+    assert len(man) == 1
+    assert man[0]["rows"] == exp_rows and man[0]["sha"] == exp_sha
+
+
+def test_spilled_scan_resumes_next_tick(tmp_path):
+    """cap < file count: tick 1 spills with progress logged, tick 2 moves."""
+    base = _ended_markets(_hive_l2_n_files(tmp_path, n_files=3))
+    src = base / "l2_raw" / f"date={OLD_DAY}"
+    exp_rows, exp_sha = lr._partition_rows_and_sha(src, base)
+    out1 = lr.apply_l2_retention(base, retention_days=RETENTION_DAYS,
+                                 now_ms=NOW, checkpoint_ms=NOW, scan_file_cap=2)
+    assert out1["moved"] == []
+    assert "2/3 files this tick" in out1["kept"][f"date={OLD_DAY}"]
+    assert src.exists(), "spilled partition stays in the live hive"
+    out2 = lr.apply_l2_retention(base, retention_days=RETENTION_DAYS,
+                                 now_ms=NOW, checkpoint_ms=NOW, scan_file_cap=2)
+    assert [m["partition"] for m in out2["moved"]] == [f"date={OLD_DAY}"], out2["kept"]
+    man = pq.read_table(str(base / "_quarantine" / "l2_raw" / lr.MANIFEST_NAME)).to_pylist()
+    assert man[0]["rows"] == exp_rows and man[0]["sha"] == exp_sha, \
+        "resumed scan must reproduce the one-pass manifest exactly"
+    assert not src.exists()
+    assert str(src) not in lr._SCAN_PROGRESS, "moved partition drops its scan state"
