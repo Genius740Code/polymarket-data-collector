@@ -311,7 +311,7 @@ class MarketsLog:
         out_dir = self.data_dir / "markets_log" / f"date={date_str}"
         out_dir.mkdir(parents=True, exist_ok=True)
         normalized = self._normalize_rows(self._staging)
-        table = pa.Table.from_pylist(normalized)
+        table = self._build_union_table(normalized)
         tmp = out_dir / f"part-{uuid.uuid4().hex[:8]}.parquet.tmp"
         final = out_dir / tmp.name.replace(".tmp", "")
         pq.write_table(table, str(tmp), compression="zstd")
@@ -325,6 +325,69 @@ class MarketsLog:
         return n
 
     # -- compaction --------------------------------------------------------
+    @staticmethod
+    def _iso_from_epoch_ms(value) -> Optional[str]:
+        """Canonicalize a NUMERIC epoch-ms value to ISO (schema: string field).
+
+        2026-10-17: markets_log fragments from before the 2026-10-14 write fix
+        carry settlement_ts_utc as int64 epoch-ms; those old backfill winner
+        rows are unreachable by any future write, so the write-side cast left
+        compact() failing fail-closed forever and markets_latest (AUTHORITY
+        for settlement backtests: export_pmdata / backtest_exec /
+        backfill_pmdata) froze.
+
+        This converts only epoch-ms NUMBERS (int/int64/float — never a str)
+        inside the 2020-2040 plausibility band. Digit-STRING rows (the
+        2026-10-10 casts, REAL_EPOCH_MS_STR), ISO strings and garbage
+        pass through verbatim: markets_log stays event-sourced, fragments are
+        never pruned or rewritten, and only the rebuilt markets_latest
+        VIEW may be canonical. Returns None (-> value left unchanged) for
+        anything not plausibly epoch-ms; nothing is ever fabricated.
+        """
+        if isinstance(value, str):
+            return None
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            return None
+        # Epoch-ms plausibility band (2020-2040); out-of-band -> None
+        # (unchanged, so an unmergeable union still raises -> fail-closed,
+        # never guessed into seconds).
+        if 1_400_000_000_000 <= ms < 2_200_000_000_000:
+            return _dt_top.datetime.fromtimestamp(
+                ms / 1000, tz=_dt_top.timezone.utc).isoformat().replace("+00:00", "Z")
+        return None
+
+    @classmethod
+    def _canon_numeric_settlement_rows(cls, rows: List[Dict]) -> List[Dict]:
+        """Copy rows, ISO-casting numeric epoch-ms settlement_ts_utc (see _iso_from_epoch_ms)."""
+        out: List[Dict] = []
+        for r in rows:
+            nr = dict(r)
+            ts = cls._iso_from_epoch_ms(nr.get("settlement_ts_utc"))
+            if ts is not None:
+                nr["settlement_ts_utc"] = ts
+            out.append(nr)
+        return out
+
+    @classmethod
+    def _build_union_table(cls, rows: List[Dict]):
+        """pa.Table.from_pylist with a mixed-vintage fallback (2026-10-17).
+
+        First builds the rows VERBATIM — string-only winners (ISO or the
+        digit-string epoch casts) already union to one string column and stay
+        untouched. Only when the union genuinely cannot build (pre-2026-10-14
+        int64 epoch-ms beside str rows -> ArrowInvalid) it retries ONCE with
+        numeric epoch-ms values ISO-cast. If that retry still fails the
+        original error propagates and compact() remains fail-closed — the
+        caller (backfill_resolutions) keeps its WARN path.
+        """
+        try:
+            return pa.Table.from_pylist(rows)
+        except Exception:
+            pass
+        return pa.Table.from_pylist(cls._canon_numeric_settlement_rows(rows))
+
     def compact(self, parquet_data_dir: Optional[Path] = None) -> Path:
         """Rebuild markets_latest.parquet — one row per condition_id, latest updated_at.
 
@@ -362,7 +425,7 @@ class MarketsLog:
         # Ensure empty table still has schema
         if rows:
             rows = self._normalize_rows(rows)
-            table = pa.Table.from_pylist(rows)
+            table = self._build_union_table(rows)
         else:
             table = pa.Table.from_pylist([], schema=pa.schema([]))
 

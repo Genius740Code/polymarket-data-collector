@@ -150,12 +150,17 @@ def test_backfill_compacts_str_epoch_fragment_without_crash(tmp_path, monkeypatc
     assert latest["0xstronly"]["settlement_ts_utc"] == REAL_EPOCH_MS_STR
 
 
-# ------------------------- fail-closed: a persisting int winner must not kill the run
-def test_backfill_survives_unmergeable_mix_fail_closed(tmp_path, monkeypatch, capsys):
-    """Production today also holds int64-typed fragments (old backfill
-    flushes) whose winner rows no write of ours can reach. compact() still
-    raises on the mixed winners — but it must stay INSIDE the backfill
-    (WARN, latest untouched, retried next run) instead of crash-looping pm2."""
+# ------------------------- fail-closed path replaced (2026-10-17): compact now CANONICALIZES
+def test_backfill_converges_over_unmergeable_mix(tmp_path, monkeypatch, capsys):
+    """Production today still holds int64-typed fragments (old backfill
+    flushes) whose winner rows no write of ours can reach — compaction on
+    the mixed winners used to WARN + keep markets_latest frozen forever
+    (the 2026-10-14 fail-closed shim). 2026-10-17: compact() builds the
+    union verbatim first; only when numeric epoch-ms makes the union
+    unbuildable does it ISO-cast those specific values, so the mixed
+    winners MERGE: markets_latest converges (int rows become the real
+    instant they carry) and no WARN is printed. Digit-STRING rows stay
+    verbatim, event-sourced, in BOTH the fragment and the log-path union."""
     _patch_clob(monkeypatch)
 
     # 1) latest: the candidate (int64 settlement) + an already-official market
@@ -167,22 +172,46 @@ def test_backfill_survives_unmergeable_mix_fail_closed(tmp_path, monkeypatch, ca
                           "polymarket_official", REAL_EPOCH_MS))
     log.flush_staging()
     log.compact()
-    # 2) collector-side digit-STRING fragment row (mixed with 1) -> unmergeable
+    # 2) collector-side digit-STRING fragment row (mixed with 1) -> previously unmergeable
     log.append(_ended_row("0xstronly", "BNB", 5971968, "resolved", "down",
                           "inferred_nearest", REAL_EPOCH_MS_STR))
     log.flush_staging()
 
-    stats = backfill_resolutions(tmp_path)  # must NOT raise
+    stats = backfill_resolutions(tmp_path)  # must NOT raise, must not WARN
 
     assert stats["upgraded"] == 1
     out = capsys.readouterr().out
-    assert "WARN markets_latest compact failed" in out
-    # fail-closed: latest is exactly as before the run (atomic compact)
+    assert "markets_latest compact failed" not in out, out[:400]
+    # the candidate row now merges: latest carries the official resolution
     latest = {r["condition_id"]: r for r in MarketsLog(tmp_path).load_latest()}
-    assert latest["0xcandidate"]["settlement_source"] == "inferred_nearest"
-    # the resolution itself was flushed with the canonical ISO cast applied
+    assert latest["0xcandidate"]["settlement_source"] == "polymarket_official"
+    assert latest["0xcandidate"]["settlement_ts_utc"] == REAL_EPOCH_ISO
+    # the int-only winner canonicalized on read (same instant, ISO form)
+    assert latest["0xintwinner"]["settlement_ts_utc"] == REAL_EPOCH_ISO
+    # digit-string cast value preserved through the log (never pruned)
     frag = [r for r in _fragment_rows(tmp_path)
-            if r.get("condition_id") == "0xcandidate"
-            and r.get("settlement_source") == "polymarket_official"]
-    assert frag and frag[-1]["settlement_ts_utc"] == REAL_EPOCH_ISO
-    assert isinstance(frag[-1]["settlement_ts_utc"], str)
+            if r.get("condition_id") == "0xstronly"]
+    assert frag and frag[-1]["settlement_ts_utc"] == REAL_EPOCH_MS_STR
+    # ... and it survives the union in latest verbatim (fallback touches
+    # only NUMERIC epoch-ms; the digit cast is an honest logged fate)
+    assert latest["0xstronly"]["settlement_ts_utc"] == REAL_EPOCH_MS_STR
+
+
+def test_compact_canonicalizes_mixed_settlement_types(tmp_path):
+    """Direct: a markets_log hive whose fragments carry int64 epoch-ms AND
+    ISO strings compact() into ONE canonical markets_latest. Old code raised
+    ArrowInvalid ('Could not convert <ISO str>: tried to convert to int64')
+    at the union — the exact production failure draining markets_latest."""
+    log = MarketsLog(tmp_path)
+    log.append(_ended_row("0xints", "BTC", 5971970, "resolved", "up",
+                          "polymarket_official", REAL_EPOCH_MS))
+    log.append(_ended_row("0xisos", "SOL", 5971970, "resolved", "down",
+                          "inferred_nearest", REAL_EPOCH_ISO))
+    log.flush_staging()
+
+    final = log.compact()
+    assert final.exists()
+    latest = {r["condition_id"]: r for r in MarketsLog(tmp_path).load_latest()}
+    assert latest["0xints"]["settlement_ts_utc"] == REAL_EPOCH_ISO
+    assert latest["0xisos"]["settlement_ts_utc"] == REAL_EPOCH_ISO
+
