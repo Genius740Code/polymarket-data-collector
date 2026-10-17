@@ -91,6 +91,71 @@ def test_missing_wire_ts_stays_null(tmp_path):
     assert captured[0][1]["ts_source"] is None
 
 
+# ------- 2026-10-17: asset=UNKNOWN trades partition (roster asset repair)
+def test_trade_roster_asset_repairs_unknown_partition(tmp_path):
+    """A trade whose caller asset is UNKNOWN but whose condition_id resolves
+    EXACTLY in the live roster must carry the roster asset — series_id
+    confirmed this resolution existed (series_id='BTC-5m' rows inside
+    asset=UNKNOWN partitions, ~200/day, unjoinable). Not invented from
+    token shape: the roster is discovery state this collector resolved."""
+    from types import SimpleNamespace
+    c, captured = _collector(tmp_path)
+    cid = "0xrosterhit"
+    c.markets[cid] = SimpleNamespace(
+        asset="BTC", series_id="BTC-5m", window_index=5971971,
+        market_id="5771729", up_token_id="tok-xyz", down_token_id="tok-down",
+        condition_id=cid)
+    m = _trade_msg(condition_id=cid)
+    assert c._handle_trade_message(m, "UNKNOWN", time.time_ns()) is True
+    row = captured[0][1]
+    assert row["asset"] == "BTC"
+    assert row["series_id"] == "BTC-5m"
+    assert row["condition_id"] == cid
+
+
+def test_trade_book_asset_repairs_unknown_partition(tmp_path):
+    """market=None but the O(1) book index resolves the token — same repair."""
+    from types import SimpleNamespace
+    c, captured = _collector(tmp_path)
+    cid = "0xbookhit"
+    # _lookup_book: O(1) by condition_id in books? Provide the monkeypatched
+    # lookup the trade path actually uses (books dict keyed by condition_id).
+    c._lookup_book = lambda _cid, _tok: SimpleNamespace(
+        condition_id=cid, asset="ETH")
+    m = _trade_msg(token_id="tok-eth")
+    assert c._handle_trade_message(m, "UNKNOWN", time.time_ns()) is True
+    row = captured[0][1]
+    assert row["asset"] == "ETH"
+    assert row["condition_id"] == cid  # NOT the token: C3 held
+
+
+def test_trade_unresolvable_stays_unknown(tmp_path):
+    """NO market resolution anywhere → still UNKNOWN (honest gap, event-
+    sourced): the repair never invents an asset from token shape."""
+    c, captured = _collector(tmp_path)
+    c._lookup_book = lambda _cid, _tok: None
+    m = _trade_msg()
+    assert c._handle_trade_message(m, "UNKNOWN", time.time_ns()) is True
+    row = captured[0][1]
+    assert row["asset"] == "UNKNOWN"
+    assert row["condition_id"] is None  # C3: never the token_id
+
+
+def test_trade_resolved_caller_asset_not_overridden(tmp_path):
+    """A caller-resolved asset is authoritative — repair never overrides."""
+    from types import SimpleNamespace
+    c, captured = _collector(tmp_path)
+    cid = "0xresolved"
+    c.markets[cid] = SimpleNamespace(
+        asset="BTC", series_id="BTC-5m", window_index=5971971,
+        market_id="5771729", up_token_id="tok-xyz", down_token_id="tok-down",
+        condition_id=cid)
+    m = _trade_msg(condition_id=cid)
+    assert c._handle_trade_message(m, "DOGE", time.time_ns()) is True
+    # caller labeled it DOGE (e.g. shard truth) — repair must NOT touch it
+    assert captured[0][1]["asset"] == "DOGE"
+
+
 # ---------------------------------------------------------------- H1
 def test_markets_log_unsent_retry(tmp_path):
     from polymarket_collector.storage.markets_log import MarketsLog

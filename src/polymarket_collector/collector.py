@@ -871,6 +871,24 @@ class Collector:
                         market = m
                         condition_id = m.condition_id
                         break
+            # 2026-10-17 asset=UNKNOWN partition fix: the message-level asset
+            # can arrive UNKNOWN while the trade still resolves EXACTLY via the
+            # live roster (precise condition_id hit, or exact token_id fill on
+            # a known book). Taking the resolved market's asset is real
+            # attribution from in-memory discovery state, never invented —
+            # leaving it UNKNOWN wrote unjoinable trades/asset=UNKNOWN rows
+            # (~200/day). Never overrides a caller-resolved asset, and an
+            # unresolvable trade still stays UNKNOWN (honest gap).
+            try:
+                if not asset or str(asset).upper() == "UNKNOWN":
+                    _m_asset = getattr(market, "asset", None)
+                    if not _m_asset:
+                        _b_as = self._lookup_book(condition_id, token_id)
+                        _m_asset = getattr(_b_as, "asset", None)
+                    if _m_asset and str(_m_asset).upper() != "UNKNOWN":
+                        asset = str(_m_asset)
+            except Exception:
+                pass
             price_raw = msg.get("price")
             size_raw = msg.get("size") or msg.get("amount")
             if price_raw is None or size_raw is None:
