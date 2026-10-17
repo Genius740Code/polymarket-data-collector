@@ -208,8 +208,15 @@ class MarketsLog:
         market_id: Optional[str] = None,
         asset: Optional[str] = None,
         details: Optional[dict] = None,
+        event_id: Optional[str] = None,
     ) -> None:
-        """Append a collector_events row for data-quality tracking."""
+        """Append a collector_events row for data-quality tracking.
+
+        event_id: optional DETERMINISTIC id. Default None -> uuid4. Callers
+        that must dedup across restart storms (e.g. the startup coverage-gap
+        narrator) pass a hash of measured gap bounds so the same evidence
+        row collapses to one copy instead of one per incarnation.
+        """
         # details column is pa.string() — serialize dicts so payloads survive to Parquet
         # PERF: intern repeated small strings (same values, less RAM; import hoisted).
         try:
@@ -223,7 +230,7 @@ class MarketsLog:
         elif details is not None:
             details = str(details)
         row = {
-            "event_id": str(uuid.uuid4()),
+            "event_id": str(event_id) if event_id else str(uuid.uuid4()),
             "event_type": event_type,
             "ts_utc": ts_utc,
             "ts_received_ns": ts_received_ns,

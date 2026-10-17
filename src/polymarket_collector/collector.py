@@ -466,7 +466,82 @@ class Collector:
             asset=details.get("asset"),
             connection_id=conn_id,
             details=details,
+            event_id=details.pop("_event_id", None),
         )
+
+    STARTUP_GAP_MIN_NS = 120 * 1_000_000_000  # 120s of measured absent coverage
+
+    def _narrate_startup_coverage_gaps(self) -> int:
+        """After WAL replay: make the collection down-time explicit (AGENT.md §1).
+
+        Measures the newest on-disk snapshot timestamp per asset lane from
+        book_snapshots_500ms (a real read, no fallback near the newest
+        files), and when the collector's off-period measured from that row
+        to now exceeds 120s, emits ONE parent coverage_gap collector_events
+        row per lane. The gap bounds are measured — the row narrates absent
+        buckets, never interpolates or fabricates any.
+
+        Restart storms must not flood evidence events, so event_id is a
+        deterministic sha256 of (asset, gap_start_ns): the pre-outage last
+        snapshot is stable while the disk asserts itself, giving the exact
+        same event_id on each blink — WAL/parquet dedup (key=event_id)
+        collapses the storm to one honest row.
+        """
+        try:
+            import glob as _glob
+            import hashlib as _hash
+            import os as _os
+            now_ns = time.time() * 1e9
+            today = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+            base = (getattr(getattr(self.config, "storage", None), "data_dir", None)
+                    or getattr(getattr(self, "writer", None), "data_dir", None)
+                    or Path("data"))
+            emitted = 0
+            for asset in sorted(getattr(self.config, "assets", []) or []):
+                fs = sorted(
+                    _glob.glob(str(base / "book_snapshots_500ms" / f"date={today}" / f"asset={asset}" / "*.parquet")),
+                    key=lambda p: _os.stat(p).st_mtime_ns if _os.path.exists(p) else 0,
+                    reverse=True,
+                )[:3]
+                last_ns = None
+                newest_file = None
+                for f in fs:
+                    try:
+                        import pyarrow.parquet as _pqt
+                        ts = _pqt.read_table(f, columns=["ts_snapshot_ns"]).column("ts_snapshot_ns").to_pylist()
+                        ts = [t for t in ts if t is not None]
+                        if ts:
+                            cand = max(ts)
+                            if last_ns is None or cand > last_ns:
+                                last_ns = cand
+                                newest_file = _os.path.basename(f)
+                    except Exception:
+                        continue
+                if last_ns is None:
+                    continue  # no measurable data for this lane — nothing to narrate against
+                gap_ns = now_ns - last_ns
+                if gap_ns < self.STARTUP_GAP_MIN_NS:
+                    continue
+                eid = _hash.sha256(f"startup_coverage_gap|{asset}|{int(last_ns)}".encode()).hexdigest()
+                details = {
+                    "reason": "startup_collection_outage",
+                    "asset": asset,
+                    "last_snapshot_ns": int(last_ns),
+                    "gap_ms": int(gap_ns // 1e6),
+                    "gap_buckets": int(gap_ns // 5e8),  # 500ms buckets absent
+                    "gap_start_utc": datetime.datetime.fromtimestamp(
+                        last_ns / 1e9, tz=datetime.timezone.utc).isoformat(),
+                    "last_file": newest_file,
+                    "_event_id": eid,
+                }
+                self._collector_event(CollectorEventType.coverage_gap, details)
+                emitted += 1
+                print(f"[startup] coverage_gap narrated asset={asset} gap_s={gap_ns/1e9:.0f} last={newest_file}")
+            return emitted
+        except Exception as e:
+            print(f"[startup] coverage_gap narrate err {e}")
+            return 0
+
 
     def _writer_event(self, event_type: CollectorEventType, details: dict) -> None:
         """Fire a collector_events row for write-status tracking (backpressure/write_failed)."""
@@ -2538,6 +2613,12 @@ class Collector:
                 pass
         except Exception as e:
             print(f"[startup] WAL replay err {e}")
+
+        # 2026-10-17 outage narrator: the process's down-time is a real gap
+        # the WAL cannot cover (nothing was collected). Emit parent
+        # coverage_gap evidence rows (deterministic event_id — restart
+        # storms dedup) instead of leaving un-narrated holes (AGENT.md §1).
+        self._narrate_startup_coverage_gaps()
 
         # 2026-09-20 disk-full fix: fail LOUD at startup when the lane
         # cadence outruns retention (warn-only: never block collection or
