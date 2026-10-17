@@ -115,6 +115,48 @@ def test_narrator_silent_when_lane_empty(tmp_path):
     assert ml.rows == []
 
 
+def test_narrator_survives_str_data_dir(tmp_path):
+    """2026-10-17 live bug: config stores data_dir as str, narrator did
+    `base / sub` on the str → TypeError "/: 'str' and 'str'" and printed
+    'coverage_gap narrate err ...' — narrator dead in prod while tests
+    passed (harness passed a Path). Coercion must make the str shape work."""
+    tmp = str(tmp_path)  # string form — the production shape
+    old_ts = int(((datetime.now(timezone.utc) - timedelta(minutes=5)).timestamp()) * 1e9)
+    _write_snapshots(Path(tmp), "BTC", old_ts)
+    emitted = _narrate_with_str_dir(tmp)
+    assert emitted == 1
+
+
+def _narrate_with_str_dir(tmp: str):
+    """Build an object collector with data_dir as a plain str, narrate."""
+    c = PolymarketCollector.__new__(PolymarketCollector)
+
+    class _Writer:
+        data_dir = tmp
+
+    class _StorageCfg:
+        data_dir = tmp
+
+    class _Cfg:
+        assets = ["BTC"]
+        storage = _StorageCfg()
+
+    c.config = _Cfg()
+    c._conn_ids = {}
+    c.writer = _Writer()
+    rows = []
+
+    class _MarketsLog:
+        def append_event(self, event_type, ts_utc, ts_received_ns, condition_id=None,
+                         market_id=None, asset=None, connection_id=None, details=None,
+                         event_id=None):
+            rows.append({"event_id": event_id, "details": details})
+    c.markets_log = _MarketsLog()
+    n = PolymarketCollector._narrate_startup_coverage_gaps(c)
+    assert n == len(rows), (n, len(rows))
+    return n
+
+
 def test_deterministic_event_id_survives_storm(tmp_path):
     """Two 'restarts' over identical on-disk data produce the same event_id."""
     c1, ml1 = _object_collector(tmp_path)

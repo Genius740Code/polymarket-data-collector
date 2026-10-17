@@ -496,6 +496,10 @@ class Collector:
             base = (getattr(getattr(self.config, "storage", None), "data_dir", None)
                     or getattr(getattr(self, "writer", None), "data_dir", None)
                     or Path("data"))
+            # 2026-10-17: config stores data_dir as str — `base / sub` on a str
+            # raises "/: 'str' and 'str'" (tests passed because the harness
+            # passed a Path; live startup crashed silently, narrator dead).
+            base = Path(str(base))
             emitted = 0
             for asset in sorted(getattr(self.config, "assets", []) or []):
                 fs = sorted(
