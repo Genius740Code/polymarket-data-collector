@@ -479,7 +479,7 @@ class Collector:
         files), and when the collector's off-period measured from that row
         to now exceeds 120s, emits ONE parent coverage_gap collector_events
         row per lane. The gap bounds are measured — the row narrates absent
-        buckets, never interpolates or fabricates any.
+        buckets only; no bucket in the window gains a row (gaps stay gaps).
 
         Restart storms must not flood evidence events, so event_id is a
         deterministic sha256 of (asset, gap_start_ns): the pre-outage last
