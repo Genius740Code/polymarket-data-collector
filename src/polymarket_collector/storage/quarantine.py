@@ -72,6 +72,169 @@ def quarantine_unreadable(data_dir: str | Path, dry_run: bool = False) -> list[d
     return moved
 
 
+AUDIT_STATE_NAME = "quarantine_audit.json"
+
+
+def quarantine_unreadable_bounded(
+    data_dir: str | Path,
+    dry_run: bool = False,
+    mtime_lookback_s: float = 120.0,
+    time_budget_s: float = 90.0,
+) -> dict:
+    """Incremental wall-clock-budgeted variant of quarantine_unreadable().
+
+    Why (2026-10-17 incident): the export path calls the unbounded audit on
+    EVERY lane tick, and it `rglob`s the whole hive (~40k+ parquet files)
+    with one footer read per file — measured 312s for just 4 of 10 dataset
+    dirs; the 08:51/09:00 ticks never finished their pass and Kaggle went
+    ~20h without a verified upload, which blocks the verified-upload prune
+    and re-creates the ENOSPC crash-loop outage.
+
+    Safety (real-data-only policy — same invariants as quarantine_unreadable):
+    - Never fabricates rows; it only MOVES footer-unreadable files into
+      data/_quarantine/ (never deletes, never rewrites live data).
+    - Fail-closed property retained for the files that can actually break
+      the current staging build: every file whose mtime is newer than the
+      last audit-weekmark (minus the lookback overlap) is footer-checked
+      on this tick. Files verified readable at an earlier tick are not
+      re-read — they were readable on disk then, and only a writer crash
+      produces footer-less stubs, and every such stub is written with a
+      fresh mtime, so it is covered by the watermark window.
+    - A wall-clock budget bounds the tick; if exceeded, the watermark is
+      NOT advanced, so the next tick re-checks the same window (a stub is
+      never skipped past by the budget, only re-planned).
+
+    State: <data_dir>/watchdog/quarantine_audit.json — atomic tmp+rename.
+    First-ever run on a data_dir performs one full audit (records complete)
+    and persists the watermark; process restarts do not repeat it.
+
+    Returns {"moved": [...], "scanned": int, "skip_mtime_hint_s": float,
+    "since_ns": int, "watermark_ns": int, "budget_exhausted": bool,
+    "seconds": float}.
+    """
+    import json as _json
+    import os as _os
+    import time as _time
+
+    import pyarrow.parquet as pq
+
+    base = Path(data_dir)
+    started = _time.monotonic()
+    now_ns = _time.time() * 1e9
+
+    state_dir = base / "watchdog"
+    state_path = state_dir / AUDIT_STATE_NAME
+    state: dict = {}
+    if state_path.exists():
+        try:
+            state = _json.loads(state_path.read_text())
+        except Exception as e:
+            print(f"[quarantine] WARN audit state unreadable ({e}); full audit")
+            state = {}
+    since_ns = int(state.get("watermark_ns") or 0)
+    full_audit = since_ns <= 0
+    lookback_ns = int(mtime_lookback_s * 1e9)
+    if not full_audit:
+        # Overlap window: a stub flushed while the previous scan was still
+        # enumerating could carry an mtime older than that scan's start —
+        # subtracting the lookback makes the NEXT scan re-check that border
+        # instead of silently skipping past a real stub.
+        since_ns = max(0, since_ns - lookback_ns)
+
+    moved: list[dict] = []
+    scanned = 0
+    budget_exhausted = False
+    if not base.exists():
+        return {"moved": moved, "scanned": 0, "since_ns": since_ns,
+                "watermark_ns": 0, "budget_exhausted": False,
+                "seconds": _time.monotonic() - started}
+
+    def _budget_left() -> float:
+        return time_budget_s - (_time.monotonic() - started)
+
+    for p in sorted(base.rglob("*.parquet")):
+        if p.name.endswith(".tmp"):
+            continue
+        if "_quarantine" in p.parts:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            # File vanished mid-scan — a later tick re-checks the window.
+            continue
+        # Footer-read gate: only candidate files inside the watermark window.
+        # Unreadable-stub detection REQUIRES the footer read, but readable-
+        # since-the-last-tick files are re-read every tick today at ~5-8 min
+        # of pure footer I/O per pass; stat() alone is ~1000x cheaper.
+        if not full_audit and st.st_mtime_ns < since_ns:
+            continue
+        if _budget_left() <= 0:
+            budget_exhausted = True
+            break
+        scanned += 1
+        try:
+            pq.read_metadata(str(p))
+            continue  # readable — leave alone
+        except Exception as e:
+            err = str(e)[:200]
+            size = st.st_size
+            rel = p.relative_to(base)
+            dest = base / "_quarantine" / rel
+            print(f"[quarantine] unreadable {rel} ({size}B): {err}")
+            if dry_run:
+                moved.append({"path": rel, "size": size, "error": err,
+                              "quarantined_to": str(dest) + " (dry-run)"})
+                continue
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                _os.replace(str(p), str(dest))
+                moved.append({"path": rel, "size": size, "error": err,
+                              "quarantined_to": str(dest)})
+                print(f"[quarantine] moved -> {dest}")
+            except Exception as me:
+                print(f"[quarantine] WARN could not move {p}: {me}")
+
+    seconds = _time.monotonic() - started
+    # Advance the watermark only on a complete (non-budget-exhausted) scan,
+    # and leave the lookback margin unscanned-territory: files written while
+    # this scan was running can carry an mtime inside the margin, so the
+    # next tick re-checks them — a stub is never skipped past.
+    # Fail-closed: an exhausted scan does NOT advance the watermark, so the
+    # next tick re-audits the same window instead of claiming coverage it
+    # did not do.
+    new_watermark = max(0, int(now_ns - lookback_ns)) if not budget_exhausted else 0
+    if not budget_exhausted:
+        state = {"watermark_ns": int(new_watermark), "since_ns": int(since_ns),
+                 "scanned": int(scanned), "seconds": round(seconds, 3),
+                 "ts_utc": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())}
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            tmp_state = state_path.with_name(state_path.name + ".tmp")
+            tmp_state.write_text(_json.dumps(state))
+            _os.replace(str(tmp_state), str(state_path))
+        except Exception as e:
+            print(f"[quarantine] WARN could not persist audit state: {e}")
+            # without a persisted watermark the next tick re-audits the full
+            # tree — correct (fail-closed), merely slower.
+            new_watermark = 0
+    else:
+        print(f"[quarantine] audit budget {time_budget_s}s exhausted after {scanned} "
+              f"scanned ({seconds:.1f}s); window re-checked next tick")
+
+    if not moved:
+        print(f"[quarantine] no unreadable files in window{'' if full_audit else ' (incremental)'} — nothing to do")
+    else:
+        print(f"[quarantine] quarantined {len(moved)} file(s); gaps remain honest "
+              f"(see coverage_gap/resync_episodes/collector_events)")
+
+    if full_audit and not budget_exhausted:
+        print(f"[quarantine] full audit baseline recorded (scanned={scanned}, {seconds:.1f}s)")
+
+    return {"moved": moved, "scanned": scanned, "since_ns": since_ns,
+            "watermark_ns": int(new_watermark), "budget_exhausted": budget_exhausted,
+            "seconds": round(seconds, 3)}
+
+
 def reap_quarantine(
     data_dir: str | Path,
     max_age_hours: float = 72,

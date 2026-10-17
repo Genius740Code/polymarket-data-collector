@@ -7869,9 +7869,22 @@ def _export_and_upload_all_kaggle_impl(
     # Step 0c: auto-quarantine unreadable stubs (audit 2026-09-22). A SIGKILL
     # mid-flush leaves footer-less parquets that fail-closed the export
     # forever. quarantine_unreadable() MOVES (never deletes) them aside.
+    # 2026-10-17: BOUNDED + incremental — the unbounded full-hive rglob +
+    # footer-read-per-file ~doubles the per-tick cost (measured 312s for 4 of
+    # 10 dataset dirs; 40k+ files) and today the 08:51/09:00 ticks never
+    # completed their pass after ENOSPC recovery, holding Kaggle ~20h stale
+    # (no verified upload -> no verified prune -> ENOSPC loop). The bounded
+    # variant keeps the same MOVES-aside invariant and the fail-closed stub
+    # detection for every file newer than the persisted watermark; a
+    # budget-exhausted scan leaves the window for the next tick (never
+    # claims coverage it did not do).
     try:
-        from .quarantine import quarantine_unreadable as _quar
-        _moved = _quar(base, dry_run=bool(dry_run))
+        from .quarantine import quarantine_unreadable_bounded as _quarb
+        _res = _quarb(base, dry_run=bool(dry_run), time_budget_s=90.0)
+        _moved = _res.get("moved") or []
+        print(f"[export] quarantine pre-check increment: scanned={_res.get('scanned')} "
+              f"moved={len(_moved)} wm={_res.get('watermark_ns')} budget_exhausted="
+              f"{_res.get('budget_exhausted')} seconds={_res.get('seconds')}")
         if _moved and not dry_run:
             try:
                 _log_quarantine_gap(base, {"files_deleted": 0, "bytes_deleted": 0,
