@@ -79,6 +79,21 @@ DAY_MS = 86_400_000
 # manifest matches the one-pass path exactly.
 SCAN_FILES_PER_PARTITION_TICK = 128
 
+# 2026-10-17 ENOSPC hang fix #2: the per-file parquet DATA read (the
+# condition_id column) costs ~1.3s/file on a saturated disk — 11.7k files
+# would need hours and blocked the flush loop (RSS balloon -> pm2 memory
+# kills, 189 restarts). Row counts now come from each file's parquet
+# FOOTER (``ParquetFile.metadata.num_rows``, ~2ms/file) and the sha from
+# ``stat`` size only. The condition_id column is read ONLY while the
+# market-end gate can still matter, i.e. the partition ends within
+# ``CID_GATE_MARGIN_MS`` of the age cutoff; clearly-older partitions rely
+# on the age + verified-checkpoint guards alone (l2_raw is the verbatim WS
+# firehose, is not gap evidence, and is not part of the uploaded rolling
+# mirror). ``SCAN_TIME_BUDGET_S`` additionally caps wall-time per call so
+# no single tick can hold the flush loop.
+SCAN_TIME_BUDGET_S = 6.0
+CID_GATE_MARGIN_MS = 2 * DAY_MS
+
 # In-process resumable scan progress: abs partition dir -> state record.
 # Survives across disk-guard ticks inside one collector process; lost on
 # restart (conservative rescan from zero). Never persisted to disk, never
@@ -334,27 +349,33 @@ def _partition_rows_and_sha(part_dir: Path, base: Path) -> tuple[int, str]:
         return 0, "unknown"
 
 
-def _scan_partition_files_bounded(part_dir: Path, base: Path, *, file_cap: int) -> dict:
+def _scan_partition_files_bounded(part_dir: Path, base: Path, *,
+                                  file_cap: int,
+                                  collect_cids: bool = True,
+                                  budget_s: float | None = None) -> dict:
     """Bounded per-file pass INSIDE an already-eligible partition. Never raises.
 
-    Old path: one unbroken rglob + parquet read of every file — O(files) on
-    a saturated disk, the hang. This reads at most ``file_cap`` files per
-    call, then spills: rows, sha parts and condition_ids accumulated so far
-    stay in process-local ``_SCAN_PROGRESS`` so the next tick resumes where
-    this one stopped instead of restarting. A completed scan is cached
-    until the partition moves (a failed move retries the move, not the
-    scan). Per-file semantics match the one-pass helpers exactly: .tmp
-    files skipped, sha over sorted ``relpath:size`` relative to ``base``,
-    rows from parquet metadata, unreadable file -> fail closed (partition
-    kept, progress reset).
+    Rows come from each file's parquet FOOTER (``ParquetFile.metadata``,
+    ~2ms/file) and the sha from ``stat`` size only — the condition_id
+    column is read ONLY while ``collect_cids`` is set (the market-end gate
+    can matter). At most ``file_cap`` files AND at most ``budget_s``
+    wall-seconds per call; the remainder spills to the next tick from
+    process-local ``_SCAN_PROGRESS``. Per-file semantics otherwise match
+    the one-pass helpers: .tmp files skipped, sha over sorted
+    ``relpath:size`` relative to ``base``, unreadable file -> fail closed
+    (partition kept, progress reset). A completed scan is cached until the
+    partition moves (a failed move retries the move, not the scan).
 
     Returns ``{"done", "files_done", "files_total", "rows", "sha",
-    "cids", "unreadable"}`` — ``done=False, unreadable=True`` means keep
-    (fail closed); ``done=False, unreadable=False`` means spilled to the
-    next tick; ``done=True`` carries rows/sha/cids for the manifest.
+    "cids", "unreadable", "budget_exhausted"}`` — ``done=False,
+    unreadable=True`` means keep (fail closed); ``done=False`` otherwise
+    means spilled to the next tick; ``done=True`` carries rows/sha/cids
+    for the manifest.
     """
     key = str(part_dir)
     try:
+        import time as _time
+
         import pyarrow.parquet as pq
 
         try:
@@ -365,41 +386,58 @@ def _scan_partition_files_bounded(part_dir: Path, base: Path, *, file_cap: int) 
         total = len(files)
         st = _SCAN_PROGRESS.get(key)
         if (isinstance(st, dict) and st.get("done")
-                and st.get("count") == total):
+                and st.get("count") == total
+                and bool(st.get("collect_cids", True)) == bool(collect_cids)):
             return {"done": True, "files_done": total, "files_total": total,
                     "rows": int(st.get("rows", 0)), "sha": str(st.get("sha", "")),
-                    "cids": set(st.get("cids") or set()), "unreadable": False}
+                    "cids": set(st.get("cids") or set()), "unreadable": False,
+                    "budget_exhausted": False}
         if (not isinstance(st, dict) or st.get("done")
                 or not isinstance(st.get("next"), int)
                 or not isinstance(st.get("parts"), list)
                 or not isinstance(st.get("cids"), set)
                 or st.get("count") != total
+                or bool(st.get("collect_cids", True)) != bool(collect_cids)
                 or st["next"] < 0 or st["next"] > total):
-            st = {"next": 0, "rows": 0, "parts": [], "cids": set(), "count": total}
-        start = int(st["next"])
+            st = {"next": 0, "rows": 0, "parts": [], "cids": set(),
+                  "count": total, "collect_cids": bool(collect_cids)}
         try:
             cap = max(1, int(file_cap))
         except Exception:
             cap = 1
-        stop = min(total, start + cap)
-        for f in files[start:stop]:
+        deadline = None
+        try:
+            if budget_s is not None:
+                deadline = _time.monotonic() + max(0.0, float(budget_s))
+        except Exception:
+            deadline = None
+        stop = min(total, int(st["next"]) + cap)
+        exhausted = False
+        i = int(st["next"])
+        while i < stop:
+            if deadline is not None and _time.monotonic() >= deadline:
+                exhausted = True
+                break
+            f = files[i]
             try:
-                t = pq.read_table(str(f), columns=["condition_id"])
+                st["rows"] += int(pq.ParquetFile(str(f)).metadata.num_rows)
             except Exception:
                 _SCAN_PROGRESS.pop(key, None)
-                return {"done": False, "files_done": start, "files_total": total,
-                        "rows": 0, "sha": "", "cids": set(), "unreadable": True}
-            try:
-                if t is not None and t.num_rows:
-                    st["rows"] += int(t.num_rows)
-                    if "condition_id" in t.schema.names:
-                        for c in t.column("condition_id").to_pylist():
+                return {"done": False, "files_done": i, "files_total": total,
+                        "rows": 0, "sha": "", "cids": set(),
+                        "unreadable": True, "budget_exhausted": False}
+            if collect_cids:
+                try:
+                    t = pq.read_table(str(f), columns=["condition_id"])
+                    if t is not None and t.num_rows and "condition_id" in t.schema.names:
+                        for c in t.column("condition_id").unique().to_pylist():
                             if c:
                                 st["cids"].add(str(c))
-            except Exception:
-                _SCAN_PROGRESS.pop(key, None)
-                return {"done": False, "files_done": start, "files_total": total,
-                        "rows": 0, "sha": "", "cids": set(), "unreadable": True}
+                except Exception:
+                    _SCAN_PROGRESS.pop(key, None)
+                    return {"done": False, "files_done": i, "files_total": total,
+                            "rows": 0, "sha": "", "cids": set(),
+                            "unreadable": True, "budget_exhausted": False}
             try:
                 rel = str(f.relative_to(base))
             except Exception:
@@ -410,18 +448,21 @@ def _scan_partition_files_bounded(part_dir: Path, base: Path, *, file_cap: int) 
                 size = -1
             st["parts"].append(f"{rel}:{size}")
             st["next"] += 1
-        if stop >= total:
+            i += 1
+        if int(st["next"]) >= total:
             rec = {"done": True, "next": total, "count": total,
                    "rows": int(st["rows"]),
                    "sha": _hashlib.sha1("\n".join(st["parts"]).encode()).hexdigest(),
-                   "cids": set(st["cids"])}
+                   "cids": set(st["cids"]), "collect_cids": bool(collect_cids)}
             _SCAN_PROGRESS[key] = rec
             return {"done": True, "files_done": total, "files_total": total,
                     "rows": rec["rows"], "sha": rec["sha"],
-                    "cids": set(rec["cids"]), "unreadable": False}
+                    "cids": set(rec["cids"]), "unreadable": False,
+                    "budget_exhausted": False}
         _SCAN_PROGRESS[key] = st
-        return {"done": False, "files_done": stop, "files_total": total,
-                "rows": 0, "sha": "", "cids": set(), "unreadable": False}
+        return {"done": False, "files_done": int(st["next"]),
+                "files_total": total, "rows": 0, "sha": "", "cids": set(),
+                "unreadable": False, "budget_exhausted": exhausted}
     except Exception as e:
         _log(f"[l2-retention] WARN bounded scan failed for {part_dir} ({e}) — keeping partition")
         try:
@@ -429,7 +470,8 @@ def _scan_partition_files_bounded(part_dir: Path, base: Path, *, file_cap: int) 
         except Exception:
             pass
         return {"done": False, "files_done": 0, "files_total": 0,
-                "rows": 0, "sha": "", "cids": set(), "unreadable": True}
+                "rows": 0, "sha": "", "cids": set(), "unreadable": True,
+                "budget_exhausted": False}
 
 
 def _append_manifest(base: Path, row: dict) -> bool:
@@ -566,6 +608,7 @@ def apply_l2_retention(
     lanes: list[str] | None = None,
     dry_run: bool = False,
     scan_file_cap: int | None = None,
+    budget_s: float | None = None,
 ) -> dict:
     """Time-partitioned retention for l2_raw. Never raises.
 
@@ -621,7 +664,17 @@ def apply_l2_retention(
                    else int(scan_file_cap))
         except Exception:
             cap = SCAN_FILES_PER_PARTITION_TICK
+        import time as _time
+        try:
+            if budget_s is None:
+                budget_s = SCAN_TIME_BUDGET_S
+            deadline = _time.monotonic() + max(0.0, float(budget_s))
+        except Exception:
+            deadline = None
         for name in _partition_dir_names(l2_root):
+            if deadline is not None and _time.monotonic() >= deadline:
+                kept[name] = "time budget exhausted this tick (resumes next tick)"
+                continue
             day = _parse_date_partition(name)
             if day is None:
                 kept[name] = "not a date= partition (left alone)"
@@ -633,9 +686,18 @@ def apply_l2_retention(
             if pend > checkpoint:
                 kept[name] = "slowest-lane checkpoint has not passed this partition"
                 continue
-            # Directory-level guards passed — per-file work starts here and
-            # is bounded per tick; the remainder spills to the next tick.
-            scan = _scan_partition_files_bounded(l2_root / name, base, file_cap=cap)
+            # Market-end gate only while a still-live (long-dated) market
+            # could reach into this partition, i.e. within CID_GATE_MARGIN_MS
+            # of the cutoff. Clearly-older partitions are governed by the age
+            # + verified-checkpoint guards alone, which keeps the hot path
+            # footer-only (no data-page reads, no multi-hour scan).
+            needs_cid_gate = pend >= (cutoff_ms - CID_GATE_MARGIN_MS)
+            rem = None
+            if deadline is not None:
+                rem = max(0.0, deadline - _time.monotonic())
+            scan = _scan_partition_files_bounded(
+                l2_root / name, base, file_cap=cap,
+                collect_cids=needs_cid_gate, budget_s=rem)
             if scan.get("unreadable"):
                 kept[name] = "condition_ids unreadable (fail closed)"
                 continue
@@ -646,18 +708,23 @@ def apply_l2_retention(
                 _log(f"[l2-retention] {name} scan {scan['files_done']}/"
                      f"{scan['files_total']} files this tick (cap {cap}) — "
                      f"remainder spills to next tick")
+                if scan.get("budget_exhausted"):
+                    # Disk is too slow to finish in-budget: stop the whole
+                    # pass this tick so the flush loop is never held.
+                    break
                 continue
-            cids = scan.get("cids") or set()
-            if not cids:
-                kept[name] = "empty partition (nothing to move)"
-                continue
-            ends = [end_by_cid.get(c) for c in cids]
-            if any(e is None for e in ends):
-                kept[name] = "unknown condition_id (market-end cutoff, conservative keep)"
-                continue
-            if max(ends) >= cutoff_ms:
-                kept[name] = "some market inside the retention leeway (market-end cutoff)"
-                continue
+            if needs_cid_gate:
+                cids = scan.get("cids") or set()
+                if not cids:
+                    kept[name] = "empty partition (nothing to move)"
+                    continue
+                ends = [end_by_cid.get(c) for c in cids]
+                if any(e is None for e in ends):
+                    kept[name] = "unknown condition_id (market-end cutoff, conservative keep)"
+                    continue
+                if max(ends) >= cutoff_ms:
+                    kept[name] = "some market inside the retention leeway (market-end cutoff)"
+                    continue
             res = quarantine_partition(base, ALLOWED_DATASET, name, dry_run=dry_run,
                                        rows_sha=(scan.get("rows", 0), scan.get("sha", "")))
             if res.get("moved"):

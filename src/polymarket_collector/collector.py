@@ -6006,16 +6006,9 @@ class Collector:
             except Exception:
                 _l2_days = None
             if _l2_days:
-                try:
-                    _l2_res = apply_l2_retention(
-                        self.config.storage.data_dir,
-                        retention_days=_l2_days)
-                    if isinstance(_l2_res, dict) and _l2_res.get("moved"):
-                        print(f"[disk-guard] l2 retention moved "
-                              f"{len(_l2_res['moved'])} partition(s) to "
-                              f"_quarantine/l2_raw")
-                except Exception as _l2e:
-                    print(f"[disk-guard] l2 retention err {_l2e}")
+                # Reap FIRST (2026-10-17 ENOSPC fix): a slow or failing
+                # apply must never block the delete pass that actually
+                # frees bytes.
                 try:
                     _l2_rs = reap_l2_quarantine(
                         self.config.storage.data_dir,
@@ -6033,6 +6026,16 @@ class Collector:
                               f"({_l2_rs.get('deleted')} partition(s))")
                 except Exception as _l2re:
                     print(f"[disk-guard] l2 reap err {_l2re}")
+                try:
+                    _l2_res = apply_l2_retention(
+                        self.config.storage.data_dir,
+                        retention_days=_l2_days)
+                    if isinstance(_l2_res, dict) and _l2_res.get("moved"):
+                        print(f"[disk-guard] l2 retention moved "
+                              f"{len(_l2_res['moved'])} partition(s) to "
+                              f"_quarantine/l2_raw")
+                except Exception as _l2e:
+                    print(f"[disk-guard] l2 retention err {_l2e}")
             # (2) full verified prune is a slow hive scan — flag it for the
             # async loop, which runs it in a thread (overlap + hourly throttle).
             # 2026-09-22 ENOSPC fix: hive prune fail-closes (0 files) while a

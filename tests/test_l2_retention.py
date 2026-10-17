@@ -23,6 +23,11 @@ RETENTION_DAYS = 7
 CUTOFF = NOW - RETENTION_DAYS * 86_400_000  # 2026-09-29T00:00Z
 
 OLD_DAY = "2026-09-01"
+# Within CID_GATE_MARGIN_MS of the cutoff (2026-09-29): the market-end /
+# unknown-cid gate still runs for this partition. Clearly-older partitions
+# (OLD_DAY) rely on the age + checkpoint guards alone — see
+# test_clearly_old_partition_skips_market_end_gate.
+GATED_DAY = "2026-09-28"
 YOUNG_DAY = "2026-10-05"
 CID_OLD = "0x" + "aa" * 32
 CID_LIVE = "0x" + "bb" * 32
@@ -116,23 +121,59 @@ def test_young_partition_stays(tmp_path):
 
 
 def test_live_market_stays(tmp_path):
-    _markets(_hive_l2_old(tmp_path, cid=CID_LIVE),
+    # Partition near the cutoff -> the market-end gate runs and keeps it
+    # because a tracked market's end is inside the retention leeway.
+    _markets(_hive_l2_old(tmp_path, day=GATED_DAY, cid=CID_LIVE),
              [{"condition_id": CID_LIVE, "market_end_ts_ms": END_LIVE}])
     out = lr.apply_l2_retention(tmp_path, retention_days=RETENTION_DAYS,
                                 now_ms=NOW, checkpoint_ms=NOW)
     assert out["moved"] == []
-    assert "market-end" in out["kept"][f"date={OLD_DAY}"] or "leeway" in out["kept"][f"date={OLD_DAY}"]
-    assert (tmp_path / "l2_raw" / f"date={OLD_DAY}").exists()
+    assert "market-end" in out["kept"][f"date={GATED_DAY}"] or "leeway" in out["kept"][f"date={GATED_DAY}"]
+    assert (tmp_path / "l2_raw" / f"date={GATED_DAY}").exists()
 
 
 def test_unknown_condition_stays(tmp_path):
-    _markets(_hive_l2_old(tmp_path, cid=CID_UNKNOWN),
+    # Near-cutoff partition whose cid is not in markets_latest -> conservative keep.
+    _markets(_hive_l2_old(tmp_path, day=GATED_DAY, cid=CID_UNKNOWN),
              [{"condition_id": CID_OLD, "market_end_ts_ms": END_OLD}])
     out = lr.apply_l2_retention(tmp_path, retention_days=RETENTION_DAYS,
                                 now_ms=NOW, checkpoint_ms=NOW)
     assert out["moved"] == []
-    assert "unknown" in out["kept"][f"date={OLD_DAY}"].lower()
-    assert (tmp_path / "l2_raw" / f"date={OLD_DAY}").exists()
+    assert "unknown" in out["kept"][f"date={GATED_DAY}"].lower()
+    assert (tmp_path / "l2_raw" / f"date={GATED_DAY}").exists()
+
+
+def test_clearly_old_partition_skips_market_end_gate(tmp_path):
+    # 2026-10-17: the l2_raw firehose is ~80% UNKNOWN condition_ids (markets
+    # we do not track), so the conservative "unknown -> keep" gate would
+    # retain EVERY old partition forever and retention could never drain.
+    # Clearly-older-than-margin partitions are therefore governed by the age
+    # + verified-checkpoint guards alone and move even with unknown cids
+    # present. (The covered partition here holds only CID_UNKNOWN and no
+    # matching market row.)
+    _hive_l2_old(tmp_path, day=OLD_DAY, cid=CID_UNKNOWN)
+    _markets(tmp_path, [{"condition_id": CID_OLD, "market_end_ts_ms": END_OLD}])
+    out = lr.apply_l2_retention(tmp_path, retention_days=RETENTION_DAYS,
+                                now_ms=NOW, checkpoint_ms=NOW)
+    assert [m["partition"] for m in out["moved"]] == [f"date={OLD_DAY}"]
+    assert not (tmp_path / "l2_raw" / f"date={OLD_DAY}").exists()
+    assert (tmp_path / "_quarantine" / "l2_raw" / f"date={OLD_DAY}").exists()
+
+
+def test_scan_time_budget_spills_without_blocking(tmp_path):
+    # 2026-10-17: the per-file cid read is ~1.3s/file on a saturated disk, so
+    # a scan must never exceed its wall budget — it spills to the next tick.
+    _hive_l2_old(tmp_path, day=OLD_DAY, cid=CID_OLD)
+    part = tmp_path / "l2_raw" / f"date={OLD_DAY}"
+    lr._SCAN_PROGRESS.clear()
+    first = lr._scan_partition_files_bounded(part, tmp_path, file_cap=128,
+                                             budget_s=0.0)
+    assert first["done"] is False
+    assert first["budget_exhausted"] is True
+    assert first["files_done"] == 0
+    nxt = lr._scan_partition_files_bounded(part, tmp_path, file_cap=128,
+                                           budget_s=5.0)
+    assert nxt["done"] is True and nxt["files_total"] >= 1
 
 
 def test_missing_checkpoint_stays(tmp_path):
@@ -281,8 +322,12 @@ def _guard_collector(tmp_path, **storage_over):
     return c
 
 
-def test_disk_guard_wires_apply_then_reap(tmp_path, monkeypatch):
-    """Low disk + keys set -> apply runs, THEN the bounded reap, in order."""
+def test_disk_guard_wires_reap_then_apply(tmp_path, monkeypatch):
+    """Low disk + keys set -> bounded reap runs FIRST, then apply.
+
+    2026-10-17 ENOSPC fix: the reap is what actually frees bytes, so a slow
+    or failing apply must never block it.
+    """
     import polymarket_collector.collector as coll
 
     calls: list = []
@@ -301,10 +346,10 @@ def test_disk_guard_wires_apply_then_reap(tmp_path, monkeypatch):
                          l2_quarantine_reap_enabled=True,
                          l2_quarantine_max_deletes_per_cycle=1)
     c._disk_guard_tick()
-    assert [name for name, _ in calls] == ["apply", "reap"], \
-        "apply must stage partitions before the reap frees them"
-    assert calls[0][1].get("retention_days") == 3
-    reap_kw = calls[1][1]
+    assert [name for name, _ in calls] == ["reap", "apply"], \
+        "the byte-freeing reap must run before the (slow) apply"
+    assert calls[1][1].get("retention_days") == 3
+    reap_kw = calls[0][1]
     assert reap_kw.get("enabled") is True
     assert reap_kw.get("max_deletes_per_cycle") == 1, "bounded: 1 delete/cycle"
     assert reap_kw.get("min_free_bytes") == c.config.storage.disk_space_min_bytes
