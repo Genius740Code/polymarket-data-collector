@@ -22,7 +22,14 @@ class DailyCompleteness:
     asset: str
     expected_snapshots: int  # 172800 per day (2/sec * 86400)
     actual_snapshots: int = 0
-    actual_clean_snapshots: int = 0
+    # None = no per-date clean count derivable metadata-only (the local
+    # clean hive is not materialized per date; the staging clean artifact is
+    # cumulative over the rolling retention window). None is NOT 0: 0 would
+    # fabricate proof of an empty day. ratio/missing degrade to raw footers.
+    actual_clean_snapshots: int | None = None
+    # where actual_clean_snapshots / the ratio came from:
+    # "local_clean_hive" | "staging" | "raw_footers_only"
+    clean_source: str | None = None
     missing_intervals: int = 0
     disconnect_duration_ms: int = 0
     resync_episode_count: int = 0
@@ -39,7 +46,16 @@ class DailyCompleteness:
     def completeness_ratio(self) -> float:
         if self.expected_snapshots == 0:
             return 0.0
-        return self.actual_clean_snapshots / self.expected_snapshots
+        # No per-date clean count derivable metadata-only → degrade to RAW
+        # footer rows (real, counted) instead of a fabricated 0.0. This
+        # measures capture completeness, not post-filter completeness —
+        # clean_source says which.
+        actual = (
+            self.actual_clean_snapshots
+            if self.actual_clean_snapshots is not None
+            else self.actual_snapshots
+        )
+        return actual / self.expected_snapshots
 
     def to_dict(self) -> dict:
         return {
@@ -48,6 +64,7 @@ class DailyCompleteness:
             "expected_snapshots": self.expected_snapshots,
             "actual_snapshots": self.actual_snapshots,
             "actual_clean_snapshots": self.actual_clean_snapshots,
+            "clean_source": self.clean_source,
             "missing_intervals": self.missing_intervals,
             "disconnect_duration_ms": self.disconnect_duration_ms,
             "resync_episode_count": self.resync_episode_count,
@@ -62,6 +79,69 @@ class DailyCompleteness:
             "sanity_violations": self.sanity_violations,
             "completeness_ratio": self.completeness_ratio(),
         }
+
+
+def _footer_count_dir(p: Path) -> tuple[int, int]:
+    """Footer-only row count for a directory of parquet parts (per-day hive).
+
+    Returns (num_rows, num_parts). Never reads/decompresses row data.
+    """
+    try:
+        parts = [x for x in p.glob("*.parquet") if not x.name.endswith(".tmp")]
+    except Exception:
+        parts = []
+    cnt = 0
+    unreadable = 0
+    for fp in parts:
+        try:
+            cnt += pq.read_metadata(str(fp)).num_rows
+        except Exception:
+            unreadable += 1
+    if parts and cnt == 0 and unreadable == len(parts):
+        print(f"[completeness] ERROR all {len(parts)} files unreadable for {p} — counts would be silently wrong")
+    return cnt, len(parts)
+
+
+def _staging_per_date_clean_count(base: Path, date_str: str, asset: str) -> int | None:
+    """Footer-only count from a staging clean artifact scoped to THIS date.
+
+    The per-lane staging clean files (data/kaggle_staging/<tf>/<slug>/
+    <ASSET>_book_snapshots_clean.parquet) are CUMULATIVE over the rolling
+    retention window — their footer count cannot be attributed to a single
+    UTC date without reading row data, which is never done here. Only a
+    staged artifact whose path is scoped to this exact date (a `date=`
+    segment) is footer-countable per day. Returns None when none exists.
+    """
+    root = base / "kaggle_staging"
+    if not root.exists():
+        return None
+    date_seg = f"date={date_str}"
+    asset_prefix = f"{asset.upper()}_book_snapshots_clean"
+    total = 0
+    found = False
+    try:
+        day_dirs = [d for d in root.glob(f"**/{date_seg}") if d.is_dir()]
+    except Exception:
+        return None
+    for d in day_dirs:
+        candidates: List[Path] = []
+        try:
+            candidates.extend(x for x in d.glob(f"{asset_prefix}*.parquet") if not x.name.endswith(".tmp"))
+            adir = d / f"asset={asset}"
+            if adir.is_dir():
+                candidates.extend(
+                    x for x in adir.glob("*.parquet")
+                    if "book_snapshots_clean" in x.name and not x.name.endswith(".tmp")
+                )
+        except Exception:
+            continue
+        for p in candidates:
+            try:
+                total += pq.read_metadata(str(p)).num_rows
+                found = True
+            except Exception:
+                pass
+    return total if found else None
 
 
 def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[DailyCompleteness]:
@@ -82,32 +162,40 @@ def compute_daily_completeness(data_dir: str | Path, date_str: str) -> List[Dail
 
     for asset in assets:
         dc = DailyCompleteness(date=date_str, asset=asset, expected_snapshots=expected_per_day)
-        # count snapshots
+        # resolve the RAW count and (if derivable metadata-only) the CLEAN count
         # PERF: footer-only row counts — previously decompressed + decoded every
         # 120-col snapshot row just to learn COUNT(*). pq.read_metadata num_rows
         # is exact; nulls/dedup untouched (no rows read).
         snap_dir = base / "book_snapshots_500ms" / f"date={date_str}" / f"asset={asset}"
         clean_dir = base / "book_snapshots_clean" / f"date={date_str}" / f"asset={asset}"
-        for p in [snap_dir, clean_dir]:
-            if p.exists():
-                try:
-                    parts = [x for x in p.glob("*.parquet") if not x.name.endswith(".tmp")]
-                except Exception:
-                    parts = []
-                cnt = 0
-                _unreadable = 0
-                for _fp in parts:
-                    try:
-                        cnt += pq.read_metadata(str(_fp)).num_rows
-                    except Exception:
-                        _unreadable += 1
-                if parts and cnt == 0 and _unreadable == len(parts):
-                    print(f"[completeness] ERROR all {len(parts)} files unreadable for {p} — counts would be silently wrong")
-                if "clean" in str(p):
-                    dc.actual_clean_snapshots = cnt
-                else:
-                    dc.actual_snapshots = cnt
-        dc.missing_intervals = max(0, dc.expected_snapshots - dc.actual_clean_snapshots)
+        if snap_dir.exists():
+            cnt, nparts = _footer_count_dir(snap_dir)
+            if nparts:
+                dc.actual_snapshots = cnt
+        if clean_dir.exists():
+            cnt, nparts = _footer_count_dir(clean_dir)
+            if nparts:
+                dc.actual_clean_snapshots = cnt
+                dc.clean_source = "local_clean_hive"
+        if dc.actual_clean_snapshots is None:
+            # No local per-date clean hive. The clean view is built per-lane
+            # inside Kaggle staging at export time; only a staging artifact
+            # scoped to THIS date (footer-countable without reading data)
+            # qualifies. Otherwise clean stays None (never fabricated 0) and
+            # the ratio/missing degrade to the RAW 500ms footers.
+            staged = _staging_per_date_clean_count(base, date_str, asset)
+            if staged is not None:
+                dc.actual_clean_snapshots = staged
+                dc.clean_source = "staging"
+            else:
+                dc.clean_source = "raw_footers_only"
+        if dc.actual_clean_snapshots is not None:
+            dc.missing_intervals = max(0, dc.expected_snapshots - dc.actual_clean_snapshots)
+        else:
+            # clean=None → missing from RAW footers (real count), not the
+            # phantom all-missing 172800 the old local-hive glob printed
+            # every day. raw==0 → missing==expected, same as before, honest.
+            dc.missing_intervals = max(0, dc.expected_snapshots - dc.actual_snapshots)
 
         # aggregate collector_events for this date/asset
         # PERF: hoisted — single CE/RE read per date (was N_assets × full
