@@ -97,6 +97,15 @@ Gate probe (`python scripts/gate_probe.py`, density% / CompNorm% gate >0.1):
 - Kaggle: first post-restart verified upload **2026-10-17T23:21:14** `✓ Upload success
   gghgg1/polymarket-5m-crypto` (was 26h stale since 10-16 13:08) + per-file uploads
   observed; **prune resumed** 23:45 (expired XRP trades quarantined then verified-reapable).
+- **Density split measured 2026-10-18 (`scripts/density_split.py`, `61b181d`) — missing
+  ticks per complete-trading day (~19k of ~250k+, ≈93% density):** BTC missing=18,862 →
+  post_roll **7,313 (39%)**, other **5,824 (31%)**, outage **5,706 (30%)**, empty-skip ~19;
+  ETH 16,898 → post_roll 5,955 (35%), other 5,264 (31%), outage 5,089 (30%); SOL 20,120 →
+  other 8,401 (42%), post_roll 6,213 (31%), outage 5,506 (27%). **Conclusion: the
+  empty-book P0 skip is NOT a density cost (≈0); post-roll dip (~35%) and outage
+  buckets (~30% — collector restarts incl. the 11:39 deploy) dominate, with ~30–40%
+  "other" still unattributed.** Next targeted fix: post-roll promotion speed in the
+  first 120s of each window; attribute "other" deeper before touching write cadence.
 - Post-deploy `asset_unknown_partition` events: **0** in any dataset (was ~115/79/77 trio
   of per-dataset trickle on 10-17 alone).
 
@@ -132,6 +141,12 @@ Gate probe (`python scripts/gate_probe.py`, density% / CompNorm% gate >0.1):
 1b. ~~completeness probe source~~ **CLOSED 2026-10-18 (`0ae92e1`): clean-source resolution
    (local hive → staging → raw footers) — HYPE raw capture ratio 0.8989 visible daily.
    Change-items #1+#2 of the 99.9%-gate plan done; spec amended (fresh-share contract).**
+1c. ~~scorecard refinements + density attribution~~ **CLOSED 2026-10-18 (`61b181d`):**
+   orphans now checked vs the FULL episode table (only true gaps remain), fair per-lane
+   budgets, and `scripts/density_split.py` attributes missing ticks (post_roll ~35%,
+   outage ~30%, other ~35%; empty-skip ≈0 — cleared as a density suspect).
+   **Next up (change-item #4): reduce the post-roll tax further in the first 120s of
+   each window; attribute the "other" bucket deeper before touching write cadence.**
 2. Kaggle cadence design decision (§6 third bullet) — progressive upload vs per-pass.
    Consider raising it given the ~37–52% stale-share finding above is a per-pass
    quality constant, not a defect. **Next up: change-item #3 — build the single
