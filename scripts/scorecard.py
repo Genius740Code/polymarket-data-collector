@@ -19,9 +19,16 @@ Reuses existing infrastructure instead of rebuilding it:
 T1 block: bounded day scan of the per-date book_snapshots_500ms parts —
 projected columns, streamed, tiny aggregate counters only (no tables kept in
 memory), .tmp skipped, files replaced mid-read (compaction) skipped-and-counted,
-wall-clock budget (--budget-s) with explicit partial=yes rows and
-n/a(partial) for any metric that could not finish. Honest exceptions only:
-a number is printed only when it was actually computed from real files.
+wall-clock budget (--budget-s, default 560s) split as FAIR PER-LANE SLICES
+(remaining / lanes-not-yet-run, recomputed after every lane — an early lane
+hands its leftover wall time to the lanes still pending) with explicit
+partial=yes rows and n/a(partial) for any metric that could not finish.
+The orphan counter checks non-blank resync_ids against the FULL
+resync_episodes table (id-only projected read of every date partition,
+built once per run, deduped): episodes persist in the partition of the day
+they started, so a day-scoped check false-positives rows written hours past
+midnight. Honest exceptions only: a number is printed only when it was
+actually computed from real files.
 
 Targets (docs/PERFECT_DATA_SPEC.md §10, as amended):
   density >= 99% | CompNorm <= 0.1% | every T1 counter = 0 | official-share >= 99%
@@ -34,7 +41,9 @@ import hashlib
 import json
 import math
 import multiprocessing
+import os
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -53,7 +62,9 @@ import gate_probe  # noqa: E402  (offline window probe, reused as-is)
 DATA_ROOT = Path("/home/fese/polymarket-data-collector/data")
 
 # --- bounded-scan knobs (3.9GB box: keep every buffer tiny) ----------------
-T1_WORKERS = 4            # parallel parquet readers for the core T1 scan
+T1_WORKERS = 8            # parallel parquet readers for the core T1 scan
+                          # (bench 2026-10-18: 55.2s vs 66.2s per full lane at 4
+                          # on this 2-core box; bounded pending buffers only)
 FOOTER_WORKERS = 8        # small-file footer/column reads parallelize better
 DUP_BLOOM_BITS = 26       # 2^26 bits = 8 MiB fixed bound for the (condition, ts) set
 DUP_BLOOM_WAYS = 3        # ~2e-4 false-positive rate at ~1.3M keys/day
@@ -72,8 +83,12 @@ G6_BATCH_ROWS = 256
 G6_SIDES = (("up", "bid"), ("up", "ask"), ("down", "bid"), ("down", "ask"))
 OFFICIAL_SOURCES = ("on_chain_confirmed", "polymarket_official")
 INFERRED_SOURCES = ("inferred_nearest",)
-RESYNC_ID_SET_CAP = 200_000
-RESYNC_LOAD_FRAC = 0.15  # share of the budget for loading the day's resync-id set
+RESYNC_ID_SET_CAP = 2_000_000  # exact per-run set; full episode table ~530k unique ids
+RESYNC_LOAD_FRAC = 0.25  # share of the budget for loading the full resync-id set
+LANE_SLICE_MIN_S = 5.0  # floor for a per-lane fair slice (empty lanes still run)
+COMP_JOIN_ALLOWANCE_S = 600.0  # extra wall allowance to join the completeness child
+                               # (measured 2026-10-18: it re-reads ~8522 collector_events
+                               #  + ~6046 episode files per day, needs >500s here)
 TARGETS = "targets: density>=99% | CompNorm<=0.1% | T1 counters=0 | official-share>=99%"
 
 _G6_COLS: list | None = None  # built once (level price/size cols 1..100 + depth cols)
@@ -168,7 +183,7 @@ class T1Block:
     out_of_range_rows: int = 0   # best price outside [0, 1]
     zero_price_rows: int = 0     # best price exactly 0.0
     state_counts: dict = field(default_factory=dict)  # book_state -> rows
-    orphan_resync_rows: int = 0  # non-blank resync_id missing from the day's episodes
+    orphan_resync_rows: int = 0  # non-blank resync_id missing from the FULL episode table
     offgrid_rows: int = 0        # ts % 500ms != 0
     g6_rows_checked: int = 0
     g6_mismatch_rows: int = 0
@@ -244,7 +259,7 @@ def day_files(asset_dir: Path, since_mtime: float | None) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Day resync-id set (projectId-only read; dataset is small)
+# Full-table resync-id set (projected id-only read; exact, once per run)
 # ---------------------------------------------------------------------------
 
 
@@ -253,18 +268,32 @@ def load_resync_ids(
     deadline: float | None = None,
     workers: int = FOOTER_WORKERS,
 ) -> tuple:
-    """resync_id-only projected read of the day's resync_episodes.
+    """resync_id-only projected read of the WHOLE resync_episodes tree.
+
+    Episodes persist in the partition of the date they STARTED, while
+    snapshot rows can carry the rid for hours into adjacent-day data —
+    checking the rid set against only the day's partition produced orphan
+    false positives (2026-10-18: BTC/BNB/DOGE/ETH "orphans" that were fully
+    present under neighbouring partitions). The set is therefore built from
+    ALL date partitions (``**/*.parquet``, .tmp skipped, deduped) exactly
+    once per run; anything still absent from this FULL set afterwards is a
+    real orphan.
 
     Returns (id_set, overflow_flag, unread_count). Overflow keeps the set
-    capped and flags the orphan metric partial (ids beyond the cap are not
-    checkable without unbounded memory).
+    capped and flags the orphan metric partial; unread counts files not read
+    at all (unreadable, or the deadline cut the load short — a short load
+    must never look like a complete one).
     """
     ids: set = set()
     overflow = False
     unread = 0
     if not resync_dir.exists():
         return ids, overflow, unread
-    parts = sorted(p for p in resync_dir.glob("*.parquet") if not p.name.endswith(".tmp"))
+    parts = sorted(
+        p for p in resync_dir.glob("**/*.parquet") if not p.name.endswith(".tmp")
+    )
+    total = len(parts)
+    done = 0
 
     def _read(fp: Path):
         try:
@@ -290,16 +319,19 @@ def load_resync_ids(
                 pending.append(ex.submit(_read, nxt))
             if tbl is None:
                 unread += 1
-                continue
-            for rid in tbl["resync_id"].to_pylist():
-                if rid is None or rid == "":
-                    continue
-                if len(ids) >= RESYNC_ID_SET_CAP:
-                    overflow = True
+            else:
+                done += 1
+                for rid in tbl["resync_id"].to_pylist():
+                    if rid is None or rid == "":
+                        continue
+                    if len(ids) >= RESYNC_ID_SET_CAP:
+                        overflow = True
+                        break
+                    ids.add(str(rid))
+                if overflow:
                     break
-                ids.add(str(rid))
-            if overflow:
-                break
+    if done + unread < total:  # deadline stopped the load mid-table
+        unread += total - done - unread
     return ids, overflow, unread
 
 
@@ -710,9 +742,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hours", type=float, default=None,
                     help="restrict the bounded scan to files written within the last N hours "
                          "(mtime-scoped: honest write-time bound, not ts-scoped)")
-    ap.add_argument("--budget-s", type=float, default=240.0,
-                    help="wall-clock budget for the bounded scan phase; overruns print "
-                         "partial=yes / n/a(partial), never invented values")
+    ap.add_argument("--budget-s", type=float, default=560.0,
+                    help="wall-clock budget for the MEASURED phase (full-table "
+                         "resync-id census + the per-lane scans). It is split "
+                         "as FAIR PER-LANE SLICES: slice = remaining / "
+                         "lanes-not-yet-run, so every lane completes at its "
+                         "own pace and an early lane hands its unused time to "
+                         "the lanes still pending; measured 2026-10-18 on this "
+                         "2-core box a full lane needs ~74s under the live "
+                         "collector's write noise, so 560s (7 lanes → ~77s "
+                         "each) runs all 7 lanes to completion. Overrun prints "
+                         "partial=yes / n/a(partial), never invented values. "
+                         "The reused daily-completeness child runs concurrently "
+                         "and joins afterwards with its own allowance (may "
+                         "extend total wall past this budget; that is "
+                         "reported, not hidden).")
     ap.add_argument("--probe-window", action="store_true",
                     help="widen the offline window-probe sample (gate_probe) to --probe-files; "
                          "the default probe already runs offline on the newest 48 mtimes")
@@ -738,41 +782,75 @@ def run_scorecard(
     kaggle_root = data_root / "kaggle_staging"
     t1_deadline = budget.started + budget_s
 
-    # The reused daily completeness is the long pole (~5 min on this box): give
-    # it a head start NOW (isolated child), overlap the bounded scan, then join
-    # with the remaining allowance (join deadline = t1_deadline + budget_s).
+    # The reused daily completeness is I/O-heavy (whole narration partitions
+    # re-read): start it immediately so its work overlaps the resync census,
+    # then FREEZE it for the per-lane scans. It is a strictly read-only
+    # probe, so a SIGSTOP/SIGCONT freeze is safe — and it otherwise hogs the
+    # same disk the lanes need (the I/O storm that starved HYPE/SOL/XRP/ETH
+    # into partial=yes at the old shared 240s budget). It resumes and joins
+    # after the lanes, with its own allowance; if it still has not finished
+    # the clean metrics print n/a(partial) honestly.
     comp_ctx = multiprocessing.get_context("spawn")
     out_json = _completeness_out_path()
     comp_proc = comp_ctx.Process(
         target=_completeness_child, args=(str(data_root), date_str, out_json), daemon=True
     )
     comp_proc.start()
+    comp_pid = None
+    if comp_proc.is_alive() and comp_proc.pid:
+        comp_pid = comp_proc.pid
 
     resync_ids, resync_overflow, resync_unread = load_resync_ids(
-        data_root / "resync_episodes" / f"date={date_str}",
+        data_root / "resync_episodes",  # FULL table: every date partition, once per run
         deadline=min(t1_deadline, time.monotonic() + RESYNC_LOAD_FRAC * budget_s),
     )
 
     probe: dict = {}
     blocks: dict = {}
-    for asset in assets:
-        asset_dir = snap_base / f"asset={asset}"
-        probe[asset] = probe_lane(asset_dir, asset, probe_files if probe_files else 48)
-        blocks[asset] = scan_lane_t1(
-            asset_dir, resync_ids, deadline=t1_deadline,
-            since_mtime=since_mtime, g6_seed=date_str,
-        )
-        if budget.expired():
-            # mark every not-yet-scanned lane partial, honestly
-            for pending_asset in assets[len(blocks):]:
-                pb = T1Block(asset=pending_asset, partial=True)
-                pb.files_total = len(day_files(snap_base / f"asset={pending_asset}", since_mtime))
-                blocks[pending_asset] = pb
-                probe[pending_asset] = (None, None, 0, True)
-            break
+    # --- per-lane fair slices (A2 2026-10-18): the old design gave every lane
+    # the same GLOBAL deadline, so a leading lane's probe+scan time (plus the
+    # concurrent completeness child's I/O storm) starved the trailing lanes
+    # into partial=yes. Each lane now gets its own slice of whatever wall
+    # budget is left: slice = remaining / lanes-not-yet-run. A lane that
+    # finishes early hands its unused time to the lanes still pending. The
+    # completeness child is frozen (read-only probe → SIGSTOP is safe) so the
+    # slices run at full disk speed, then it wakes and joins.
+    comp_frozen = False
+    if comp_pid:
+        try:
+            os.kill(comp_pid, signal.SIGSTOP)
+            comp_frozen = True
+        except OSError:
+            comp_frozen = False
+    try:
+        pending_assets = list(assets)
+        while pending_assets and not budget.expired():
+            n = len(pending_assets)
+            slice_s = min(max(LANE_SLICE_MIN_S, budget.remaining() / n), budget.remaining())
+            asset = pending_assets.pop(0)
+            lane_deadline = time.monotonic() + slice_s
+            asset_dir = snap_base / f"asset={asset}"
+            probe[asset] = probe_lane(asset_dir, asset, probe_files if probe_files else 48)
+            blocks[asset] = scan_lane_t1(
+                asset_dir, resync_ids, deadline=lane_deadline,
+                since_mtime=since_mtime, g6_seed=date_str,
+            )
+    finally:
+        if comp_frozen:
+            try:
+                os.kill(comp_pid, signal.SIGCONT)
+            except OSError:
+                pass
+            comp_frozen = False
+    for pending_asset in pending_assets:
+        # budget gone mid-loop: mark the not-yet-scanned lanes partial, honestly
+        pb = T1Block(asset=pending_asset, partial=True)
+        pb.files_total = len(day_files(snap_base / f"asset={pending_asset}", since_mtime))
+        blocks[pending_asset] = pb
+        probe[pending_asset] = (None, None, 0, True)
 
-    # join the completeness child with its remaining allowance
-    comp_join_deadline = t1_deadline + budget_s
+    # join the completeness child with its own allowance AFTER the lanes
+    comp_join_deadline = t1_deadline + COMP_JOIN_ALLOWANCE_S
     comp_map, comp_status = _collect_completeness(comp_proc, out_json, comp_join_deadline)
 
     official, official_partial = official_settlement_share(
