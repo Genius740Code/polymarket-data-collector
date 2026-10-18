@@ -25,6 +25,8 @@ Real-Data-Only policy (AGENT.md/AGENTS.md) is inviolable:
 
 | Commit | Fix | Verified outcome |
 |---|---|---|
+| `0ae92e1` | **change-item #2: daily completeness probe reads real sources.** `compute_daily_completeness` counted clean ticks from a LOCAL `book_snapshots_clean` hive that the architecture no longer materializes (clean view lives in per-lane Kaggle staging) → print of clean=0/missing=172800 for every day was tooling drift, not data loss. New resolution: local clean hive → per-date staging artifact → `None` + `clean_source="raw_footers_only"` fallback math on raw 500ms footers (cumulative staging artifacts are NEVER attributed to one date); `to_dict()` superset with `clean_source`; cumulative-per-date attribution guarded by test | via subagent; 12/12 green (targeted), ruff no-new (4 pre-existing), FAIL-on-old 5/5, pushed `e399526..0ae92e1`. First real daily numbers, 2026-10-18: BTC raw 175,982 ratio 1.0184, HYPE raw 155,322 ratio 0.8989 (a real capture shortfall, now visible) |
+| docs | **change-item #1: spec amendment + HYPE market-structure note.** `PERFECT_DATA_SPEC.md` §3.3 staleness bar replaced by the freshness-semantics contract (fresh share measured+reported daily; stale-row content must stay real; label never repurposed/filled). `DATA_CARD.md` +HYPE block: oracle identical (1.0s, ~225.8k/3d all assets), median OBI −0.167 ask-heavy vs BTC +0.31/ETH +0.22/SOL +0.29, CompNorm flaps 0.3–0.5% vs 0.0, no Binance spot exists (pipeline never consumes Binance — S1 research lane is BTC-only) → OBI differences are market structure: normalize per asset in research, never in collector | operator-validated; un-parked HYPE in the doc sense (parking as action item unchanged) |
 | `a072785` | **backlog #1 `stale_no_episode` CLOSED.** Measured first (2026-10-18): orphan rids joining no `resync_episodes` parent = **50 unique rids / ~2.9k of 2.49M rows (0.28%) over 10-17+10-18** — airborne, not the ~700–750 spans of 10-17. Root cause of the residue: books marked stale off the WS-message path (cursor recovery, quiet books whose next real frame is the heal) never reached the per-message `_ensure_episode_for_stale_book` hook, so every 2Hz snapshot row of the spell carried a permanently orphaned uuid. Fix: `_ensure_stale_row_parent` runs the SAME find-or-create at row-emit time (evidence-only: no relabel, no gap fill, row content untouched; idempotent — one dict lookup per row after the first mint; minting goes through `handle_disconnect` whose RAM insert precedes persist, so a failed write cannot mint a storm) | deployed (pkill-INT restart 11:39, WAL replayed 761 rows, restart#194): **20 fresh `stale_no_episode` parents minted in the first 3 min** across BTC/DOGE/ETH/HYPE/SOL/XRP. Gates: ruff `--select F,E9` 20 before == 20 after; forbidden grep 0; FAIL-on-old 5/5; suite = exactly the 9 pre-existing backlog failures, none new; tests 5/5 pass |
 | `3da1dcc` | bounded incremental unreadable-quarantine precheck (`quarantine_unreadable_bounded()`, watermark + 120s mtime lookback, 90s budget, no advance on exhaustion) wired into export Step 0c | live: `scanned=8633 … seconds=90.424 budget_exhausted=True` (old code: 312s+ unbounded per tick, blocked all export passes) → exports pass again |
 | `5027d6d` | startup coverage-gap narrator (`Collector._narrate_startup_coverage_gaps`), deterministic `event_id = sha256(startup_coverage_gap\|{asset}\|{gap_start_ns})` for restart-storm dedup | narrator code live; `event_id` passthrough in `MarketsLog.append_event` |
@@ -127,21 +129,27 @@ Gate probe (`python scripts/gate_probe.py`, density% / CompNorm% gate >0.1):
    historical orphan rids (≤0.28% of rows, 10-17/18) keep their honest orphan tags —
    rows are never rewritten; the counting rule for "episode-backed rows" should treat
    post-`a072785` rows as fully joined.
+1b. ~~completeness probe source~~ **CLOSED 2026-10-18 (`0ae92e1`): clean-source resolution
+   (local hive → staging → raw footers) — HYPE raw capture ratio 0.8989 visible daily.
+   Change-items #1+#2 of the 99.9%-gate plan done; spec amended (fresh-share contract).**
 2. Kaggle cadence design decision (§6 third bullet) — progressive upload vs per-pass.
    Consider raising it given the ~37–52% stale-share finding above is a per-pass
-   quality constant, not a defect.
+   quality constant, not a defect. **Next up: change-item #3 — build the single
+   scorecard gate probe (density/CompNorm/BBO-nulls/dupes/orphans/grid/G6-depth/nulls/
+   uploads/resolution-share) from the existing pieces (gate_probe, pmdata_diff,
+   kalshi_xcheck, completeness).**
 3. 1h lane will re-stage its older datasets (clean/trades/chainlink keep their last
    verified cutoffs until its next tick; books-only are already fresh through 10-17 11:39).
 4. 15m lane writes stopped 2026-10-02 (Kalshi primary pass consequence) — investigate
    the lane's history or accept documented.
-5. Pre-existing (NOT from this pass, identical on stashed HEAD) failing tests, verified
-   2026-10-18 (9, none new): `test_export_timeout.py::test_stream_snapshot_completes_on_real_files`,
+5. Pre-existing failing tests, verified 2026-10-18 (9, none new): `test_export_timeout.py::test_stream_snapshot_completes_on_real_files`,
    `test_chaos_ws_stale.py` (2), `test_rest_timeout.py::test_sleep_capped_at_2s_when_retry_after_large`,
    `test_silent_except_lint.py` (3), `test_r_fixes.py::test_r1_prewarm_gate…`, `test_stale_healing.py::test_heal_bg…`.
-6. HYPE **parked by user decision** ("lets not use hype for now"): no WS-only banking
-   policy change; its ~6.5% grid deficit is upstream REST 404s (verified against
-   `https://clob.polymarket.com/book` with genuine token IDs) and is evidence-narrated.
-   Do NOT implement WS-only from t0 for HYPE without an explicit user OK.
+6. HYPE **parked by user decision**; 2026-10-18: reclassified as STRUCTURAL (oracle and
+   book WS healthy, ask-heavy thin book − OBI normalized in research per DATA_CARD §HYPE).
+   Remaining HYPE-specific lever is WS-only banking from t0 (needs explicit operator OK
+   + one FAIL-on-old cycle) to close the last ~2.6% density deficit that REST 404
+   promotion windows cost.
 
 ## 8. Quick commands
 

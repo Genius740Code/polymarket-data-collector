@@ -102,6 +102,20 @@ Not everything can be held to the same bar. Every rule below belongs to exactly 
   clean view.
 - **Staleness (T3):** `book_state='stale'` on ≤ 0.1% of raw rows; `up_book_age_ms`/`down_book_age_ms`
   ≤ 1500 on ≥ 99.9% of clean rows.
+  > **Amended 2026-10-18 (measured):** the 0.1% stale bar predates the freshness redesign
+  > (`FRESH_BOOK_AGE_MS=5000`): "no exchange frame in the last 5s ⇒ row reads `stale`",
+  > uniformly across liquidity classes, and ~37–52% of 500ms rows carry it by design
+  > (frames only arrive on book change; quiet minutes are frame-sparse).
+  > The honest acceptance contract replaces the stale-label bar with:
+  > 1. **fresh share** — `book_state='live'` (or fresh-content-verified) rows / all rows,
+  >    measured and reported per lane every day (no hard target until a full quiet-season
+  >    baseline exists; gate probe prints it),
+  > 2. row **content** correctness of stale rows is unchanged: every stale row carries the
+  >    last real venue state (never interpolated), `resync_id` attribution closed (2026-10-18,
+  >    `a072785`), and
+  > 3. the `stale` label must NEVER be repurposed, smoothed, or filled — market structure
+  >    effects (ask-heavy thin books, e.g. HYPE median OBI −0.167, structurally clearer per
+  >    venue; DOGE/BNB equivalently thin) belong in DATA_CARD, not in the label.
 - **Remaining time is derived, not free (T1):** `market_time_remaining_ms` must equal
   `market_end_ts_ms − ts_snapshot_ns/1e6` exactly, and ∈ [0, 300000].
 - **Rollover flag is derived (T1):** `is_rollover_window = true` iff

@@ -42,6 +42,30 @@ Global: `markets.parquet`, `collector_events.parquet`, `resync_episodes.parquet`
 - **Honest gap 2026-09-09T20:05→2026-09-11T06:39Z (~34.5h) — 15m/1h/4h `book_snapshots_500ms` (+ `_clean`) ONLY:** the hourly Kaggle loop never completed an export pass for 44h (per-lane export ~40 min × 4 lanes sequential > process lifetime between OOM restarts; worker RSS-cap aborts; full-hive re-read validation — all fixed 2026-09-11), then the first manual 5m catch-up upload ran the rolling prune with a max-checkpoint, deleting shared-hive files whose 15m/1h/4h rows those lanes had never uploaded (prune killed mid-run; now min-checkpoint gated by the slowest lane). 5m snapshots are COMPLETE (uploaded whole span 2026-09-11); `book_events`/`trades`/`chainlink_events`/`markets` have NO gap on any lane (hive intact, later versions carry full history). Book snapshots for the gap span are unrecoverable (no history API) — backtests must treat missing 15m/1h/4h snapshot timestamps in this span as a gap, never interpolate.
 - **Null-vs-zero (E4, 2026-09-09):** empty book sides are NULL, never `0.0` — pre-fix rows carry a `0.04%` `0.0` sentinel on `up/down_bid` + L1. Filter `price > 0` when mixing vintages.
 
+## HYPE market-structure note (2026-10-18, measured)
+
+- **HYPE is not broken — it is structurally different.** Its Chainlink oracle feed is
+  identical in quality to every other asset (1.0s median cadence, ~225.8k ticks over any
+  recent 3-day span; the tiny cross-asset spread in tick counts is sampling noise, and
+  HYPE historically carries the same outage gaps as the rest). The book WS is healthy.
+- **What differs is the book itself:** median book imbalance is **−0.167 (ask side
+  persistently heavier)** — the only coin with a persistently negative OBI (BTC +0.31,
+  ETH +0.22, SOL +0.29). Depth is thin like DOGE/BNB (~20 shares median). Consequence:
+  `CompNorm` complementarity flaps at 0.3–0.5% on HYPE (0.0 on the others) and its grid
+  density runs lower — market structure, not collector failure. **OBI-type signals read
+  differently on HYPE by nature; normalize per asset in research**, never in the
+  collector.
+- **No spot cross-check exists for HYPE:** it is not listed on Binance, so no CEX spot
+  feed exists to cross-check the oracle. That absence affects nothing in this dataset:
+  the collector/resolution/export pipeline never consumes Binance
+  (`enable_binance_fallback=False` by config; `binance-ticker-proxy` rows are excluded
+  from all exports by default). Only the S1 CEX lead-lag *research* lane consumes Binance
+  spot, and it is BTC-only by spec (see `docs/S1_CEX_LEADLAG_SPEC.md`).
+- **HYPE parking status:** parked as a quality-action item by operator decision; all of
+  the above is evidence-narrated, data is kept honest and complete as far as upstream
+  allows (REST `/book` 404s on promotion windows are upstream-invisible; the 27s
+  stale→WS-provisional→live narration covers them).
+
 ## Recommended read path for research
 
 `book_snapshots_clean` (`book_state='live'` only). Querying `book_snapshots_500ms` directly includes `stale`/`resyncing` rows intentionally kept for audit.
