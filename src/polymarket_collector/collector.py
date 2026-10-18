@@ -1387,6 +1387,46 @@ class Collector:
         except Exception:
             return None
 
+    def _ensure_stale_row_parent(self, book, asset: str, row: dict) -> None:
+        """stale_no_episode closure (2026-10-18): find-or-create the parent
+        episode of a stale snapshot ROW at emit time.
+
+        The per-message `_ensure_episode_for_stale_book` hook only runs when a
+        WS message arrives for the book. A book marked stale off the message
+        path (cursor recovery, a quiet book whose next real frame is its heal)
+        emitted every 2Hz snapshot row of its spell with a uuid that joins to
+        no resync_episodes row — the spell had evidence but no parent. This
+        hook closes that from the emit path: for a stale row whose rid does
+        not join, run the SAME find-or-create (one episode per stale
+        transition, minting via resync.handle_disconnect whose RAM insert at
+        resync.py:1025 precedes any persist, so a failed write can never mint
+        twice) and tag THIS row with the joined id. Row-only evidence: no
+        relabeling, no gap fill, no liveness ownership change; idempotent
+        after the first mint (one dict lookup per subsequent row). Never
+        raises; row keys other than resync_id stay untouched.
+        """
+        try:
+            if row.get("book_state") != "stale":
+                return
+            _rid = row.get("resync_id")
+            _joined = False
+            if _rid:
+                try:
+                    _joined = _rid in getattr(self.resync, "_episodes", {})
+                except Exception:
+                    _joined = False
+                if _joined:
+                    return
+            _ens = self._ensure_episode_for_stale_book(book, asset, "stale_no_episode")
+            _new_rid = getattr(book, "resync_id", None) or _ens
+            try:
+                if _new_rid and _joined is False and _new_rid in getattr(self.resync, "_episodes", {}):
+                    row["resync_id"] = _new_rid
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _link_stale_book_episode(self, book, asset: str, reason: str) -> None:
         """Mark a book stale and link its resync_id to a real episode (never raises).
 
@@ -5771,6 +5811,23 @@ class Collector:
                                         if not _brid2 or _brid2 not in getattr(self.resync, "_episodes", {}):
                                             _brid2 = self._row_episode_id(book, m.asset, m.condition_id, "catchup_downgrade")
                                         row["resync_id"] = _brid2
+                            except Exception:
+                                pass
+                            # stale_no_episode closure (2026-10-18): a stale
+                            # row whose resync_id joins to no resync_episodes
+                            # parent gets its find-or-create parent HERE, not
+                            # only on the WS-apply path. Books marked stale off
+                            # the message path (cursor recovery, quiet books
+                            # that draw no frame until heal) never reached the
+                            # per-message _ensure_episode_for_stale_book hook —
+                            # every 2Hz snapshot row of the spell carried a
+                            # permanently orphaned uuid. One call per row;
+                            # idempotent after the first mint (one dict lookup
+                            # per subsequent row). Row-only: no relabeling, no
+                            # gap filling — the episode is evidence, the row
+                            # keeps its honest content.
+                            try:
+                                self._ensure_stale_row_parent(book, m.asset, row)
                             except Exception:
                                 pass
                             # P0 write-amp fix (weather audit 2026-09-21): skip
