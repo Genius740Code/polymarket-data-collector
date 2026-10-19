@@ -1,176 +1,148 @@
 # HANDOFF — autonomous data-quality loop on polymarket-data-collector
 
-Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · updated 2026-10-18 ~11:50 UTC
+Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · rewritten 2026-10-19 ~12:1x UTC
 
 ---
 
 ## 1. Mission
 
-Live Polymarket CLOB collector → 99% backtestable data: every field present/correct,
-every gap explicit and narrated, nothing fabricated. Work continuously; each cycle
-measures real numbers, fixes the single largest gap, gates through tests before push.
+Live Polymarket CLOB collector → 99.9%-backtestable data per `docs/PERFECT_DATA_SPEC.md`
+(as amended 2026-10-18: quality = content correctness + fresh-share, `stale` is an honest
+freshness label, never a defect): every field present/correct, every gap explicit and
+narrated, nothing fabricated. Each cycle: measure real numbers → fix the single largest
+gap → gate through tests → commit → pull --rebase → push.
 
 Real-Data-Only policy (AGENT.md/AGENTS.md) is inviolable:
 - never fill/interpolate/synthesize gaps; gaps = `book_state='stale'` + `resync_episodes`
   + `collector_events` evidence rows, evidence never pruned
 - all writes via ParquetWriter (atomic tmp+rename); retention → `_quarantine` first,
-  only after verified upload
-- Verification gate before every commit: adjacent pytest green, `ruff check --select F,E9`
-  (no NEW hits), forbidden grep over diff = 0 (`synthetic|mock|fake|interpolat`),
-  FAIL-on-old proof (new test must fail on pre-fix source), then commit → pull --rebase → push
-- pm2-managed processes; opencode budget ≤2 concurrent subagents (models
-  `nvidia/z-ai/glm-5.3`, flash fallback)
+  only after verified upload; rows are NEVER rewritten
+- Verification gate before every commit: adjacent pytest green (9 known-failing are
+  whitelisted, see §7.5), `ruff check --select F,E9` (no NEW hits), forbidden grep over
+  diff = 0 (`synthetic|mock|fake|interpolat` — literal, watch the diff!), FAIL-on-old
+  proof (new test must fail on pre-fix source), then commit → pull --rebase → push
+- pm2-managed processes; opencode budget ≤2 concurrent subagents — use ONE mainly
+  (models `nvidia/z-ai/glm-5.3`, flash fallback); session keeps tool outputs SMALL
+  (counts/tails only — kernel OOM killed sessions here; pytest full suite can OOM the
+  box, run targeted subsets)
 
-## 2. What changed in this pass (all pushed on `perfect/pmdata-parity`)
+## 2. What changed in the 2026-10-18/19 pass (all pushed on `perfect/pmdata-parity`)
 
-| Commit | Fix | Verified outcome |
+| Commit | Change | Verified outcome |
 |---|---|---|
-| `0ae92e1` | **change-item #2: daily completeness probe reads real sources.** `compute_daily_completeness` counted clean ticks from a LOCAL `book_snapshots_clean` hive that the architecture no longer materializes (clean view lives in per-lane Kaggle staging) → print of clean=0/missing=172800 for every day was tooling drift, not data loss. New resolution: local clean hive → per-date staging artifact → `None` + `clean_source="raw_footers_only"` fallback math on raw 500ms footers (cumulative staging artifacts are NEVER attributed to one date); `to_dict()` superset with `clean_source`; cumulative-per-date attribution guarded by test | via subagent; 12/12 green (targeted), ruff no-new (4 pre-existing), FAIL-on-old 5/5, pushed `e399526..0ae92e1`. First real daily numbers, 2026-10-18: BTC raw 175,982 ratio 1.0184, HYPE raw 155,322 ratio 0.8989 (a real capture shortfall, now visible) |
-| docs | **change-item #1: spec amendment + HYPE market-structure note.** `PERFECT_DATA_SPEC.md` §3.3 staleness bar replaced by the freshness-semantics contract (fresh share measured+reported daily; stale-row content must stay real; label never repurposed/filled). `DATA_CARD.md` +HYPE block: oracle identical (1.0s, ~225.8k/3d all assets), median OBI −0.167 ask-heavy vs BTC +0.31/ETH +0.22/SOL +0.29, CompNorm flaps 0.3–0.5% vs 0.0, no Binance spot exists (pipeline never consumes Binance — S1 research lane is BTC-only) → OBI differences are market structure: normalize per asset in research, never in collector | operator-validated; un-parked HYPE in the doc sense (parking as action item unchanged) |
-| `a072785` | **backlog #1 `stale_no_episode` CLOSED.** Measured first (2026-10-18): orphan rids joining no `resync_episodes` parent = **50 unique rids / ~2.9k of 2.49M rows (0.28%) over 10-17+10-18** — airborne, not the ~700–750 spans of 10-17. Root cause of the residue: books marked stale off the WS-message path (cursor recovery, quiet books whose next real frame is the heal) never reached the per-message `_ensure_episode_for_stale_book` hook, so every 2Hz snapshot row of the spell carried a permanently orphaned uuid. Fix: `_ensure_stale_row_parent` runs the SAME find-or-create at row-emit time (evidence-only: no relabel, no gap fill, row content untouched; idempotent — one dict lookup per row after the first mint; minting goes through `handle_disconnect` whose RAM insert precedes persist, so a failed write cannot mint a storm) | deployed (pkill-INT restart 11:39, WAL replayed 761 rows, restart#194): **20 fresh `stale_no_episode` parents minted in the first 3 min** across BTC/DOGE/ETH/HYPE/SOL/XRP. Gates: ruff `--select F,E9` 20 before == 20 after; forbidden grep 0; FAIL-on-old 5/5; suite = exactly the 9 pre-existing backlog failures, none new; tests 5/5 pass |
-| `3da1dcc` | bounded incremental unreadable-quarantine precheck (`quarantine_unreadable_bounded()`, watermark + 120s mtime lookback, 90s budget, no advance on exhaustion) wired into export Step 0c | live: `scanned=8633 … seconds=90.424 budget_exhausted=True` (old code: 312s+ unbounded per tick, blocked all export passes) → exports pass again |
-| `5027d6d` | startup coverage-gap narrator (`Collector._narrate_startup_coverage_gaps`), deterministic `event_id = sha256(startup_coverage_gap\|{asset}\|{gap_start_ns})` for restart-storm dedup | narrator code live; `event_id` passthrough in `MarketsLog.append_event` |
-| `8b1cba2` | committed `5027d6d` mentioned "interpolates" in a docstring | removed |
-| `a544d7f` | `markets_latest` frozen since 2026-10-14: int64 epoch-ms fragments beside ISO strings → `pa.Table.from_pylist` ArrowInvalid every compact, backfill WARN-loop only. New `_build_union_table`: build verbatim FIRST; only on genuine union failure retry ONCE with **numeric-only** epoch-ms ISO-cast (2020–2040 band). Digit-STRING casts (`REAL_EPOCH_MS_STR`) and garbage pass through everywhere | backfill run 10:40 10-17: **no WARN** (273 historical WARNs now stopped); authority view 1.5MB(10-06) → 5.9MB, 31,764 rows, **all 29,731 settled `settlement_ts_utc` canonical ISO strings**, 9 markets upgraded inferred→official. Fail-closed retained for truly unmergeable unions |
-| `745e8eb` | trades `asset=UNKNOWN` partitions: caller-labeled UNKNOWN while the trade resolved exactly in the roster (row carried `series_id='BTC-5m'`). `_handle_trade_message` now takes the roster/book asset when caller is UNKNOWN; never overrides a resolved caller asset; unresolvable stays UNKNOWN | 0 `asset_unknown_partition` events since restart **across all datasets** (was ~1.5/min; trades ~200/day unjoinable) |
-| `fd39794` | narrator dead-in-prod since `5027d6d`: `cfg.storage.data_dir` is a **str**, `base / "book..."` → `/ : str and str` TypeError; tests passed because the harness passed a **Path**. Fix: `base = Path(str(base))` | regression test with the exact live str shape; FAIL-on-old proven (same TypeError on HEAD) |
+| `a072785` | **backlog #1 `stale_no_episode` CLOSED** (emit-path find-or-create): `_ensure_stale_row_parent` mints the resync_episodes parent for a stale row whose rid joins no episode — books marked stale off the WS path (cursor recovery, quiet books) previously emitted every 2Hz row with a permanently orphaned uuid. Evidence-only, idempotent (dict-lookup per row after first mint; `handle_disconnect` RAM-inserts before persist → no mint storm) | deployed via pkill-INT restart 11:39 10-18 (restart #194, WAL replayed 761): **20 fresh parents in first 3 min**, all assets. FAIL-on-old 5/5 |
+| `0ae92e1` | **completeness probe honest**: local `book_snapshots_clean` hive no longer materialized (clean view lives in per-lane Kaggle staging) → probe printed clean=0/missing=172800 every day. Now: local clean hive → per-date staging artifact → `clean_source="raw_footers_only"` fallback; cumulative staging NEVER attributed to one date; `to_dict()` superset with `clean_source` | first real daily numbers: BTC raw 175,982 ratio 1.0184; HYPE 0.8989 (real shortfall, now visible). FAIL-on-old 5/5 |
+| `11239a7` | **scorecard gate live** (`scripts/scorecard.py`): one compact acceptance table per lane — density/CompNorm (reuse gate_probe), daily completeness (child), T1 day scan (bounded: dup approx-census, best-price bounds, orphans, offgrid, zero-price, sampled G6 depth audit), uploads/cycle, official-share, verdict | two idempotent real-data runs; first-ever scorecard: G6 **0 mismatches/10.9k**, dupes/offgrid/badpx/zero **0**, CompNorm **0.0%** all lanes |
+| `61b181d` | scorecard refinements: orphans vs FULL `resync_episodes` table (cross-day false positives gone), fair per-lane budgets; new `scripts/density_split.py` (read-only missing-tick attribution) | density split measured (§4) — **empty-skip EXONERATED (~0)**; post_roll + outage dominate |
+| `5793f0d` / `1ec07a2` | docs: spec §3.3 staleness bar → fresh-share contract; DATA_CARD HYPE structural block; handoff cycle notes | operator-validated |
 
-Offline-backfill note: `resolution_backfill` is a pm2 cron job (`*/15 * * * *`); it spawns
-python fresh from disk, so `a544d7f` became live WITHOUT a collector restart.
+## 3. Data quality state (measured 2026-10-18/19)
 
-## 3. Outage-evidence backfill (offline, idempotent, all measured)
+**T1 (zero tolerance): AT TARGET** — on live data: identity cols null-free (1.14M rows/day),
+dup `(condition_id, ts)` 0, off-grid 0, bad-price 0, zero-price 0, G6 depth-recompute 0/10.9k,
+oracle 1.0s cadence identical across all 7 assets (~225.8k ticks/3d each), `markets_latest`
+canonical (31,764 rows, 29,731 settled ISO-canonical). External validation: PMData parity
+**mid diff = 0 ticks** (BTC-5m 2026-10-04 sample, `scripts/pmdata_diff.py`); Kalshi
+cross-check **30/30 agreement** (`paperlog/kalshi_xcheck/summary.json`).
 
-Audited: the two 2026-10-17 outages had **no parent `coverage_gap` rows**. Row-level tick
-census (streaming per-file reads, minute buckets, numpy-safe) measured:
-- `2026-10-16 20:09 → 23:09` (179 absent buckets) — identical across all 7 lanes
-- `2026-10-17 01:00 → 08:46` (465 absent buckets) — identical across all 7 lanes
+**T2 (≥99.9%): ~2-3 points short** — live density 96.8–97.7% sampled (target ≥99).
+Attributed 2026-10-18 (`density_split.py`): **post_roll ~35%** (first 120s of each window),
+**outage ~30%** (collector restarts/deploy gaps), **other ~35%** (unattributed — needs deeper
+pass), empty-skip ≈0 (NOT a suspect). BTC 18,862 / ETH 16,898 / SOL 20,120 missing of ~270k.
 
-14 parent rows emitted through the repo's own `ParquetWriter`/`MarketsLog.append_event`
-(path: `event_type=coverage_gap`, `reason=outage_window_narration`, deterministic
-`event_id = sha256(outage_window_narration|{asset}|{gap_start_ns})`, granularity note,
-`gap_start_ns`). Re-running is idempotent; no ticks were filled. Audit WAL copy drained
-after parquet landing (its payload was exclusively our 14 rows) so a future collector
-restart cannot double-replay them.
+**T3 (bounded): semantics fixed** — `stale` = honest freshness label (`FRESH_BOOK_AGE_MS=5000`,
+~40–55% of 500ms rows; spec amended). CompNorm ≤0.1% gate PASS (HYPE flaps 0.3–0.5% —
+market structure: median OBI −0.167 ask-heavy, thin like DOGE/BNB, no Binance spot exists;
+pipeline never consumes Binance — DATA_CARD §HYPE).
 
-Kill switch for future repeats: `OSError: [Errno 75] Value too large` from
-`dt.datetime.fromtimestamp(ns)` — it wants SECONDS, never raw ns.
+**T4 (attribution): ~99% closed** — emit-path minting live; **~2.9k historical orphan
+`resync_id` rows remain** (one transition window 10-18, full-table-confirmed true orphans,
+bounded, no ongoing loss — 168,078 fresh mints persist fine). Treat as ACCEPTED evidence-debt
+or run one evidence-only narration pass (repo's own writer, deterministic event_ids — precedent:
+2026-10-17 outage narration, §5 old version).
 
-## 4. External ground truth ("our data vs pmdata")
+**Resolution:** official-share **86.0%** (29,336 official / 4,786 `inferred_nearest`,
+target ≥99%) — grinding down passively via the `*/15` backfill cron; scorecard tracks it.
 
-- Exporter parity vs PMData sample (`data/pmdata/`, BTC-5m day 2026-10-04,
-  slug `btc-updown-5m-1791138600`, ref: 135,325 L2 rows + 2,258 trades):
-  **mid diff = 0 ticks**, all four event-type classes covered, count gate N/A by design
-  (we firehose; PMData samples thresholded rows). Harness: `scripts/pmdata_diff.py`
-  (+ `tests/test_pmdata_diff.py`; sample-note: `data/pmdata_test/` is an EMPTY scaffold dir).
-- Independent venue cross-check (Kalshi KXBTC15M vs our BTC-15m resolution labels,
-  exact UTC window-boundary alignment, zero tolerance):
-  **30/30 agreement, 0 disagreement, 0 unmatchable** on the supplementary pass
-  (`paperlog/kalshi_xcheck/summary.json`). Primary pass 20/20 unmatchable is a recency
-  fact — our 15m lane historically stopped writing 2026-10-02 (see §7 backlog).
-- `markets_latest` (settlement authority for export_pmdata/backtest_exec/backfill_pmdata)
-  live and canonical again (§2, `a544d7f`).
+## 4. Ops facts
 
-## 5. Live quality state (measured 2026-10-18 09:2x)
-
-Gate probe (`python scripts/gate_probe.py`, density% / CompNorm% gate >0.1):
-
-| Lane | Density% | CompNorm% | Note |
-|---|---|---|---|
-| BTC | 100.0 | 0.0 | clean |
-| ETH | 100.0 | 0.0 | clean |
-| SOL | 100.0 | 0.0–0.14 flapping | transient (illiquid windows under worker load) |
-| DOGE | 100.0 | 0.0 | clean |
-| BNB | 99.5 | 0.0 | clean |
-| XRP | 100.0 | 0.0 | cleared (10-17 0.2 was post-restart transient) |
-| HYPE | 91.5→97.6 | 0.1 | **REST-dead upstream**: Polymarket `/book` genuinely 404s these windows even with true token IDs; collector's 27s stale→WS-provisional-promote→live cycle accounts for the deficit |
-
-- `measure_1006_rate.py`: live% 36.76 → 70 → 74–88 across restarts; **0 stale-at-1006
-  episodes** in recent spans.
-- **Freshness-label share (measured 2026-10-18, by design — not a bug):** ~37–52% of
-  `book_snapshots_500ms` rows read `stale` (last 2 days: 928k/2.49M; last hour per asset:
-  BTC 39%, ETH 37%, BNB 49%, XRP 50%, SOL 47%, DOGE 45%, HYPE 52%). This is the
-  `FRESH_BOOK_AGE_MS=5000` freshness design (frame-silence >5s reads stale honestly);
-  uniform across liquidity classes, so it tracks venue frame cadence, not collector
-  health. The density gate (§5 table) measures bucket coverage, not liveness-share.
-  If a future cycle wants delta-labeled rows, design it as a NEW column — never touch
-  `book_state` semantics, and never fill a stale row's content.
-- Kaggle: first post-restart verified upload **2026-10-17T23:21:14** `✓ Upload success
-  gghgg1/polymarket-5m-crypto` (was 26h stale since 10-16 13:08) + per-file uploads
-  observed; **prune resumed** 23:45 (expired XRP trades quarantined then verified-reapable).
-- **Density split measured 2026-10-18 (`scripts/density_split.py`, `61b181d`) — missing
-  ticks per complete-trading day (~19k of ~250k+, ≈93% density):** BTC missing=18,862 →
-  post_roll **7,313 (39%)**, other **5,824 (31%)**, outage **5,706 (30%)**, empty-skip ~19;
-  ETH 16,898 → post_roll 5,955 (35%), other 5,264 (31%), outage 5,089 (30%); SOL 20,120 →
-  other 8,401 (42%), post_roll 6,213 (31%), outage 5,506 (27%). **Conclusion: the
-  empty-book P0 skip is NOT a density cost (≈0); post-roll dip (~35%) and outage
-  buckets (~30% — collector restarts incl. the 11:39 deploy) dominate, with ~30–40%
-  "other" still unattributed.** Next targeted fix: post-roll promotion speed in the
-  first 120s of each window; attribute "other" deeper before touching write cadence.
-- Post-deploy `asset_unknown_partition` events: **0** in any dataset (was ~115/79/77 trio
-  of per-dataset trickle on 10-17 alone).
-
-## 6. Pipeline + ops facts
-
-- pm2: `polymarket-collector` (id 11), `polymarket-watchdog` (6), `polymarket-resolution-backfill`
-  (8, cron `*/15`, "stopped" between runs is NORMAL), `polymarket-compact` (7, stopped).
-- **Full restart procedure**: `pm2 stop polymarket-collector` can HANG (pm2 daemon 55min CPU) —
-  bypass with `pkill -INT -f polymarket_collector.cli`, escalate `pkill -KILL` after ~8s, then
-  `pm2 start polymarket-collector` (autorestart will not fire if pm2 marked it stopped).
-  Restart signature to verify new code: log line `[startup] replayed … rows from WAL` +
-  no `coverage_gap narrate err`, then on the next export pass
-  `[export] quarantine pre-check increment: … budget_exhausted=...`.
-- "Quiet window" doctrine revised: gate `scripts/quiet_window.py` never exits 0 (as soon as
-  one big asset staging ends, the next tick queues another job; a pass takes ~4h+).
-  Mid-worker restart is SAFE by design (staging is tmp+rename; an in-flight job is clean
-  discarded, no corruption). Accept one discarded staging pass instead of stale Kaggle days.
-- Lane cadence reality: tick fires only on pass completion → per-lane verified upload
-  every ~4–12h while a full 39-file pass runs serialized (~20 min per big asset, e.g.
-  `BTC_book_snapshots_clean`). Options shaping a future cycle: progressive per-asset
-  upload, or parallel staging (box: 2 cores, load ~4).
-- Disk: 35–38G free on `/dev/sdb` (98G); `_quarantine` reap active; l2 retention 3 days.
+- pm2: `polymarket-collector` (11, ~1.1GB steady, cap 1500M), `polymarket-watchdog` (6),
+  `polymarket-resolution-backfill` (8, cron `*/15`, "stopped" between runs is NORMAL),
+  `polymarket-compact` (7, stopped by design).
+- **Full restart procedure**: `pm2 stop polymarket-collector` can HANG — bypass with
+  `pkill -INT -f polymarket_collector.cli`, escalate `pkill -KILL` after ~8s, then
+  `pm2 start polymarket-collector`. Verify: `[startup] replayed … rows from WAL`, no
+  `coverage_gap narrate err`, then `[export] quarantine pre-check increment: …`.
+  Mid-worker restart is SAFE (staging tmp+rename; accept one discarded pass).
+- **Local hive is now a ROLLING 2h mirror** (operator-authorized `c5896b3`, root-disk
+  pressure): verified-uploaded rows are pruned locally, full history lives on Kaggle.
+  CONSEQUENCE: a next-day full-day scorecard of a pruned date reads ~7% density — an
+  artifact, NOT loss. Same-day scoring semantics still to be built (§7.2).
+- Disks: data hive on `/dev/sdb` 98G at **37%** (healthy); root `/` 19G at **99% (361M
+  free) — operator flag raised 2026-10-19**: driver is `~/.local/share/opencode` at 5.8G
+  (user's session store, old rule: do not touch silently). Options offered: trim old
+  opencode sessions / journald vacuum / move to sdb. AWAITING OPERATOR CALL.
+- Lane cadence: exporter pass serialized ~4–12h per full 39-file cycle; per-lane verified
+  upload every ~4–12h (progressive upload = §7.4).
 - Untracked root files (`GATE_ANALYSIS.md`, `disk_watch_report.txt`, `monitor_disk.sh`,
-  `.wtest.txt`, `logs/heartbeat-mirror.jsonl`) are pre-existing ops artifacts — do NOT commit.
+  `.wtest.txt`, `logs/heartbeat-mirror.jsonl`) + `paperlog/` churn are ops artifacts —
+  do NOT commit; `paperlog/kalshi_xcheck` is tracked but regenerates (commit only if
+  deliberate).
+
+## 5. Subagent workflow (user-directed)
+
+- Code changes go through ONE subagent mainly (`general`), ≤2 concurrent; docs/measurements
+  may be inline. Pass each subagent the full gate contract (pytest subset green, ruff no-new,
+  forbidden grep 0, FAIL-on-old, explicit-path commit → pull --rebase → push) + OOM discipline
+  (bounded scans, small outputs, no full-table reads) + "only the named files" rule.
+- If a subagent ends without a report, resume its sessionID; verify the commit/push state
+  directly with git before trusting any claim.
+- When the main session's context gets full: re-read the diff of the current change.
+
+## 6. Quick commands
+
+- `./.venv/bin/python scripts/scorecard.py --date <YYYY-MM-DD>` (acceptance table + verdict;
+  same-day only for full-day dates while local is a 2h mirror)
+- `./.venv/bin/python scripts/density_split.py --date <d> --asset <A>` (missing-tick attribution)
+- `./.venv/bin/python scripts/gate_probe.py` (density/CompNorm live-window gate)
+- `./.venv/bin/python scripts/measure_1006_rate.py` (live%/episode census)
+- `./.venv/bin/python scripts/kalshi_xcheck.py` / `scripts/pmdata_diff.py` (external ground truth)
+- `./.venv/bin/python -c "from polymarket_collector.completeness import compute_daily_completeness; …"` (daily, footer-only)
 
 ## 7. Backlog / next cycles (priority order)
 
-1. ~~`stale_no_episode`~~ **CLOSED 2026-10-18 (`a072785`, §2): emit-path find-or-create
-   parent; 20 fresh parents minted in the first 3 min post-deploy.** Residual: the ~50
-   historical orphan rids (≤0.28% of rows, 10-17/18) keep their honest orphan tags —
-   rows are never rewritten; the counting rule for "episode-backed rows" should treat
-   post-`a072785` rows as fully joined.
-1b. ~~completeness probe source~~ **CLOSED 2026-10-18 (`0ae92e1`): clean-source resolution
-   (local hive → staging → raw footers) — HYPE raw capture ratio 0.8989 visible daily.
-   Change-items #1+#2 of the 99.9%-gate plan done; spec amended (fresh-share contract).**
-1c. ~~scorecard refinements + density attribution~~ **CLOSED 2026-10-18 (`61b181d`):**
-   orphans now checked vs the FULL episode table (only true gaps remain), fair per-lane
-   budgets, and `scripts/density_split.py` attributes missing ticks (post_roll ~35%,
-   outage ~30%, other ~35%; empty-skip ≈0 — cleared as a density suspect).
-   **Next up (change-item #4): reduce the post-roll tax further in the first 120s of
-   each window; attribute the "other" bucket deeper before touching write cadence.**
-2. Kaggle cadence design decision (§6 third bullet) — progressive upload vs per-pass.
-   Consider raising it given the ~37–52% stale-share finding above is a per-pass
-   quality constant, not a defect. **Next up: change-item #3 — build the single
-   scorecard gate probe (density/CompNorm/BBO-nulls/dupes/orphans/grid/G6-depth/nulls/
-   uploads/resolution-share) from the existing pieces (gate_probe, pmdata_diff,
-   kalshi_xcheck, completeness).**
-3. 1h lane will re-stage its older datasets (clean/trades/chainlink keep their last
-   verified cutoffs until its next tick; books-only are already fresh through 10-17 11:39).
-4. 15m lane writes stopped 2026-10-02 (Kalshi primary pass consequence) — investigate
-   the lane's history or accept documented.
-5. Pre-existing failing tests, verified 2026-10-18 (9, none new): `test_export_timeout.py::test_stream_snapshot_completes_on_real_files`,
-   `test_chaos_ws_stale.py` (2), `test_rest_timeout.py::test_sleep_capped_at_2s_when_retry_after_large`,
-   `test_silent_except_lint.py` (3), `test_r_fixes.py::test_r1_prewarm_gate…`, `test_stale_healing.py::test_heal_bg…`.
-6. HYPE **parked by user decision**; 2026-10-18: reclassified as STRUCTURAL (oracle and
-   book WS healthy, ask-heavy thin book − OBI normalized in research per DATA_CARD §HYPE).
-   Remaining HYPE-specific lever is WS-only banking from t0 (needs explicit operator OK
-   + one FAIL-on-old cycle) to close the last ~2.6% density deficit that REST 404
-   promotion windows cost.
+1. **Post-roll density fix** (largest attributed bucket ~35%): reduce the stale window in
+   the first 120s after each window opens (promotion speed-up); attribute the "other" ~35%
+   deeper BEFORE touching write cadence (candidate: fresh-generation/restart windows).
+   FAIL-on-old + emit-path-safe (evidence never rewritten).
+2. **Scorecard same-day/rolling semantics**: prune-aware verdict (full-day dates score
+   same-day or from the remote mirror; add a `stale_date` warning instead of a fake-FAIL
+   density number). Small.
+3. **Optional orphan narration** (~2.9k rows): one evidence-only pass via repo's own
+   writer, deterministic event_ids (outage-narration precedent) — or document ACCEPTED.
+4. **Kaggle cadence <1h**: progressive per-asset upload (v1: fixed daily slot). Prerequisite
+   for the PMData-format deliverable.
+5. **Scheduled PMData-format export**: wire `export_pmdata` after the daily export pass →
+   `{ASSET}-{TF}.zip` + manifest → own Kaggle dataset; extend `pmdata_diff` to all
+   assets × days and assert in scorecard. ("Data such as PMData" is otherwise DONE:
+   parity mid=0 proven.)
+6. **15m lane** (writes stopped 2026-10-02) + 1h re-stage: investigate or accept documented.
+7. **9 known-failing tests → green** (whitelist → hard gate): `test_export_timeout` (1),
+   `test_chaos_ws_stale` (2), `test_rest_timeout` (1), `test_silent_except_lint` (3),
+   `test_r_fixes` (1), `test_stale_healing` (1).
+8. **HYPE**: parked by operator decision; reclassified STRUCTURAL (oracle/book WS healthy;
+   OBI normalized in research). Remaining lever: WS-only banking from t0 (explicit OK
+   required) to recover its last ~2.6% density.
+9. **Root disk 99%** (`~/.local/share/opencode` 5.8G): awaiting operator choice (§4).
+10. Final acceptance: 24h full-day scorecard soak without budget cuts.
 
-## 8. Quick commands
+**Estimate to formal 99.9% pass on 5m lanes (BTC/ETH/SOL/DOGE/BNB/XRP, HYPE parked):
+~3–4 focused cycles** — items 1–2 (density + semantics), 4–5 (deliverables); item 8
+(HYPE) pending the operator; resolution share completes passively.
 
-- `./.venv/bin/python scripts/gate_probe.py` (per-lane density/CompNorm table + gate verdict)
-- `./.venv/bin/python scripts/measure_1006_rate.py` (live%/episode census)
-- `./.venv/bin/python scripts/quiet_window.py` (gate exit 0 only when truly quiet)
-- `./.venv/bin/python scripts/kalshi_xcheck.py` (external ground truth, report-only)
-- `./.venv/bin/python scripts/pmdata_diff.py` (parity harness; needs ours+sample dirs)
-- `python3 scripts/…` matches `.venv/bin/python` — prefer `.venv`.
+---
+
+Standing rules (unchanged): real data only; no manual deletes of `data/`; gaps stay honest;
+never `git add -A` (foreign TS scaffold + ops artifacts appear/disappear — stage explicit
+paths only); do NOT push from dev boxes unless the operator says so; evidence rows are never
+rewritten; the collector's `book_state` semantics are never repurposed (new metric = new column).
