@@ -1,6 +1,6 @@
 # HANDOFF — autonomous data-quality loop on polymarket-data-collector
 
-Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · rewritten 2026-10-19 ~12:1x UTC
+Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · updated 2026-10-20 ~21:3x UTC (cycle vs 2026-10-19 rewrite)
 
 ---
 
@@ -64,11 +64,38 @@ or run one evidence-only narration pass (repo's own writer, deterministic event_
 **Resolution:** official-share **86.0%** (29,336 official / 4,786 `inferred_nearest`,
 target ≥99%) — grinding down passively via the `*/15` backfill cron; scorecard tracks it.
 
-## 4. Ops facts
+## 2b. What changed in the 2026-10-20 cycle (ops crisis + restore, all verified live)
 
-- pm2: `polymarket-collector` (11, ~1.1GB steady, cap 1500M), `polymarket-watchdog` (6),
-  `polymarket-resolution-backfill` (8, cron `*/15`, "stopped" between runs is NORMAL),
-  `polymarket-compact` (7, stopped by design).
+| Item | Event (measured, wall-stamped UTC) |
+|---|---|
+| pm2 wipe discovered 11:08 | collector survived as ORPHAN (ppid=1) but was ZOMBIE-WEENED: last cursor snap 2026-10-19 20:12 (age 23.7h narrated at startup as `coverage_gap`), heartbeats kept ticking, Kaggle last upload 2026-10-19 14:42 (29h stall). Watchdog + resolution-backfill NOT running since the wipe. |
+| Fleet restored 19:55 | quiet_window GREEN (exit 0) → pkill -INT (ignored, `Rsl`) → pkill -KILL (note: `-f` pattern also SIGKILLs the invoking shell — quote patterns or use exact pids!) → `pm2 start ecosystem.config.cjs` (collector+watchdog+compact+backfill all online) → `pm2 save`. Books recovered `stale_ms=7`; live% 85.68→90.32 post-restart. |
+| OOM crash motif PROVEN | 3 collector deaths today: ~11:08 (pm2 daemon wiped = presumed OOM), 20:43 (mid-export; WAL replay 38,271 rows OK), 21:25 (mid-export; WAL 35,664 rows OK). EVERY crash lands within ~10 min of a resolution-backfill cron run (cron `*/15`, ~500MB `markets_log.compact()` full-table read) while the collector's export build subprocess peaks ~1GB on a 3.9GB box → swap 4095/4095 → kernel OOM-kill takes the collector, export pass dies mid-build, ~40min/cycle lost + fresh outage gaps. |
+| Cron storm removed 21:26 | `pm2 delete polymarket-resolution-backfill` (cron `*/15` storm) — second removal today, `polymarket-compact` deleted ~20:20 (both had "stopped by design" precedent in the 10-19 handoff). Fleet now collector + watchdog ONLY, `pm2 save`ued. Memory after deletion: available 300-400M → 1735M, swap draining (4095→3957). |
+| Kaggle stall | export tick fired 20:07:56 (first), 20:52:38 (1h lane); staging cutoff ADVANCED 1792419186→1792434460; verified-upload STILL PENDING at 21:29 — revisit before trusting quality claims. Official-share upgrade (86%→99%) is CRON-DEPENDENT: with backfill deleted, share freezes until a solution lands (see backlog #1b). |
+
+WAL integrity note: across all 3 crashes today zero rows lost (replay counts = flushed counts, startup lines show `post-replay flush persisted N (replayed=N)`).
+
+## 4. Ops facts (updated 2026-10-20 — heavy overrides vs the 2026-10-19 notes)
+
+- pm2 fleet NOW: `polymarket-collector` (pid varies, ~0.5–1.2GB, cap 1500M) +
+  `polymarket-watchdog` (~170MB). `polymarket-resolution-backfill` (was cron `*/15`,
+  ~500MB peak) and `polymarket-compact` are **DELETED from pm2** (21:26 / ~20:20 EDT)
+  — see §4b consequence + revert paths. "stopped between runs is NORMAL" no longer
+  applies (it does not run at all until re-added).
+
+## 4b. Ops consequences + revert paths (2026-10-20 state)
+
+- If the collector dies again, pm2 respawns it (↺ counter tracks the count; today ↺=2 by 21:26).
+- Backfill re-enable path: `pm2 start ecosystem.config.cjs --only polymarket-resolution-backfill` — but NOT until the memory-bounded compaction fix (backlog #1b) or you re-create the OOM storm deliberately.
+- Manual backfill burst (safe when no `[kaggle` tick is mid-pass, confirms fast): `.venv/bin/python -m polymarket_collector.resolution_backfill --config config/collector.yaml` (~500MB, a few min at 100% CPU).
+- Confirm pm2 list persists: `pm2 ls` after `pm2 save`. Note compact/backfill have cron restarts defined INSIDE ecosystem.config.cjs — a bare `pm2 stop` leaves the cron armed; usage `pm2 delete` to fully retract.
+
+Legacy notes (2026-10-19, superseded where marked):
+
+- pm2 (HISTORICAL): `polymarket-collector` (11, ~1.1GB steady, cap 1500M), `polymarket-watchdog` (6),
+  `polymarket-resolution-backfill` (8, cron `*/15`, "stopped" between runs is NORMAL — DELETED 2026-10-20),
+  `polymarket-compact` (7, stopped by design — DELETED 2026-10-20).
 - **Full restart procedure**: `pm2 stop polymarket-collector` can HANG — bypass with
   `pkill -INT -f polymarket_collector.cli`, escalate `pkill -KILL` after ~8s, then
   `pm2 start polymarket-collector`. Verify: `[startup] replayed … rows from WAL`, no
@@ -78,10 +105,7 @@ target ≥99%) — grinding down passively via the `*/15` backfill cron; scoreca
   pressure): verified-uploaded rows are pruned locally, full history lives on Kaggle.
   CONSEQUENCE: a next-day full-day scorecard of a pruned date reads ~7% density — an
   artifact, NOT loss. Same-day scoring semantics still to be built (§7.2).
-- Disks: data hive on `/dev/sdb` 98G at **37%** (healthy); root `/` 19G at **99% (361M
-  free) — operator flag raised 2026-10-19**: driver is `~/.local/share/opencode` at 5.8G
-  (user's session store, old rule: do not touch silently). Options offered: trim old
-  opencode sessions / journald vacuum / move to sdb. AWAITING OPERATOR CALL.
+- Disks: data hive on `/dev/sdb` 98G at **69% / 30G free** (older note said 37% — superseded); root `/` 19G at **78%** (~4G free, the 2026-10-19 99% flag RESOLVED by entries on the operator's side — `~/.local/share/opencode` no longer listed as the driver at the measured size).
 - Lane cadence: exporter pass serialized ~4–12h per full 39-file cycle; per-lane verified
   upload every ~4–12h (progressive upload = §7.4).
 - Untracked root files (`GATE_ANALYSIS.md`, `disk_watch_report.txt`, `monitor_disk.sh`,
@@ -110,6 +134,23 @@ target ≥99%) — grinding down passively via the `*/15` backfill cron; scoreca
 - `./.venv/bin/python -c "from polymarket_collector.completeness import compute_daily_completeness; …"` (daily, footer-only)
 
 ## 7. Backlog / next cycles (priority order)
+
+1a. **OOM resilience (ACTIVE blocker)** — three collector OOM-deaths on 2026-10-20
+   (~11:08 pm2 wipe, 20:43, 21:25; every death ≤10 min into a backfill cron window).
+   root cause: `resolution_backfill` runs `markets_log.compact()` = full-table
+   pyarrow read (~500MB spike) while the collector's export build subprocess peaks
+   ~1GB (3.9GB box, swap 4095/4095). Fix the chang e (bounded/filtered compaction,
+   only rows needed for pending upgrades) via ONE subagent + full gate
+   (`tests` targeted subsets; FAIL-on-old is a real memory-profile test — e.g.
+   compact of a fixture 100k-row markets_log must stay <150MB peak RSS).
+   Until fixed: keep backfill OUT of pm2 (deleted 21:26), manual bursts only.
+
+1b. **Kaggle verified-upload still pending after 29h+ stall** (last checkpoint
+   2026-10-19 20:09). Export ticks fire (20:07, 20:52) but each died mid-build to the
+   OOM churn — the quiet-box pass after 21:26 should complete; VERIFY the checkpoint
+   ts advances + `[kaggle] verified upload` (or equivalent) before trusting quality
+   numbers. If it does not advance without OOM pressure, the 3600s worker budget or
+   the 4852-file × 2.5s estimate needs measurement (`measure_export_impact.py`).
 
 1. **Post-roll density fix** (largest attributed bucket ~35%): reduce the stale window in
    the first 120s after each window opens (promotion speed-up); attribute the "other" ~35%
