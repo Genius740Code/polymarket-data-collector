@@ -61,6 +61,15 @@ bounded, no ongoing loss — 168,078 fresh mints persist fine). Treat as ACCEPTE
 or run one evidence-only narration pass (repo's own writer, deterministic event_ids — precedent:
 2026-10-17 outage narration, §5 old version).
 
+T4 metric caveat (2026-10-20): `disconnect_reason='stale_no_episode'` in `resync_episodes`
+is now the BY-DESIGN label emitted on every minted parent
+(`_ensure_stale_row_parent`, fix `a072785`), so any census that ranks episodes by
+`disconnect_reason` will show `stale_no_episode` as the top bucket — that is the fix
+working, NOT fresh unparented orphans. Fresh-orphan proof post-restart 19:55 was 0/637
+sampled collector_events (2026-10-20 21:0x probe); the 2.9k historical rows stay the only debt.
+`scripts/measure_1006_rate.py` should either exclude by-design parent labels or split
+"minted-parent" vs "legacy-orphan" so nobody re-opens #1 by mistake.
+
 **Resolution:** official-share **86.0%** (29,336 official / 4,786 `inferred_nearest`,
 target ≥99%) — grinding down passively via the `*/15` backfill cron; scorecard tracks it.
 
