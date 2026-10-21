@@ -233,13 +233,13 @@ class RolloverState:
     # loop2-iter1: mid-window recovery probe bookkeeping
     consecutive_failures: int = 0  # polls with no market while current is None
     last_probe_ms: Optional[int] = None
-    # pre-warm bounded retry (2026-10-10): own 10s throttle + per-window stop
+    # pre-warm bounded retry (2026-10-10): own 2s throttle + per-window stop
     # marker so the settle-independent next-slug poll is bounded.
     prewarm_last_attempt_ms: Optional[int] = None
     prewarm_done_for_ts: Optional[int] = None
     # P2 gap-tail (2026-10-11): the fresh window's start (== the ended
     # window's end) recorded at a GAPPED promote, so pre-warm can poll the
-    # fresh slug on its own 10s cadence across [T, T+60s] — after the
+    # fresh slug on its own 2s cadence across [T, T+180s] — after the
     # promote nulls `current` the old pre-warm tail was unreachable and
     # plain 5-minute windows (always gapped: Gamma indexes fresh 5m slugs
     # ~36s after open, past the 30s lead) had no pre-warm coverage at all.
@@ -1091,7 +1091,7 @@ class RolloverManager:
             if was_next_none and prev_end_ms is not None:
                 # P2 gap-tail (2026-10-11): a gapped promote nulls current
                 # before the pre-warm tail could run — record the fresh
-                # window start so prewarm_next_window covers [T, T+60s] for
+                # window start so prewarm_next_window covers [T, T+180s] for
                 # it (see the gap-tail branch there), and emit the stall
                 # marker so the timing run sees the exact promote wall-clock.
                 state.prewarm_gap_after_ms = int(prev_end_ms)
@@ -1123,10 +1123,10 @@ class RolloverManager:
             # pre-warm NEVER ran for them — the timing evidence (zero prewarm
             # markers across every window) is this gate, not Gamma. Attempt
             # pre-warm on every lookahead tick in its active span: it owns a
-            # 10s cadence + hard window bounds, so Gamma load stays flat, and
-            # the gap-tail branch below extends coverage to the fresh window
-            # of a gapped promote. Never blocks the main poll (await-only on
-            # its own 10s turns).
+            # 2s cadence + hard window bounds (at most one Gamma GET per 2s
+            # per lane), and the gap-tail branch below extends coverage to
+            # the fresh window of a gapped promote. Never blocks the main
+            # poll (await-only on its own 2s turns).
             try:
                 _pw_ev = await self.prewarm_next_window(asset, subscribe_fn, now_ms=now_ms, tf=tf)
             except Exception:
@@ -1316,12 +1316,19 @@ class RolloverManager:
     # Next-window slugs are deterministic (_slug_for is a pure function of
     # asset + window ts, verified live on Gamma), but Gamma indexes a fresh
     # slug late — after the lead-window lookahead started and sometimes after
-    # settle. This retries the exact NEXT slug on its own 10s cadence from
-    # T-lead onward with a hard stop at window end +60s, consulting no
+    # settle. This retries the exact NEXT slug on its own cadence from
+    # T-lead onward with a hard stop past window end, consulting no
     # settlement state at all. On discovery it subscribes and routes through
     # the existing notify_settlement path so the fresh window polls at once.
-    PREWARM_RETRY_MS = 10_000
-    PREWARM_STOP_AFTER_END_MS = 60_000
+    # Tail extension (2026-10-21): last-24h measurement — 330/2443 5m
+    # discoveries land post-open (p50 lag 43.3s, p90 220.6s, max 299s) and 82
+    # windows ran >120s late, 77 of them via=poll, because this slug path had
+    # already given up at T+60s while Gamma served the slug at 60-180s. Both
+    # bounded tails (gap-tail and pre-window tail) now run to T+180s on a 2s
+    # cadence: at most one Gamma GET per 2s per lane, hard stop at T+180s —
+    # never an unbounded spinner.
+    PREWARM_RETRY_MS = 2_000
+    PREWARM_STOP_AFTER_END_MS = 180_000
 
     async def prewarm_next_window(
         self,
@@ -1332,11 +1339,11 @@ class RolloverManager:
     ) -> Optional[str]:
         """Bounded settle-independent poll for the deterministic NEXT slug.
 
-        Active in [current.end - lead, current.end + 60s] while current is
-        set, AND — P2 gap-tail (2026-10-11) — in [T, T+60s] after a gapped
+        Active in [current.end - lead, current.end + 180s] while current is
+        set, AND — P2 gap-tail (2026-10-11) — in [T, T+180s] after a gapped
         promote (current is None, prewarm_gap_after_ms set), polling the
         fresh window's own slug so plain 5-minute windows get the same
-        early-subscribe the hourly lane gets. At most one Gamma GET per 10s
+        early-subscribe the hourly lane gets. At most one Gamma GET per 2s
         per lane; never raises (returns None on any error).
         Returns "market_added" on discovery, else None.
         """
@@ -1353,13 +1360,13 @@ class RolloverManager:
             cur = state.current
             if cur is None:
                 # P2 gap-tail branch (2026-10-11): a GAPPED promote nulls
-                # current before the [T, T+60s] tail could run, so plain
+                # current before the [T, T+180s] tail could run, so plain
                 # 5-minute windows — which promote gapped every time because
                 # Gamma indexes fresh 5m slugs ~36s after open, past the 30s
                 # lead — had NO pre-warm coverage at all (the hourly lane
                 # only looked covered because its 360s lead spans the lag).
                 # Poll the fresh window's own deterministic slug on the same
-                # 10s cadence until T+60s; adopt via state.current so the
+                # 2s cadence until T+180s; adopt via state.current so the
                 # book is subscribed the moment Gamma serves it. The
                 # initial-discovery poll races us — whoever adopts first
                 # wins, and the loser re-checks current before touching

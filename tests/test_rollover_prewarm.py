@@ -3,7 +3,7 @@
 Next-window slugs are a pure function of (asset, window ts); Gamma publication
 of the fresh slug lags (sometimes past settle), costing the fresh-window
 opening. RolloverManager.prewarm_next_window retries the exact NEXT slug on
-its own 10s cadence from T-lead onward with a hard stop at window end +60s,
+its own 2s cadence from T-lead onward with a hard stop at window end +180s,
 consulting no settlement state; on discovery it subscribes and routes through
 the existing notify_settlement path.
 
@@ -109,7 +109,7 @@ async def test_prewarm_idle_before_lead():
 
 
 @pytest.mark.asyncio
-async def test_prewarm_polls_in_lead_with_10s_retry():
+async def test_prewarm_polls_in_lead_with_2s_retry():
     events = []
     mgr = _mgr(events)
     state = mgr.states[("BTC", "5m")]
@@ -130,21 +130,21 @@ async def test_prewarm_polls_in_lead_with_10s_retry():
 
     assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0) is None
     assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0 + 1_000) is None
-    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0 + 9_999) is None
-    assert len(calls) == 1  # single attempt inside the 10s retry window
-    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0 + 10_000) is None
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0 + 1_999) is None
+    assert len(calls) == 1  # single attempt inside the 2s retry window
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=t0 + 2_000) is None
     assert len(calls) == 2
     asset, after, adjacent = calls[0]
     assert asset == "BTC" and after == end_ms and adjacent is True
 
 
 @pytest.mark.asyncio
-async def test_prewarm_stops_after_end_plus_60s():
+async def test_prewarm_stops_after_end_plus_180s():
     events = []
     mgr = _mgr(events)
     state = mgr.states[("BTC", "5m")]
     now_ms = int(time.time() * 1000)
-    state.current = _market("cur", -61_000)  # ended 61s ago
+    state.current = _market("cur", -181_000)  # ended 181s ago
     end_ms = state.current.market_end_ts_ms
 
     calls = []
@@ -312,7 +312,7 @@ async def test_prewarm_runs_on_unthrottled_lookahead_tick(capsys):
     """P2 entry-gate: the 5m lane's poller cadence equals its discovery
     interval (2s == 2s), so throttle-only wiring meant pre-warm NEVER ran for
     plain 5-minute windows (zero prewarm markers across every P2 window).
-    It must attempt on EVERY lookahead tick — its own 10s cadence bounds load."""
+    It must attempt on EVERY lookahead tick — its own 2s cadence bounds load."""
     events = []
     mgr = _mgr(events)
     state = mgr.states[("BTC", "5m")]
@@ -352,7 +352,7 @@ async def test_prewarm_runs_on_unthrottled_lookahead_tick(capsys):
 async def test_gapped_promote_records_gap_then_prewarm_adopts(capsys):
     """P2 gap-tail: a gapped promote (plain 5m windows promote gapped every
     time — Gamma indexes fresh 5m slugs ~36s past the 30s lead) used to null
-    current before pre-warm's [T, T+60s] tail could run. The gap bookkeeping
+    current before pre-warm's [T, T+180s] tail could run. The gap bookkeeping
     must let pre-warm adopt the fresh window even while the main poll sits on
     grown backoff (429-style), emitting the phase markers."""
     events = []
@@ -434,8 +434,8 @@ async def test_prewarm_gap_loses_race_to_adoption():
 
 
 @pytest.mark.asyncio
-async def test_prewarm_gap_stops_after_end_plus_60s():
-    """Bounded stop for the gap tail: past T+60s the pre-warm gives up and
+async def test_prewarm_gap_stops_after_end_plus_180s():
+    """Bounded stop for the gap tail: past T+180s the pre-warm gives up and
     retires the bookkeeping (initial discovery keeps its own 2s cadence)."""
     events = []
     mgr = _mgr(events)
@@ -457,16 +457,16 @@ async def test_prewarm_gap_stops_after_end_plus_60s():
     async def subscribe(market):
         raise AssertionError("must not subscribe past the stop bound")
 
-    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 61_000) is None
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 181_000) is None
     assert calls == []
     assert state.prewarm_gap_after_ms is None  # stop marker persists
-    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 90_000) is None
+    assert await mgr.prewarm_next_window("BTC", subscribe, now_ms=end_ms + 240_000) is None
     assert calls == []
 
 
 @pytest.mark.asyncio
 async def test_initial_poll_adoption_emits_gap_marker_and_clears(capsys):
-    """When the main poll wins the fresh-window race (pre-warm inside its 10s
+    """When the main poll wins the fresh-window race (pre-warm inside its 2s
     retry window), the adoption still emits window_discovered with the gap
     provenance (via=poll_gap) and clears the gap bookkeeping."""
     events = []
@@ -486,8 +486,8 @@ async def test_initial_poll_adoption_emits_gap_marker_and_clears(capsys):
         pass
 
     assert await mgr.check_and_roll("BTC", subscribe, now_ms=end_ms + 1_000) == "coverage_gap"
-    # pre-warm inside its own 10s retry window defers → main poll adopts
-    state.prewarm_last_attempt_ms = end_ms + 1_000
+    # pre-warm inside its own 2s retry window defers → main poll adopts
+    state.prewarm_last_attempt_ms = end_ms + 3_000
     state.last_discovery_attempt_ms = None
     now2 = end_ms + 4_000
     assert await mgr.check_and_roll("BTC", subscribe, now_ms=now2) == "market_added"
