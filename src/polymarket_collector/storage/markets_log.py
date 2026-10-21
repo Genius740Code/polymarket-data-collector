@@ -24,7 +24,11 @@ def _os_replace_safe(src, dst):
     _os.replace(str(src), str(dst))
 
 
-from .parquet_io import read_table
+# compact() helper: first-win ordering column, never written to disk
+_WIN_SEQ_COL = "__compact_win_seq"
+
+
+from .parquet_io import concat, read_table
 
 from ..enums import MarketStatus, ResolutionOutcome
 
@@ -37,6 +41,14 @@ class MarketsLog:
     # rollover re-discovery — a market seen long ago is final and its
     # suppression window has passed, so FIFO eviction past the cap is safe.
     MAX_SEEN_CONDITION_IDS = 20000
+
+    # compact() streaming row-batch bound (rows per read batch in both passes)
+    _COMPACT_BATCH_ROWS = 2048
+    # compact() piece coalescing: winner-row pieces are concatenated into
+    # one running table every N pieces — the real hive has ~50k fragments
+    # and one tiny arrow Table per fragment costs ~8KB of object/buffer
+    # overhead, which alone ratchets RSS by hundreds of MB.
+    _COMPACT_COALESCE_PIECES = 1024
 
     def __init__(self, data_dir: str | Path, writer=None):
         self.data_dir = Path(data_dir)
@@ -391,43 +403,166 @@ class MarketsLog:
     def compact(self, parquet_data_dir: Optional[Path] = None) -> Path:
         """Rebuild markets_latest.parquet — one row per condition_id, latest updated_at.
 
-        Reads all markets_log parquet files under data_dir and writes atomically.
+        Memory-bounded two-pass streaming rebuild (2026-10-21, backlog #1a).
+        The old shape read EVERY markets_log fragment fully and accumulated
+        all rows as Python dicts before dedup: measured on the real hive
+        (192,241 rows / 40,433 condition_ids / 49,733 fragments) that is a
+        ~500MB peak, which collided with the collector's ~1GB export build
+        on this 3.9GB box — 3 kernel OOM kills of the collector on
+        2026-10-20, each within 10min of a backfill cron window. This
+        version never holds the log as dicts:
+
+          pass 1 streams ONLY (condition_id, updated_at) per fragment in
+          bounded row batches and keeps a winner index cid -> (updated_at,
+          src, row) — a few hundred bytes per unique cid, the one structure
+          the dedup cannot avoid;
+          pass 2 re-reads just the winning rows (bounded batches, stops at
+          each fragment's last winner) and assembles the exact table the
+          dict-merge produced: same winners (max updated_at, first row
+          wins exact ties), same first-win row order, same 2026-10-17
+          ISO-cast canonicalization for mixed settlement vintages (applied
+          piece-wise so the union stays columnar, see
+          _canon_settlement_piece), same all-None -> null column typing
+          from_pylist had, same atomic tmp+rename write.
+
+        Event-sourced fragments are never rewritten or pruned. A fragment
+        that fails to read in pass 1 is skipped whole (same net effect as
+        the old per-file except); one that fails only in pass 2 is skipped
+        with a loud WARN (its winner rows rejoin on the next rebuild —
+        markets_latest is a rebuildable view, the log stays authoritative).
         """
         base = Path(parquet_data_dir) if parquet_data_dir else self.data_dir
         log_root = base / "markets_log"
         latest_dir = base / "markets_latest"
         latest_dir.mkdir(parents=True, exist_ok=True)
 
-        # collect all rows (including in-memory staging)
         # M7: _staging holds BOTH markets rows (append) and collector_events
         # rows (append_event) — only markets rows (status-bearing) may enter
-        # markets_latest.
-        all_rows: List[Dict] = [r for r in self._staging if "status" in r]
-        if log_root.exists():
-            for part in log_root.rglob("*.parquet"):
-                try:
-                    table = read_table(part)
-                    all_rows.extend(table.to_pylist())
-                except Exception:
-                    continue
+        # markets_latest. Staging rows compete first, exactly as before.
+        staging_rows: List[Dict] = [r for r in self._staging if "status" in r]
+        staging_chunk = None
+        if staging_rows:
+            staging_chunk = self._build_union_table(self._normalize_rows(list(staging_rows)))
+        parts: List[Path] = list(log_root.rglob("*.parquet")) if log_root.exists() else []
 
-        # deduplicate: keep row with max updated_at per condition_id
-        latest: Dict[str, Dict] = {}
-        for r in all_rows:
+        # pass 1: winner index. cid -> [updated_at, src, row, seq]
+        #   src: -1 = staging chunk, >=0 = index into parts (rglob order)
+        #   row: row offset within that source
+        #   seq: first-win order — the output position of the cid in the old
+        #        dict-merge (latest[cid]=r kept the original insertion slot
+        #        on replacement), restored by sorting on the unique seq.
+        idx: Dict[str, List] = {}
+        seq = 0
+        for s_row, r in enumerate(staging_rows):
             cid = r.get("condition_id")
             if not cid:
                 continue
-            cur = latest.get(cid)
-            if cur is None or r.get("updated_at", "") > cur.get("updated_at", ""):
-                latest[cid] = r
+            u = r.get("updated_at", "")
+            cur = idx.get(cid)
+            if cur is None:
+                idx[cid] = [u, -1, s_row, seq]
+                seq += 1
+            elif u > cur[0]:  # strict: exact ties keep the first row, as before
+                cur[0], cur[1], cur[2] = u, -1, s_row
+        for f_idx, part in enumerate(parts):
+            try:
+                pf = pq.ParquetFile(str(part))
+                names = pf.schema_arrow.names
+                if "condition_id" not in names:
+                    continue  # no candidate rows possible (old: every row cid-None -> skipped)
+                cols = ["condition_id"] + (["updated_at"] if "updated_at" in names else [])
+                row_off = 0
+                for batch in pf.iter_batches(batch_size=self._COMPACT_BATCH_ROWS, columns=cols):
+                    cvals = batch.column("condition_id").to_pylist()
+                    uvals = (batch.column("updated_at").to_pylist()
+                             if "updated_at" in names else [""] * batch.num_rows)
+                    for i in range(batch.num_rows):
+                        cid = cvals[i]
+                        if not cid:
+                            continue
+                        u = uvals[i]
+                        cur = idx.get(cid)
+                        if cur is None:
+                            idx[cid] = [u, f_idx, row_off + i, seq]
+                            seq += 1
+                        elif u > cur[0]:
+                            cur[0], cur[1], cur[2] = u, f_idx, row_off + i
+                    row_off += batch.num_rows
+            except Exception as e:
+                print(f"[markets_log] WARN compact pass1 unreadable fragment (skipped whole): {part}: {e}")
+                continue
 
-        rows = list(latest.values())
-        # Ensure empty table still has schema
-        if rows:
-            rows = self._normalize_rows(rows)
-            table = self._build_union_table(rows)
-        else:
+        # pass 2: re-read only the winning rows, batch-bounded. Pieces are
+        # ISO-canonized at creation (mixed settlement vintages merge
+        # columnar, see _canon_settlement_piece) and coalesced every
+        # _COMPACT_COALESCE_PIECES so the piece count stays O(files/1024).
+        per_src: Dict[int, Dict[int, int]] = {}
+        for entry in idx.values():
+            per_src.setdefault(entry[1], {})[entry[2]] = entry[3]
+        chunk_tables: List[pa.Table] = []
+        piece_buf: List[pa.Table] = []
+
+        def _acc(piece: pa.Table) -> None:
+            piece_buf.append(piece)
+            if len(piece_buf) >= self._COMPACT_COALESCE_PIECES:
+                chunk_tables.append(concat(piece_buf) if len(piece_buf) > 1 else piece_buf[0])
+                piece_buf.clear()
+
+        if staging_chunk is not None:
+            sm = per_src.pop(-1, None)
+            if sm:
+                rows_sorted = sorted(sm)
+                piece = staging_chunk.take(pa.array(rows_sorted, pa.int64()))
+                piece = piece.append_column(
+                    _WIN_SEQ_COL, pa.array([sm[r_] for r_ in rows_sorted], pa.int64()))
+                _acc(self._canon_settlement_piece(piece))
+        for src in sorted(per_src):
+            rows_map = per_src[src]
+            want = sorted(rows_map)
+            wp = 0
+            row_off = 0
+            pieces: List[pa.Table] = []
+            try:
+                pf = pq.ParquetFile(str(parts[src]))
+                for batch in pf.iter_batches(batch_size=self._COMPACT_BATCH_ROWS):
+                    end = row_off + batch.num_rows
+                    local_rows: List[int] = []
+                    local_seqs: List[int] = []
+                    while wp < len(want) and want[wp] < end:
+                        r_ = want[wp]
+                        local_rows.append(r_ - row_off)
+                        local_seqs.append(rows_map[r_])
+                        wp += 1
+                    if local_rows:
+                        piece = pa.Table.from_batches(
+                            [batch.take(pa.array(local_rows, pa.int64()))])
+                        pieces.append(piece.append_column(
+                            _WIN_SEQ_COL, pa.array(local_seqs, pa.int64())))
+                    row_off = end
+                    if wp >= len(want):
+                        break  # past this fragment's last winner — stop reading
+            except Exception as e:
+                print(f"[markets_log] WARN compact pass2 unreadable fragment "
+                      f"(its winner rows rejoin on the next rebuild): {parts[src]}: {e}")
+                continue
+            for p in pieces:
+                _acc(self._canon_settlement_piece(p))
+            del pieces
+        if piece_buf:
+            chunk_tables.append(concat(piece_buf) if len(piece_buf) > 1 else piece_buf[0])
+            piece_buf.clear()
+
+        if not chunk_tables:
+            # Ensure empty table still has schema (unchanged empty path)
             table = pa.Table.from_pylist([], schema=pa.schema([]))
+        else:
+            # verbatim union; a still-unmergeable schema pair (anything the
+            # piece-level canon cannot reach) fails closed — the error
+            # propagates and the caller keeps markets_latest unchanged,
+            # exactly like the old code's terminal retry.
+            merged = concat(chunk_tables)
+            ordered = merged.sort_by([(_WIN_SEQ_COL, "ascending")]).drop_columns([_WIN_SEQ_COL])
+            table = self._nullify_all_empty_columns(ordered)
 
         tmp_path = latest_dir / "markets_latest.parquet.tmp"
         final_path = latest_dir / "markets_latest.parquet"
@@ -435,6 +570,49 @@ class MarketsLog:
         # atomic rename (§10A)
         _os_replace_safe(tmp_path, final_path)
         return final_path
+
+    @classmethod
+    def _canon_settlement_piece(cls, piece: "pa.Table") -> "pa.Table":
+        """ISO-cast an integer/float-typed settlement_ts_utc piece in place.
+
+        The production log still carries both settlement vintages (pre-2026-
+        10-14 fragments typed int64 epoch-ms beside the canonical strings),
+        and their winner rows cannot merge columnar. Casting at the PIECE
+        level (a fragment's few winner rows take the Python detour, not the
+        whole winner set) keeps the union columnar and bounded. Same
+        contract as _iso_from_epoch_ms: only numeric values inside the
+        2020-2040 plausibility band become ISO; digit-strings, out-of-band
+        values and everything else pass through verbatim, and a still-
+        unmergeable union fails closed at the concat."""
+        if "settlement_ts_utc" not in piece.schema.names:
+            return piece
+        f = piece.schema.field("settlement_ts_utc")
+        if not (pa.types.is_integer(f.type) or pa.types.is_floating(f.type)):
+            return piece
+        rows = piece.to_pylist()
+        for r in rows:
+            ts = cls._iso_from_epoch_ms(r.get("settlement_ts_utc"))
+            if ts is not None:
+                r["settlement_ts_utc"] = ts
+        out = pa.Table.from_pylist(rows)
+        del rows
+        return out
+
+    @staticmethod
+    def _nullify_all_empty_columns(table: "pa.Table") -> "pa.Table":
+        """Match the from_pylist output typing of the old dict-merge compact.
+
+        pa.Table.from_pylist types a column whose values are ALL None as
+        null; concat promotion instead keeps each fragment's declared type
+        (e.g. today's all-null resolution_rule stays string). Production
+        markets_latest carries such columns as null-typed, so the rebuilt
+        view keeps exactly that: all-null columns become null-typed again.
+        Values are unchanged (all None either way)."""
+        for i, col in enumerate(table.columns):
+            if col.null_count == table.num_rows:
+                table = table.set_column(i, table.schema.field(i).with_type(pa.null()),
+                                         pa.nulls(table.num_rows))
+        return table
 
     def load_latest(self, parquet_data_dir: Optional[Path] = None) -> List[Dict]:
         base = Path(parquet_data_dir) if parquet_data_dir else self.data_dir
