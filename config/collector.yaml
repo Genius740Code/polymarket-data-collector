@@ -231,7 +231,19 @@ timeframes:
   # change; guard stays silent-deny (fail-closed prune) — do NOT weaken it.
   # - 15m  # LOCKED — see above
   - 5m
-  - 1h
+  # 2026-10-22: 1h PAUSED (autonomous, disk emergency) — 98G data disk 97%
+  # full / 3.6G free; ~12GB/day l2_raw ingestion outran the drain because
+  # every drain gate (500ms per-lane prune, l2 retention slowest-lane
+  # checkpoint) fails closed on 1h's verified upload, frozen 2026-10-19
+  # 14:01 UTC. 1h export passes died to OOM mid-flight 5+ times since
+  # 2026-10-20 (pm2 SIGKILL motif, WAL replays 0 rows lost) — each death
+  # reset a 5-8h pass, never reaching upload+verify. History above shows
+  # the SAME 2026-09-22 ENOSPC post-mortem. 5m is the highest-value data;
+  # 1h stays ON Kaggle (verified to 2026-10-19 14:01, prunable nothing).
+  # Re-add `- 1h` ONLY after: (a) disk is stable (<75%) for 24h AND
+  # (b) a completed 1h export pass reached a verified upload. Revert:
+  # uncomment the line below, restart within a quiet window.
+  # - 1h  # PAUSED 2026-10-22 — see note above
 
 ws:
   # Dual-WS A/B pair per shard (WS1, 2026-10-03 code; enabled 2026-10-05 first

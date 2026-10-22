@@ -1,6 +1,51 @@
 # HANDOFF — autonomous data-quality loop on polymarket-data-collector
 
-Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · updated 2026-10-20 ~21:3x UTC (cycle vs 2026-10-19 rewrite)
+Branch `perfect/pmdata-parity` · box `/home/fese/polymarket-data-collector` · updated 2026-10-22 ~16:4x UTC (2026-10-22 disk-emergency cycle)
+
+## 0. 2026-10-22 cycle state (measured; read first)
+
+- **DISK EMERGENCY at 16:30 UTC: `data/` 97% (3.6G free)** — ~12GB/day l2_raw
+  ingestion vs every drain gate fail-closed. Root: 1h lane verified-upload
+  checkpoint frozen 2026-10-19 14:01 (1h export passes died to OOM mid-flight
+  9+ times since 10-20: pm2 `SIGKILL` motif at exit-code-0 formation, WAL
+  replays **0 rows lost** every time — write path durable). The config's own
+  2026-09-22 ENOSPC post-mortem is the same motif.
+  - **MITIGATION in effect**: `config/collector.yaml` `timeframes: [5m]`
+    (1h PAUSED with dated comment + revert conditions, the documented
+    2026-09-21-style cut). Deployed on the next restart by the armed watcher
+    `/tmp/opencode/restart_watcher.sh` (fires ONLY when `scripts/quiet_window.py`
+    exits 0; exact-pid INT→KILL escalation; pm2 respawns).
+  - Post-restart expect: 5m-owned cutoffs (2026-10-22 08:18 verified upload)
+    become the gate → ~17G of `book_snapshots_500ms/date=2026-10-20..22`
+    prunes, book_events 5G follows, disk back toward ~70-75%.
+  - 1h data is safe on Kaggle to 2026-10-19 14:01. Re-add `- 1h` only per the
+    config comment conditions.
+- **#1a landed `d66ed4a`** (memory-bounded `markets_log.compact()`, two-pass
+  streaming; fixture FAIL 371.5MB→PASS ~103MB; production-scale rehearsal
+  ~255MB vs ~500MB+ old). Verified live in the collector since the 10-21
+  13:17 restart. Deaths continue → **#1a alone was not the whole crash cause**.
+- **#4a landed `85875f4`** (prewarm gap-tail stop 60s→180s, retry 10s→2s).
+  DEPLOYED already (current process started after the commit). Baseline to
+  beat: 24h log evidence — 2443 5m discoveries, 330 post-open (13.5%),
+  p50 lag 43.3s / p90 220.6s / max 299s, 82 windows >120s (77 `via=poll`);
+  86.5% discovered pre-open. Re-measure after a 24h soak.
+- **#5 crash motif MEASURED (next code cycle):** in the 14:04–14:39 incarnation
+  (`logs/collector-out-0.log` lines 595268–601827): during the 5m lane tick the
+  parent climbed `[mem] rss=530→850MB` with `ebuf` pinned 11–17k rows and
+  `eps` 57→322 the whole pass (sweep stalled mid-tick = the 2026-09-25
+  "pinned +600MB" motif, still live), while the export worker peaks 430MB–1GB
+  (cap 1000MB). Steady baseline: collector ~780MB + watchdog ~170MB + pm2
+  daemon 309MB + agent session ~455MB ≈ over 3.9GB with any worker spike.
+  Deaths at cycle boundaries: post-upload validation (13:17), `[flush] 19996`
+  (15:35), `[prune] quarantined…` (18:27), whale worker write (19:01).
+
+## 0b. Subagent completions 2026-10-21/22 (both gate-proven, pushed)
+
+| Commit | Item | Proof |
+|---|---|---|
+| `d66ed4a` | #1a OOM-bounded compact | 4/4 new tests green (re-run), FAIL-on-old wall-measured, ruff 0 new (1 pre-existing F401) |
+| `85875f4` | #4a prewarm tail | 6 FAIL-on-old red→green, 86 passed / 1 pre-existing red (`test_r_fixes`, proven red at HEAD), ruff 0 new, forbidden 0 |
+
 
 ---
 
