@@ -30,6 +30,19 @@ they started, so a day-scoped check false-positives rows written hours past
 midnight. Honest exceptions only: a number is printed only when it was
 actually computed from real files.
 
+Coverage semantics (backlog #2, 2026-10-19 handoff §4b): the local
+book_snapshots_500ms/ hive is a ROLLING mirror — verified-uploaded rows are
+pruned locally after every Kaggle verified upload, so a next-day scorecard
+of a pruned date reads a low local row count (~7% density) that is a mirror
+artifact, not a loss (the data lives in the verified Kaggle dataset), and a
+same-day score is a partial day by construction. A footer-only row census
+per lane plus the grid-derived full-day expectation classify each scored
+date (full|partial|stale) and the verdict reflects it: same-day=partial-ok
+(SOAK — an in-progress day is neither accepted nor density-FAILED on
+coverage alone), pruned days=stale-local (warn-only, backed by the kaggle
+verified-upload checkpoint; the honest line is "locally pruned,
+verified-uploaded"), full days unchanged.
+
 Targets (docs/PERFECT_DATA_SPEC.md §10, as amended):
   density >= 99% | CompNorm <= 0.1% | every T1 counter = 0 | official-share >= 99%
 """
@@ -37,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime as _dt
 import hashlib
 import json
 import math
@@ -256,6 +270,301 @@ def day_files(asset_dir: Path, since_mtime: float | None) -> list:
                 continue
         parts = keep
     return parts
+
+
+# ---------------------------------------------------------------------------
+# Prune-aware coverage semantics (backlog #2) — the local hive is a rolling
+# mirror: rows are pruned after verified uploads, so local row counts alone
+# must never be read as "data loss" (nor as local completeness).
+# ---------------------------------------------------------------------------
+
+# Per-lane (ONE asset) full-day expectation on the 500ms grid, derived from
+# the grid this module already gates with — arithmetic from first principles,
+# never a bare 172_800:
+#   GRID_NS = 500_000_000 ns = 0.5 s per tick -> 1_000_000_000 // GRID_NS = 2 ticks/s
+#   one UTC day = 24*60*60 = 86_400 s         -> 86_400 * 2 = 172_800 rows/asset-day
+#   whole-partition expectation = (asset lanes in the partition) x 172_800 —
+#   the per-lane line below prints the per-asset term and each lane's own
+#   footer rows are compared against that same per-asset term.
+ROWS_PER_SEC = 1_000_000_000 // GRID_NS                    # 2 (500ms grid)
+DAY_SECONDS = 24 * 60 * 60                                 # 86_400 s of a UTC day
+FULL_DAY_ROWS_PER_ASSET = DAY_SECONDS * ROWS_PER_SEC       # 172_800 rows/asset-day
+STALE_LOCAL_FRAC = 0.40  # ~40% of the expectation: a pruned mirror date reads
+                         # ~7% locally; a full local day reads >= 100%
+COVERAGE_SCAN_S = 45.0   # footer-only census allowance for the whole run
+                         # (17k footers across 7 lanes read in single-digit
+                         # seconds here; generous headroom under write noise)
+
+
+def classify_coverage(date_utc, local_rows, expected_est, now_utc):
+    """Pure date classification of one scored date's LOCAL coverage.
+
+    Inputs: the scored UTC date (date or datetime — a datetime is narrowed to
+    its date), the lane's real local footer rows, the grid-derived full-day
+    expectation (FULL_DAY_ROWS_PER_ASSET), and the wall clock, INJECTED — this
+    function never reads the clock itself, so tests pin any instant without
+    touching the process clock. Returns (klass, reason) with klass one of
+    'full' | 'partial' | 'stale':
+
+    - partial: the scored date is today (UTC) and the wall clock has not yet
+      reached the day's end — a same-day score is a partial day by
+      construction, so coverage alone must not FAIL it (verdict modifier
+      partial-ok; the verdict line prints SOAK).
+    - stale: the day HAS ended on the wall clock, but local_rows is below
+      ~STALE_LOCAL_FRAC of expected_est — the rolling-mirror signature of a
+      locally pruned, verified-uploaded date (modifier stale-local -> WARN,
+      only when the kaggle checkpoint confirms; without it the density FAIL
+      stands — never a loss claim, never a completeness claim).
+    - full: the day ended with local coverage at/above the threshold —
+      legacy full-day gate semantics apply unchanged.
+
+    The threshold compare runs in integers (rows*5 < est*2 == rows/est < 2/5
+    = 40% exactly), so the boundary is free of float drift: at exactly 40%
+    the legacy semantics apply.
+    """
+    if isinstance(date_utc, _dt.datetime):
+        date_utc = date_utc.date()
+    if not isinstance(now_utc, _dt.datetime):  # a bare date has no time of day
+        now_utc = _dt.datetime.combine(now_utc, _dt.time.min, tzinfo=_dt.timezone.utc)
+    elif now_utc.tzinfo is None:  # a naive wall clock is read as UTC
+        now_utc = now_utc.replace(tzinfo=_dt.timezone.utc)
+    day_start = _dt.datetime(date_utc.year, date_utc.month, date_utc.day,
+                             tzinfo=_dt.timezone.utc)
+    day_end = day_start + _dt.timedelta(days=1)
+    if date_utc == now_utc.date() and now_utc < day_end:
+        return "partial", (
+            f"same-day {date_utc.isoformat()}: wall clock {now_utc.isoformat()} "
+            f"< day end {day_end.isoformat()} — partial day by construction"
+        )
+    if expected_est > 0 and local_rows * 5 < expected_est * 2:
+        return "stale", (
+            f"day ended {day_end.isoformat()}: local_rows={local_rows:,} "
+            f"< {STALE_LOCAL_FRAC:.0%} of expected_est={expected_est:,} — "
+            f"locally pruned/low-coverage (rolling mirror)"
+        )
+    return "full", (
+        f"day ended {day_end.isoformat()}: local_rows={local_rows:,} "
+        f"vs expected_est={expected_est:,}"
+    )
+
+
+def lane_footer_rows(asset_dir: Path, deadline: float,
+                     workers: int = FOOTER_WORKERS) -> tuple:
+    """Footer-only row census of one lane's day files -> (rows, files, unread, cut).
+
+    pq.ParquetFile(path).metadata.num_rows reads the parquet footer and
+    pf.schema_arrow carries the pq.read_schema facts off the SAME open
+    footer — one open, no data pages — confirming the file is a snapshots
+    part (ts_snapshot_ns column) before its rows count. .tmp files are
+    excluded by day_files; unreadable or non-snapshot files are skipped and
+    counted, never guessed. A scan stopped by its deadline returns cut=True
+    so a partial sum can never be presented as a complete census.
+    """
+    files = day_files(asset_dir, None)
+    total = len(files)
+    if time.monotonic() > deadline:
+        return 0, total, 0, True
+    rows = 0
+    unread = 0
+    cut = False
+
+    def _footer(fp: Path):
+        try:
+            pf = pq.ParquetFile(str(fp))
+            if "ts_snapshot_ns" not in pf.schema_arrow.names:
+                return None
+            return int(pf.metadata.num_rows)
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        pending: deque = deque()
+        it = iter(files)
+        for _ in range(workers * 2):
+            nxt = next(it, None)
+            if nxt is None:
+                break
+            pending.append(ex.submit(_footer, nxt))
+        while pending:
+            if time.monotonic() > deadline:
+                cut = True
+                break
+            fut = pending.popleft()
+            n = fut.result()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append(ex.submit(_footer, nxt))
+            if n is None:
+                unread += 1
+            else:
+                rows += n
+    if cut:
+        for f in list(pending):  # cancel queued-but-unstarted footer reads
+            f.cancel()
+    return rows, total, unread, cut
+
+
+def _parse_utc(value) -> object:
+    """Best-effort ISO datetime parse -> aware UTC datetime, or None."""
+    try:
+        parsed = _dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed
+
+
+def staging_manifest_rows(kaggle_root: Path) -> dict:
+    """Freshest staged row count per asset from the exporter's staging manifests.
+
+    data/kaggle_staging/*/gghgg1/*/staging-manifest.json records per-file
+    FOOTER rows for the staged window files (e.g. BTC_book_snapshots_500ms
+    .parquet) with its built_at_utc. Those are cutoff-bounded staging
+    windows, NOT date-partition coverage, so the count is only ever printed
+    as corroborating evidence and never fed to the classification.
+    Returns {asset: (rows, built_at_utc)}; metadata-only, never raises.
+    """
+    out: dict = {}
+    if not kaggle_root.exists():
+        return out
+    for mf in sorted(kaggle_root.glob("*/gghgg1/*/staging-manifest.json")):
+        try:
+            data = json.loads(mf.read_text()) or {}
+        except Exception:
+            continue
+        built = str(data.get("built_at_utc") or "")
+        for ent in data.get("files") or []:
+            if not isinstance(ent, dict):
+                continue
+            name = str(ent.get("name") or "")
+            if not name.endswith("_book_snapshots_500ms.parquet"):
+                continue
+            rows = ent.get("rows")
+            if not isinstance(rows, int):
+                continue
+            asset = name[: -len("_book_snapshots_500ms.parquet")]
+            prev = out.get(asset)
+            if prev is None or built > str(prev[1]):
+                out[asset] = (rows, built)
+    return out
+
+
+def kaggle_verified_covers(kaggle_root: Path, date_end_epoch_s: float) -> tuple:
+    """(covered, newest_last_upload_iso) from kaggle_staging/*/_kaggle_state.json.
+
+    An entry covers the scored date when its verified build's hive-read
+    cutoff — build_start, the prune's OWN coverage proof (rows newer than
+    every lane's build_start are never deleted; see export.py
+    _write_kaggle_state) — is at or after the date's end, i.e. that one
+    verified build read the whole date. Entries without build_start fall
+    back to the literal last_upload_utc >= date end. Metadata-only: JSON
+    reads, no network, no parquet reads; unreadable state files are skipped
+    and never counted as coverage.
+    """
+    covered = False
+    newest = None
+    if not kaggle_root.exists():
+        return covered, newest
+    for state_path in sorted(kaggle_root.glob("*/_kaggle_state.json")):
+        try:
+            state = json.loads(state_path.read_text()) or {}
+        except Exception:
+            continue
+        for _ds, info in state.items():
+            if not isinstance(info, dict):
+                continue
+            lu = info.get("last_upload_utc")
+            if not lu:
+                continue  # no verified upload recorded for this entry
+            if newest is None or str(lu) > str(newest):
+                newest = lu
+            bs_ms = info.get("build_start_unix_ms")
+            if isinstance(bs_ms, (int, float)) and bs_ms > 0:
+                frontier = bs_ms / 1000.0
+            else:
+                lu_dt = _parse_utc(lu)
+                frontier = lu_dt.timestamp() if lu_dt else None
+            if frontier is not None and frontier >= date_end_epoch_s:
+                covered = True
+    return covered, newest
+
+
+def coverage_entries(snap_base: Path, assets: list, date_str: str,
+                    kaggle_root: Path, now_utc,
+                    deadline_s: float = COVERAGE_SCAN_S) -> dict:
+    """Per-lane LOCAL coverage census + classification (metadata-only).
+
+    Rows come from parquet footers of each lane's day files (never a data
+    read); expected_est is the 500ms full-day grid arithmetic for ONE asset
+    lane; classify_coverage() pins the date class against the INJECTED wall
+    clock (run_scorecard passes datetime.now(tz=UTC) — every emitted number
+    stays wall-stamped to that instant); kaggle_verified_covers() supplies
+    the verified-upload checkpoint that separates an honestly pruned mirror
+    (stale-local) from a density FAIL that must stand. A footer census cut
+    short by its deadline leaves rows=None and no classification for the
+    lanes it did not finish — never a complete-looking count, and the legacy
+    verdict semantics apply to those lanes untouched.
+    """
+    try:
+        date_utc = _dt.date.fromisoformat(date_str)
+    except ValueError:
+        date_utc = None  # resolve_date only proved the partition dir exists
+    verified, verified_upload = (False, None)
+    if date_utc is not None:
+        day_end = (
+            _dt.datetime(date_utc.year, date_utc.month, date_utc.day,
+                         tzinfo=_dt.timezone.utc) + _dt.timedelta(days=1)
+        )
+        verified, verified_upload = kaggle_verified_covers(kaggle_root, day_end.timestamp())
+    manifests = staging_manifest_rows(kaggle_root)
+    deadline = time.monotonic() + deadline_s
+    entries: dict = {}
+    for asset in assets:
+        asset_dir = snap_base / f"asset={asset}"
+        rows, nfiles, unread, cut = lane_footer_rows(asset_dir, deadline)
+        entry = {
+            "rows": None if cut else rows,
+            "files": nfiles,
+            "unread": unread,
+            "partial": cut,
+            "expected_est": FULL_DAY_ROWS_PER_ASSET,
+            "verified": verified,
+            "verified_upload": verified_upload,
+        }
+        staged = manifests.get(asset)
+        if staged is not None:
+            s_rows, s_built = staged
+            built_dt = _parse_utc(s_built)
+            if built_dt is not None:
+                # "when fresher": the manifest was built after every local
+                # file of this lane was last written (a lane with no local
+                # files is trivially fresher) — record it as evidence.
+                newest_local = 0.0
+                try:
+                    for p in day_files(asset_dir, None):
+                        newest_local = max(newest_local, p.stat().st_mtime)
+                except OSError:
+                    newest_local = 0.0
+                if built_dt.timestamp() >= newest_local:
+                    entry["staged_rows"] = s_rows
+                    entry["staged_built"] = s_built
+        if not cut and date_utc is not None:
+            klass, reason = classify_coverage(
+                date_utc, rows, FULL_DAY_ROWS_PER_ASSET, now_utc
+            )
+            entry["klass"] = klass
+            entry["reason"] = reason
+            if klass == "partial":
+                entry["modifier"] = "partial-ok"
+            elif klass == "stale":
+                entry["modifier"] = "stale-local" if verified else "stale-noverify"
+            else:
+                entry["modifier"] = "full"
+        else:
+            entry["modifier"] = "n/a(partial)" if cut else "n/a"
+        entries[asset] = entry
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -676,15 +985,47 @@ def lanes_upload_state(kaggle_root: Path) -> list:
 
 
 def gate_verdict(probe: dict, blocks: dict, official: dict,
-                 official_share: float | None, partial_any: bool) -> tuple:
+                 official_share: float | None, partial_any: bool,
+                 coverage: dict | None = None) -> tuple:
     """Returns (status, fail_lines). WATCH (never PASS) when any input was
-    partial — a scorecard that could not finish a metric must not print PASS."""
+    partial — a scorecard that could not finish a metric must not print PASS.
+
+    coverage (optional; None — the legacy call — keeps the semantics below
+    byte-for-byte) carries each lane's classify_coverage() result. A
+    'partial' (same-day) lane's NUMERIC density fail is coverage-driven and
+    is dropped — the density number stays printed in the table; when nothing
+    else fails, the verdict line prints SOAK: an in-progress day is neither
+    accepted nor density-FAILED on coverage alone. A 'stale' lane whose date
+    is covered by a verified kaggle upload checkpoint gets a
+    'WARN stale-local (...)' line INSTEAD of its density fail — warn-only,
+    never a gate FAIL and never a completeness claim for the local mirror;
+    without the checkpoint the density FAIL stands (never a loss claim
+    either). n/a(partial) density, CompNorm, T1 counters and official-share
+    keep their legacy semantics exactly. WARN lines are appended to the
+    returned list but never count towards the FAIL decision."""
     fails = []
+    warns = []
+    cov = coverage or {}
     for asset, (dens, norm, _f, _p) in probe.items():
+        entry = cov.get(asset) or {}
+        klass = entry.get("klass")
         if dens is None:
             fails.append(f"{asset} density=n/a(partial) — target>=99%")
         elif dens < 99.0:
-            fails.append(f"{asset} density={dens:g}% — target>=99%")
+            if klass == "partial":
+                pass  # same-day partial day: density stays in the table; coverage alone must not FAIL
+            elif klass == "stale" and entry.get("verified"):
+                loc = ""
+                if isinstance(entry.get("rows"), int) and entry.get("expected_est"):
+                    loc = f" local_rows={entry['rows']:,}/{entry['expected_est']:,}"
+                vu = entry.get("verified_upload")
+                warns.append(
+                    f"{asset}: WARN stale-local (data on Kaggle; see kaggle checkpoint) "
+                    f"locally pruned, verified-uploaded — density={dens:g}%{loc}"
+                    + (f" verified_upload={vu}" if vu else "")
+                )
+            else:
+                fails.append(f"{asset} density={dens:g}% — target>=99%")
         if norm is None:
             fails.append(f"{asset} CompNorm=n/a(partial) — target<=0.1%")
         elif norm > gate_probe.COMP_NORM_GATE_PCT:
@@ -704,8 +1045,18 @@ def gate_verdict(probe: dict, blocks: dict, official: dict,
             f"(official={official['official']}/{official['settled']} resolved, "
             f"inferred={official['inferred']}, other={official['other']})"
         )
-    status = "FAIL" if fails and not partial_any else ("WATCH" if fails or partial_any else "PASS")
-    return status, fails
+    classes = {e.get("klass") for e in cov.values()
+               if isinstance(e, dict) and e.get("klass")}
+    same_day = classes == {"partial"}  # every classified lane is the in-progress day
+    if fails:
+        status = "FAIL" if not partial_any else "WATCH"
+    elif same_day:
+        status = "SOAK"  # coverage alone: never ACCEPT, never FAIL
+    elif partial_any or warns:
+        status = "WATCH"
+    else:
+        status = "PASS"
+    return status, fails + warns
 
 
 def _t1_detail(block: T1Block) -> str:
@@ -849,6 +1200,14 @@ def run_scorecard(
         blocks[pending_asset] = pb
         probe[pending_asset] = (None, None, 0, True)
 
+    # --- prune-aware coverage census (backlog #2): footer-only, bounded, and
+    # wall-stamped to one real now_utc (datetime.now(tz=UTC), never frozen) ---
+    now_utc = _dt.datetime.now(tz=_dt.timezone.utc)
+    coverage = coverage_entries(
+        snap_base, assets, date_str, kaggle_root, now_utc,
+        deadline_s=COVERAGE_SCAN_S,
+    )
+
     # join the completeness child with its own allowance AFTER the lanes
     comp_join_deadline = t1_deadline + COMP_JOIN_ALLOWANCE_S
     comp_map, comp_status = _collect_completeness(comp_proc, out_json, comp_join_deadline)
@@ -871,7 +1230,9 @@ def run_scorecard(
         or resync_unread > 0
         or any(b.partial for b in blocks.values())
     )
-    status, fails = gate_verdict(probe, blocks, official, official_share, partial_any)
+    status, fails = gate_verdict(
+        probe, blocks, official, official_share, partial_any, coverage=coverage
+    )
     return {
         "date": date_str,
         "probe": probe,
@@ -887,6 +1248,8 @@ def run_scorecard(
         "fails": fails,
         "resync_unread": resync_unread,
         "resync_overflow": resync_overflow,
+        "coverage": coverage,
+        "now_utc": now_utc.isoformat(),
     }
 
 
@@ -911,12 +1274,16 @@ def render_scorecard(snap: dict, assets: list) -> None:
     print(
         f"=== Acceptance scorecard — date {snap['date']} UTC, {', '.join(assets)} | {TARGETS} ==="
     )
+    print(
+        "[scorecard] coverage semantics: same-day=partial-ok, "
+        "pruned-days=stale-local(warn-only), full-day=unchanged"
+    )
     comp = snap["completeness"]
     comp_ok = snap["completeness_status"] == "ok"
     header = (
         f"{'lane':<5} {'tick/day':>8} {'clean%':>11} {'dens%':>6} {'norm%':>6} "
         f"{'files':>7} {'dup':>5} {'badpx':>5} {'orph':>6} {'offgrid':>7} {'zero':>5} "
-        f"{'g6mm/n':>9} {'g6f':>4} {'states':>12} {'part':>4}"
+        f"{'g6mm/n':>9} {'g6f':>4} {'states':>12} {'part':>4} {'cov':>17} {'covcls':>14}"
     )
     print(header)
     print("-" * len(header))
@@ -939,11 +1306,18 @@ def render_scorecard(snap: dict, assets: list) -> None:
             else "n/a(partial)"
         )
         part = "yes" if b.partial else "no"
+        cov_e = (snap.get("coverage") or {}).get(asset) or {}
+        if cov_e.get("rows") is not None:
+            cov_s = f"{cov_e['rows']:,}/{cov_e['expected_est']:,}"
+        else:
+            cov_s = "n/a(partial)" if cov_e else "n/a"
+        covcls = cov_e.get("modifier") or "n/a"
         print(
             f"{asset:<5} {_fmt(tick):>8} {clean:>11} {_fmt(dens):>6} {_fmt(norm):>6} "
             f"{b.files_scanned:>3}/{b.files_total:<3} {dupnote:>5} {b.out_of_range_rows:>5} "
             f"{b.orphan_resync_rows:>6} {b.offgrid_rows:>7} {b.zero_price_rows:>5} "
-            f"{g6:>9} {b.g6_files_sampled:>4} {states:>12} {part:>4}"
+            f"{g6:>9} {b.g6_files_sampled:>4} {states:>12} {part:>4} "
+            f"{cov_s:>17} {covcls:>14}"
         )
         extra = []
         if b.files_skipped:
@@ -952,13 +1326,29 @@ def render_scorecard(snap: dict, assets: list) -> None:
             extra.append("resync-id set capped — orphan metric partial")
         if not b.g6_done and not b.partial and b.files_total:
             extra.append("g6 not sampled (budget)")
+        if cov_e.get("unread"):
+            extra.append(f"cov_footer_unread={cov_e['unread']}")
+        if cov_e.get("partial"):
+            extra.append("coverage census cut (budget) — classification n/a(partial)")
+        if cov_e.get("staged_rows") is not None:
+            extra.append(
+                f"staging-manifest staged_rows={cov_e['staged_rows']:,} built "
+                f"{cov_e['staged_built']} (fresher than local files)"
+            )
+        if cov_e.get("klass") == "stale" and not cov_e.get("verified"):
+            extra.append(
+                f"low local coverage, no verified-upload checkpoint at/after day end: "
+                f"{cov_e.get('reason')}"
+            )
         if extra:
             print("      note: " + ", ".join(extra))
     print(
         "(dup* = approx-hash census, fixed 8MiB bound, fresh key can rarely "
         "hash-collide → count may be slightly high, 0 is exact; "
         f"g6mm/n = depth-recompute mismatches/rows sampled, tol {DEPTH_TOL:g}; "
-        "clean% source tag: sta=staging raw=raw-footers-only)"
+        "clean% source tag: sta=staging raw=raw-footers-only; "
+        "cov = local footer rows/expected full-day rows per asset-day, "
+        "covcls: partial-ok|stale-local|stale-noverify|full)"
     )
 
     off = snap["official"]
@@ -981,9 +1371,16 @@ def render_scorecard(snap: dict, assets: list) -> None:
             f"daily-completeness: {snap['completeness_status']} — clean metrics n/a(partial)"
         )
     if snap["fails"]:
-        print("FAILING METRICS:")
-        for line in snap["fails"]:
-            print(f"  - {line}")
+        warn_lines = [f for f in snap["fails"] if "WARN stale-local" in f]
+        fail_lines = [f for f in snap["fails"] if "WARN stale-local" not in f]
+        if fail_lines:
+            print("FAILING METRICS:")
+            for line in fail_lines:
+                print(f"  - {line}")
+        if warn_lines:
+            print("WARN stale-local (warn-only, not gate-failing):")
+            for line in warn_lines:
+                print(f"  - {line}")
     print(f"verdict: {snap['status']}")
 
 
