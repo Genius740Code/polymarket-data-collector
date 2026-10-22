@@ -6016,6 +6016,94 @@ def _kaggle_dataset_slug(window_label: str = "5m") -> str:
     return _get_kaggle_dataset_name(window_label)
 
 
+# 2026-10-22 #5b disk leak: a SIGKILLed publish worker leaks its staging
+# scratch FOREVER. Publishes are atomic tmp+rename with the WORKER PID
+# embedded in the tmp name (streaming._publish_tmp writes
+# X.parquet.tmp.<pid>.tmp on top of export's own X.parquet.tmp), so a dead
+# worker's scratch is never overwritten — every respawn strands a new
+# 100-160MB tmp (17 respawns in ~28h measured; last three: ETH 18:29 148MB,
+# BTC 18:59 158MB, BTC 19:15 133MB) and GBs accumulated under kaggle_staging
+# (5m ~3.4GB + 1h ~1.1GB, a large share dead tmps). _staging_resources
+# already excludes tmp names from upload manifests, and the pre-upload
+# janitor in _upload_kaggle_folder only runs when a pass REACHES the upload
+# — an OOM/kill loop never does, so nothing anywhere deletes the leaked
+# scratch. Reap once per staging-prepare pass instead: bounded walk of
+# data/kaggle_staging/** deleting ONLY files whose name ends in '.tmp'
+# (every publish-scratch shape) older than the grace window. A live
+# worker's in-flight tmp is younger than the grace (longest measured
+# staging pass ~1h/worker — 120min = 2x margin) and survives. Non-tmp
+# names, _quarantine/ and _wal/ subtrees are out of scope by construction.
+# Idempotent, stateless, no config keys; never raises.
+_STAGING_DEAD_TMP_GRACE_MIN = 120
+_STAGING_DEAD_TMP_REAP_MAX_FILES = 20000
+_STAGING_DEAD_TMP_REAP_BUDGET_S = 20.0
+
+
+def _reap_dead_staging_tmps(
+    root: "Path",
+    *,
+    grace_min: float = _STAGING_DEAD_TMP_GRACE_MIN,
+    max_files: int = _STAGING_DEAD_TMP_REAP_MAX_FILES,
+    budget_s: float = _STAGING_DEAD_TMP_REAP_BUDGET_S,
+) -> dict:
+    """Bounded sweep of DEAD publish tmps below `root` (never raises).
+
+    Deletes only regular files whose NAME ends in '.tmp' — every publish
+    scratch shape (X.parquet.tmp, X.parquet.tmp.tmp, X.parquet.tmp.<pid>.tmp)
+    — whose mtime is older than grace_min minutes. Younger tmps (a live
+    worker's in-flight scratch), non-tmp names, and the _quarantine/ and
+    _wal/ subtrees are never touched. Bounded like the other scans in this
+    module: the walk stops after max_files entries or budget_s seconds and
+    the ONE summary line says so honestly; the next pass continues where
+    this one stopped. No state, idempotent. Returns {"deleted", "bytes",
+    "scanned", "budget_exhausted"} for tests + ops (bytes = on-disk sizes
+    of the files actually unlinked).
+    """
+    import os as _os_rp
+    import time as _time_rp
+
+    res = {"deleted": 0, "bytes": 0, "scanned": 0, "budget_exhausted": False}
+    try:
+        _root = Path(root)
+        if not _root.is_dir():
+            return res
+        _cut = _time_rp.time() - (float(grace_min) * 60.0)
+        _deadline = _time_rp.monotonic() + float(budget_s)
+        _stopped = False
+        for _dirpath, _dirnames, _filenames in _os_rp.walk(_root, onerror=lambda _e: None):
+            # never descend into quarantine/WAL subtrees (the live ones sit
+            # under data/, not staging — pruned so the rule is structural)
+            _dirnames[:] = [d for d in _dirnames if d not in ("_quarantine", "_wal")]
+            for _fn in _filenames:
+                res["scanned"] += 1
+                if res["scanned"] > int(max_files) or _time_rp.monotonic() > _deadline:
+                    _stopped = True
+                    break
+                if not _fn.endswith(".tmp"):
+                    continue
+                _p = Path(_dirpath) / _fn
+                try:
+                    _st = _p.stat()
+                    if _st.st_mtime >= _cut:
+                        continue  # younger than grace: live worker's scratch
+                    _p.unlink()
+                    res["deleted"] += 1
+                    res["bytes"] += int(_st.st_size)
+                except OSError:
+                    pass  # raced away / unstatable / undeletable — next pass retries
+        res["budget_exhausted"] = _stopped
+        print(f"[export] dead-tmp reap: deleted {res['deleted']} file(s) / {res['bytes']} bytes "
+              f"(grace {int(grace_min)}min"
+              + (", walk stopped at scan budget - next pass continues" if _stopped else "")
+              + ")")
+    except Exception as _e:
+        try:
+            print(f"[export] WARN dead-tmp reap failed: {_e!r}")
+        except Exception:
+            pass
+    return res
+
+
 def prepare_kaggle_staging_5m(
     data_dir: str | Path,
     staging_dir: str | Path | None = None,
@@ -6046,6 +6134,10 @@ def prepare_kaggle_staging_5m(
     if assets is None:
         assets = ["BTC", "ETH", "SOL", "HYPE", "BNB", "XRP", "DOGE"]
     staging = Path(staging_dir) if staging_dir else base / "kaggle_staging" / timeframe_label / dataset_prefix
+    # #5b: reap dead publish tmps ONCE per staging-prepare pass, before any
+    # build work — bounded, grace-windowed, never raises (dead workers'
+    # leaked scratch; scope = data/kaggle_staging/** *.tmp only).
+    _reap_dead_staging_tmps(base / "kaggle_staging")
     staging.mkdir(parents=True, exist_ok=True)
 
     # Export per-asset TF-lane files directly into staging (not intermediate export/)
