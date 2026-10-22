@@ -127,6 +127,26 @@ class ParquetWriter:
 
     MAX_DEDUP_KEYS_PER_DATASET = 100_000  # hard cap to prevent unbounded memory growth
 
+    # #5a (2026-10-22): bounded flush batches. One _write_group call pushes
+    # its whole row list through a single pa.Table.from_pylist + pq.write_table
+    # serialize+write pass. For the widest rows (book_snapshots_500ms family —
+    # 842 cols at full depth) the measured transient is ~40.1KB/row RSS
+    # (600-row _write_group pass on this box, 2026-10-22), so a whole
+    # 23-33k-row group held 300MB+ in one pass — the kernel-OOM spikes behind
+    # the 9+ SIGKILL respawns ([mem] rss 484MB->747MB at buf=14443, [flush]
+    # 32685 rows under export ticks). Oversized groups are therefore written
+    # in cap-sized slices (see flush()). Caps are sized by width: 1200 x
+    # 40.1KB ~= 47MB per batch for the 842-col family, 4000 for l2_raw
+    # (verbatim multi-KB frame_json strings), and a large 20k default for
+    # narrow datasets. The cap bounds PER-BATCH rows only — WAL-before-buffer,
+    # dedup, ordering within a part file, and atomic tmp+rename are unchanged.
+    MAX_ROWS_PER_WRITE_BATCH = 20_000  # default per-write-batch row cap (narrow datasets)
+    _WRITE_BATCH_ROW_CAPS = {
+        "book_snapshots_500ms": 1_200,  # 842-col full-depth family
+        "book_snapshots_clean": 1_200,  # same schema family
+        "l2_raw": 4_000,  # verbatim multi-KB frame_json rows
+    }
+
     def __init__(
         self,
         data_dir: str | Path,
@@ -514,6 +534,20 @@ class ParquetWriter:
                     pass
         return True
 
+    def _write_batch_cap(self, dataset: str) -> int:
+        """#5a: per-write-batch row cap for a dataset (width-based). 0 = no cap."""
+        try:
+            cap = self._WRITE_BATCH_ROW_CAPS.get(dataset)
+        except Exception:
+            cap = None
+        if cap is None:
+            cap = self.MAX_ROWS_PER_WRITE_BATCH
+        try:
+            cap = int(cap)
+        except Exception:
+            return 0
+        return cap if cap > 0 else 0
+
     def flush(self) -> int:
         """Flush buffered rows to Parquet. Returns number of rows flushed.
 
@@ -575,9 +609,29 @@ class ParquetWriter:
         _batch_incomplete = False
         items = list(groups.items())
         for idx, ((dataset, date_str, asset), rows) in enumerate(items):
+            # #5a (2026-10-22): bounded flush batches — write an oversized
+            # group in cap-sized slices (_write_batch_cap, width-based) so ONE
+            # serialize+write pass stays memory-bounded (the 842-col snapshot
+            # family transient measured ~40.1KB/row on this box; a whole
+            # 23-33k-row group in one pass was the kernel-OOM driver). All
+            # slices complete before flush() returns: rows are never dropped
+            # or rewritten, the group just spans more atomic tmp+rename part
+            # files (multi-part partitions are the pre-existing §10A layout;
+            # readers sort per E13), and `flushed` still counts every row, so
+            # the [flush] report keeps printing the TOTAL row count.
+            _cap_rows = self._write_batch_cap(dataset)
+            _off = 0  # rows[:_off] of this group are durable part files once a slice raises
             try:
-                self._write_group(dataset, date_str, asset, rows)
-                flushed += len(rows)
+                if _cap_rows > 0 and len(rows) > _cap_rows:
+                    while _off < len(rows):
+                        _chunk = rows[_off:_off + _cap_rows]
+                        self._write_group(dataset, date_str, asset, _chunk)
+                        flushed += len(_chunk)
+                        _off += len(_chunk)
+                else:
+                    self._write_group(dataset, date_str, asset, rows)
+                    flushed += len(rows)
+                    _off = len(rows)
                 # success resets the consecutive-failure counter for this key
                 try:
                     self._flush_fail_counts.pop((dataset, date_str, str(asset)), None)
@@ -588,9 +642,14 @@ class ParquetWriter:
                 except Exception:
                     pass
             except Exception as e:
+                # #5a: earlier slices of this group are already durable part
+                # files — only rows[_off:] are still at risk, so they are the
+                # only rows requeued (requeueing durable slices would
+                # double-write them) or dead-lettered.
+                _tail = rows[_off:]
                 if self.on_event:
                     try:
-                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(rows)})
+                        self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "error": str(e), "rows": len(_tail)})
                     except Exception:
                         pass
                 # N2: dead-letter only after a SUSTAINED fault (min failures AND
@@ -629,7 +688,7 @@ class ParquetWriter:
                         _dl_dir.mkdir(parents=True, exist_ok=True)
                         _dl_path = _dl_dir / f"dead-{int(time.time_ns())}-{os.getpid()}.jsonl"
                         with open(_dl_path, "a", encoding="utf-8") as _df:
-                            for _r in rows:
+                            for _r in _tail:
                                 _df.write(json.dumps({"dataset": dataset, "asset": asset, "date_str": date_str, "row": _r}) + "\n")
                             try:
                                 _df.flush()
@@ -641,13 +700,13 @@ class ParquetWriter:
                         _dl_ok = False
                         try:
                             if self.on_event:
-                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_letter_failed", "rows": len(rows), "error": str(_dle)[:200]})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_letter_failed", "rows": len(_tail), "error": str(_dle)[:200]})
                         except Exception:
                             pass
                     if _dl_ok:
                         try:
                             if self.on_event:
-                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(rows), "failures": _fails, "age_s": round(_age_s, 1)})
+                                self._emit_event(CollectorEventType.write_failed, {"dataset": dataset, "reason": "dead_lettered", "rows": len(_tail), "failures": _fails, "age_s": round(_age_s, 1)})
                         except Exception:
                             pass
                         try:
@@ -666,15 +725,23 @@ class ParquetWriter:
                             for r in reversed(r2):
                                 _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
                         break
-                    # dead-letter write failed — requeue failing + later groups (no loss)
-                    for (d2, ds2, a2), r2 in reversed(items[idx:]):
+                    # dead-letter write failed — requeue at-risk tail + later groups (no loss).
+                    # Later groups requeue FIRST: appendleft builds back-to-front,
+                    # so the buffer keeps arrival order.
+                    for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
                         for r in reversed(r2):
                             _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                    for r in reversed(_tail):
+                        _requeue_front(BufferedRow(dataset=dataset, asset=asset, date_str=date_str, row=r))
                     raise
-                # re-queue failing group AND every unprocessed group front-first (no loss)
-                for (d2, ds2, a2), r2 in reversed(items[idx:]):
+                # re-queue at-risk rows of the failing group AND every unprocessed
+                # group front-first (no loss). Later groups requeue FIRST: appendleft
+                # builds back-to-front, so the buffer keeps arrival order.
+                for (d2, ds2, a2), r2 in reversed(items[idx + 1:]):
                     for r in reversed(r2):
                         _requeue_front(BufferedRow(dataset=d2, asset=a2, date_str=ds2, row=r))
+                for r in reversed(_tail):
+                    _requeue_front(BufferedRow(dataset=dataset, asset=asset, date_str=date_str, row=r))
                 raise
             finally:
                 # PERF RAM: release per-group Arrow/Py list peak promptly.
