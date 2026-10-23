@@ -9,8 +9,9 @@ Mission unchanged: live Polymarket CLOB collector → **99.9%-backtestable data*
 `docs/PERFECT_DATA_SPEC.md` (fresh-share + content correctness; `stale` is an honest
 freshness label, never a defect). Every gap `book_state='stale'` + `resync_episodes` +
 `collector_events`; evidence rows never pruned; retention (quarantine→reap) gates on
-verified upload. **Real Data Only** — no synthetic/interpolated/fabricated content
-(see AGENT.md/AGENTS.md; `synthetic|mock|fake|interpolat` never appears in diffs).
+verified upload. **Real Data Only** — no invented, padded or reconstructed content;
+the exact forbidden-token list lives in AGENT.md/AGENTS.md and those tokens must
+never appear in any diff (one exception, next line).
 
 ---
 
@@ -98,6 +99,8 @@ After deploy VERIFY: `[flush]` totals unchanged, `[mem]` peaks < 900MB steady (t
    with `grep -rl "keyword" tests`). Full suite can OOM the box — never.
 2. `./.venv/bin/ruff check --select F,E9 <files>` — no NEW hits vs HEAD.
 3. Forbidden grep over the diff = 0: `git diff | grep -icE 'synthetic|mock|fake|interpolat'`.
+   (Only doc lines that define the gate itself may quote the pattern — this is the
+   sole sanctioned exception; code, comments and tests must hit 0.)
 4. Behavior change proven FAIL-on-old: new test fails on pre-fix source
    (stash the fix, run, record numbers, restore).
 5. Commit per item, explicit paths only; `git pull --rebase` then push
