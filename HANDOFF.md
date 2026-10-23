@@ -1,6 +1,7 @@
 # HANDOFF — perfect-data autonomous loop on polymarket-data-collector
 
-> REWRITE 2026-10-23 ~10:5x UTC, replacing the 2026-10-19/20 body. Purpose: a fresh
+> REWRITE 2026-10-23 ~10:5x UTC, replacing the 2026-10-19/20 body. Updated same day
+> ~13:1x UTC (see "## 1b) Session notes 2026-10-23 afternoon"). Purpose: a fresh
 > autonomous session (this or a sub-agent chain) can continue the mission on
 > `perfect/pmdata-parity` without re-deriving anything. History worth keeping is
 > compressed at the bottom; operational truth is the top.
@@ -17,8 +18,9 @@ never appear in any diff (one exception, next line).
 
 ## 1) Current state (measured 2026-10-23 10:4x UTC)
 
-**Repo/branch**: `perfect/pmdata-parity`, HEAD `26c632b`. All pushing flows through the
-gate below; never `git add -A` (foreign TS scaffold + ops artifacts churn).
+**Repo/branch**: `perfect/pmdata-parity`, HEAD `e5cf18f` (docs commit on top of the fix
+stack). All pushing flows through the gate below; never `git add -A` (foreign TS
+scaffold + ops artifacts churn).
 
 **Stack of landed, gate-proven fixes (all pushed):**
 
@@ -26,56 +28,89 @@ gate below; never `git add -A` (foreign TS scaffold + ops artifacts churn).
 |---|---|---|
 | `d66ed4a` #1a | memory-bounded `markets_log.compact()` (two-pass streaming; fixture FAIL 371.5MB → PASS ~103MB; prod-scale ~255MB) | ✅ LIVE since 10-21 13:17 |
 | `85875f4` #4a | prewarm gap-tail stop 60s→180s, retry 10s→2s (`rollover.py:1330-1331`) | ✅ LIVE since 10-21 19:01 restart |
-| `a5c03ed` #5a | bounded flush batches (`parquet_writer.py`: `MAX_ROWS_PER_WRITE_BATCH=20k`, wide-842-col family cap 1200 rows ≈ 47MB; 40.1KB/row measured) | ⏳ PUSHED, NOT deployed — running pid 1840264 predates it |
-| `bef1b30` #5b | dead staging-tmp reaper (`export.py:6042`, grace 120min, ≥1 call/pass at `prepare_kaggle_staging_5m` top; recovers leaked per-pid ~140MB tmps) | ⏳ PUSHED, NOT deployed |
+| `a5c03ed` #5a | bounded flush batches (`parquet_writer.py`: `MAX_ROWS_PER_WRITE_BATCH=20k`, wide-842-col family cap 1200 rows ≈ 47MB; 40.1KB/row measured) | ✅ LIVE since 10-23 10:56 (watcher-gated deploy, pid 1930987) |
+| `bef1b30` #5b | dead staging-tmp reaper (`export.py:6042`, grace 120min, ≥1 call/pass at `prepare_kaggle_staging_5m` top; recovers leaked per-pid ~140MB tmps) | ✅ LIVE since 10-23 10:56. First pass fired 11:08:25: `[export] dead-tmp reap: deleted 39 file(s) / 3163129506 bytes` (3.16GB of leaked tmps) |
 | `26c632b` #6 | scorecard coverage semantics: `classify_coverage()` pure fn → `partial-ok` = SOAK verdict for same-day, `stale-local` = WARN-only (data on Kaggle) for pruned ended days | ✅ LIVE (probe script, next run uses it) |
 | config `c2fb5a0`+ | 1h lane PAUSED (`timeframes: [5m]`, dated comment + re-add conditions); `disk_space_min_bytes 1G→8G`; `l2_retention_days 3→2`; `l2_quarantine_max_deletes_per_cycle 1→3` | ✅ LIVE since 10-22 19:37 |
 
-**Live fleet (pm2)**: `polymarket-collector` pid 1840264, uptime ~15h, ↺21 online,
-RSS ~780MB ± hist; `polymarket-watchdog` online. **↺ counter frozen at 21 since 10-22
-19:41** → ≥15h crash-free (previous best was hours).
+**Live fleet (pm2)**: `polymarket-collector` ↺23 online (see §1b for the 12:28 OOM
+incident), `polymarket-watchdog` online 20h+. Deploy verify for #5a/#5b (10-23 10:57
+→ 12:28, pid 1930987): `[flush]` totals unchanged (2k-38k rows/tick, same motif);
+RSS steady 755-798MB with a single ≤1014MB startup-transient sample at 11:07:44 —
+the 747-850MB flush-spike motif did NOT recur; no spike-motif deaths.
 
 **Night telemetry (2026-10-22 20:37 → 10:45, 357 samples/5min, `/tmp/opencode/night_log.csv`)**:
 free disk 14→40G (the l2 dated partitions Oct 12 draining via quarantine-reap), settling ~14G;
-`mem_avail` 455-1311MB; collector RSS 674-837 (median 781) — the OLD un-capped flush still
-spiked inside that path (deploy #5a to bound it). **0 overnight respawns.**
+RSS max 837MB; `mem_avail` dipped to 0MB at least once overnight without a kill
+(page-cache reclaim carried it). **0 overnight respawns.**
 
 **Disaster-fixed states**:
 - Disk: 99% (1.7G free) at 10-22 19:2x → 78-86.7% now via the disk-guard funnel
-  (8G threshold) + l2 retention ring (2d). The 500ms-hive coverage proof was frozen at
-  2026-10-20 19:27 (500ms staging commits) — it heals as 500ms passes commit again.
+  (8G threshold) + l2 retention ring (2d) + #5b reaper reclaim. Root disk is the
+  tight one for *code/logs* (15G/19G used incl. opencode); the `data/` mount
+  (/dev/sdb) had 15G free at 12:1x-13:0x.
 - 1h lane: paused; Kaggle verified to 2026-10-19 14:01. Re-add only per config
   comment conditions (stable disk <75% 24h + one completed 1h verified upload).
 
-**Quality baselines to re-measure (last measured 10-18/20):**
+**Quality baselines (re-measured 10-23, see §1b):**
+- **#4a post-roll soak RE-MEASURED (10-23 ~12:05, trailing-24h window 10-22 12:10 →
+  10-23 12:10, 2280 5m windows): post-open 159 (7.0%)** vs baseline 330/2443 (13.5%)
+  — halved. p50 112.7s / p90 248.8s / max 299.9s; 68 windows >120s (61 `via=poll`).
+  Cumulative since the #4a deploy (10-21 19:01 → 10-23 12:1x, 3973 windows):
+  248 post-open (6.2%), 91 >120s (79 poll). The >120s residue clusters in specific
+  hours (7-asset batches ×1/h during 13-19h on 10-22 + the 19h deploy window struck
+  26) — poll-path lag during export passes; still the biggest loss bucket.
 - Live density 96.8-97.7% sampled (goal ≥99.9%): buckets post_roll ~35% / outage ~30% /
-  other ~35% (`scripts/density_split.py`).
-- Post-roll discoveries (10-21 24h log evidence): 2443 5m windows, 330 (13.5%)
-  discovered post-open p50 43.3s / p90 220.6s / max 299s, 82 >120s (77 `via=poll`).
-  #4a deployed pre-streak → re-measure after a 24h soak.
-- Official-share 86.0% (29,336 official / 4,786 `inferred_nearest`) — backfill-dependent
-  (cron deleted as OOM hazard; #1a makes re-enabling safe; re-enable once RSS bounded).
+  other ~35% (`scripts/density_split.py`) — re-run `density_split` after the catch-up
+  pass settles.
+- Official-share 86.0% (29,336 official / 4,786 `inferred_nearest`) — backfill last
+  ran 2026-10-20 21:26 (`logs/resolution-backfill-out.log`); cron still OFF. Gap
+  grows ~1.3k windows/day until re-enabled (§1b sequencing).
 - Content: dup/offgrid/badpx/zero = 0; CompNorm 0.0% all lanes; G6 0/10.9k;
   PMData mid-diff 0 ticks (BTC-5m 2026-10-04); Kalshi xcheck 30/30.
 - T4 debt: ~2.9k historical orphan resync rows (bounded, no ongoing loss post `a072785`
   minting) — treat ACCEPTED or one evidence-only narration pass (deterministic ids).
 
-## 2) CURRENT BLOCKER: deploy #5a+#5b (running pid is 15h old)
+## 1b) Session notes 2026-10-23 12:00-13:1x UTC (afternoon session)
 
-The quiet-window gate never found a 10-min green gap overnight — the 5m export pass
-cycled back-to-back (each pass re-scans assets whose tmps were killed pre-publish,
-~20-40min each x many datasets; gaps between passes exist but the probe window missed
-them within the 8h arm). DEPLOY OPTIONS (order):
-1. **Re-arm the watcher with a 24h window** (`/tmp/opencode/restart_watcher.sh` has
-   `seq 1 96` → change to `seq 1 288`; it polls quiet_window every 300s and restarts
-   on green). Honest pass-boundary gap will occur within ~24-30h of pass runtime.
-2. If the pass completes a full cycle: the tick result `[kaggle:5m] staging N files -> …
-   succ X prune Y` prints, the gate turns GREEN, watcher fires → deploy happens.
-3. If a crash predates the green gate: pm2 respawns into HEAD automatically (any death
-   deploys #5a+#5b).
-After deploy VERIFY: `[flush]` totals unchanged, `[mem]` peaks < 900MB steady (the
-747-850MB spike motif dies), the `[export] dead-tmp reap:` line prints per pass, and
-`uptime` counter resets with ↺+1.
+- **Deploy #5a+#5b completed via the watcher (as designed)**: `/tmp/opencode/restart_watcher.log`
+  shows gate GREEN 10:54:43 → SIGINT 10:56:13 → SIGKILL 1840264 → pm2 respawn into
+  HEAD at 10:56:15 (↺22). Verify numbers in §1 table.
+- **FYI good**: quiet_window.out showed `OK: quiet window — no issues found`; the
+  watcher exited after the deploy (NOT armed now — re-arm only for a future deploy).
+- **12:28:09 kernel OOM — self-inflicted, PROBED**: the collector (RSS 722MB) was
+  killed alongside tiny systemd units while an ~86-min catch-up pass was IN FLIGHT
+  and an offline `scorecard.py --date 2026-10-22` (completeness child at 623MB) was
+  running concurrently. The scorecard survived (not the victim); the collector pm2
+  respawned (↺23, pid 1940035) and recovered cursors/books cleanly. **NEW HARD RULE:
+  NEVER run any offline scan/probe (scorecard, gate_probe, tests, pytest) while a
+  kaggle pass is in flight — check for an in-flight pass first**
+  (`tail logs/collector-out-0.log | grep '\[export'`); the scorecard's own -560s
+  per-lane budget + completeness child is ~600-800MB, which is exactly the headroom
+  a big staging build consumes.
+- **Kaggle backlog state (12:3x)**: 5m dataset last VERIFIED upload 2026-10-22 08:18
+  (`_kaggle_state.json`); backfill last ran 10-20 21:26. The 11:02 tick (old pid,
+  86+ min catch-up pass) died pre-publish — fail-closed, staging tmps remain and
+  will be reaped by #5b on passes after their 120min grace. New pid re-armed the
+  kaggle loop (12:31:36, `stagger +535s`) → next tick 12:36/12:40 window.
+- **The scorecard rerun for 2026-10-22 is PENDING** (first attempt killed to free
+  RAM at 12:5x, printed nothing). Re-run ONLY with no pass in flight, and give it
+  the box to itself (it prints only at exit; buffer via `python -u` or run under
+  `stdbuf -oL` to see progress live).
+- **#4a soak re-measure done (see §1)** — the remaining 7.0% post-open residue p50
+  112.7s is poll-path lag during passes; next fix lever = discovery scan budget vs
+  export-pass overlap, NOT another prewarm tweak.
+
+## 2) CURRENT STATE: deploy DONE; queue = catch-up tick → 2h bounded RSS → backfill re-enable
+
+- Watcher-gated deploy happened at 10:56; the verify checklist near-met: flush
+  totals unchanged, RSS steady ≤798MB with one 1014MB startup transient, dead-tmp
+  reap line prints (3.16GB first pass). Last verify item: one full pass + a tick
+  completing `[kaggle:5m] staging N files -> … succ X prune Y` under the NEW code.
+- After that verified pass and ~2h bounded RSS on the current pid: re-enable the
+  backfill cron (`pm2 start ecosystem.config.cjs --only
+  polymarket-resolution-backfill`) — #5a+#1a now bound the co-spike hazard that
+  killed it on 10-20. If avail-RAM is <600MB at re-enable time, wait.
 
 ## 3) The subagent protocol (USER-DIRECTED WORKFLOW)
 
@@ -123,18 +158,22 @@ After deploy VERIFY: `[flush]` totals unchanged, `[mem]` peaks < 900MB steady (t
 
 ## 6) Backlog / next cycles (priority order)
 
-1. **Deploy #5a+#5b** (unverified: the flush spikes still kill RAM headroom) →
-   then VERIFY (below) → push docs update.
-2. **#4a 24h post-roll soak re-measure**: fresh `window_discovered` census vs the
-   10-21 baseline (p50 43.3s/p90 220.6s, 82 windows >120s). Expect post-open share ≪13.5%.
-   Then `density_split.py` re-blame (post_roll bucket ~35%).
+1. ~~Deploy #5a+#5b~~ → **DONE 10-23 10:56, verified** (§1/§1b). Next: finish ONE
+   full pass + verified `[kaggle:5m]` tick under the new code, then push docs.
+2. ~~#4a 24h post-roll soak re-measure~~ → **DONE 10-23 (~12:05)**: post-open
+   13.5% → **7.0%** trailing-24h. Next: `density_split.py` re-blame after the
+   catch-up pass settles; remaining residue = poll-path lag during passes.
 3. **Backfill re-enable** (official-share 86→99%): `pm2 start ecosystem.config.cjs
-   --only polymarket-resolution-backfill` — ONLY after #5a deployed and RSS bounded
-   for ~2h (cron influx vs caps). The bounded-compact fix (d66ed4a) protects it.
+   --only polymarket-resolution-backfill` — ONLY after a full pass + verified
+   Kaggle tick + ~2h bounded RSS on the current pid (blocked 10-20 by co-spikes;
+   now bounded by #5a/#5b/#1a) + avail-RAM ≥600MB. Backlog is now ~2 days (last
+   verified 2026-10-22 08:18): expect the first pass to be slow (~1h worker
+   budget); do NOT run anything concurrent.
 4. **PMData-format export deliverable** (`export_pmdata` wired after the daily pass →
    `{ASSET}-{TF}.zip` + manifest → own Kaggle dataset; extend `pmdata_diff` to all
    assets×days; assert in scorecard). This turns "PMData parity proven" into "PMData
-   format delivered".
+   format delivered". Needs the operator-side `base_url` for pmdata_diff ground truth
+   or a secured reference copy.
 5. Optional: ~2.9k orphan narration OR document ACCEPTED; 9 whitelisted failing
    tests → green (list below); 15m lane + 1h re-stage (operator decisions);
    HYPE WS-only banking (operator explicit OK required).
