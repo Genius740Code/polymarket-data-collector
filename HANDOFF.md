@@ -59,7 +59,8 @@ RSS max 837MB; `mem_avail` dipped to 0MB at least once overnight without a kill
   Cumulative since the #4a deploy (10-21 19:01 → 10-23 12:1x, 3973 windows):
   248 post-open (6.2%), 91 >120s (79 poll). The >120s residue clusters in specific
   hours (7-asset batches ×1/h during 13-19h on 10-22 + the 19h deploy window struck
-  26) — poll-path lag during export passes; still the biggest loss bucket.
+  26 + the 10-23 10h deploy hour hit 7) — poll-path lag during export passes; still
+  the biggest loss bucket.
 - Live density 96.8-97.7% sampled (goal ≥99.9%): buckets post_roll ~35% / outage ~30% /
   other ~35% (`scripts/density_split.py`) — re-run `density_split` after the catch-up
   pass settles.
@@ -100,6 +101,58 @@ RSS max 837MB; `mem_avail` dipped to 0MB at least once overnight without a kill
 - **#4a soak re-measure done (see §1)** — the remaining 7.0% post-open residue p50
   112.7s is poll-path lag during passes; next fix lever = discovery scan budget vs
   export-pass overlap, NOT another prewarm tweak.
+
+## 1c) Session notes 2026-10-24 (catch-up grind forensics)
+
+**No crash-loop mystery anymore; also a NEW structural finding on the catch-up path
+(read-only verified, no code changed).**
+
+- **↺23 → ↺40, ~17 kernel-OOM deaths in ~24h** (journal `-k "Killed process"`
+  showed every one: victims = collector parent python mid-pass, anon-RSS
+  1.19-1.70GB; pm2 max_memory_restart (collector cap `'2100M'`,
+  ecosystem.config.cjs:88) monitors ONLY the single parent pid at 30s
+  (`PM2_WORKER_INTERVAL`, pm2 Worker.js:89-93) — it never fires here; the kernel
+  OOM-killer wins when system avail hits ~0 during a pass peak + co-residents).
+- **Co-resident thief found and reaped 10-24 13:44**: 38 stuck `PM2 v7.0.4: God
+  Daemon` zombies (~570MB RSS beyond the live pid, spawned all at once during the
+  10-20 20:2x ops storm) + 109 orphan `node …/pm2 update` processes. Killed all
+  except the live God Daemon (pid 1446029); collector/watchdog unaffected, avail
+  +~335MB immediately. All zombies shared one spawn moment → not an ongoing
+  generator (watch for recurrence after another `pm2 wipe`-style event).
+- **Night grind is REAL but partial**: `data/kaggle_staging/_progress.json`
+  shows XRP 500ms cutoff advanced from the frozen 1792532244 (Oct-22 08:17) to
+  ~1792795586 (late 10-23) and BTC book_snapshots_clean also advanced — scope-skip
+  carry works. But 4 slices hit `spawn failed → TimeoutExpired` (10:51, 15:08,
+  16:09 ETH, 17:09 SOL) and each commits only a `bounded in-process fallback`
+  PARTIAL: `EXPORT_FALLBACK_FILE_CAP = 40` files
+  (`src/polymarket_collector/storage/export.py:4824`).
+- **Structural math (verified in code)**: worker budget =
+  `files × 2.5s + 300s` clamped to `[1800, MAX 3600]`
+  (`export.py:4849-4853`). Whale catch-up slices need ~10.5k files × 2.5s ≈
+  26.6ks but the cap 3600s guarantees TimeoutExpired → per-slice 40-file slivers.
+  Real scan rate ≈ 4.8s/file (worker 1941527 scanned 49min without finishing). The
+  2.5s/file constant predates the current streaming-carry path. Backlog burn rate
+  today ≈ (full slices) + (40-file slivers × seq) — the Kaggle checkpoint will
+  advance on some slices per pass but the 2-full-day-old slivers may take
+  multiple days at the current cap.
+- **Candidate smallest fixes (documented, NOT applied — a pass is live; never edit
+  `src/` mid-tick):
+  1. Make `EXPORT_WORKER_TIMEOUT_MAX_S` avail-aware for catch-up slices
+     (`export.py:4850`): grant max(3600, budget) up to a hard ceiling (e.g.
+     9000-14400s) ONLY when avail ≥ the min-avail guard — mirrors the existing
+     avail-guard pattern at :4876-78. Restart after a quiet gate.
+  2. The in-process fallback PARTIAL publishes a *smaller* staging file than prior
+     (success path carries prior rows + delta; fallback carries only its 40-file
+     delta commit). Verify whether `_stream_export_asset_dataset` also streams the
+     prior staging carry in the fallback; if not, the fallback must NOT replace the
+     full staging file (keep-prior + skip, not partial-commit) — else each fallback
+     would ship a truncated staging version to Kaggle. FAIL-on-old test needed.**
+- **RSS sampler live**: `/tmp/opencode/rss_sampler.sh` (20s cadence, pure shell;
+  parent+worker RSS columns → `/tmp/opencode/rss_sampler.csv`) — retention
+  evidence for the death window; use it, not python probes, during passes.
+- **Backlog item 3 (backfill re-enable) remains blocked** until one verified
+  `[kaggle:5m]` tick lands under bounded RSS; keep the box lean meanwhile.
+
 
 ## 2) CURRENT STATE: deploy DONE; queue = catch-up tick → 2h bounded RSS → backfill re-enable
 
